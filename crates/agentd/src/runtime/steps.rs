@@ -945,7 +945,7 @@ impl Runtime {
             run.unattended = Some(crate::engine::run::Unattended {
                 principal: a.principal.clone(),
                 via: a.via,
-                asked: Vec::new(),
+                asked: Default::default(),
             });
         }
         run.subagent = ev

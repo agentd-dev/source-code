@@ -1649,11 +1649,20 @@ What holds:
   shows is agentd's identifiers, never a payload; the approval's ID token
   must name the grant's own `iss` and `sub` — a hint can resolve to another
   account — or the firing fails closed; it is the subject of that firing's
-  mints alone, held in memory and never written, so a restart fails the
-  firing closed rather than asking again; and a refresh token the IdP
-  issued with it is revoked when the run ends — held in memory alone, a
-  restart before then leaves it alive at the IdP until it expires. The
-  login hint a CIBA
+  mints and exchanges alone — a `grant: token_exchange` server's exchange
+  presents it, bound to the approval, never the grant's access token —
+  held in memory and never written. A restart loses the request and the
+  approval, and the firing asks the person once more — one new request,
+  saying `again`, nothing of the old one used — and the run's record says
+  so before it is sent, so a second restart fails the firing closed and a
+  denied request is never asked again. A refresh token the IdP issued
+  with an approval is kept sealed in the store while the run lasts and
+  revoked when it ends; one a crash left there is revoked at the next
+  start, before any request is sent, so it never outlives its run at the
+  IdP for longer than agentd is down — or, under an external signer down
+  at that start, than the signer is: the start's pass is tried again, with
+  a backoff, until it finishes, and a request made meanwhile fails unsent.
+  The login hint a CIBA
   request falls back to is kept sealed under the person's personal key.
 - **A gone grant waits only where it is safe to.** Under `auth.on_revoked:
   ask` a workflow step whose grant was revoked or expired, or whose run's
@@ -1721,10 +1730,12 @@ the IdP removes a Resource connection until the next mint (at most
 keeps a record of its own; for one person on a kernel without Landlock,
 with no separate worker uid, the vault and a mounted key file are readable
 by any same-uid process; a `via: ciba` approval answers for every
-delegated call of its firing at the person's IdP, not for each; a refresh
-token an IdP issues with a CIBA approval outlives a restart at the IdP
-until it expires; and DPoP binds the authorization-server and MCP legs,
-not the exchange at the IdP.
+delegated call of its firing at the person's IdP, not for each; a restart
+asks the person a second time for a firing they had approved; a refresh
+token an IdP issues with a CIBA approval lives at the IdP while agentd is
+down, until the next start revokes it, and one that IdP will not revoke
+then is forgotten all the same; and DPoP binds the authorization-server
+and MCP legs, not the exchange at the IdP.
 
 ### A container deployment with a worker uid
 

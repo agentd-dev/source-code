@@ -32,23 +32,28 @@
 //!
 //! **`via: ciba`** asks the person at the first delegated call of a firing
 //! at each grant, by OpenID CIBA in poll mode ([`crate::auth::ciba`]): one
-//! request per firing and grant — never a second, a restart included — at
-//! most one waiting per person and workflow, and at most `ciba.per_day` a
-//! day per person, counted in their grant. The request's hint is a fresh ID
-//! token from a `refresh_token` grant under the grant's lock, discarded
-//! once sent; an IdP that answers none is sent the `preferred_username`
-//! the person enrolled with, kept sealed under their personal key (§6.4).
-//! The approval's ID token must name the grant's own `iss` and `sub` — a
-//! hint can resolve to another account — or the firing fails closed. It is
-//! then the subject of the firing's mints alone, in memory, until it
-//! expires (`subject_expired`); the tokens minted with it are pooled for
-//! the firing alone; and a refresh token the IdP issued with it anyway is
-//! revoked (RFC 7009) when the run ends.
+//! request per firing and grant, and once more after a restart that lost
+//! it while it waited or once approved — never a third, and never after a
+//! denial — at most one waiting per person and workflow, and at most
+//! `ciba.per_day` a day per person, counted in their grant. The request's
+//! hint is a fresh ID token from a `refresh_token` grant under the grant's
+//! lock, discarded once sent; an IdP that answers none is sent the
+//! `preferred_username` the person enrolled with, kept sealed under their
+//! personal key (§6.4). The approval's ID token must name the grant's own
+//! `iss` and `sub` — a hint can resolve to another account — or the firing
+//! fails closed. It is then the subject of the firing's mints and
+//! exchanges alone, in memory, until it expires (`subject_expired`); the
+//! tokens minted with it are pooled for the firing alone; and a refresh
+//! token the IdP issued with it anyway is kept sealed in the store while
+//! the run lasts and revoked (RFC 7009) when it ends — or, after a crash,
+//! at the next start's first pass, before any request is sent (§7.P3c).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde_json::json;
 
+use super::vault::{Approval, Unopened};
 use super::{Acting, Code, Delegation, DelegationError, Idp, Who, WhoKind, refuse};
 use crate::a2a::principals::typed::{PrincipalRef, Source};
 use crate::auth::ciba::{self, Hint, Polled};
@@ -56,11 +61,26 @@ use crate::auth::idjag::Refusal;
 use crate::config::settings::Role;
 use crate::config::settings::delegation::{Profile, Template, Via};
 use crate::engine::model::ActForPrincipal;
-use crate::engine::run::UNATTENDED_SID_PREFIX;
+use crate::engine::run::{Asked, UNATTENDED_SID_PREFIX};
 use crate::state::now_ms;
 
 /// Where a grant's sealed login hint is kept, by `grant_id`.
 const HINTS: &str = "delegation/hint/";
+
+/// How long after a start's pass over the approvals' refresh tokens left
+/// in the store could not finish the next is due, at first and at most.
+const SWEEP_RETRY_MS: (u64, u64) = (5_000, 300_000);
+
+/// When a reactor pass next runs the start's pass over the refresh tokens
+/// approvals left in the store ([`Delegation::revoke_left_approvals`]).
+#[derive(Default)]
+pub(super) struct SweepDue {
+    /// Due once now is past it: 0 at a start, `u64::MAX` while one runs or
+    /// once one finished.
+    at_ms: u64,
+    /// How long after the last that could not finish.
+    backoff_ms: u64,
+}
 
 /// An `act_for` workflow as the runtime installed it: what its firings act
 /// with, and what a person's sign-in consents to.
@@ -86,21 +106,26 @@ pub struct Firing {
 }
 
 /// A firing acting now: whom it is for, the grants it has asked its person
-/// at, those it is asking at, and what their approvals gave it.
+/// at in this life, how its run's record says it asked before this life
+/// began, the grants it is asking at, and what their approvals gave it.
 pub(super) struct Running {
     pub(super) firing: Firing,
     principal: ActForPrincipal,
     asked: BTreeSet<String>,
+    earlier: BTreeMap<String, Asked>,
     asking: BTreeSet<String>,
     subjects: BTreeMap<String, Subject>,
 }
 
-/// What a CIBA approval gave a firing at one grant: memory only.
+/// What a CIBA approval gave a firing at one grant: the ID token in memory
+/// alone, and a refresh token the IdP issued with it also kept sealed in
+/// the store, as `kept`, until the run ends.
 struct Subject {
     id_token: String,
     /// Seconds since the epoch.
     exp: u64,
     refresh_token: Option<String>,
+    kept: Option<Approval>,
 }
 
 /// The subject a firing mints with at a grant.
@@ -109,10 +134,11 @@ pub(super) enum FiringSubject {
     Approved(String, u64),
     /// Its request waits on the person's answer.
     Asking,
-    /// It asked, and holds no approval: denied, expired, or lost to a
-    /// restart.
+    /// It asked, and holds no approval: denied or expired in this life, or
+    /// lost to a restart after it had asked once more.
     Asked,
-    /// It has not asked yet.
+    /// It has not asked yet — or a restart lost its request, or the
+    /// approval it gave, and it asks once more.
     Unasked,
 }
 
@@ -370,8 +396,15 @@ impl Delegation {
     }
 
     /// A firing started — or, after a restart, resumes — acting through
-    /// `firing.sid` for `principal`, having asked at the grants `asked`.
-    pub fn firing_started(&self, firing: Firing, principal: ActForPrincipal, asked: &[String]) {
+    /// `firing.sid` for `principal`, having asked as its run's record says
+    /// (`earlier`): what any request or approval gave it ended with the
+    /// last life.
+    pub fn firing_started(
+        &self,
+        firing: Firing,
+        principal: ActForPrincipal,
+        earlier: &BTreeMap<String, Asked>,
+    ) {
         self.firings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -380,11 +413,21 @@ impl Delegation {
                 Running {
                     firing,
                     principal,
-                    asked: asked.iter().cloned().collect(),
+                    asked: BTreeSet::new(),
+                    earlier: earlier.clone(),
                     asking: BTreeSet::new(),
                     subjects: BTreeMap::new(),
                 },
             );
+    }
+
+    /// Whether firing `sid` has asked its person at `grant` in this life.
+    pub fn firing_asked(&self, sid: &str, grant: &str) -> bool {
+        self.firings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(sid)
+            .is_some_and(|r| r.asked.contains(grant))
     }
 
     /// Whether firing `sid` is acting now.
@@ -456,11 +499,11 @@ impl Delegation {
             .map(|_| sid.to_string())
     }
 
-    /// Firing `sid` asks its person at grant `grant` now — never again —
-    /// and waits on their answer: unless another firing of its workflow
-    /// for the same person is waiting on theirs (one request waits at a
-    /// time per person and workflow), decided with the mark made, so two
-    /// firings asking at once never both wait or both refuse.
+    /// Firing `sid` asks its person at grant `grant` now — never again in
+    /// this life — and waits on their answer: unless another firing of its
+    /// workflow for the same person is waiting on theirs (one request waits
+    /// at a time per person and workflow), decided with the mark made, so
+    /// two firings asking at once never both wait or both refuse.
     pub fn ciba_asking(&self, sid: &str, grant: &str) -> Result<(), DelegationError> {
         let mut f = self.firings.lock().unwrap_or_else(|e| e.into_inner());
         let Some(me) = f.get(sid) else {
@@ -508,7 +551,12 @@ impl Delegation {
             Some(_) => FiringSubject::Asked,
             None if r.asking.contains(grant) => FiringSubject::Asking,
             None if r.asked.contains(grant) => FiringSubject::Asked,
-            None => FiringSubject::Unasked,
+            // A restart lost the request or its approval: once more, unless
+            // it had asked once more already, or was refused.
+            None => match r.earlier.get(grant) {
+                None | Some(Asked::Once) => FiringSubject::Unasked,
+                Some(Asked::Again | Asked::Refused) => FiringSubject::Asked,
+            },
         }
     }
 
@@ -532,8 +580,10 @@ impl Delegation {
 
     /// Ask the person firing `sid` acts for to approve it, at grant
     /// `grant_id`, with `binding` as the message their device shows: off
-    /// the loop, once [`Self::ciba_asking`] marked it, and only while its
-    /// wait is still open. `ciba.per_day` a day per person.
+    /// the loop, once [`Self::ciba_asking`] marked it, only while its wait
+    /// is still open, and only once every refresh token an approval left
+    /// in the store before this start is revoked
+    /// ([`Self::revoke_left_approvals`]). `ciba.per_day` a day per person.
     pub fn start_ciba(
         &self,
         sid: &str,
@@ -552,7 +602,9 @@ impl Delegation {
                 "the wait for the person's approval ended before the request was sent",
             ));
         }
-        let out = self.ask_ciba(sid, grant_id, binding);
+        let out = self
+            .revoke_left_approvals()
+            .and_then(|()| self.ask_ciba(sid, grant_id, binding));
         if out.is_err() {
             self.not_asking(sid, grant_id);
         }
@@ -778,7 +830,58 @@ impl Delegation {
                         ),
                     );
                 }
-                let kept = {
+                let ended = |kept: Option<&Approval>| {
+                    // The firing ended while its person approved: nothing
+                    // is kept, and no refresh token is left alive.
+                    if let Some(rt) = &signed.refresh_token {
+                        self.discard_refresh_token(idp, rt);
+                    }
+                    if let Some(a) = kept {
+                        let _ = self.vault.forget_approval(&a.name());
+                    }
+                    CibaOutcome::Refused {
+                        code: Code::Revoked,
+                        why: "the firing ended before its person approved it".into(),
+                    }
+                };
+                let run = self
+                    .firings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(sid)
+                    .map(|r| r.firing.run.clone());
+                let Some(run) = run else {
+                    return ended(None);
+                };
+                // A refresh token the IdP issued anyway is kept sealed in
+                // the store before the approval is used: a crash from here
+                // on leaves none alive at the IdP that the next start does
+                // not revoke. One that cannot be kept so is revoked now,
+                // and the approval with it.
+                let kept = match &signed.refresh_token {
+                    None => None,
+                    Some(rt) => {
+                        let a = Approval {
+                            firing: sid.to_string(),
+                            run,
+                            grant_id: grant_id.to_string(),
+                            idp: g.idp.clone(),
+                        };
+                        match self.vault.keep_approval(&a, rt) {
+                            Ok(()) => Some(a),
+                            Err(e) => {
+                                self.discard_refresh_token(idp, rt);
+                                let e = super::not_stored(
+                                    e,
+                                    Code::IdpUnavailable,
+                                    "the refresh token the IdP issued with the approval could not be kept sealed, so it was revoked and the approval with it",
+                                );
+                                return refused(e.code, e.message);
+                            }
+                        }
+                    }
+                };
+                let held = {
                     let mut f = self.firings.lock().unwrap_or_else(|e| e.into_inner());
                     match f.get_mut(sid) {
                         Some(r) => {
@@ -789,6 +892,7 @@ impl Delegation {
                                     id_token: signed.id_token.clone(),
                                     exp: signed.claims.exp,
                                     refresh_token: signed.refresh_token.clone(),
+                                    kept: kept.clone(),
                                 },
                             );
                             true
@@ -796,16 +900,8 @@ impl Delegation {
                         None => false,
                     }
                 };
-                if !kept {
-                    // The firing ended while its person approved: nothing
-                    // is kept, and no refresh token is left alive.
-                    if let Some(rt) = &signed.refresh_token {
-                        self.discard_refresh_token(idp, rt);
-                    }
-                    return CibaOutcome::Refused {
-                        code: Code::Revoked,
-                        why: "the firing ended before its person approved it".into(),
-                    };
+                if !held {
+                    return ended(kept.as_ref());
                 }
                 self.audit(
                     "delegation.ciba",
@@ -824,8 +920,8 @@ impl Delegation {
 
     /// Firing `sid`'s run ended: its approvals are dropped, the tokens
     /// minted with them purged, and a refresh token an IdP issued with one
-    /// anyway revoked at it (RFC 7009) — off the loop, since the IdP is
-    /// asked.
+    /// anyway revoked at it (RFC 7009) and forgotten by the store — off the
+    /// loop, since the IdP is asked.
     pub fn firing_ended(&self, sid: &str) {
         let Some(r) = self
             .firings
@@ -856,6 +952,14 @@ impl Delegation {
                 Some(i) => self.revoke_at_idp(i, &rt),
                 None => Err("the IdP is no longer declared".into()),
             };
+            if let Some(a) = &s.kept
+                && let Err(e) = self.vault.forget_approval(&a.name())
+            {
+                self.log.warn(
+                    "delegation.ciba.unforgotten",
+                    json!({"grant_id": grant, "run": r.firing.run, "err": e}),
+                );
+            }
             self.audit(
                 "delegation.ciba",
                 "revoked",
@@ -863,6 +967,113 @@ impl Delegation {
                 json!({"grant_id": grant, "run": r.firing.run, "workflow": r.firing.workflow,
                        "revoked_at_idp": at_idp.is_ok(), "at_idp_error": at_idp.err()}),
             );
+        }
+    }
+
+    /// Every refresh token an IdP issued with a CIBA approval that the
+    /// store still keeps from before this start — a run the last life left
+    /// unended, a crash — revoked at its IdP (RFC 7009) and forgotten:
+    /// at the first pass, and before any request is sent, so a new
+    /// approval is never revoked with an old one (RFC 0044 §7.P3c). Off the
+    /// loop; done once. One the external signer cannot open now, or the
+    /// store not read or list now, is kept for a later pass
+    /// ([`Self::sweep_left_approvals`]), and every request meanwhile fails
+    /// unsent; one that never opens is forgotten.
+    pub fn revoke_left_approvals(&self) -> Result<(), DelegationError> {
+        let mut swept = self
+            .approvals_swept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if *swept {
+            return Ok(());
+        }
+        let mut left = None;
+        let names = self.vault.approvals().unwrap_or_else(|e| {
+            left = Some((Code::IdpUnavailable, e));
+            Vec::new()
+        });
+        for name in names {
+            let (run, grant, at_idp) = match self.vault.open_approval(&name) {
+                Ok(None) => continue,
+                Ok(Some((a, rt))) => {
+                    let at_idp = match self.providers.get(&a.idp) {
+                        Some(i) => self.revoke_at_idp(i, &rt),
+                        None => Err("the IdP is no longer declared".into()),
+                    };
+                    (Some(a.run), Some(a.grant_id), at_idp)
+                }
+                Err(Unopened::Signer(e)) => {
+                    left = Some((Code::SignerUnavailable, e));
+                    continue;
+                }
+                Err(Unopened::Store(e)) => {
+                    left = Some((Code::IdpUnavailable, e));
+                    continue;
+                }
+                // Nothing to revoke with: it is forgotten all the same.
+                Err(Unopened::Never(e)) => (None, None, Err(format!("it does not open: {e}"))),
+            };
+            if let Err(e) = self.vault.forget_approval(&name) {
+                self.log.warn(
+                    "delegation.ciba.unforgotten",
+                    json!({"grant_id": grant, "run": run, "err": e}),
+                );
+            }
+            self.audit(
+                "delegation.ciba",
+                "revoked",
+                None,
+                json!({"grant_id": grant, "run": run, "left_by": "restart",
+                       "revoked_at_idp": at_idp.is_ok(), "at_idp_error": at_idp.err()}),
+            );
+        }
+        match left {
+            None => {
+                *swept = true;
+                Ok(())
+            }
+            Some((code, e)) => {
+                self.log
+                    .warn("delegation.ciba.unrevoked", json!({"err": e.clone()}));
+                Err(refuse(
+                    code,
+                    format!(
+                        "a refresh token an approval left in the store before this start is not revoked yet, and no request is sent until it is: {e}"
+                    ),
+                ))
+            }
+        }
+    }
+
+    /// Run [`Self::revoke_left_approvals`] off the loop when it is due: at
+    /// a start, and again after one the signer or the store kept from
+    /// finishing — 5 s after, doubling to 5 min — until one finishes,
+    /// whether or not a CIBA request comes meanwhile. At a start, and every
+    /// reactor pass.
+    pub fn sweep_left_approvals(self: &Arc<Self>) {
+        {
+            let mut due = self.approvals_due.lock().unwrap_or_else(|e| e.into_inner());
+            if now_ms() < due.at_ms {
+                return;
+            }
+            due.at_ms = u64::MAX;
+        }
+        let me = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("delegation-ciba-sweep".into())
+            .spawn(move || {
+                if me.revoke_left_approvals().is_err() {
+                    let mut due = me.approvals_due.lock().unwrap_or_else(|e| e.into_inner());
+                    let (first, most) = SWEEP_RETRY_MS;
+                    due.backoff_ms = (due.backoff_ms * 2).clamp(first, most);
+                    due.at_ms = now_ms() + due.backoff_ms;
+                }
+            });
+        if spawned.is_err() {
+            self.approvals_due
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .at_ms = 0;
         }
     }
 

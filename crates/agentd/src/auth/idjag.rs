@@ -436,12 +436,17 @@ pub fn exchange(
 
 /// One RFC 8693 on-behalf-of exchange at the MCP server's own authorization
 /// server, which is the person's IdP (RFC 0044 §5.7, M1b): an access token
-/// issued to agentd for the person, exchanged for one the pinned audience
-/// and resource take.
+/// issued to agentd for the person — or the ID token of a firing's CIBA
+/// approval (§7.P3c) — exchanged for one the pinned audience and resource
+/// take.
 pub struct AccessExchange<'a> {
-    /// An access token for agentd: from the grant's refresh token at this
-    /// authorization server, or the caller's verified inbound token.
+    /// An access token for agentd — from the grant's refresh token at this
+    /// authorization server, or the caller's verified inbound token — or a
+    /// `via: ciba` firing's approval's ID token.
     pub subject_token: &'a str,
+    /// [`wire::TOKEN_TYPE_ACCESS_TOKEN`], or [`wire::TOKEN_TYPE_ID_TOKEN`]
+    /// for an approval's.
+    pub subject_token_type: &'static str,
     /// The pinned audience the result is issued for.
     pub audience: &'a str,
     /// The pinned MCP server.
@@ -533,28 +538,34 @@ pub fn check_access_exchange(
 
 /// The on-behalf-of exchange at `asrv`, the authorization server that is
 /// both the person's IdP and the MCP server's (RFC 8693 §2.1): the subject
-/// an access token for agentd, the result one for the pinned audience and
-/// resource. `asrv` carries agentd's client authentication there. The
-/// subject goes to that token endpoint and nowhere else.
+/// an access token for agentd or an approval's ID token, the result one
+/// for the pinned audience and resource. `asrv` carries agentd's client
+/// authentication there. The subject goes to that token endpoint and
+/// nowhere else.
 pub fn exchange_access(
     asrv: &OAuth2Params,
     ex: &AccessExchange<'_>,
     expect: &ExpectAccess<'_>,
     timeout: Duration,
 ) -> Result<(Redeemed, Option<String>), Refusal> {
+    let body = token_request(asrv, access_form(&asrv.client_id, ex), timeout)?;
+    check_access_exchange(&body, ex, expect).map_err(Refusal::Checked)
+}
+
+/// The on-behalf-of exchange's form, before client authentication.
+pub(crate) fn access_form(client_id: &str, ex: &AccessExchange<'_>) -> Form {
     let mut form = Form::new();
     form.field("grant_type", wire::GRANT_TOKEN_EXCHANGE);
     form.field("subject_token", ex.subject_token);
-    form.field("subject_token_type", wire::TOKEN_TYPE_ACCESS_TOKEN);
+    form.field("subject_token_type", ex.subject_token_type);
     form.field("requested_token_type", wire::TOKEN_TYPE_ACCESS_TOKEN);
     form.field("audience", ex.audience);
     form.field("resource", ex.resource);
     if !ex.scopes.is_empty() {
         form.field("scope", &ex.scopes.join(" "));
     }
-    form.field("client_id", &asrv.client_id);
-    let body = token_request(asrv, form, timeout)?;
-    check_access_exchange(&body, ex, expect).map_err(Refusal::Checked)
+    form.field("client_id", client_id);
+    form
 }
 
 /// An access token from the authorization server, checked.
@@ -1393,6 +1404,7 @@ mod tests {
         let scopes = vec!["issues:read".to_string()];
         let ex = AccessExchange {
             subject_token: "at",
+            subject_token_type: wire::TOKEN_TYPE_ACCESS_TOKEN,
             audience: "api://issues",
             resource: RES,
             scopes: &scopes,
@@ -1473,5 +1485,50 @@ mod tests {
         let (r, sub) =
             check_access_exchange(&answer("opaque".into(), json!({})), &ex, &okta).unwrap();
         assert_eq!((r.access_token.as_str(), sub), ("opaque", None));
+    }
+
+    /// An on-behalf-of exchange names its subject's type: an access token
+    /// for agentd, or the ID token of a `via: ciba` firing's approval
+    /// (RFC 0044 §7.P3c), which the exchange then binds to.
+    #[test]
+    fn an_exchange_names_its_subjects_type() {
+        let scopes = vec!["issues:read".to_string()];
+        let fields = |ty: &'static str| {
+            let ex = AccessExchange {
+                subject_token: "eyJ.approval.sig",
+                subject_token_type: ty,
+                audience: "api://issues",
+                resource: RES,
+                scopes: &scopes,
+            };
+            String::from_utf8(access_form("agentd-idp", &ex).finish())
+                .unwrap()
+                .split('&')
+                .map(|kv| {
+                    let (k, v) = kv.split_once('=').unwrap();
+                    (k.to_string(), crate::auth::browser::pct_decode(v))
+                })
+                .collect::<Vec<_>>()
+        };
+        let get = |f: &[(String, String)], k: &str| {
+            f.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone())
+        };
+        let f = fields(wire::TOKEN_TYPE_ID_TOKEN);
+        assert_eq!(
+            get(&f, "subject_token_type").as_deref(),
+            Some(wire::TOKEN_TYPE_ID_TOKEN)
+        );
+        assert_eq!(
+            get(&f, "subject_token").as_deref(),
+            Some("eyJ.approval.sig")
+        );
+        assert_eq!(
+            get(&f, "requested_token_type").as_deref(),
+            Some(wire::TOKEN_TYPE_ACCESS_TOKEN)
+        );
+        assert_eq!(
+            get(&fields(wire::TOKEN_TYPE_ACCESS_TOKEN), "subject_token_type").as_deref(),
+            Some(wire::TOKEN_TYPE_ACCESS_TOKEN)
+        );
     }
 }

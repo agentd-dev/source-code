@@ -198,15 +198,30 @@ pub const UNATTENDED_SID_PREFIX: &str = "ua_";
 pub const HANDED_ON_SID: &str = "ua_handed-on";
 
 /// What a firing of an `act_for` workflow acts with (RFC 0044 §5.12 E): the
-/// person, as its workflow named them; how it acts for them; and the grants
-/// it has asked them about by CIBA — at each, one request per firing, a
-/// restart included.
+/// person, as its workflow named them; how it acts for them; and, by grant,
+/// how it has asked them by CIBA — one request per firing, and one more
+/// after a restart that lost the first while it waited or once approved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Unattended {
     pub principal: crate::engine::model::ActForPrincipal,
     pub via: crate::config::settings::delegation::Via,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub asked: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub asked: BTreeMap<String, Asked>,
+}
+
+/// How a firing has asked its person at a grant, written before each
+/// request is sent (RFC 0044 §7.P3c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Asked {
+    /// Its request was sent: it waits on the person, or they approved it.
+    /// A restart loses either, and the firing asks once more.
+    Once,
+    /// A restart lost the first, and it asked once more: a restart asks
+    /// no more.
+    Again,
+    /// Its request was denied, ran out, or was never sent: it asks no more.
+    Refused,
 }
 
 impl Carries {

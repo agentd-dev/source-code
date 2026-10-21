@@ -1140,6 +1140,11 @@ pub struct Delegation {
     acts: RwLock<Vec<unattended::ActForDecl>>,
     /// The firings acting now, by the session id their work acts through.
     firings: Mutex<BTreeMap<String, unattended::Running>>,
+    /// Held while the refresh tokens CIBA approvals left in the store
+    /// before this start are revoked; true once they are.
+    approvals_swept: Mutex<bool>,
+    /// When a reactor pass next revokes them, while that has not finished.
+    approvals_due: Mutex<unattended::SweepDue>,
     /// The key DPoP-bound tokens are bound to, made at its first use and
     /// held in memory alone (RFC 0044 T23).
     dpop: OnceLock<Arc<crate::auth::dpop::DpopKey>>,
@@ -1436,6 +1441,8 @@ impl Delegation {
             personal_open: Mutex::new(()),
             acts: RwLock::new(Vec::new()),
             firings: Mutex::new(BTreeMap::new()),
+            approvals_swept: Mutex::new(false),
+            approvals_due: Mutex::new(Default::default()),
             dpop: OnceLock::new(),
             nonces: Arc::default(),
             bound_servers: Mutex::new(BTreeSet::new()),
@@ -2895,10 +2902,12 @@ impl Delegation {
     /// M1b): the pooled one while it may be used, else a new on-behalf-of
     /// exchange at the server's own authorization server — of an access
     /// token for agentd the grant's refresh token gets there (`subject:
-    /// grant`), or of the caller's inbound token (`subject: inbound`),
-    /// which is sent to its issuer and nowhere else. The result is held to
-    /// the pinned audience and the person, and any refresh token in it is
-    /// dropped: renewal is a new exchange.
+    /// grant`), or, for a `via: ciba` firing, of its person's approval's ID
+    /// token, which binds the result to that approval (§7.P3c); or of the
+    /// caller's inbound token (`subject: inbound`), which is sent to its
+    /// issuer and nowhere else. The result is held to the pinned audience
+    /// and the person, and any refresh token in it is dropped: renewal is a
+    /// new exchange.
     #[allow(clippy::too_many_arguments)]
     fn exchanged(
         &self,
@@ -2927,10 +2936,29 @@ impl Delegation {
             return Ok(());
         }
         *entry.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // A `via: ciba` firing exchanges only once its person approved it:
-        // the exchange's subject is still the grant's access token, which
-        // the approval's ID token is not.
-        let approval = self.approval(unattended::ciba_sid(firing), grant)?;
+        // A `via: ciba` firing exchanges only once its person approved it,
+        // and its exchange binds to that approval: the subject is the
+        // approval's ID token, never the grant's access token (§7.P3c).
+        // Okta's on-behalf-of exchange takes an access token alone, so
+        // there the call is refused before the person is asked for an
+        // approval it could not use.
+        let ciba = unattended::ciba_sid(firing);
+        if ciba.is_some()
+            && subject == cfg::ExchangeSubject::Grant
+            && self
+                .providers
+                .get(&s.idp)
+                .is_some_and(|i| i.cfg.profile == cfg::Profile::Okta)
+        {
+            return Err(refuse(
+                Code::Config,
+                format!(
+                    "{} is exchanged by Okta's on-behalf-of exchange, which takes an access token alone as its subject, and a via: ciba firing exchanges its person's approval: {} serves no via: ciba firing (a via: standing one exchanges the grant's token)",
+                    s.name, s.name
+                ),
+            ));
+        }
+        let approval = self.approval(ciba, grant)?;
         let via = firing.map(|f| f.via);
         let budget = self.paced(grant, s, c)?;
         let idp = self
@@ -2967,6 +2995,7 @@ impl Delegation {
                     })?;
                 let ex = idjag::AccessExchange {
                     subject_token: &token,
+                    subject_token_type: idjag::wire::TOKEN_TYPE_ACCESS_TOKEN,
                     audience: &s.audience,
                     resource: &s.resource,
                     scopes,
@@ -3015,27 +3044,43 @@ impl Delegation {
                         ),
                     ));
                 }
-                // An access token for agentd at this authorization server,
-                // from the grant's refresh token with no `scope`: the scopes
-                // the person granted stand, offline_access with them.
-                let ahead = self.ahead(&g)?;
-                let t = match idjag::refresh(&params, &rt, self.timeout) {
-                    Ok(t) => t,
-                    Err(Refusal::Oauth { code, .. }) if code == idjag::wire::INVALID_GRANT => {
-                        return Err(self.revoke_dead(&g, "the refresh token is no longer good"));
-                    }
-                    Err(r) => {
-                        self.keep_ahead(&g, ahead);
-                        return Err(refuse(unavailable(&r), format!("{}: refresh: {r}", s.idp)));
+                // The subject: a `via: ciba` firing's approval's ID token;
+                // else an access token for agentd at this authorization
+                // server, from the grant's refresh token with no `scope`:
+                // the scopes the person granted stand, offline_access with
+                // them.
+                let (subject_token, subject_token_type) = match &approval {
+                    Some((t, _)) => (t.clone(), idjag::wire::TOKEN_TYPE_ID_TOKEN),
+                    None => {
+                        let ahead = self.ahead(&g)?;
+                        let t = match idjag::refresh(&params, &rt, self.timeout) {
+                            Ok(t) => t,
+                            Err(Refusal::Oauth { code, .. })
+                                if code == idjag::wire::INVALID_GRANT =>
+                            {
+                                return Err(
+                                    self.revoke_dead(&g, "the refresh token is no longer good")
+                                );
+                            }
+                            Err(r) => {
+                                self.keep_ahead(&g, ahead);
+                                return Err(refuse(
+                                    unavailable(&r),
+                                    format!("{}: refresh: {r}", s.idp),
+                                ));
+                            }
+                        };
+                        match &t.refresh_token {
+                            Some(new) => self.rotate(&mut g, &mut rt, new, ahead)?,
+                            None => self.keep_ahead(&g, ahead),
+                        }
+                        self.with_live(&g.grant_id, |l| l.proved_ms = now_ms());
+                        (t.access_token, idjag::wire::TOKEN_TYPE_ACCESS_TOKEN)
                     }
                 };
-                match &t.refresh_token {
-                    Some(new) => self.rotate(&mut g, &mut rt, new, ahead)?,
-                    None => self.keep_ahead(&g, ahead),
-                }
-                self.with_live(&g.grant_id, |l| l.proved_ms = now_ms());
                 let ex = idjag::AccessExchange {
-                    subject_token: &t.access_token,
+                    subject_token: &subject_token,
+                    subject_token_type,
                     audience: &s.audience,
                     resource: &s.resource,
                     scopes,
@@ -3044,7 +3089,10 @@ impl Delegation {
                     Ok(x) => x,
                     Err(r) => {
                         drop(_held);
-                        return Err(self.exchange_refusal(&g, s, r));
+                        return Err(match approval {
+                            Some(_) => self.approval_refusal(&g, s, r),
+                            None => self.exchange_refusal(&g, s, r),
+                        });
                     }
                 };
                 let mut q = q;
@@ -3073,7 +3121,11 @@ impl Delegation {
             Some(&grant.principal.display()),
             json!({"grant_id": grant.grant_id, "run": c.run, "step": c.step, "tool": c.tool,
                    "grant": "token_exchange",
-                   "subject": match subject { cfg::ExchangeSubject::Grant => "grant", cfg::ExchangeSubject::Inbound => "inbound" },
+                   "subject": match (subject, &approval) {
+                       (cfg::ExchangeSubject::Grant, Some(_)) => "approval",
+                       (cfg::ExchangeSubject::Grant, None) => "grant",
+                       (cfg::ExchangeSubject::Inbound, _) => "inbound",
+                   },
                    "as_iss": idp.cfg.issuer, "audience": s.audience, "resource": s.resource,
                    "scope_granted": redeemed.scope, "month_to_date": month,
                    "unattended": via.is_some(), "via": via.map(|v| v.as_str())}),
@@ -3087,6 +3139,35 @@ impl Delegation {
             approval.map(|(_, exp)| exp),
         );
         Ok(())
+    }
+
+    /// An exchange of a `via: ciba` firing's approval the authorization
+    /// server refused: one that takes no ID token as the subject says so
+    /// (`invalid_request`, RFC 8693 §2.2.2), which no later firing changes;
+    /// one that no longer takes this approval ends the firing's use of it,
+    /// for a firing asks once.
+    fn approval_refusal(&self, g: &Grant, s: &Server, r: Refusal) -> DelegationError {
+        match r {
+            Refusal::Oauth { code, status, .. }
+                if code == "invalid_request" || code == "unsupported_token_type" =>
+            {
+                refuse(
+                    Code::Config,
+                    format!(
+                        "{} did not take the CIBA approval's ID token as the subject of the exchange for {} ({code}, HTTP {status}): a via: ciba firing's exchange presents its person's approval, so {} serves no via: ciba firing there",
+                        s.idp, s.name, s.name
+                    ),
+                )
+            }
+            Refusal::Oauth { code, .. } if code == idjag::wire::INVALID_GRANT => refuse(
+                Code::SubjectExpired,
+                format!(
+                    "{} no longer takes this firing's approval as the subject of the exchange for {} (invalid_grant), and a firing asks once",
+                    s.idp, s.name
+                ),
+            ),
+            r => self.exchange_refusal(g, s, r),
+        }
     }
 
     /// An exchange the authorization server refused, by its code.
@@ -3197,8 +3278,9 @@ impl Delegation {
 
     /// The approval a `via: ciba` firing mints with at `grant`, when
     /// `scope` is one: `Err` while it has none — `ciba_required` when it
-    /// has not asked its person yet or its request waits on their answer,
-    /// else `subject_expired`, for a firing asks once.
+    /// has not asked its person yet, a restart lost what it asked, or its
+    /// request waits on their answer; else `subject_expired`, for a firing
+    /// asks once, and once more after a restart.
     fn approval(
         &self,
         scope: Option<&str>,
@@ -3213,7 +3295,7 @@ impl Delegation {
             unattended::FiringSubject::Asked => Err(refuse(
                 Code::SubjectExpired,
                 format!(
-                    "this firing's approval by {who} at {} has expired, was refused, or was lost to a restart, and a firing asks its person once",
+                    "this firing's approval by {who} at {} has expired, was refused, or was lost to a restart after it had asked once more, and a firing asks its person once — once more after a restart",
                     grant.idp
                 ),
             )),
@@ -4594,8 +4676,11 @@ impl Delegation {
     }
 
     /// Every grant used within the last `liveness_interval` whose last proof
-    /// is older than it: probed off the loop, a dead one revoked.
+    /// is older than it: probed off the loop, a dead one revoked; and the
+    /// refresh tokens approvals left in the store before this start
+    /// revoked, while a pass over them has not finished.
     pub fn tick(self: &Arc<Self>) {
+        self.sweep_left_approvals();
         let now = now_ms();
         let window = self.liveness.as_millis() as u64;
         let due: Vec<Grant> = {
@@ -4967,9 +5052,22 @@ mod tests {
 
     /// The delegation supervisor `settings` build, its session store `book`.
     fn supervisor(settings: &Settings, book: Arc<Book>) -> Arc<Delegation> {
+        supervisor_on(
+            settings,
+            book,
+            Arc::new(crate::store::memory::MemoryStore::new()),
+        )
+    }
+
+    /// [`supervisor`] over `store`.
+    fn supervisor_on(
+        settings: &Settings,
+        book: Arc<Book>,
+        store: Arc<dyn crate::store::Store>,
+    ) -> Arc<Delegation> {
         use crate::obs::log::{Comp, Level, LogCtx};
         let durable = Arc::new(Durable::new(
-            Arc::new(crate::store::memory::MemoryStore::new()),
+            store,
             "t/",
             "t",
             crate::state::Policy::default(),
@@ -5376,8 +5474,8 @@ mod tests {
             digest: digest.into(),
             via: Via::Ciba,
         };
-        d.firing_started(firing("ua_1", "d1"), alice.clone(), &[]);
-        d.firing_started(firing("ua_2", "d2"), alice.clone(), &[]);
+        d.firing_started(firing("ua_1", "d1"), alice.clone(), &Default::default());
+        d.firing_started(firing("ua_2", "d2"), alice.clone(), &Default::default());
         let at = |sid: &str| d.admit(Acting::new(None, Some(sid)), "linear");
         let ok = at("ua_1").unwrap();
         assert_eq!(ok.who.id, who.id);
@@ -5394,7 +5492,7 @@ mod tests {
                 ..firing("ua_4", "b1")
             },
             alice.clone(),
-            &[],
+            &Default::default(),
         );
         let e = at("ua_4").err().unwrap();
         assert_eq!(e.code, Code::UnattendedSuspended);
@@ -5419,7 +5517,7 @@ mod tests {
         assert_eq!(code(d.approval(Some("ua_1"), &g)), Some(Code::CibaRequired));
         d.ciba_asking("ua_1", &gid).unwrap();
         assert_eq!(code(d.approval(Some("ua_1"), &g)), Some(Code::CibaRequired));
-        d.firing_started(firing("ua_3", "d1"), alice.clone(), &[]);
+        d.firing_started(firing("ua_3", "d1"), alice.clone(), &Default::default());
         assert_eq!(
             code(d.ciba_asking("ua_3", &gid)),
             Some(Code::BudgetExhausted)
@@ -5450,6 +5548,162 @@ mod tests {
         d.firing_ended("ua_1");
         assert_eq!(code(at("ua_1")), Some(Code::Revoked));
         assert!(!d.session_live("ua_1"));
+    }
+
+    /// A firing a restart found going asks its person once more at a grant
+    /// its run's record says it asked once — its request, or the approval
+    /// it gave, ended with the last life — and never after it asked once
+    /// more or was refused; once it asks in this life, never again in it
+    /// (RFC 0044 §7.P3c).
+    #[test]
+    fn a_restarted_firing_asks_once_more_and_no_more() {
+        use crate::config::settings::delegation::Via;
+        use crate::engine::model::ActForPrincipal;
+        use crate::engine::run::Asked;
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = template("people", "oidc", &["issues:read"]);
+        t["unattended"] = json!("ciba");
+        let book = Arc::new(Book::default());
+        book.add("a", oidc("00u1alice"), None);
+        let d = supervisor(&people(dir.path(), json!({"templates": [t]})), book);
+        let g = hold(&d, "a", "00u1alice", "people", None);
+        let alice = ActForPrincipal {
+            source: "oidc".into(),
+            issuer: Some(ISS.into()),
+            sub: Some("00u1alice".into()),
+            id: None,
+        };
+        let restored = |sid: &str, earlier: Option<Asked>| {
+            d.firing_started(
+                unattended::Firing {
+                    sid: sid.into(),
+                    run: format!("run-{sid}"),
+                    workflow: "nightly".into(),
+                    digest: "d1".into(),
+                    via: Via::Ciba,
+                },
+                alice.clone(),
+                &earlier
+                    .map(|a| [(g.grant_id.clone(), a)].into())
+                    .unwrap_or_default(),
+            );
+        };
+        restored("ua_once", Some(Asked::Once));
+        restored("ua_again", Some(Asked::Again));
+        restored("ua_refused", Some(Asked::Refused));
+        let approval = |sid: &str| code(d.approval(Some(sid), &g));
+        assert_eq!(
+            approval("ua_once"),
+            Some(Code::CibaRequired),
+            "a restart lost its request or approval: it asks once more"
+        );
+        assert!(!d.firing_asked("ua_once", &g.grant_id));
+        assert_eq!(approval("ua_again"), Some(Code::SubjectExpired));
+        assert_eq!(approval("ua_refused"), Some(Code::SubjectExpired));
+        // Asked once more in this life, and closed unanswered: no more.
+        d.ciba_asking("ua_once", &g.grant_id).unwrap();
+        assert!(d.firing_asked("ua_once", &g.grant_id));
+        d.not_asking("ua_once", &g.grant_id);
+        assert_eq!(approval("ua_once"), Some(Code::SubjectExpired));
+    }
+
+    /// A store that fails its reads, or its listings, while told to.
+    #[derive(Default)]
+    struct Flaky {
+        inner: crate::store::memory::MemoryStore,
+        reads: AtomicBool,
+        lists: AtomicBool,
+    }
+
+    impl crate::store::Store for Flaky {
+        fn put(
+            &self,
+            key: &str,
+            seq: u64,
+            envelope: &Value,
+        ) -> Result<crate::store::PutOutcome, crate::store::StoreError> {
+            self.inner.put(key, seq, envelope)
+        }
+        fn get(
+            &self,
+            key: &str,
+            seq: Option<u64>,
+        ) -> Result<Option<Value>, crate::store::StoreError> {
+            if self.reads.load(Ordering::Relaxed) {
+                return Err(crate::store::StoreError::Io("down".into()));
+            }
+            self.inner.get(key, seq)
+        }
+        fn list(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<crate::store::KeySeq>, crate::store::StoreError> {
+            if self.lists.load(Ordering::Relaxed) {
+                return Err(crate::store::StoreError::Io("down".into()));
+            }
+            self.inner.list(prefix)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::store::StoreError> {
+            self.inner.delete(key)
+        }
+        fn kind(&self) -> &'static str {
+            "memory"
+        }
+    }
+
+    /// An approval's refresh token the store cannot read or list now is
+    /// kept for a later pass, and the start's pass is not done: only one
+    /// that never opens is forgotten unrevoked; once the store answers,
+    /// the pass forgets every one and is done (RFC 0044 §7.P3c).
+    #[test]
+    fn a_left_approval_the_store_cannot_read_now_waits_for_a_later_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Flaky::default());
+        let d = supervisor_on(
+            &people(
+                dir.path(),
+                json!({"templates": [template("people", "oidc", &["issues:read"])]}),
+            ),
+            Arc::new(Book::default()),
+            Arc::clone(&store) as Arc<dyn crate::store::Store>,
+        );
+        let a = vault::Approval {
+            firing: "ua_1".into(),
+            run: "run-1".into(),
+            grant_id: "g1".into(),
+            idp: "gone".into(),
+        };
+        d.vault.keep_approval(&a, "ciba-rt-1").unwrap();
+        let kept = || {
+            store.lists.store(false, Ordering::Relaxed);
+            d.vault.approvals().unwrap()
+        };
+        store.lists.store(true, Ordering::Relaxed);
+        assert!(d.revoke_left_approvals().is_err(), "unlisted, not done");
+        assert_eq!(kept(), vec![a.name()]);
+        store.reads.store(true, Ordering::Relaxed);
+        let e = d.revoke_left_approvals().unwrap_err();
+        assert_eq!(e.code, Code::IdpUnavailable, "{}", e.message);
+        assert_eq!(kept(), vec![a.name()], "unread, kept for a later pass");
+        store.reads.store(false, Ordering::Relaxed);
+        // One that never opens is forgotten with the rest.
+        d.durable
+            .put(
+                crate::state::Kind::Cred,
+                "delegation/approval/ua_2.g1",
+                json!({"not": "an approval"}),
+                None,
+            )
+            .unwrap();
+        d.revoke_left_approvals().unwrap();
+        assert!(kept().is_empty());
+        d.vault.keep_approval(&a, "ciba-rt-2").unwrap();
+        d.revoke_left_approvals().unwrap();
+        assert_eq!(
+            kept(),
+            vec![a.name()],
+            "done once: this life's are its runs'"
+        );
     }
 
     /// A step-up sign-in is held to when the IdP asked as its gate's record

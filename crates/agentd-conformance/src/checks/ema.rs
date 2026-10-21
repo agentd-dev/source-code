@@ -556,9 +556,34 @@ pub fn checks() -> Vec<Check> {
             p3b::a_ciba_hint_falls_back_and_binds_its_person,
         ),
         check(
-            "ema/ciba-firing-fails-closed-on-restart",
-            "a restart fails a via ciba firing closed — one waiting on its person's answer fails ciba_denied, one approved fails its next call subject_expired — and never asks again",
-            p3b::a_ciba_firing_fails_closed_on_restart,
+            "ema/ciba-firing-asks-once-more-after-a-restart",
+            "a restart loses a via ciba firing's request, or the approval it gave, and the firing asks its person exactly once more, saying again — the step that waited waits on the new request, a later call asks; approved, the run completes; denied, it fails ciba_denied",
+            p3b::a_ciba_firing_asks_once_more_after_a_restart,
+        ),
+        check(
+            "ema/ciba-firing-fails-closed-on-a-second-restart",
+            "a second restart while the request a restart made a via ciba firing send is out fails the firing closed (ciba_denied), and no third request is sent",
+            p3b::a_ciba_firing_fails_closed_on_a_second_restart,
+        ),
+        check(
+            "ema/ciba-firing-refused-asks-no-more-after-a-restart",
+            "a via ciba firing whose request its person denied, or whose wait they cancelled, goes on past the refused call with its run's record saying refused; after a restart its next call fails subject_expired and no second request is sent",
+            p3b::a_ciba_refusal_holds_across_a_restart,
+        ),
+        check(
+            "ema/ciba-refresh-token-revoked-after-a-crash",
+            "the refresh token an IdP issues with a CIBA approval is kept sealed in the store, never in the clear, while the run lasts; after a crash the next start revokes it at the IdP and forgets it, before any new request is sent",
+            p3b::a_ciba_refresh_token_is_revoked_after_a_crash,
+        ),
+        check(
+            "ema/ciba-refresh-token-revoked-once-the-signer-is-back",
+            "under key_custody external, an approval's refresh token a crash left in the store stays, unrevoked, while the signer is down at the next start, and no request is sent; once the signer is back a later pass revokes it at the IdP and forgets it with no CIBA request to make it",
+            p3b::a_ciba_refresh_token_is_revoked_once_the_signer_is_back,
+        ),
+        check(
+            "ema/ciba-exchange-binds-to-the-approval",
+            "a via ciba firing's same-domain exchange (grant: token_exchange) presents its approval's ID token as the subject, never the grant's access token; an authorization server that takes no ID token subject fails the call config, and under profile okta the call is refused before the person is asked",
+            p3b::a_ciba_exchange_binds_to_the_approval,
         ),
         check(
             "ema/act-for-on-a-webhook-refused",
@@ -778,6 +803,10 @@ struct Opts {
     provider_extra: &'static str,
     /// More of each delegated server's `auth` fields, one line each.
     server_extra: &'static str,
+    /// The delegated servers' tokens are exchanged at the person's IdP,
+    /// which is their own authorization server (`grant: token_exchange`,
+    /// M1b), for the grant's subject.
+    exchange: bool,
     extra: String,
 }
 
@@ -803,13 +832,15 @@ impl Default for Opts {
             template_extra: "",
             provider_extra: "",
             server_extra: "",
+            exchange: false,
             extra: String::new(),
         }
     }
 }
 
 /// A deployment: its directory, its mock, its configuration and socket —
-/// and, under `key_custody: external`, the reference signer.
+/// and, under `key_custody: external`, the reference signer, and the knobs
+/// it was started with.
 struct Setup {
     tmp: TempDir,
     xaa: Xaa,
@@ -817,6 +848,7 @@ struct Setup {
     sock: PathBuf,
     log: PathBuf,
     signer: std::sync::Mutex<Option<Child>>,
+    signer_knobs: Option<Value>,
 }
 
 impl Drop for Setup {
@@ -890,6 +922,11 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
     };
     let server_extra = o.server_extra;
     let server = |name: &str, url: &str| {
+        if o.exchange {
+            return format!(
+                "    - name: {name}\n      endpoint: \"{url}\"\n      tags: {tags}\n      auth:\n        kind: oauth2\n        grant: token_exchange\n        idp: okta\n        subject: grant\n        audience: \"api://issues\"\n        resource: \"{url}\"\n        scopes: [\"issues:read\"]\n{trusted}{server_extra}"
+            );
+        }
         format!(
             "    - name: {name}\n      endpoint: \"{url}\"\n      tags: {tags}\n      auth:\n        kind: oauth2\n        grant: id_jag\n        idp: okta\n        audience: \"{}\"\n        resource: \"{url}\"\n        client_id: agentd-at-ras\n        client_auth: {ras_auth}\n        scopes: [\"issues:read\"]\n        tool_scopes: {{create_issue: [\"issues:write\"]}}\n{trusted}{server_extra}",
             x.ras
@@ -970,8 +1007,7 @@ impl Setup {
         let cfg = tmp.path().join("c.yaml");
         std::fs::write(&cfg, config(&xaa, tmp.path(), &sock, o)).expect("write");
         let log = tmp.path().join("daemon.log");
-        let signer = o.signer_uid.map(|_| {
-            let socket = tmp.path().join("signer.sock");
+        let signer_knobs = o.signer_uid.map(|_| {
             let record = tmp.path().join("signer.jsonl");
             let outage = o.signer_outage.then(
                 || json!({"file": tmp.path().join("outage"), "after": "sign:idp", "refuse": 1}),
@@ -981,37 +1017,58 @@ impl Setup {
             let ras_audience = o
                 .ras_audience
                 .map_or_else(|| format!("{}/token", xaa.ras), str::to_string);
+            // The key-encryption key is given, so a signer started again
+            // unwraps what it wrapped before.
+            let kek: String = [rand16(), rand16()]
+                .concat()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
             let keys = json!({
                 "idp": {"alg": "ES256", "audiences": [format!("{}/token", xaa.idp)]},
                 "ras": {"alg": "ES256", "audiences": [ras_audience]},
-                "seal": {"use": "wrap"},
+                "seal": {"use": "wrap", "hex": kek},
             });
-            let child = Command::new(h.agentd())
-                .args([
-                    "--internal-mock-signer",
-                    socket.to_str().expect("utf8"),
-                    "--knobs",
-                    &json!({"keys": keys, "record": record, "outage": outage}).to_string(),
-                ])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("spawn the reference signer");
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while !socket.exists() {
-                assert!(Instant::now() < deadline, "the signer never listened");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            child
+            json!({"keys": keys, "record": record, "outage": outage})
         });
-        Setup {
+        let s = Setup {
             tmp,
             xaa,
             cfg,
             sock,
             log,
-            signer: std::sync::Mutex::new(signer),
+            signer: std::sync::Mutex::new(None),
+            signer_knobs,
+        };
+        s.start_signer(h);
+        s
+    }
+
+    /// Start the reference signer, under `key_custody: external`, with the
+    /// knobs it was first started with, once it listens.
+    fn start_signer(&self, h: &Harness) {
+        let Some(knobs) = &self.signer_knobs else {
+            return;
+        };
+        let socket = self.tmp.path().join("signer.sock");
+        let _ = std::fs::remove_file(&socket);
+        let child = Command::new(h.agentd())
+            .args([
+                "--internal-mock-signer",
+                socket.to_str().expect("utf8"),
+                "--knobs",
+                &knobs.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the reference signer");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !socket.exists() {
+            assert!(Instant::now() < deadline, "the signer never listened");
+            std::thread::sleep(Duration::from_millis(10));
         }
+        *self.signer.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
     }
 
     /// Stop the reference signer.

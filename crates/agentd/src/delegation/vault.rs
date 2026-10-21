@@ -53,6 +53,7 @@ use crate::b64;
 use crate::obs::chain::{Anchor, Chain};
 use crate::sec::signer::{Signer, SignerError};
 use crate::state::{Durable, Kind};
+use crate::store::StoreError;
 
 /// Where the grants are, by `grant_id`.
 const GRANT_PREFIX: &str = "delegation/grant/";
@@ -180,6 +181,52 @@ struct StoredPersonal {
     wrapped: Option<Wrapped>,
 }
 
+/// Where the refresh token an IdP issued with a firing's CIBA approval is
+/// kept while the firing's run lasts, by firing and grant.
+const APPROVAL_PREFIX: &str = "delegation/approval/";
+
+/// Whose a CIBA approval's refresh token is (RFC 0044 §7.P3c): the firing
+/// its person approved, its run, the grant it was asked at, and the IdP it
+/// is revoked at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approval {
+    pub firing: String,
+    pub run: String,
+    pub grant_id: String,
+    pub idp: String,
+}
+
+impl Approval {
+    /// Its record's name under [`APPROVAL_PREFIX`].
+    pub fn name(&self) -> String {
+        format!("{}.{}", self.firing, self.grant_id)
+    }
+
+    /// What the refresh token (`kind` `delegation-ciba-refresh`), or its
+    /// data key, is sealed under: a record moved to another firing, run,
+    /// grant or IdP does not open.
+    fn ad(&self, kind: &[u8]) -> Vec<u8> {
+        associated_data(&[
+            kind,
+            self.firing.as_bytes(),
+            self.run.as_bytes(),
+            self.grant_id.as_bytes(),
+            self.idp.as_bytes(),
+        ])
+    }
+}
+
+/// An approval's refresh token as the store keeps it: sealed as a grant's
+/// is, under `seal_key` or a data key the signer wrapped.
+#[derive(Serialize, Deserialize)]
+struct StoredApproval {
+    approval: Approval,
+    /// base64url of the sealed refresh token.
+    sealed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dek: Option<Wrapped>,
+}
+
 /// What a personal key is sealed or wrapped under.
 fn personal_ad(principal: &str, id: &str) -> Vec<u8> {
     associated_data(&[
@@ -215,6 +262,19 @@ pub enum Refused {
     Unreadable(String),
     /// The external signer did not unwrap its data key: nothing was opened.
     SignerUnavailable(String),
+}
+
+/// Why an approval's refresh token the store keeps was not opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unopened {
+    /// The external signer did not unwrap its data key: it stays, for a
+    /// later pass.
+    Signer(String),
+    /// The store did not answer: it stays, for a later pass.
+    Store(String),
+    /// It never will — not an approval record, or sealed under keys no
+    /// longer held: there is nothing to revoke with.
+    Never(String),
 }
 
 /// Why a grant was not stored.
@@ -821,6 +881,145 @@ impl Vault {
             .filter(|k| !k.is_empty())
             .collect()
     }
+
+    /// Keep `rt`, the refresh token an IdP issued with approval `a`, sealed
+    /// until [`Self::forget_approval`] (RFC 0044 §7.P3c): under a local key,
+    /// or under a fresh data key the external signer wraps now — a signer
+    /// that wraps none leaves nothing written.
+    pub fn keep_approval(&self, a: &Approval, rt: &str) -> Result<(), NotStored> {
+        let ad = a.ad(b"delegation-ciba-refresh");
+        let (sealed, dek) = match &self.custody {
+            Custody::Local { key, .. } => (
+                key.seal(&ad, rt.as_bytes()).map_err(NotStored::Failed)?,
+                None,
+            ),
+            Custody::External { signer, key, .. } => {
+                let mut dek = [0u8; 32];
+                crate::sec::random::fill(&mut dek).map_err(|e| {
+                    NotStored::Failed(format!("no OS randomness for a data key: {e}"))
+                })?;
+                let out = signer
+                    .wrap(key, &dek, &a.ad(b"delegation-ciba-refresh-key"))
+                    .map_err(|e| NotStored::Signer(e.to_string()))
+                    .and_then(|w| {
+                        SealKey::new(&dek)
+                            .and_then(|k| k.seal(&ad, rt.as_bytes()))
+                            .map(|s| (s, w))
+                            .map_err(NotStored::Failed)
+                    });
+                crate::sec::harden::wipe(&mut dek);
+                let (sealed, wrapped) = out?;
+                (
+                    sealed,
+                    Some(Wrapped {
+                        key: key.clone(),
+                        wrapped: b64::url_nopad(&wrapped),
+                    }),
+                )
+            }
+        };
+        let v = serde_json::to_value(StoredApproval {
+            approval: a.clone(),
+            sealed: b64::url_nopad(&sealed),
+            dek,
+        })
+        .map_err(|e| NotStored::Failed(e.to_string()))?;
+        self.durable
+            .put(
+                Kind::Cred,
+                &format!("{APPROVAL_PREFIX}{}", a.name()),
+                v,
+                None,
+            )
+            .map(|_| ())
+            .map_err(|e| NotStored::Failed(format!("approval {}: {e}", a.name())))
+    }
+
+    /// The names of every approval's refresh token kept; `Err` when the
+    /// store failed to list them. A store that cannot list
+    /// (`Unsupported`) finds none, as it finds no grant at a start.
+    pub fn approvals(&self) -> Result<Vec<String>, String> {
+        let listed = match self.durable.list_prefix(Kind::Cred, APPROVAL_PREFIX) {
+            Ok(l) => l,
+            Err(StoreError::Unsupported(_)) => Vec::new(),
+            Err(e) => return Err(format!("the approvals kept: {e}")),
+        };
+        Ok(listed
+            .into_iter()
+            .filter_map(|k| k.key.rsplit('/').next().map(str::to_string))
+            .filter(|k| !k.is_empty())
+            .collect())
+    }
+
+    /// The approval kept as `name`, and its refresh token, opened.
+    pub fn open_approval(&self, name: &str) -> Result<Option<(Approval, String)>, Unopened> {
+        let Some(env) = self
+            .durable
+            .get(Kind::Cred, &format!("{APPROVAL_PREFIX}{name}"))
+            .map_err(|e| match e {
+                StoreError::Corrupt(e) => Unopened::Never(e),
+                e => Unopened::Store(format!("approval {name}: {e}")),
+            })?
+        else {
+            return Ok(None);
+        };
+        let s: StoredApproval = serde_json::from_value(env.state)
+            .map_err(|e| Unopened::Never(format!("not an approval record: {e}")))?;
+        let sealed = b64::url_decode(&s.sealed)
+            .map_err(|_| Unopened::Never("the sealed refresh token is not base64url".into()))?;
+        let ad = s.approval.ad(b"delegation-ciba-refresh");
+        let plain = match (&self.custody, &s.dek) {
+            (Custody::Local { key, previous }, None) => key
+                .open(&ad, &sealed)
+                .or_else(|e| match previous {
+                    Some(p) => p.open(&ad, &sealed),
+                    None => Err(e),
+                })
+                .map_err(Unopened::Never)?,
+            (
+                Custody::External {
+                    signer,
+                    key,
+                    previous,
+                },
+                Some(w),
+            ) if &w.key == key || previous.as_ref() == Some(&w.key) => {
+                let wrapped = b64::url_decode(&w.wrapped)
+                    .map_err(|_| Unopened::Never("the wrapped data key is not base64url".into()))?;
+                let mut dek = signer
+                    .unwrap(
+                        &w.key,
+                        &wrapped,
+                        &s.approval.ad(b"delegation-ciba-refresh-key"),
+                    )
+                    .map_err(|e| match &e {
+                        SignerError::Refused { code, .. } if code == "unwrap_failed" => {
+                            Unopened::Never(e.to_string())
+                        }
+                        _ => Unopened::Signer(e.to_string()),
+                    })?;
+                let opened = SealKey::new(&dek).and_then(|k| k.open(&ad, &sealed));
+                crate::sec::harden::wipe(&mut dek);
+                opened.map_err(Unopened::Never)?
+            }
+            _ => {
+                return Err(Unopened::Never(
+                    "sealed under another custody or key-encryption key".into(),
+                ));
+            }
+        };
+        let rt = String::from_utf8(plain)
+            .map_err(|_| Unopened::Never("the refresh token is not UTF-8".into()))?;
+        Ok(Some((s.approval, rt)))
+    }
+
+    /// Forget the approval's refresh token kept as `name`: revoked, or its
+    /// run ended.
+    pub fn forget_approval(&self, name: &str) -> Result<(), String> {
+        self.durable
+            .delete(Kind::Cred, &format!("{APPROVAL_PREFIX}{name}"))
+            .map_err(|e| format!("approval {name}: {e}"))
+    }
 }
 
 #[cfg(test)]
@@ -1331,5 +1530,84 @@ mod tests {
         ));
         // Under a local key nothing is drawn.
         assert!(vault(&store, 7, None).ahead(&g).unwrap().is_none());
+    }
+
+    /// The refresh token an IdP issued with a CIBA approval is kept sealed
+    /// — never a byte of it in the clear, under a local key or a data key
+    /// the signer wraps — listed by name until it is forgotten; a record
+    /// moved to another firing, run, grant or IdP does not open, nor one
+    /// kept under the other custody, and a signer that wraps nothing
+    /// writes nothing (RFC 0044 §7.P3c).
+    #[test]
+    fn an_approvals_refresh_token_is_kept_sealed_until_it_is_forgotten() {
+        let a = Approval {
+            firing: "ua_f1".into(),
+            run: "r1".into(),
+            grant_id: grant().grant_id,
+            idp: "okta".into(),
+        };
+        let store = Arc::new(MemoryStore::new());
+        let v = vault(&store, 7, None);
+        v.keep_approval(&a, "ciba-rt-secret").unwrap();
+        assert_eq!(v.approvals(), Ok(vec![a.name()]));
+        let id = format!("{APPROVAL_PREFIX}{}", a.name());
+        let record = raw(&store, &id);
+        assert!(!record.to_string().contains("ciba-rt-secret"), "{record}");
+        assert_eq!(
+            v.open_approval(&a.name()).unwrap(),
+            Some((a.clone(), "ciba-rt-secret".to_string()))
+        );
+        assert!(matches!(
+            vault(&store, 8, None).open_approval(&a.name()),
+            Err(Unopened::Never(_))
+        ));
+        // Revoked at another IdP: the record names the one it was kept for.
+        let mut moved = record["state"].clone();
+        moved["approval"]["idp"] = serde_json::json!("elsewhere");
+        durable(&store).put(Kind::Cred, &id, moved, None).unwrap();
+        assert!(matches!(
+            v.open_approval(&a.name()),
+            Err(Unopened::Never(_))
+        ));
+        v.forget_approval(&a.name()).unwrap();
+        assert_eq!(v.approvals(), Ok(vec![]));
+        assert_eq!(v.open_approval(&a.name()), Ok(None));
+
+        // Under the external signer: wrapped, and only it opens the token.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("signer.sock");
+        let _signer =
+            crate::sec::signer::mock::serve(&sock, &crate::sec::signer::mock::default_knobs())
+                .unwrap();
+        let ext = Arc::new(MemoryStore::new());
+        external(&ext, &sock)
+            .keep_approval(&a, "ciba-rt-ext")
+            .unwrap();
+        let record = raw(&ext, &id);
+        assert!(!record.to_string().contains("ciba-rt-ext"), "{record}");
+        assert_eq!(record["state"]["dek"]["key"], "seal");
+        assert_eq!(
+            external(&ext, &sock).open_approval(&a.name()).unwrap(),
+            Some((a.clone(), "ciba-rt-ext".to_string()))
+        );
+        assert!(matches!(
+            vault(&ext, 7, None).open_approval(&a.name()),
+            Err(Unopened::Never(_))
+        ));
+        let gone = dir.path().join("gone.sock");
+        assert!(matches!(
+            external(&ext, &gone).open_approval(&a.name()),
+            Err(Unopened::Signer(_))
+        ));
+        let fresh = Arc::new(MemoryStore::new());
+        assert!(matches!(
+            external(&fresh, &gone).keep_approval(&a, "ciba-rt-2"),
+            Err(NotStored::Signer(_))
+        ));
+        assert_eq!(
+            external(&fresh, &gone).approvals(),
+            Ok(vec![]),
+            "nothing written"
+        );
     }
 }

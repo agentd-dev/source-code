@@ -1108,16 +1108,41 @@ the grant's own `iss` and `sub`, or the firing fails closed
 (`binding_mismatch`): a hint can resolve to another account. It is then the
 subject of that firing's exchanges alone — kept in memory, and the tokens
 minted with it pooled for that firing alone — until it expires, after which
-the firing's calls fail `subject_expired`. A firing asks once at a grant —
+the firing's calls fail `subject_expired`. That holds for a `grant:
+token_exchange` server too: its exchange presents the approval's ID token
+(`subject_token_type` `urn:ietf:params:oauth:token-type:id_token`), binding
+the token it gets to that approval, never the grant's access token; an
+authorization server that takes no ID token subject (`invalid_request`)
+fails the call `config`, and so, before the person is asked, does a
+`profile: okta` IdP, whose on-behalf-of exchange takes an access token
+alone — run such a server `via: standing`. A firing asks once at a grant —
 its run's record says so before the request is sent: another call it makes
-while the request waits waits on the same request, and a refused, expired
-or lost approval is never asked again. At most one request per person and
+while the request waits waits on the same request, and a refused or
+expired approval is never asked again. At most one request per person and
 workflow waits at a time — once a firing's wait closes, however it closes,
 another firing may ask — and at most `ciba.per_day` (10) are sent a person
 a day (`budget_exhausted` past either). A refresh token the IdP issued with
-an approval anyway is revoked (RFC 7009) when the run ends; it is held in
-memory alone, so a restart before then leaves it alive at the IdP until it
-expires.
+an approval anyway is kept sealed in the store — as a grant's refresh token
+is, under `seal_key` or a data key the external signer wraps — while the
+run lasts, and revoked (RFC 7009) and forgotten when it ends; one a crash
+or a restart left there is revoked at its IdP and forgotten at the next
+start's first pass, before any request is sent. Where that pass cannot
+finish — the external signer down, or the store not answering — the
+record stays and the pass is tried again, 5 s later and doubling to
+5 min, until it does, whether or not a request comes; a request a firing
+makes meanwhile is not sent, and its call fails `signer_unavailable` (or
+`idp_unavailable`). One that cannot be kept sealed (the signer down) is
+revoked at once, and the approval fails `signer_unavailable`.
+
+**A restart asks once more.** The request id and the approval are never
+written down, so a restart loses them; the firing then asks the person once
+more — one new request, its binding message saying `again`, nothing of the
+old one used — and its run's record says so before it is sent
+(`unattended.asked.<grant>: again`). A step that was waiting on the person
+waits on the new request; a later call of a firing they had approved asks
+when it finds no approval. A second restart while that request is out
+fails the call closed (`ciba_denied`), and one after it was approved fails
+the next call `subject_expired`: never a third request.
 
 **How a waiting run shows.** The step is suspended on its wait —
 `{kind: consent, signin: {how: ciba}}` in its wait record — for up to the
@@ -1125,10 +1150,12 @@ request's expiry; the gate is among the person's own in
 `delegation.list`, and the run's task, when it has one, is in
 `auth-required` with agentd's words. A denial or an expiry fails the call
 `ciba_denied`; the person may also deny the gate itself
-(`--delegation-deny`). A restart ends the wait and fails the call closed —
-the request id is never written down — and an approval, held in memory
-alone, is gone with it: the firing's next delegated call fails
-`subject_expired`.
+(`--delegation-deny`). After a restart the run shows its second wait as it
+showed the first: the same step suspended on the same wait, for the new
+request, the gate among the person's again, the task in `auth-required` —
+and its record naming the grant `again` under `unattended.asked`; the log
+says `delegation.ciba {decision: asked_again}`. Nothing is added to the
+workflow.
 
 ### When a grant is gone mid-run
 

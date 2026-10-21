@@ -23,8 +23,9 @@
 //!   used one presented again revokes its family, as reuse detection does.
 //!   As the MCP server's own authorization server (RFC 0044 M1b) it also
 //!   exchanges an access token it issued — from a refresh, or one it
-//!   signed — for one the MCP server takes (RFC 8693, `requested_token_type`
-//!   access_token), and it signs any token a test asks for
+//!   signed — or an ID token it signed, a CIBA approval's, for one the MCP
+//!   server takes (RFC 8693, `requested_token_type` access_token), and it
+//!   signs any token a test asks for
 //!   (`POST <idp>/_mock/mint`, `{header, claims}`): the access tokens an
 //!   A2A caller presents.
 //! - **The authorization server** takes the JWT bearer grant: it verifies
@@ -45,9 +46,10 @@
 //!   `peer_authorized`.
 //!
 //! Every request it receives is recorded (`GET <idp>/_mock/record`), with
-//! its form or JSON-RPC body and the headers that matter, and a test steers
-//! it with `POST <idp>/_mock/control` — a JSON object merged into its knobs
-//! ([`Knobs`]).
+//! its form or JSON-RPC body and the headers that matter — a CIBA poll it
+//! approved with the ID token it answered (`issued_id_token`) — and a test
+//! steers it with `POST <idp>/_mock/control` — a JSON object merged into
+//! its knobs ([`Knobs`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -116,8 +118,11 @@ pub fn default_knobs() -> Value {
         // stream), and answers with what the client said.
         "elicit": null,
         // The access-token exchange (M1b) issues its token for this
-        // audience instead of the one asked.
+        // audience instead of the one asked; and takes an ID token it
+        // signed as the subject, or — false — refuses one as RFC 8693
+        // §2.2.2 says, `invalid_request`.
         "m1b_aud": null,
+        "m1b_id_token_subject": true,
         // The peer's tasks wait on a sign-in, until `peer_authorized`.
         "peer_auth": false,
         "peer_authorized": false,
@@ -158,8 +163,10 @@ fn unattended_knobs() -> Value {
         "dpop_required": false,
         "dpop_nonce": null,
         "mcp_dpop_nonce": null,
-        // How long the IdP takes to answer a `refresh_token` grant.
+        // How long the IdP takes to answer a `refresh_token` grant, and
+        // a revocation.
         "slow_refresh_ms": 0,
+        "slow_revoke_ms": 0,
     })
 }
 
@@ -707,12 +714,13 @@ fn dpop_proof(
 }
 
 fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
-    let (down, slow, slow_refresh) = {
+    let (down, slow, slow_refresh, slow_revoke) = {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         (
             s.flag("idp_down"),
             s.knob("slow_ms").as_u64().unwrap_or(0),
             s.knob("slow_refresh_ms").as_u64().unwrap_or(0),
+            s.knob("slow_revoke_ms").as_u64().unwrap_or(0),
         )
     };
     if down {
@@ -726,6 +734,9 @@ fn idp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
         && req.form().get("grant_type").map(String::as_str) == Some("refresh_token")
     {
         std::thread::sleep(std::time::Duration::from_millis(slow_refresh));
+    }
+    if req.path == "/revoke" && slow_revoke > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(slow_revoke));
     }
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     let iss = s.idp.clone();
@@ -982,6 +993,14 @@ fn ciba_poll(
     s.idp_ats.insert(at.clone(), sub.clone());
     let mut v = json!({"access_token": at, "token_type": "Bearer", "expires_in": 3600,
                        "id_token": it, "scope": "openid"});
+    if let Some(r) = s
+        .record
+        .iter_mut()
+        .rev()
+        .find(|r| r["body"]["auth_req_id"].as_str() == Some(id.as_str()))
+    {
+        r["issued_id_token"] = json!(it);
+    }
     if s.flag("ciba_refresh_token") {
         let rt = s.new_rt_as("ciba-rt", &sub, None, t);
         v["refresh_token"] = json!(rt);
@@ -1161,17 +1180,27 @@ fn own_claims(s: &State, jwt: &str) -> Option<Value> {
 
 /// The on-behalf-of exchange (RFC 8693, M1b): an access token this IdP
 /// issued for agentd — from a refresh, or a JWT it signed (an A2A caller's
-/// token) — for one the MCP server takes, its `aud` the one asked (or
-/// `m1b_aud`), whose it is in `sub` and `uid`.
+/// token) — or an ID token it issued to agentd (a CIBA approval's), unless
+/// `m1b_id_token_subject` is false, for one the MCP server takes, its `aud`
+/// the one asked (or `m1b_aud`), whose it is in `sub` and `uid`.
 fn access_exchange(
     stream: &TcpStream,
     form: &BTreeMap<String, String>,
     mut s: std::sync::MutexGuard<'_, State>,
 ) {
     let get = |k: &str| form.get(k).cloned().unwrap_or_default();
-    if get("subject_token_type") != wire::TOKEN_TYPE_ACCESS_TOKEN || get("audience").is_empty() {
+    let id_token =
+        get("subject_token_type") == wire::TOKEN_TYPE_ID_TOKEN && s.flag("m1b_id_token_subject");
+    if (get("subject_token_type") != wire::TOKEN_TYPE_ACCESS_TOKEN && !id_token)
+        || get("audience").is_empty()
+    {
         drop(s);
-        return oauth_error(stream, 400, "invalid_request", json!({}));
+        return oauth_error(
+            stream,
+            400,
+            "invalid_request",
+            json!({"error_description": "subject_token_type not supported"}),
+        );
     }
     if let Some(e) = s.knob("exchange_error").as_object().cloned() {
         drop(s);
@@ -1185,14 +1214,33 @@ fn access_exchange(
         );
     }
     let subject = get("subject_token");
-    let sub = s.idp_ats.get(&subject).cloned().or_else(|| {
-        own_claims(&s, &subject).and_then(|c| {
-            c["uid"]
-                .as_str()
-                .or_else(|| c["sub"].as_str())
-                .map(str::to_string)
+    let sub = if id_token {
+        // An ID token it issued to agentd, as the ID-JAG exchange takes one.
+        let aud = s
+            .knob("idp_client_id")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        crate::auth::idjag::verify_id_token(
+            &subject,
+            &json!({"keys": [s.key.public_jwk()]}),
+            &s.idp,
+            &aud,
+            None,
+            now(),
+        )
+        .ok()
+        .map(|c| c.sub)
+    } else {
+        s.idp_ats.get(&subject).cloned().or_else(|| {
+            own_claims(&s, &subject).and_then(|c| {
+                c["uid"]
+                    .as_str()
+                    .or_else(|| c["sub"].as_str())
+                    .map(str::to_string)
+            })
         })
-    });
+    };
     let Some(sub) = sub else {
         drop(s);
         return oauth_error(stream, 400, "invalid_grant", json!({}));

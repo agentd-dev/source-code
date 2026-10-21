@@ -253,11 +253,18 @@ feature; [Work nobody is there for](authentication.md#work-nobody-is-there-for))
   request on their device with agentd's message — the instance, the
   workflow, the run and the tool — and the gate among their own in
   `delegation.list`. Another call the firing makes meanwhile waits on the
-  same request. Denied or expired, the call fails `ciba_denied`; a
-  restart fails it closed, and a firing never asks twice. Give the
+  same request. Denied or expired, the call fails `ciba_denied`. Give the
   workflow a `concurrency` that drops overlapping firings: at most one
   request per person and workflow waits at a time, and another firing may
   ask once that wait has closed.
+- **After a restart.** A restart loses the request and any approval, and
+  the run asks the person once more — the message on their device says
+  `again` — and shows that second wait as it showed the first: a step
+  that was waiting is suspended on the same wait for the new request, a
+  later call that finds no approval waits on a new one, the run's task is
+  in `auth-required`, and the run's record names the grant `again` under
+  `unattended.asked`. A second restart fails the call closed; a denied
+  request is never asked again. The workflow says nothing about any of it.
 - **What it may do.** The work is unattended and tainted: the person's
   consent rules ask them and deny unanswered, a delegated tool tagged
   `egress` is refused unless their template lists it in `unattended_tools`,

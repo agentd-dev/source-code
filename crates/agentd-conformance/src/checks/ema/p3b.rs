@@ -338,69 +338,163 @@ pub(super) fn a_ciba_hint_falls_back_and_binds_its_person(h: &Harness) -> Outcom
         })
 }
 
-/// A restart fails a `via: ciba` firing closed and never asks it again:
-/// one waiting on alice's answer fails `ciba_denied`; one she approved,
-/// whose approval lived in memory alone, fails its next delegated call
-/// `subject_expired` — and neither run sends a second request.
-pub(super) fn a_ciba_firing_fails_closed_on_restart(h: &Harness) -> Outcome {
-    let s = Setup::new(h, json!({"ciba": "pending"}), &ciba_opts(10));
-    let d = s.daemon(h);
-    tryo!(s.login(h));
-    tryo!(s.until("a CIBA request", Duration::from_secs(30), &|| {
-        !s.ciba_requests().is_empty()
-    }));
-    let binding = s.ciba_requests()[0]["body"]["binding_message"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-    std::thread::sleep(Duration::from_millis(500));
-    drop(d);
-    let _d = s.daemon(h);
-    let waiting = tryo!(s.ended("nightly", 0, Duration::from_secs(30)));
-    let asked = s
-        .ciba_requests()
-        .iter()
-        .filter(|r| r["body"]["binding_message"] == binding)
-        .count();
-    let o = failed_with(&waiting, "ciba_denied")
-        .and(|| {
-            Outcome::require(
-                run_of(&binding, &waiting)
-                    && waiting["err"]
+/// `nightly` acting for alice `via: ciba`: a call, a wait for the signal
+/// `go`, and a second call.
+const TWICE: &str = "  - name: nightly\n    act_for: {principal: {source: operator, id: alice}, via: ciba}\n    concurrency: {max_runs: 1, on_overflow: drop}\n    steps:\n      start: {kind: schedule, every: 2s}\n      one: {kind: mcp.tool, depends_on: [start], server: linear, tool: whoami, args: {}}\n      w: {kind: wait, depends_on: [one], on: signal, signal: go}\n      two: {kind: mcp.tool, depends_on: [w], server: linear, tool: whoami, args: {}}\n      done: {kind: finish, depends_on: [two]}\n";
+
+impl Setup {
+    /// The binding message of the first CIBA request, once one is sent.
+    fn first_binding(&self) -> Result<String, String> {
+        self.until("a CIBA request", Duration::from_secs(30), &|| {
+            !self.ciba_requests().is_empty()
+        })?;
+        Ok(self.ciba_requests()[0]["body"]["binding_message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// The CIBA requests sent for the run `binding` names.
+    fn asked_for(&self, binding: &str) -> Vec<String> {
+        let run = binding
+            .split(' ')
+            .skip_while(|w| *w != "run")
+            .nth(1)
+            .unwrap_or("?")
+            .to_string();
+        self.ciba_requests()
+            .iter()
+            .filter_map(|r| r["body"]["binding_message"].as_str())
+            .filter(|m| m.split(' ').skip_while(|w| *w != "run").nth(1) == Some(&run))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Kill the daemon as a crash would: nothing it holds in memory is
+    /// revoked or written.
+    fn crash(&self) {
+        let pid = self
+            .log_events()
+            .iter()
+            .find_map(|e| e["pid"].as_i64())
+            .unwrap_or_default() as i32;
+        if pid > 0 {
+            // SAFETY: a signal to the daemon this check started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    /// The store's files that keep an approval's refresh token.
+    fn approvals_kept(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        self.store_bytes()
+            .into_iter()
+            .filter(|(p, _)| p.components().any(|c| c.as_os_str() == "approval"))
+            .collect()
+    }
+
+    /// The revocations at the mock IdP of a refresh token a CIBA approval
+    /// came with, each with its place in the record.
+    fn ciba_revokes(&self) -> Vec<(usize, Value)> {
+        self.xaa
+            .record()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                r["path"] == "/revoke"
+                    && r["body"]["token"]
                         .as_str()
-                        .is_some_and(|e| e.contains("a restart")),
-                format!("the waiting firing fails closed on the restart: {waiting} ({binding})"),
-            )
-        })
-        .and(|| Outcome::require(asked == 1, format!("asked once: {asked}")));
+                        .is_some_and(|t| t.starts_with("ciba-rt-"))
+            })
+            .collect()
+    }
+
+    /// How the runs' records the store keeps say their firings asked, per
+    /// grant: `once`, `again` or `refused`.
+    fn asked_recorded(&self) -> Vec<String> {
+        self.store_bytes()
+            .into_iter()
+            .filter_map(|(_, b)| serde_json::from_slice::<Value>(&b).ok())
+            .filter_map(|v| v["state"]["unattended"]["asked"].as_object().cloned())
+            .flat_map(|m| {
+                m.into_values()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+            })
+            .collect()
+    }
+}
+
+/// Whether the requests `asked` for one run are a first and one more that
+/// says it is asked again.
+fn asked_twice(asked: &[String]) -> bool {
+    asked.len() == 2
+        && !asked[0].split(' ').any(|w| w == "again")
+        && asked[1].split(' ').any(|w| w == "again")
+}
+
+/// A restart loses a `via: ciba` firing's request, or the approval it
+/// gave, and the firing asks alice exactly once more, the request's
+/// binding message saying `again` (RFC 0044 §7.P3c): a step that waited on
+/// her answer when the daemon stopped waits on a new request — approved,
+/// the run completes; denied, it fails `ciba_denied` — and one whose
+/// approval a restart lost between two calls asks at its next call, and
+/// completes once she approves again.
+pub(super) fn a_ciba_firing_asks_once_more_after_a_restart(h: &Harness) -> Outcome {
+    let waiting = |answer: &str| -> Result<(Value, Vec<String>), String> {
+        let s = Setup::new(h, json!({"ciba": "pending"}), &ciba_opts(10));
+        let d = s.daemon(h);
+        s.login(h)?;
+        let binding = s.first_binding()?;
+        std::thread::sleep(Duration::from_millis(500));
+        drop(d);
+        s.xaa.control(json!({"ciba": answer}));
+        let _d = s.daemon(h);
+        let run = s.ended("nightly", 0, Duration::from_secs(40))?;
+        if !run_of(&binding, &run) {
+            return Err(format!("another run ended first: {run} ({binding})"));
+        }
+        Ok((run, s.asked_for(&binding)))
+    };
+    let (approved, asked) = tryo!(waiting("approve"));
+    let o = completed(&approved).and(|| {
+        Outcome::require(
+            asked_twice(&asked),
+            format!("the waiting firing asks once more, saying again: {asked:?}"),
+        )
+    });
+    if !o.passed {
+        return o;
+    }
+    let (denied, asked) = tryo!(waiting("deny"));
+    let o = failed_with(&denied, "ciba_denied").and(|| {
+        Outcome::require(
+            asked_twice(&asked),
+            format!("denied, the once-more request was the last: {asked:?}"),
+        )
+    });
     if !o.passed {
         return o;
     }
     // Approved, then a restart between two calls.
-    let twice = "  - name: nightly\n    act_for: {principal: {source: operator, id: alice}, via: ciba}\n    concurrency: {max_runs: 1, on_overflow: drop}\n    steps:\n      start: {kind: schedule, every: 2s}\n      one: {kind: mcp.tool, depends_on: [start], server: linear, tool: whoami, args: {}}\n      w: {kind: wait, depends_on: [one], on: signal, signal: go}\n      two: {kind: mcp.tool, depends_on: [w], server: linear, tool: whoami, args: {}}\n      done: {kind: finish, depends_on: [two]}\n";
     let s = Setup::new(
         h,
         json!({}),
         &Opts {
-            extra: twice.to_string(),
+            extra: TWICE.to_string(),
             ..ciba_opts(10)
         },
     );
     let d = s.daemon(h);
     tryo!(s.login(h));
-    tryo!(
-        s.until("the first call made", Duration::from_secs(40), &|| {
-            s.xaa
-                .mcp_calls("tools/call")
-                .iter()
-                .any(|c| c["body"]["params"]["name"] == "whoami")
-        })
-    );
+    tryo!(s.until(
+        "the first call made",
+        Duration::from_secs(40),
+        &|| s.made("whoami") >= 1
+    ));
+    let binding = tryo!(s.first_binding());
     std::thread::sleep(Duration::from_millis(500));
-    let binding = s.ciba_requests()[0]["body"]["binding_message"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
     drop(d);
     let _d = s.daemon(h);
     std::thread::sleep(Duration::from_millis(500));
@@ -408,20 +502,479 @@ pub(super) fn a_ciba_firing_fails_closed_on_restart(h: &Harness) -> Outcome {
     if fired.get("error").is_some() {
         return Outcome::fail(format!("signal: {fired}"));
     }
-    let approved = tryo!(s.ended("nightly", 0, Duration::from_secs(30)));
-    let asked = s
-        .ciba_requests()
-        .iter()
-        .filter(|r| r["body"]["binding_message"] == binding)
-        .count();
-    failed_with(&approved, "subject_expired")
+    let run = tryo!(s.ended("nightly", 0, Duration::from_secs(40)));
+    let asked = s.asked_for(&binding);
+    let again = s
+        .events("delegation.ciba")
+        .into_iter()
+        .any(|e| e["decision"] == "asked_again");
+    completed(&run)
         .and(|| {
             Outcome::require(
-                run_of(&binding, &approved),
-                format!("the approved firing's second call fails after the restart: {approved}"),
+                run_of(&binding, &run) && s.made("whoami") == 2,
+                format!("the approved firing's second call is made after the restart: {run}"),
             )
         })
-        .and(|| Outcome::require(asked == 1, format!("asked once: {asked}")))
+        .and(|| {
+            Outcome::require(
+                asked_twice(&asked) && again,
+                format!("its second call asks once more, saying again: {asked:?}"),
+            )
+        })
+}
+
+/// A second restart while the request a restart made a `via: ciba` firing
+/// send is still out fails the firing closed: the run's record says it
+/// asked once more, so the step fails `ciba_denied` and no third request
+/// is ever sent.
+pub(super) fn a_ciba_firing_fails_closed_on_a_second_restart(h: &Harness) -> Outcome {
+    let s = Setup::new(h, json!({"ciba": "pending"}), &ciba_opts(10));
+    let d = s.daemon(h);
+    tryo!(s.login(h));
+    let binding = tryo!(s.first_binding());
+    std::thread::sleep(Duration::from_millis(500));
+    drop(d);
+    let d = s.daemon(h);
+    tryo!(s.until(
+        "the request asked once more",
+        Duration::from_secs(30),
+        &|| s.asked_for(&binding).len() >= 2
+    ));
+    std::thread::sleep(Duration::from_millis(500));
+    drop(d);
+    let _d = s.daemon(h);
+    let run = tryo!(s.ended("nightly", 0, Duration::from_secs(30)));
+    std::thread::sleep(Duration::from_secs(2));
+    let asked = s.asked_for(&binding);
+    failed_with(&run, "ciba_denied")
+        .and(|| {
+            Outcome::require(
+                run_of(&binding, &run)
+                    && run["err"].as_str().is_some_and(|e| e.contains("once more")),
+                format!("the firing fails closed on the second restart: {run} ({binding})"),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                asked_twice(&asked),
+                format!("never a third request: {asked:?}"),
+            )
+        })
+}
+
+/// The refresh token alice's IdP issues with her CIBA approval, though
+/// none was asked for, is kept sealed in the store — never a byte of it in
+/// the clear — while the run lasts. A crash leaves it there; the next
+/// start revokes it at the IdP and forgets it, before the request the
+/// restart makes the firing send — however long the revocation takes — so
+/// the store keeps none when that request is sent; and the refresh token
+/// issued with that approval is revoked at the run's end, the store
+/// keeping none.
+pub(super) fn a_ciba_refresh_token_is_revoked_after_a_crash(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"ciba_refresh_token": true}),
+        &Opts {
+            extra: TWICE.to_string(),
+            ..ciba_opts(10)
+        },
+    );
+    let d = s.daemon(h);
+    tryo!(s.login(h));
+    tryo!(s.until(
+        "the first call made",
+        Duration::from_secs(40),
+        &|| s.made("whoami") >= 1
+    ));
+    let kept = s.approvals_kept();
+    let clear = s
+        .store_bytes()
+        .iter()
+        .any(|(_, b)| String::from_utf8_lossy(b).contains("ciba-rt-"));
+    s.crash();
+    drop(d);
+    let after_crash = s.ciba_revokes().len();
+    let mark = s.xaa.record().len();
+    // The new request waits on alice until the store is looked at.
+    s.xaa
+        .control(json!({"slow_revoke_ms": 3000, "ciba": "pending"}));
+    let _d = s.daemon(h);
+    let fired = s.op("workflow.signal", json!({"name": "go"}));
+    if fired.get("error").is_some() {
+        return Outcome::fail(format!("signal: {fired}"));
+    }
+    let sent = s.until(
+        "the request the restart makes the firing send",
+        Duration::from_secs(30),
+        &|| {
+            s.xaa
+                .record()
+                .iter()
+                .skip(mark)
+                .any(|r| r["path"] == "/bc/authorize")
+        },
+    );
+    let kept_when_sent = s.approvals_kept().len();
+    s.xaa.control(json!({"ciba": "approve"}));
+    let swept = s.until(
+        "the approval's refresh token revoked at the next start",
+        Duration::from_secs(20),
+        &|| s.ciba_revokes().iter().any(|(i, _)| *i >= mark),
+    );
+    let run = tryo!(s.ended("nightly", 0, Duration::from_secs(40)));
+    let record = s.xaa.record();
+    let revoke = s.ciba_revokes().into_iter().find(|(i, _)| *i >= mark);
+    let asked = record
+        .iter()
+        .enumerate()
+        .skip(mark)
+        .find(|(_, r)| r["path"] == "/bc/authorize");
+    let ended = s.until(
+        "the second approval's refresh token revoked at the run's end",
+        Duration::from_secs(20),
+        &|| s.ciba_revokes().len() >= 2 && s.approvals_kept().is_empty(),
+    );
+    let t = |r: &Value| r["t"].as_u64().unwrap_or(0);
+    completed(&run)
+        .and(|| {
+            Outcome::require(
+                kept.len() == 1 && !clear,
+                format!(
+                    "kept sealed while the run lasts: {} kept, in the clear: {clear}",
+                    kept.len()
+                ),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                after_crash == 0,
+                "nothing is revoked by a crash",
+            )
+        })
+        .and(|| Outcome::require(swept.is_ok(), swept.err().unwrap_or_default()))
+        .and(|| Outcome::require(sent.is_ok(), sent.err().unwrap_or_default()))
+        .and(|| {
+            Outcome::require(
+                kept_when_sent == 0,
+                format!(
+                    "the start forgets the record it revoked, before the restart's request: {kept_when_sent} kept when it was sent"
+                ),
+            )
+        })
+        .and(|| match (&revoke, asked) {
+            (Some((ri, r)), Some((ai, a))) => Outcome::require(
+                ri < &ai && t(a) >= t(r) + 2_500,
+                format!(
+                    "revoked before the restart's request is sent, its revocation answered first: revoke #{ri} at {}, request #{ai} at {}",
+                    t(r),
+                    t(a)
+                ),
+            ),
+            _ => Outcome::fail(format!(
+                "a revocation and a request after the restart: {revoke:?} {asked:?}"
+            )),
+        })
+        .and(|| Outcome::require(ended.is_ok(), ended.err().unwrap_or_default()))
+}
+
+/// Under `key_custody: external`, the refresh token alice's CIBA approval
+/// came with, which a crash left in the store, stays there while the
+/// signer is down at the next start — not revoked, not forgotten, and no
+/// request is sent — and once the signer is back a later pass revokes it
+/// at the IdP and forgets it, though no CIBA request comes to make it.
+pub(super) fn a_ciba_refresh_token_is_revoked_once_the_signer_is_back(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"ciba_refresh_token": true}),
+        &Opts {
+            signer_uid: Some(uid()),
+            extra: TWICE.to_string(),
+            ..ciba_opts(10)
+        },
+    );
+    let d = s.daemon(h);
+    tryo!(s.login(h));
+    tryo!(s.until(
+        "the first call made",
+        Duration::from_secs(40),
+        &|| s.made("whoami") >= 1
+    ));
+    let kept = s.approvals_kept().len();
+    s.crash();
+    drop(d);
+    s.stop_signer();
+    let mark = s.xaa.record().len();
+    let since = |path: &str| {
+        s.xaa
+            .record()
+            .iter()
+            .skip(mark)
+            .filter(|r| r["path"] == path)
+            .count()
+    };
+    let _d = s.daemon(h);
+    let held = s.until(
+        "the start's pass kept from finishing by the signer",
+        Duration::from_secs(20),
+        &|| !s.events("delegation.ciba.unrevoked").is_empty(),
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    let (revoked_while_down, left) = (since("/revoke"), s.approvals_kept().len());
+    s.start_signer(h);
+    let swept = s.until(
+        "the refresh token revoked once the signer is back",
+        Duration::from_secs(30),
+        &|| s.ciba_revokes().iter().any(|(i, _)| *i >= mark) && s.approvals_kept().is_empty(),
+    );
+    Outcome::require(kept == 1, format!("kept while the run lasts: {kept}"))
+        .and(|| Outcome::require(held.is_ok(), held.err().unwrap_or_default()))
+        .and(|| {
+            Outcome::require(
+                revoked_while_down == 0 && left == 1,
+                format!(
+                    "left for a later pass while the signer is down: {revoked_while_down} revoked, {left} kept"
+                ),
+            )
+        })
+        .and(|| Outcome::require(swept.is_ok(), swept.err().unwrap_or_default()))
+        .and(|| {
+            Outcome::require(
+                since("/bc/authorize") == 0,
+                "no CIBA request made the pass run",
+            )
+        })
+}
+
+/// `nightly` acting for alice `via: ciba`: a call the run goes on past
+/// when it fails, a wait for the signal `go`, and a second call.
+const PAST_A_REFUSAL: &str = "  - name: nightly\n    act_for: {principal: {source: operator, id: alice}, via: ciba}\n    concurrency: {max_runs: 1, on_overflow: drop}\n    steps:\n      start: {kind: schedule, every: 2s}\n      one: {kind: mcp.tool, depends_on: [start], server: linear, tool: whoami, args: {}, on_error: continue}\n      w: {kind: wait, depends_on: [one], on: signal, signal: go}\n      two: {kind: mcp.tool, depends_on: [w], server: linear, tool: whoami, args: {}}\n      done: {kind: finish, depends_on: [two]}\n";
+
+/// A firing whose request alice denied on her device, or whose wait she
+/// cancelled with `--delegation-deny`, asks her no more at that grant, a
+/// restart included (RFC 0044 §7.P3c): its run goes on past the refused
+/// call, its record says `refused` before the restart, and the call it
+/// makes after the restart fails `subject_expired`, no second request
+/// sent.
+pub(super) fn a_ciba_refusal_holds_across_a_restart(h: &Harness) -> Outcome {
+    let refused = |cancel: bool| -> Result<(Value, Vec<String>, Vec<String>), String> {
+        let s = Setup::new(
+            h,
+            json!({"ciba": if cancel { "pending" } else { "deny" }}),
+            &Opts {
+                extra: PAST_A_REFUSAL.to_string(),
+                ..ciba_opts(10)
+            },
+        );
+        let d = s.daemon(h);
+        s.login(h)?;
+        let binding = s.first_binding()?;
+        if cancel {
+            let gate = s.gates(h, 1)?;
+            let id = gate[0]["gate"].as_str().unwrap_or_default().to_string();
+            let r = s.cli(h, &["--delegation-deny", &id]);
+            if r.code != Some(0) {
+                return Err(format!("--delegation-deny: {} {}", r.stdout, r.stderr));
+            }
+        }
+        s.until(
+            "the run's record saying the firing was refused",
+            Duration::from_secs(20),
+            &|| s.asked_recorded().iter().any(|a| a == "refused"),
+        )?;
+        let recorded = s.asked_recorded();
+        std::thread::sleep(Duration::from_millis(500));
+        drop(d);
+        let _d = s.daemon(h);
+        std::thread::sleep(Duration::from_millis(500));
+        let fired = s.op("workflow.signal", json!({"name": "go"}));
+        if fired.get("error").is_some() {
+            return Err(format!("signal: {fired}"));
+        }
+        let run = s.ended("nightly", 0, Duration::from_secs(30))?;
+        if !run_of(&binding, &run) {
+            return Err(format!("another run ended first: {run} ({binding})"));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        Ok((run, s.asked_for(&binding), recorded))
+    };
+    for (cancel, how) in [(false, "denied on her device"), (true, "cancelled")] {
+        let (run, asked, recorded) = tryo!(refused(cancel));
+        let o = failed_with(&run, "subject_expired")
+            .and(|| {
+                Outcome::require(
+                    recorded == ["refused"],
+                    format!("{how}: the record says refused before the restart: {recorded:?}"),
+                )
+            })
+            .and(|| {
+                Outcome::require(
+                    asked.len() == 1,
+                    format!("{how}: asked once, and not again after the restart: {asked:?}"),
+                )
+            });
+        if !o.passed {
+            return o;
+        }
+    }
+    Outcome::pass()
+}
+
+/// The approval's ID token alice's CIBA approval gave a `via: ciba`
+/// firing is the subject of its same-domain exchange (`grant:
+/// token_exchange`, M1b): every exchange the firing makes presents that
+/// very token, typed as an ID token, and none the grant's access token —
+/// the token the MCP server is sent is hers. An authorization server that
+/// takes no ID token as the subject (`invalid_request`) fails the call
+/// `config`, and nothing falls back to the grant's token; under `profile:
+/// okta`, whose on-behalf-of exchange takes an access token alone, the
+/// call is refused before she is asked.
+pub(super) fn a_ciba_exchange_binds_to_the_approval(h: &Harness) -> Outcome {
+    let m1b = |provider_extra: &'static str| Opts {
+        exchange: true,
+        template: Some("linear: {scopes: [\"issues:read\"]}"),
+        provider_extra: Box::leak(
+            format!("      ciba: {{enabled: true, per_day: 10}}\n{provider_extra}")
+                .into_boxed_str(),
+        ),
+        ..ciba_opts(10)
+    };
+    let s = Setup::new(h, json!({}), &m1b(""));
+    // The MCP server's own authorization server is the person's IdP.
+    s.xaa
+        .control(json!({"prm_authorization_servers": [s.xaa.idp]}));
+    let _d = s.daemon(h);
+    tryo!(s.login(h));
+    let binding = tryo!(s.first_binding());
+    let run = tryo!(s.ended("nightly", 0, Duration::from_secs(40)));
+    let record = s.xaa.record();
+    let first_ask = record
+        .iter()
+        .position(|r| r["path"] == "/bc/authorize")
+        .unwrap_or(record.len());
+    let approval = record
+        .iter()
+        .find_map(|r| r["issued_id_token"].as_str())
+        .unwrap_or_default()
+        .to_string();
+    let exchanges: Vec<&Value> = record[first_ask..]
+        .iter()
+        .filter(|r| r["at"] == "idp" && r["body"]["grant_type"] == EXCHANGE)
+        .collect();
+    // The first firing's, before the next firing asks.
+    let next_ask = record[first_ask + 1..]
+        .iter()
+        .position(|r| r["path"] == "/bc/authorize")
+        .map_or(record.len(), |i| first_ask + 1 + i);
+    let of_this: Vec<&Value> = record[first_ask..next_ask]
+        .iter()
+        .filter(|r| r["at"] == "idp" && r["body"]["grant_type"] == EXCHANGE)
+        .collect();
+    let sent = s
+        .xaa
+        .mcp_calls("tools/call")
+        .iter()
+        .filter_map(|c| c["authorization"].as_str().map(str::to_string))
+        .next()
+        .unwrap_or_default();
+    let at = claims(sent.strip_prefix("Bearer ").unwrap_or_default());
+    let minted = s.events("delegation.minted");
+    let o = completed(&run)
+        .and(|| {
+            Outcome::require(
+                run_of(&binding, &run) && !approval.is_empty() && !of_this.is_empty(),
+                format!("the firing's exchange after her approval: {of_this:?}"),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                exchanges.iter().all(|r| {
+                    r["body"]["subject_token_type"] == "urn:ietf:params:oauth:token-type:id_token"
+                }) && of_this
+                    .iter()
+                    .all(|r| r["body"]["subject_token"] == approval.as_str()),
+                format!(
+                    "every exchange of a firing presents its approval's ID token, never the grant's access token: {exchanges:?}"
+                ),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                at["aud"] == "api://issues" && at["sub"] == "00u1alice",
+                format!("the MCP server is sent the exchanged token, hers: {sent}"),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                minted
+                    .iter()
+                    .any(|m| m["subject"] == "approval" && m["via"] == "ciba"),
+                format!("the exchange is recorded as of the approval: {minted:?}"),
+            )
+        });
+    if !o.passed {
+        return o;
+    }
+    // An authorization server that takes no ID token as the subject.
+    s.xaa.control(json!({"m1b_id_token_subject": false}));
+    let n = s.runs_done("nightly").len();
+    let before = s.xaa.grants("idp", EXCHANGE).len();
+    let refused = tryo!(s.ended("nightly", n, Duration::from_secs(40)));
+    let tried: Vec<Value> = s
+        .xaa
+        .grants("idp", EXCHANGE)
+        .into_iter()
+        .skip(before)
+        .collect();
+    let o = failed_with(&refused, "config")
+        .and(|| {
+            Outcome::require(
+                refused["err"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("did not take the CIBA approval's ID token")),
+                format!("the refusal says the server takes no ID token subject: {refused}"),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                tried.iter().all(|r| {
+                    r["body"]["subject_token_type"] == "urn:ietf:params:oauth:token-type:id_token"
+                }),
+                format!("nothing falls back to the grant's token: {tried:?}"),
+            )
+        });
+    if !o.passed {
+        return o;
+    }
+    // Okta's on-behalf-of exchange takes an access token alone. (The mock
+    // serves its keys where its metadata says, not at Okta's path.)
+    let s = Setup::new(h, json!({}), &m1b(""));
+    s.reconfigure(&m1b(Box::leak(
+        format!(
+            "      profile: okta\n      jwks_uri: \"{}/keys\"\n",
+            s.xaa.idp
+        )
+        .into_boxed_str(),
+    )));
+    s.xaa
+        .control(json!({"prm_authorization_servers": [s.xaa.idp]}));
+    let _d = s.daemon(h);
+    tryo!(s.login(h));
+    let okta = tryo!(s.firing(Duration::from_secs(40)));
+    failed_with(&okta, "config")
+        .and(|| {
+            Outcome::require(
+                okta["err"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("Okta's on-behalf-of exchange")),
+                format!("refused, naming Okta's exchange: {okta}"),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                s.ciba_requests().is_empty(),
+                "she is never asked for an approval the exchange could not use",
+            )
+        })
 }
 
 /// `act_for` beside a webhook start, or a signal start, is refused at

@@ -410,8 +410,9 @@ gates the same way, approve refused — they may deny one to end it:
   {how: ciba}}` — for up to the request's expiry
   (`identity.providers.<name>.ciba.request_expiry`, 300 s), and fails
   `ciba_denied` when they deny it or it expires. Another call the firing
-  makes meanwhile waits on the same request. A restart ends the wait and
-  fails the call closed; a firing never asks twice
+  makes meanwhile waits on the same request. A restart ends the request,
+  and the firing asks once more — a waiting step on the same wait, a new
+  request — and a second restart fails the call closed
   ([Work nobody is there for](authentication.md#work-nobody-is-there-for)).
 - **Signing in again.** A workflow step whose grant was revoked or expired,
   or whose run's session ended, at a server with `auth.on_revoked: ask`,
@@ -660,8 +661,10 @@ fires when a gate is answered, with `{task, via}`.
   replay opens its own.
 - The policy, timeout and addressee of a policy gate on a workflow step are
   durable too.
-- A firing's wait on its person's CIBA approval does not: the request is
-  never written down, so a restart fails the call `ciba_denied`. A step
+- A firing's wait on its person's CIBA approval keeps its gate but not its
+  request, which is never written down: after a restart the gate is asked
+  again with a new request, once — the run's record says so — and a second
+  restart fails the call `ciba_denied`. A step
   waiting for its person to sign in again (`on_revoked: ask`) does, and is
   checked again from the first pass. A device-grant step-up keeps when the
   IdP asked for it, and the sign-in a restart resumes is held to that.

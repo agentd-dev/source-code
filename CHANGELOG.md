@@ -1655,12 +1655,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   memory; its tokens are pooled for the firing alone. A firing asks once at
   a grant — its run's record says so before the request is sent; another
   call it makes while the request waits waits on the same request, and a
-  restart fails it closed — at most one request per person and workflow
-  waits, another firing asking once that wait closes, and at most
+  restart asks once more (below) — at most one request per person and
+  workflow waits, another firing asking once that wait closes, and at most
   `per_day` (10) a day are sent (`budget_exhausted`); a denial or an expiry
   is `ciba_denied`; a refresh token the IdP issued with an approval is
-  revoked when the run ends (`delegation.ciba`) — held in memory alone, a
-  restart before then leaves it alive at the IdP until it expires.
+  revoked when the run ends (`delegation.ciba`), kept sealed until then
+  (below).
 - `mcp.servers[].auth.on_revoked: ask` (refused at load until now): a
   workflow step whose grant was revoked or expired, or whose run's session
   ended, waits for its person — among their gates, the run's task in
@@ -1706,6 +1706,52 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `engine::model::{ActFor, ActForPrincipal, ACT_FOR_STARTS}` and
   `Workflow::act_for`; `engine::run::{Unattended, UNATTENDED_SID_PREFIX,
   HANDED_ON_SID}` and `RunState::unattended`.
+- CIBA follow-ups (RFC 0044 §7.P3c, `xaa`). **A restart asks once more:** a
+  `via: ciba` firing whose request was waiting on its person, or approved,
+  when agentd stopped sends one new request after the restart — the step
+  that waited waits on the same gate for it, a later call that finds no
+  approval asks — its binding message saying `again`, and nothing of the
+  old request (its `auth_req_id`, its approval, the tokens minted with it)
+  used; the run's record says so before it is sent (`unattended.asked:
+  {<grant>: once | again | refused}`, `delegation.ciba {decision:
+  asked_again}`), so a second restart fails the firing closed and a denied
+  or expired request is never asked again. **An approval's refresh token
+  never outlives its run:** one an IdP issues with an approval is kept
+  sealed in the store, as a grant's refresh token is — under `seal_key`, or
+  a data key the external signer wraps — while the run lasts, and revoked
+  (RFC 7009) and forgotten when it ends; one a crash or a restart left in
+  the store is revoked at its IdP and forgotten at the next start's first
+  pass, before any CIBA request is sent (`delegation.ciba {left_by:
+  restart}`, `delegation.ciba.unforgotten`) — where the external signer or
+  the store keeps that pass from finishing, the record stays and the pass
+  is tried again, 5 s later and doubling to 5 min, until it finishes, and a
+  request made meanwhile fails unsent (`delegation.ciba.unrevoked`); one
+  that cannot be kept sealed is revoked at once, and the approval fails
+  `signer_unavailable`. **The approval binds the exchange:** in a `via:
+  ciba` firing a `grant: token_exchange` server's exchange presents the
+  approval's ID token as the subject (`subject_token_type` id_token,
+  `delegation.minted {subject: approval}`), never the grant's access token;
+  an authorization server that answers `invalid_request` for it fails the
+  call `config`, and a `profile: okta` IdP — whose on-behalf-of exchange
+  takes an access token alone — is refused before the person is asked.
+- Six `ema` conformance checks of those
+  (`ema/ciba-firing-asks-once-more-after-a-restart`,
+  `ema/ciba-firing-fails-closed-on-a-second-restart`, in place of
+  `ema/ciba-firing-fails-closed-on-restart`;
+  `ema/ciba-firing-refused-asks-no-more-after-a-restart`,
+  `ema/ciba-refresh-token-revoked-after-a-crash`,
+  `ema/ciba-refresh-token-revoked-once-the-signer-is-back`,
+  `ema/ciba-exchange-binds-to-the-approval`), and the mock IdP's ID-token
+  subject on its same-domain exchange (`m1b_id_token_subject`), the ID token
+  a CIBA approval answered in its record (`issued_id_token`), and a slow
+  revocation (`slow_revoke_ms`).
+- `agentd-core`: `delegation::vault::{Approval, Unopened}` and
+  `Vault::{keep_approval, approvals, open_approval, forget_approval}`;
+  `Delegation::{revoke_left_approvals, sweep_left_approvals,
+  firing_asked}`; `engine::run::Asked`;
+  `auth::idjag::AccessExchange::subject_token_type`.
+  **Breaking:** `engine::run::Unattended::asked` is a map of grant to
+  `Asked`, and `Delegation::firing_started` takes one.
 
 **Changed.**
 

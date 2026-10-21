@@ -27,16 +27,22 @@
 //! own device, off the loop, and the gate's request is polled on the
 //! reactor's passes until they approve — the call is then made again with
 //! their approval as its subject — or deny, or it expires (`ciba_denied`).
-//! The firing's run records that it asked — written before the request is
-//! sent — so neither a second call nor a restart asks again: another call
-//! of the firing made while the request waits waits on the same request,
-//! and a restart ends the wait and fails the call closed. Once the wait
-//! closes, however it does, the firing waits on its person no longer, and
-//! another firing of the workflow may ask. The step shows suspended on the wait — `{kind: consent, signin:
-//! {how: ciba}}` — for up to the request's expiry; the run's task, when it
-//! has one, shows `TASK_STATE_AUTH_REQUIRED` with agentd's words; the
-//! person sees the request on their device, and the gate among their own
-//! in `delegation.list`.
+//! The firing's run records how it asked — written before the request is
+//! sent — so a second call never asks again: another call of the firing
+//! made while the request waits waits on the same request. A restart loses
+//! the request, or the approval it gave, and the firing asks its person
+//! once more (RFC 0044 §7.P3c): a step that was waiting waits on its gate
+//! again, for a new request; a later call that finds no approval asks.
+//! Nothing of the old request is used, and the record says it asked again,
+//! so a second restart fails the call closed; a request denied, run out or
+//! never sent is never asked again. Once the wait closes, however it does,
+//! the firing waits on its person no longer, and another firing of the
+//! workflow may ask. The step shows suspended on the wait — `{kind:
+//! consent, signin: {how: ciba}}` — for up to the request's expiry, the
+//! second wait as the first; the run's task, when it has one, shows
+//! `TASK_STATE_AUTH_REQUIRED` with agentd's words; the person sees the
+//! request on their device — a second one says `again` — and the gate
+//! among their own in `delegation.list`.
 //!
 //! **A step whose grant is gone** — revoked, expired, or the session its
 //! run acted through ended — at a server whose `auth.on_revoked` is `ask`
@@ -58,6 +64,8 @@ use super::stepup::{CibaWait, How, SignIn, StepUpAsk};
 use super::tools::{ToolCaller, ToolOutcome};
 use crate::delegation::unattended::{ActForDecl, CibaOutcome, Firing};
 use crate::engine::model::{ActFor, Workflow};
+#[cfg(feature = "a2a")]
+use crate::engine::run::Asked;
 use crate::engine::run::UNATTENDED_SID_PREFIX;
 use crate::state::InboxEvent;
 #[cfg(feature = "a2a")]
@@ -207,18 +215,21 @@ impl Runtime {
                     via: a.via,
                 },
                 a.principal.clone(),
-                &[],
+                &Default::default(),
             );
         }
     }
 
     /// At start: every firing whose run a restart found still going acts
-    /// again, as having asked whatever its run says it asked — its
-    /// approvals, memory only, are gone.
+    /// again, as having asked as its run says — what its requests and
+    /// approvals gave it ended with the last life; and every refresh token
+    /// an approval left in the store is revoked at its IdP, off the loop,
+    /// before any request is sent.
     pub(crate) fn restore_firings(&self) {
         let Some(d) = &self.delegation else {
             return;
         };
+        d.sweep_left_approvals();
         for r in self.runs.values().filter(|r| !r.status.is_terminal()) {
             let (Some(u), Some(sid)) = (&r.unattended, &r.session) else {
                 continue;
@@ -235,6 +246,36 @@ impl Runtime {
                 &u.asked,
             );
         }
+    }
+
+    /// How firing `sid`'s run's record says it asked its person at `grant`.
+    #[cfg(feature = "a2a")]
+    fn firing_record(&self, sid: &str, grant: &str) -> Option<Asked> {
+        self.runs
+            .values()
+            .filter(|r| r.session.as_deref() == Some(sid))
+            .find_map(|r| r.unattended.as_ref())?
+            .asked
+            .get(grant)
+            .copied()
+    }
+
+    /// Firing `sid`'s run's record says it asked its person at `grant`
+    /// `how`: written, and checkpointed, before a request is sent.
+    #[cfg(feature = "a2a")]
+    fn firing_records(&mut self, sid: &str, grant: &str, how: Asked) {
+        let Some(r) = self
+            .runs
+            .values_mut()
+            .find(|r| r.session.as_deref() == Some(sid) && r.unattended.is_some())
+        else {
+            return;
+        };
+        if let Some(u) = r.unattended.as_mut() {
+            u.asked.insert(grant.to_string(), how);
+        }
+        r.touch();
+        self.checkpoint(false);
     }
 
     /// Run `run_id` ended: when it was a firing, the firing ends with it —
@@ -362,32 +403,31 @@ impl Runtime {
                 })
             })
             .map(|(id, _)| id.clone());
+        // A firing asks its person once at a grant, and once more after a
+        // restart lost that request or its approval: its run's record says
+        // how, written before the request is sent.
+        let mut again = false;
         if leader.is_none() {
-            // A firing asks its person once at a grant, a restart included:
-            // its run's record says so, written before the request is sent.
-            let asked = self
-                .runs
-                .get(&f.run)
-                .and_then(|r| r.unattended.as_ref())
-                .is_some_and(|u| u.asked.contains(&grant));
-            if asked {
-                return fail(
-                    self,
-                    format!(
-                        "{name}: delegation refused (subject_expired): this firing asked {person} once, and asks no more"
-                    ),
-                );
-            }
+            again = match self.firing_record(&f.sid, &grant) {
+                None => false,
+                Some(Asked::Once) if !d.firing_asked(&f.sid, &grant) => true,
+                Some(_) => {
+                    return fail(
+                        self,
+                        format!(
+                            "{name}: delegation refused (subject_expired): this firing asked {person} once — once more after a restart — and asks no more"
+                        ),
+                    );
+                }
+            };
             if let Err(e) = d.ciba_asking(&f.sid, &grant) {
                 return fail(self, format!("{name}: {e}"));
             }
-            if let Some(r) = self.runs.get_mut(&f.run) {
-                if let Some(u) = r.unattended.as_mut() {
-                    u.asked.push(grant.clone());
-                }
-                r.touch();
-            }
-            self.checkpoint(false);
+            self.firing_records(
+                &f.sid,
+                &grant,
+                if again { Asked::Again } else { Asked::Once },
+            );
         }
         let expiry = d.providers.get(&idp).map_or(
             crate::config::settings::delegation::CIBA_REQUEST_EXPIRY,
@@ -439,38 +479,16 @@ impl Runtime {
         self.consents.insert(id.clone(), gate);
         self.log.info(
             "delegation.ciba",
-            json!({"gate": id, "decision": if leader.is_some() { "waits" } else { "asked" },
+            json!({"gate": id, "decision": match (&leader, again) {
+                       (Some(_), _) => "waits",
+                       (None, true) => "asked_again",
+                       (None, false) => "asked",
+                   },
                    "follows": leader, "workflow": f.workflow, "run": f.run, "server": server,
                    "tool": name, "principal": person}),
         );
         if leader.is_none() {
-            let binding = crate::auth::ciba::binding_message(&[
-                "agentd",
-                &self.instance,
-                &f.workflow,
-                "run",
-                &f.run[f.run.len().saturating_sub(8)..],
-                &name,
-            ]);
-            let (d, tx, gate, sid) = (
-                std::sync::Arc::clone(&d),
-                self.events_tx.clone(),
-                id.clone(),
-                f.sid.clone(),
-            );
-            std::thread::Builder::new()
-                .name("delegation-ciba".into())
-                .spawn(move || {
-                    let progress = match d.start_ciba(&sid, &grant, &binding) {
-                        Ok(st) => CibaProgress::Sent(st),
-                        Err(e) => CibaProgress::Polled(CibaOutcome::Refused {
-                            code: e.code,
-                            why: e.message,
-                        }),
-                    };
-                    let _ = tx.send(super::events::Event::Ciba { gate, progress });
-                })
-                .ok();
+            self.send_ciba(&d, &id, &f, &grant, &name, again);
         }
         let outcome = ToolOutcome::Deferred(PendingKind::Consent { id });
         match &target {
@@ -483,6 +501,122 @@ impl Runtime {
                 self.child_tool_outcome(node, req, &name, outcome);
             }
             _ => {}
+        }
+    }
+
+    /// Ask firing `f`'s person at `grant` for gate `gate`'s call of `tool`,
+    /// off the loop: the binding message their device shows is agentd's
+    /// identifiers alone, `again` for the request a restart made it send.
+    fn send_ciba(
+        &self,
+        d: &std::sync::Arc<crate::delegation::Delegation>,
+        gate: &str,
+        f: &Firing,
+        grant: &str,
+        tool: &str,
+        again: bool,
+    ) {
+        let binding = crate::auth::ciba::binding_message(&[
+            "agentd",
+            &self.instance,
+            &f.workflow,
+            "run",
+            &f.run[f.run.len().saturating_sub(8)..],
+            if again { "again" } else { "" },
+            tool,
+        ]);
+        let (d, tx, gate, sid, grant) = (
+            std::sync::Arc::clone(d),
+            self.events_tx.clone(),
+            gate.to_string(),
+            f.sid.clone(),
+            grant.to_string(),
+        );
+        std::thread::Builder::new()
+            .name("delegation-ciba".into())
+            .spawn(move || {
+                let progress = match d.start_ciba(&sid, &grant, &binding) {
+                    Ok(st) => CibaProgress::Sent(st),
+                    Err(e) => CibaProgress::Polled(CibaOutcome::Refused {
+                        code: e.code,
+                        why: e.message,
+                    }),
+                };
+                let _ = tx.send(super::events::Event::Ciba { gate, progress });
+            })
+            .ok();
+    }
+
+    /// After a restart: the `ciba` gates workflow steps waited on, rebuilt
+    /// from their wait records. The request each waited on ended with the
+    /// last life, and nothing of it is used: a firing that had asked its
+    /// person once asks them once more, the step waiting on the same gate
+    /// for the new request — one per firing and grant, the other steps
+    /// that waited on it waiting on it again — and one that had asked once
+    /// more already, or whose firing is gone, fails the call closed.
+    pub(crate) fn ask_rebuilt_cibas(&mut self, ids: &[String]) {
+        let mut leaders: Vec<(String, String, String)> = Vec::new();
+        for id in ids {
+            let Some((sid, grant)) = self
+                .consents
+                .get(id)
+                .and_then(|g| g.signin.as_ref())
+                .and_then(|s| Some((s.firing.clone()?, s.grant.clone())))
+            else {
+                continue;
+            };
+            let first = leaders
+                .iter()
+                .find(|(_, s, g)| *s == sid && *g == grant)
+                .map(|(l, _, _)| l.clone());
+            if let Some(s) = self.consents.get_mut(id).and_then(|g| g.signin.as_mut()) {
+                s.follows = first.clone();
+            }
+            if first.is_none() {
+                leaders.push((id.clone(), sid, grant));
+            }
+        }
+        let Some(d) = self.delegation.clone() else {
+            return;
+        };
+        for (id, sid, grant) in leaders {
+            let firing = d.firing_at(&sid).map(|(f, _)| f);
+            let fresh = matches!(self.firing_record(&sid, &grant), None | Some(Asked::Once));
+            let asking = match &firing {
+                Some(_) if fresh => d.ciba_asking(&sid, &grant).map_err(|e| e.message),
+                Some(_) => Err("a restart ended the wait for the person's approval of this firing, after it had asked them once more, and a firing asks no more".into()),
+                None => Err("a restart ended the wait for the person's approval, and the firing it was for with it".into()),
+            };
+            let (Some(f), Ok(())) = (firing, &asking) else {
+                self.close_signin(&id, &asking.err().unwrap_or_default());
+                continue;
+            };
+            self.firing_records(&sid, &grant, Asked::Again);
+            let expiry = d
+                .providers
+                .get(
+                    self.consents
+                        .get(&id)
+                        .and_then(|g| g.signin.as_ref())
+                        .map_or("", |s| s.idp.as_str()),
+                )
+                .map_or(
+                    crate::config::settings::delegation::CIBA_REQUEST_EXPIRY,
+                    |p| p.cfg.ciba.request_expiry(),
+                );
+            let tool = match self.consents.get_mut(&id) {
+                Some(g) => {
+                    g.deadline_ms = now_ms() + expiry.as_millis() as u64 + 60_000;
+                    g.call.tool.clone()
+                }
+                None => continue,
+            };
+            self.log.info(
+                "delegation.ciba",
+                json!({"gate": id, "decision": "asked_again", "workflow": f.workflow, "run": f.run,
+                       "tool": tool}),
+            );
+            self.send_ciba(&d, &id, &f, &grant, &tool, true);
         }
     }
 
@@ -576,8 +710,17 @@ impl Runtime {
     }
 
     /// Gate `gate`'s request was refused, or never sent: every call that
-    /// waited on it fails, `code`.
+    /// waited on it fails, `code`, and its firing asks no more at that
+    /// grant, a restart included.
     fn ciba_refused(&mut self, gate: &str, code: crate::delegation::Code, why: &str) {
+        if let Some((sid, grant)) = self
+            .consents
+            .get(gate)
+            .and_then(|g| g.signin.as_ref())
+            .and_then(|s| Some((s.firing.clone()?, s.grant.clone())))
+        {
+            self.firing_records(&sid, &grant, Asked::Refused);
+        }
         for id in self.ciba_gates(gate) {
             let Some(g) = self.consents.remove(&id) else {
                 continue;
@@ -622,8 +765,11 @@ impl Runtime {
                             && s.grant == grant
                     })
                 });
+                // Closed with no approval — denied in a display client,
+                // past its deadline, its session ended: asked no more.
                 if !open {
                     d.not_asking(&sid, &grant);
+                    self.firing_records(&sid, &grant, Asked::Refused);
                 }
             }
         }

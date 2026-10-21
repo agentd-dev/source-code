@@ -764,19 +764,22 @@ impl Runtime {
     }
 
     /// After a restart: a rebuilt `authorize` step-up gate's sign-in ended
-    /// with the last life, and so did a firing's wait on its person's
-    /// approval — a firing asks once, so the call fails closed.
+    /// with the last life, so its call fails; and so did the request a
+    /// firing's wait on its person's approval was for — the firing asks
+    /// them once more ([`Runtime::ask_rebuilt_cibas`]).
     pub(crate) fn end_rebuilt_signins(&mut self, ids: &[(String, How)]) {
+        let mut cibas = Vec::new();
         for (id, how) in ids {
+            if *how == How::Ciba {
+                cibas.push(id.clone());
+                continue;
+            }
             self.close_signin(
                 id,
-                if *how == How::Ciba {
-                    "a restart ended the wait for the person's approval of this firing, and a firing asks once"
-                } else {
-                    "a restart ended the sign-in it asked for, and the session it was for with it"
-                },
+                "a restart ended the sign-in it asked for, and the session it was for with it",
             );
         }
+        self.ask_rebuilt_cibas(&cibas);
     }
 }
 

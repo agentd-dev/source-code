@@ -534,6 +534,58 @@ fn a_workflow_pays_on_solana_and_gets_the_resource() {
     }
 }
 
+/// A server that answers the paid request 402 with no `PAYMENT-RESPONSE`
+/// took no payment: the payment is `refused`, not `unknown`, so the step's
+/// retry may pay again — with a new authorization, which the server sees.
+#[cfg(feature = "x402")]
+#[test]
+fn a_402_to_the_payment_with_no_settlement_is_a_refusal() {
+    let dir = scratch();
+    let m = mock(json!({"settle": "decline"}));
+    let steps = format!(
+        "{}      done: {{kind: finish, depends_on: [get]}}\n",
+        paying(
+            "get",
+            "s",
+            &format!("{}/d", m.url),
+            "0.05",
+            ", retry: {max: 1, backoff: 100ms}, on_error: continue"
+        )
+    );
+    let payments = local(
+        dir.path(),
+        &usdc("per_run: \"1\", per_day: \"1\", per_payee: \"1\"", ""),
+        "    ask_when_tainted: false\n",
+    );
+    let cfg = config(dir.path(), &payments, "", "buy", &steps);
+    wallet_address(&cfg);
+    let mut d = Daemon::spawn(&cfg, &[]);
+    d.wait("run.done", |d| d.events("run.done").into_iter().next());
+    let errs: Vec<String> = d
+        .events("step.done")
+        .into_iter()
+        .filter(|e| e["step"] == "get")
+        .map(|e| e["err"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(errs.len(), 2, "{errs:?}");
+    for e in &errs {
+        assert!(
+            e.contains(
+                "payment failed: the server answered 402 to the payment, and settled nothing"
+            ),
+            "{e}"
+        );
+    }
+    let paid = paid(&m);
+    assert_eq!(paid.len(), 2, "paid again after a refusal");
+    assert_ne!(paid[0]["nonce"], paid[1]["nonce"], "with a new nonce");
+    assert_eq!(
+        outcomes(dir.path()),
+        ["authorized", "failed", "authorized", "failed"]
+    );
+    assert_eq!(d.exits(), Some(0));
+}
+
 /// ADR 0003: "a payment outside them refused unsent". Each entry the policy
 /// does not allow — past the run's cap, over a payment's cap and the
 /// step's `max`, for a payee, an asset or a network not on its lists, or

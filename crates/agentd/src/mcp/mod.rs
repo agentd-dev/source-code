@@ -328,6 +328,12 @@ pub mod mock_http;
 pub mod mock_skills;
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 pub mod mock_tasks;
+// The tool that answers as an x402 resource server would (`mock.paid`).
+#[cfg(all(any(feature = "internal-mocks", debug_assertions), feature = "x402"))]
+pub mod mock_x402;
+// Where x402 rides on MCP: a tool's payment request, the paid call's `_meta`,
+// the settlement (RFC 0049 §7.1).
+pub mod x402;
 
 // agentd-as-A2A-client: the remote-A2A-agent delegation backend. Reads a
 // declared peer's card, sends the objective, follows the task to a terminal

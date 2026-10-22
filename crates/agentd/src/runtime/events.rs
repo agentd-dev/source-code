@@ -196,8 +196,9 @@ pub enum Event {
         id: String,
         step: super::company_direct::DirectStep,
     },
-    /// An `http` step that may pay was answered 402 with a payment request
-    /// (RFC 0049): the loop decides whether, and from what, it pays.
+    /// A step that may pay was answered with a payment request (RFC 0049):
+    /// an `http` step's 402, an `mcp.tool` step's tool result, an A2A
+    /// step's peer task. The loop decides whether, and from what, it pays.
     #[cfg(feature = "x402")]
     PaymentRequired(Box<super::payments::Asked>),
     /// A paid request was sent, or could not be: its outcome, for the

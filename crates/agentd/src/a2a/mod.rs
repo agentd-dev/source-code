@@ -45,6 +45,9 @@ pub mod tasks;
 /// The wire projection, built from the specification's own types.
 #[cfg(feature = "a2a")]
 pub mod wire;
+/// Where x402 rides on A2A: the a2a-x402 extension's metadata (RFC 0049).
+#[cfg(feature = "a2a")]
+pub mod x402;
 
 pub use principals::{Evidence, Principal, Resolution, Resolver, Via};
 

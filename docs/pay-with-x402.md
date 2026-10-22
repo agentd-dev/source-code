@@ -1,18 +1,19 @@
 # Pay for things with x402
 
-This guide lets a workflow pay for an HTTP resource that asks to be paid
-with x402 — an API call, a document, a data feed priced at a few cents — from
-a wallet agentd holds, and only within a spend policy you declare. It is for
+This guide lets a workflow pay for what it uses with x402 — an HTTP
+resource, a tool on an MCP server, the work of another agent over A2A,
+priced at a few cents — from a wallet agentd holds, and only within a spend
+policy you declare. It is for
 operators who run agentd against such resources. After it you can make a
 wallet, say what agentd may spend, in which tokens and to whom, have a
 workflow step pay, and have a person approve each payment above an amount
 you choose.
 
 > **Preview.** agentd pays as a client of x402 v2, pinned at the
-> specification's commit `e7a3b4ff47`: over HTTP, with the `exact` scheme on
-> EVM chains (an EIP-3009 authorization) and on Solana (an SPL transfer). It
-> is behind the `x402` build feature, which no release binary or image
-> carries. Paying over MCP and A2A is designed and not built.
+> specification's commit `e7a3b4ff47`: over HTTP, MCP and A2A (the a2a-x402
+> extension), with the `exact` scheme on EVM chains (an EIP-3009
+> authorization) and on Solana (an SPL transfer). It is behind the `x402`
+> build feature, which no release binary or image carries.
 
 ## What it is
 
@@ -35,9 +36,10 @@ spend policy.
 
 ## When to use it
 
-Use it when a resource answers `402` with an x402 v2 `PAYMENT-REQUIRED`
-offering `exact` on an EVM chain or on Solana — USDC on Base or on Solana,
-say — and you want a workflow you wrote to pay for it.
+Use it when a resource answers `402` with an x402 v2 `PAYMENT-REQUIRED`, an
+MCP tool answers with a payment request, or an A2A peer's task asks to be
+paid, offering `exact` on an EVM chain or on Solana — USDC on Base or on
+Solana, say — and you want a workflow you wrote to pay for it.
 
 Use something else when:
 
@@ -171,7 +173,16 @@ the process (`file`, `mcp` or `http`): the ledger is kept there.
 
 ## What a payment looks like
 
-The step sends its request as written. When the answer is `402` with a
+Four kinds of step can pay, each over its own transport, and each with the
+same `payment` field, policy, approver, ledger and audit records:
+
+| Step | What asks to be paid | How the payment goes |
+|---|---|---|
+| `http` | a `402` with a `PAYMENT-REQUIRED` header | the request again, with `PAYMENT-SIGNATURE` |
+| `mcp.tool` | a tool result with `isError: true` carrying a `PaymentRequired` ([below](#pay-for-a-tool-on-an-mcp-server)) | the call again, with the payment in `_meta["x402/payment"]` |
+| `a2a.delegate`, `a2a.send` | the peer's task in `input-required`, asking to be paid ([below](#pay-another-agent-over-a2a)) | a message on the peer's task carrying the payment |
+
+An `http` step sends its request as written. When the answer is `402` with a
 `PAYMENT-REQUIRED`, agentd:
 
 1. checks that the resource it names is the URL the step asked — scheme,
@@ -377,6 +388,102 @@ key's public JWK (`EdDSA`) to learn the address, sends it the transaction's
 message to sign (`sign_solana_transaction`), and verifies the signature
 under the wallet's address before it sends anything.
 
+## Pay for a tool on an MCP server
+
+Give the `mcp.tool` step a `payment` field:
+
+```yaml
+# fragment: under workflows[].steps
+report:
+  kind: mcp.tool
+  depends_on: [start]
+  server: research
+  tool: market_report
+  args: {ticker: "{{ inputs.ticker }}"}
+  payment: {wallet: ops, max: "0.05 usdc-base"}
+```
+
+The first call goes out as written. When the tool answers that it must be
+paid, agentd reads the payment request from the result's
+`structuredContent`, or from its first text part when the server sends no
+structured content. The request must be for this tool —
+`resource.url` `mcp://tool/market_report` — or it is refused. Once the
+policy allows the payment, the call is made again: the same tool, the same
+arguments and the same `_meta`, with the payment beside them. The server's
+settlement comes back in the result's `_meta["x402/payment-response"]`.
+
+The step's output is `{result, payment}`: `result` is the tool's result, as
+an `mcp.tool` step's output always is, and `payment` is what was paid, or
+`null` when the tool asked for nothing:
+
+```yaml
+# fragment: under workflows[].steps
+summary:
+  kind: assign
+  depends_on: [report]
+  value: "{{ steps.report.output.result.summary }} (paid {{ steps.report.output.payment.amount }}, {{ steps.report.output.payment.transaction }})"
+```
+
+A paying call is never made an MCP task: it goes out without the Tasks
+extension, and `detach` and `input` are refused beside `payment`. A call to
+a delegated server is never paid. A paid call that gets no answer, or an
+answer with no settlement, is an unknown outcome, and is never made again;
+an HTTP 4xx, or the payment request again, is a refusal.
+
+A model's own call of a tool that charges is never paid; the model reads
+the payment request as the tool's error. To let a model use a paid tool,
+write a workflow with a paying `mcp.tool` step and expose it as a tool. Its
+payments are asked of the approver, because a model asked for them.
+
+## Pay another agent over A2A
+
+Give the `a2a.delegate` or `a2a.send` step a `payment` field:
+
+```yaml
+# fragment: under workflows[].steps
+images:
+  kind: a2a.delegate
+  depends_on: [start]
+  peer: illustrator
+  objective: "A cover image for {{ inputs.title }}"
+  timeout: 5m
+  payment: {wallet: ops, max: "0.50 usdc-base"}
+```
+
+A step that may pay activates the a2a-x402 extension on every request it
+makes, so a peer whose card requires the extension accepts it. When the
+peer's task stops in `input-required` and asks to be paid, the step hands
+the request to the supervisor. Once the policy allows the payment, agentd
+answers on the peer's own task with a message carrying the payment, over
+the same connection. A delegation then follows the task to its end; a send
+follows it until the peer's receipt for the payment arrives. The receipt is
+the last of the task's `x402.payment.receipts`.
+
+The step's output is `{result, payment}`: `result` is the delegation's
+result or the peer's reply, and `payment` what was paid, or `null` when the
+peer asked for nothing. `timeout` bounds how long the step follows the task
+after it pays; a receipt that has not come by then is an unknown outcome,
+and the payment is never made again. `payment-failed`, or the peer asking
+to be paid again, is a refusal.
+
+Once it pays, agentd asks the peer for none of the task's history, and the
+task it keeps has every `x402.payment.payload` taken out: a peer that hands
+the payment message back puts no signed payment in the step's output or
+the log.
+
+A delegation that may not pay ends as soon as the peer asks to be paid, and
+says so. A peer whose card requires a2a-x402 is refused before anything is
+sent to it.
+
+agentd speaks A2A 1.0.1 and x402 v2: it activates the extension with the
+`A2A-Extensions` header, under both of the extension's URIs, and does not
+pay a request of x402 version 1. The approver's question names what is paid
+for, with the peer's task id or the tool's name quoted — `the task "…" of
+the A2A peer illustrator (https://…)`, or `a call of the tool
+"market_report" on the MCP server research` — and the audit records' `url`
+the peer's endpoint, or the tool's `mcp://tool/<name>`. RFC 0049 §7.2 lists
+where the extension's documents differ from A2A 1.0.1.
+
 ## What it does not do
 
 - **It pays no one else's way.** Only `exact`, with EIP-3009 on EVM chains
@@ -392,7 +499,11 @@ under the wallet's address before it sends anything.
   settles. A server that takes the payment and serves nothing is
   beyond reach — the `authorization` flow settles after the resource is
   served, and the audit chain keeps what a dispute needs.
-- **It follows no redirect,** and pays only for the URL the step asked.
+- **It follows no redirect,** and pays only for the URL the step asked, the
+  tool it called, or the peer task that asked.
+- **No `payment-rejected` to a peer.** A payment agentd refuses or the
+  approver declines leaves the peer's task in `input-required`; the step
+  fails.
 - **A paying step in a loop pays once per element:** a request is the step
   in its run, so each element of a `foreach` is its own request.
 
@@ -402,6 +513,7 @@ under the wallet's address before it sends anything.
   payment, and what does not.
 - [Configuration reference](configuration.md#payments): every
   `security.payments` key.
-- [The `http` node](node-registry.md#http): the step's other fields.
+- [The node registry](node-registry.md#http): the other fields of the
+  `http`, `mcp.tool`, `a2a.send` and `a2a.delegate` steps.
 - [Telemetry reference](telemetry-reference.md#payment): the `payment.*`
   events and audit records.

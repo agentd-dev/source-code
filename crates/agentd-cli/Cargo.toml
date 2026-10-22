@@ -51,7 +51,7 @@ decrypt = ["sign", "agentd/decrypt"]
 companies = ["oauth", "tls", "agentd/companies"]
 # Acting for one enrolled person through their IdP (RFC 0044); not in the release set.
 xaa = ["oauth", "agentd/xaa"]
-# Paying for an HTTP resource with x402 within a spend policy (RFC 0049); not in the release set.
+# Paying for an HTTP resource, an MCP tool's call or an A2A peer's task with x402 within a spend policy (RFC 0049); not in the release set.
 x402 = ["oauth", "agentd/x402"]
 internal-mocks = ["agentd/internal-mocks"]
 mock-models = ["agentd/mock-models"]

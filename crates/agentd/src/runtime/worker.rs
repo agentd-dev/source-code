@@ -1841,12 +1841,14 @@ mod tests {
             content: vec![json!({"type": "text", "text": "{\"x\": 2}"})],
             is_error: None,
             structured_content: None,
+            meta: None,
         };
         assert_eq!(tool_result_value(&res), json!({"x": 2}));
         let res = ::mcp::wire::CallToolResult {
             content: vec![json!({"type": "text", "text": "plain"})],
             is_error: None,
             structured_content: Some(json!({"s": 1})),
+            meta: None,
         };
         assert_eq!(tool_result_value(&res), json!({"s": 1}));
     }

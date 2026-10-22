@@ -26,7 +26,8 @@
       "breaker",
       "rate",
       "auth_to",
-      "auth_timeout"
+      "auth_timeout",
+      "payment"
     ],
     "implemented": true,
     "kind": "a2a.delegate",
@@ -46,7 +47,8 @@
       "timeout",
       "idempotency",
       "breaker",
-      "rate"
+      "rate",
+      "payment"
     ],
     "implemented": true,
     "kind": "a2a.send",
@@ -564,7 +566,8 @@
       "breaker",
       "rate",
       "detach",
-      "input"
+      "input",
+      "payment"
     ],
     "implemented": true,
     "kind": "mcp.tool",

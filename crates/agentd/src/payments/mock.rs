@@ -28,7 +28,8 @@
 //! - A payment that holds is answered as `settle` says: `ok` (200, the
 //!   resource, `success: true` with a transaction and the payer — on
 //!   Solana the sponsor's signature, having signed as the fee payer), `fail`
-//!   (402, `insufficient_funds`, no transaction), `pending` (200,
+//!   (402, `insufficient_funds`, no transaction), `decline` (402, no
+//!   `PAYMENT-RESPONSE`), `pending` (200,
 //!   `settlement_pending` with a transaction), `none` (200, no
 //!   `PAYMENT-RESPONSE`), `error` (500, none), `garbled` (200, a
 //!   `PAYMENT-RESPONSE` that is not base64 JSON) or `stall` (no answer for
@@ -90,7 +91,7 @@ pub fn default_knobs() -> Value {
         "resource_url": null,
         // Echoed as the PaymentRequired's extensions.
         "extensions": null,
-        // ok | fail | pending | none | error | garbled | stall
+        // ok | fail | decline | pending | none | error | garbled | stall
         "settle": "ok",
         "stall_ms": 10_000,
     })
@@ -401,6 +402,7 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
                     )),
                     resource,
                 ),
+                "decline" => (402, None, b"{}".to_vec()),
                 "none" => (200, None, resource),
                 "error" => (500, None, b"{}".to_vec()),
                 "garbled" => (200, Some("not a settlement!".into()), resource),

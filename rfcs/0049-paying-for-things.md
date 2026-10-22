@@ -1,10 +1,10 @@
 # RFC 0049: Paying for things — x402 as a paying client, only within a spend policy
 
-**Status:** Accepted 2026-10-22, as track P of RFC 0048 (§5.6); unit 1 (HTTP, EVM) and Solana for it (§10) implemented, unit 2 (MCP, A2A) to come
+**Status:** Accepted 2026-10-22, as track P of RFC 0048 (§5.6); implemented: unit 1 (HTTP, EVM), Solana (§10) and unit 2 (MCP and A2A, §7.1, §7.2)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-22
 **Builds on:** ADR 0003 (no payment without a spend policy — binding here), RFC 0044 P2a (the external signer, the audit chain, Landlock over supervisor-only paths), RFC 0047 (gates addressed to one person that no judge or operator answers, sealed records), RFC 0042 (what a served document may set), RFC 0054 (capabilities reach workflows first)
-**Standards:** x402 v2 (x402 Foundation), pinned at [`e7a3b4ff47`](https://github.com/x402-foundation/x402/tree/e7a3b4ff47dd67c3a3a7521307ed071d34ce9527/specs) (2026-10-22, the latest commit to touch `specs/`): the core specification `x402-specification-v2.md` [X], the HTTP transport `transports-v2/http.md` [X-HTTP], the MCP transport `transports-v2/mcp.md` [X-MCP], the A2A transport `transports-v2/a2a.md` [X-A2A], the `exact` scheme `schemes/exact/scheme_exact.md` [EXACT] and its EVM and SVM bindings `scheme_exact_evm.md` [EXACT-EVM] and `scheme_exact_svm.md` [EXACT-SVM]. RFC 0048 surveyed `1566e13f3d` (2026-10-06); the two commits since change the core specification's wording only (a §9 link, an Express API name) and the SVM `batch-settlement` scheme, which agentd does not use. [EIP-712](https://eips.ethereum.org/EIPS/eip-712) (typed structured data hashing and signing), [EIP-3009](https://eips.ethereum.org/EIPS/eip-3009) (`transferWithAuthorization`), [EIP-55](https://eips.ethereum.org/EIPS/eip-55) (checksummed addresses), [CAIP-2](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-2.md) (chain ids) and [CAIP-19](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-19.md) (asset ids), RFC 6979 (deterministic ECDSA), SEC 1 (secp256k1); for Solana (§10), RFC 8032 (Ed25519), RFC 8037 (the `OKP` JWK), Solana's transaction format (version-0 messages, compact-u16 lengths), the SPL Token, Token-2022, associated token account, compute-budget and Memo programs, and Bitcoin's base58 alphabet.
+**Standards:** x402 v2 (x402 Foundation), pinned at [`e7a3b4ff47`](https://github.com/x402-foundation/x402/tree/e7a3b4ff47dd67c3a3a7521307ed071d34ce9527/specs) (2026-10-22, the latest commit to touch `specs/`): the core specification `x402-specification-v2.md` [X], the HTTP transport `transports-v2/http.md` [X-HTTP], the MCP transport `transports-v2/mcp.md` [X-MCP], the A2A transport `transports-v2/a2a.md` [X-A2A], the `exact` scheme `schemes/exact/scheme_exact.md` [EXACT] and its EVM and SVM bindings `scheme_exact_evm.md` [EXACT-EVM] and `scheme_exact_svm.md` [EXACT-SVM]; the a2a-x402 extension (google-agentic-commerce/a2a-x402), its `spec/v0.2/spec.md` pinned at [`05b589dbe1`](https://github.com/google-agentic-commerce/a2a-x402/blob/05b589dbe1ebba52add76d199e48eefff0c86c5d/spec/v0.2/spec.md) (2025-11-04, the latest commit to touch it) and `spec/v0.1/spec.md` at [`4d915b0f2e`](https://github.com/google-agentic-commerce/a2a-x402/blob/4d915b0f2e2cea6596f1435f8124123929e1b107/spec/v0.1/spec.md) [A2A-X402]; A2A 1.0.1 for the `A2A-Extensions` header (§4.6, §14.2.2) [A2A]. RFC 0048 surveyed `1566e13f3d` (2026-10-06); the two commits since change the core specification's wording only (a §9 link, an Express API name) and the SVM `batch-settlement` scheme, which agentd does not use. [EIP-712](https://eips.ethereum.org/EIPS/eip-712) (typed structured data hashing and signing), [EIP-3009](https://eips.ethereum.org/EIPS/eip-3009) (`transferWithAuthorization`), [EIP-55](https://eips.ethereum.org/EIPS/eip-55) (checksummed addresses), [CAIP-2](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-2.md) (chain ids) and [CAIP-19](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-19.md) (asset ids), RFC 6979 (deterministic ECDSA), SEC 1 (secp256k1); for Solana (§10), RFC 8032 (Ed25519), RFC 8037 (the `OKP` JWK), Solana's transaction format (version-0 messages, compact-u16 lengths), the SPL Token, Token-2022, associated token account, compute-budget and Memo programs, and Bitcoin's base58 alphabet.
 
 agentd paths are relative to `crates/agentd/src` unless they start with
 `crates/`, `docs/` or `rfcs/`.
@@ -39,7 +39,7 @@ three transports and both chain families, and splits the build in two:
 |---|---|---|---|
 | 1 | HTTP — the `http` workflow step | EVM: `exact` with EIP-3009 | implemented |
 | 1 | HTTP — the `http` workflow step | Solana: `exact` on SVM | implemented (§10) |
-| 2 | MCP — the `mcp.tool` step; A2A — `a2a.send` and `a2a.delegate` | both | designed here (§7) |
+| 2 | MCP — the `mcp.tool` step; A2A — `a2a.send` and `a2a.delegate` | both | implemented (§7.1, §7.2) |
 
 The spend policy, the ledger, custody, the approval gate and the audit
 records are built once, in unit 1, for both.
@@ -69,7 +69,8 @@ signing needs secp256k1 and Keccak-256, which `ring` does not have: `k256`
 off) are optional dependencies `x402` alone enables, as the user approved.
 Their RustCrypto dependencies come with them; none is in the release graph.
 
-**D2. Where agentd pays: a workflow's `http` step, and nothing else.** An
+**D2. Where agentd pays: a workflow's `http`, `mcp.tool`, `a2a.send` or
+`a2a.delegate` step, and nothing else.** An
 `http` step gains `payment: {wallet, max, approve?}`: `wallet` a configured
 wallet, `max` one typed amount or a list of them (`"0.05 usdc-base"`, a
 decimal in the asset's whole units and a configured asset's name), `approve:
@@ -83,7 +84,8 @@ what a step may spend. A paying step must be in a workflow the operator's
 own configuration defines: one an instruction document defines is refused at
 load (RFC 0042: a served document configures no payment), and one
 `workflow.create` or `workflow.update` wrote, or the store restored, fails
-the step without paying.
+the step without paying. Unit 2 gives the same field, under the same rules,
+to the `mcp.tool`, `a2a.send` and `a2a.delegate` steps (§7.1, §7.2).
 
 *A model-facing tool that pays* — decided against, in both units. A model's
 tool arguments are chosen by the model from text that may be anyone's, and
@@ -341,42 +343,147 @@ dispute needs), and a chain or token contract that misbehaves.
 
 ## 7. Unit 2: MCP and A2A
 
-Designed here; built next, on unit 1's policy, ledger, custody, gate and
-audit, unchanged. Where unit 2 plugs in:
+Built on unit 1's policy, ledger, custody, gate and audit, unchanged, and
+on both chain families (§10). A payment request reaches the loop the same
+way over every transport: the step hands it to `Runtime::pay_for(run, step,
+required, call, first)` — `required` the `PaymentRequired` as the transport
+carried it, or why what it carried is none; `call` the call it came back on,
+a `runtime::payments::PaidCall` (an `http` step's request, an `mcp.tool`
+step's `ToolCall`, an A2A step's `PeerTask`); `first` the answer that asked,
+the step's output when nothing is paid. The policy, the approver's gate,
+the ledger record and the audit chain never look inside the call; each one
+says what a record and a gate name it by (the gate quoting what the step or
+the peer chose: the URL, the tool's name, the peer's task id), whether a
+payment request's `resource` is its own, and how it is made once more
+carrying the payment and what came back (`PaidCall::send_paid` →
+`Answer`), from which `runtime::payments` alone decides `settled`,
+`refused`, `unknown` or `unsent`. Before the step's call is made,
+`Runtime::payment_precheck` and, when it refuses,
+`Runtime::payment_refused_before`; a step kind that takes
+`payment` is listed in `config::settings::payments::PAYING_KINDS` and its
+field list. The paid request is the step's, as in D4: its idempotency key,
+and a step whose record is `settled` or `unknown` is failed before it sends
+anything.
 
-- **A transport** is a `PaidCall` its step hands `Runtime::pay_for(run,
-  step, required, call, first)` — `required` the `PaymentRequired` as the
-  transport carried it, or why what it carried is none; `first` the answer
-  that asked, the step's output when nothing is paid. Before the step's
-  call is made, `Runtime::payment_precheck` and, when it refuses,
-  `Runtime::payment_refused_before`. A step kind that takes `payment` is
-  listed in `config::settings::payments::PAYING_KINDS` and its field list.
-- **A chain family** is a variant of `payments::scheme::Family` and of its
-  `Token`, `Account`, `Terms` and prepared payment, with its arm in each of
-  their functions; the policy, the ledger, the gate and the audit chain
-  read none of them.
+Every paying step of unit 2 has the output `{result, payment}`: the answer
+the step otherwise has as its output — the tool's result, the peer's reply,
+the delegation's result — and the payment, D3's object, or `null` when
+nothing asked to be paid. The answer is the server's or the peer's own
+object, so the payment goes beside it, never into it.
 
-- **MCP** [X-MCP]: a `tools/call` result with `isError: true` whose
-  `structuredContent` (else `content[0].text` as JSON) is a
-  `PaymentRequired`; the call is sent again with the `PaymentPayload` in
-  `params._meta["x402/payment"]`, and the settlement read from
-  `result._meta["x402/payment-response"]`. Where agentd pays: an `mcp.tool`
-  step's `payment` field, of the same shape. `resource.url` (`mcp://tool/<name>`
-  in the spec's examples) must name the tool called. A turn's call of the
-  same tool is never paid (D2): its `PaymentRequired` is the tool's error.
-- **A2A** [X-A2A] — the a2a-x402 extension: a task in `input-required`
-  whose status message carries `x402.payment.status: payment-required` and
-  `x402.payment.required`; agentd answers on the task with
-  `x402.payment.status: payment-submitted` and `x402.payment.payload`, and
-  reads `x402.payment.receipts`. Where agentd pays: the `a2a.send` and
-  `a2a.delegate` steps' `payment` field. The extension's activation header
-  in its specification is `X-A2A-Extensions`, which predates A2A 1.0.1's
-  `A2A-Extensions`; agentd sends what A2A 1.0.1 defines, and the mismatch is
-  drafted as a note for upstream, locally, for the user to file (RFC 0048
-  §5.6).
-- **Solana** [EXACT-SVM]: built for the `http` step, on unit 1's policy,
-  ledger, custody, gate and audit — §10. The MCP and A2A steps take it as
-  they take EVM.
+### 7.1 MCP
+
+[X-MCP]. Where agentd pays: an `mcp.tool` step's `payment` field, of the
+`http` step's shape and under its rules (D2).
+
+| x402 over MCP asks | agentd |
+|---|---|
+| A paid tool answers `tools/call` with `isError: true`, the `PaymentRequired` in `structuredContent` and, JSON-encoded, in `content[0].text`; a client prefers `structuredContent` | Read from `structuredContent` when it has `x402Version` and `accepts`, else from `content[0].text` parsed. One that is not version 2, has no `accepts` or no `resource.url` is no payment request: the step fails saying so, nothing paid. |
+| `resource.url`: `mcp://tool/<name>` in the transport's examples, the default of the x402 SDKs' MCP servers | Must be `mcp://tool/<the tool called>`; any other is refused unsent (`resource_mismatch`). A server that names its tool's resource otherwise is not paid: no other URL is known to name the call agentd made. |
+| Retry the call with the `PaymentPayload` in `params._meta["x402/payment"]` | Once: the same tool, the same arguments and the same `_meta` — the step's idempotency key, the attempt, the trace — with the payload beside them. |
+| The settlement in `result._meta["x402/payment-response"]`; a failed settlement is `isError: true` with the payment request again | `success: true`: `settled`. `settlement_pending`, or a failure that names a transaction: `unknown`. `success: false` and no transaction: `refused`. No settlement on a result that asks to be paid again: `refused`; on any other result: `unknown`. A call that got no answer, or one it could not read, a JSON-RPC error, an HTTP 5xx: `unknown`. An HTTP 4xx: `refused`. A call that never left: nothing sent. |
+
+*An MCP task (RFC 0050) that asks for payment* — decided: a paying call is
+never made a task. It goes out without the Tasks extension, so the server
+answers it inline; `detach` and `input`, which act on the call's task, are
+refused beside `payment` at load. x402 binds a payment to the call's own
+result, and a task moves that result to `tasks/result`, of which the
+transport says nothing — which request carries `x402/payment`, where the
+settlement is read — so paying one would be agentd's guess at a protocol. A
+server that makes the call a task anyway is answered as for a task the call
+did not declare: before the payment, the step's error; after it, `unknown`.
+
+*A model's turn* — never paid (D2): its call of a tool that charges reads the
+payment request as the tool's error. A model reaches a paid tool only
+through a workflow with a paying `mcp.tool` step that the operator exposed
+as a tool and granted; that run is work a model asked for, so D7 sends its
+payment to the approver whatever the amount, unless the operator set
+`ask_when_tainted: false`.
+
+*A delegated server's call* (RFC 0044) — never paid: it acts for its
+person, and agentd pays for none of it from its wallets. A Company's server
+takes no `mcp.tool` call at all (RFC 0047).
+
+A step with no `payment` field fails on a tool that asks to be paid, saying
+so, its payment request as its output — in every build, as an `http` step
+does on a 402.
+
+### 7.2 A2A
+
+[X-A2A] and the extension it carries, a2a-x402 [A2A-X402], in its
+standalone flow. Where agentd pays: the `a2a.send` and `a2a.delegate`
+steps' `payment` field, of the `http` step's shape and under its rules.
+
+| a2a-x402 asks | agentd |
+|---|---|
+| A peer declares the extension on its card; a client activates it on its requests | A paying step activates it on every request of the step (`A2A-Extensions`, both URIs below), and a card that requires it is one such a step talks to. A step with no `payment` field, to a card that requires it, is refused before anything is sent, saying the peer charges. |
+| The peer asks with a task in `input-required` whose status message's metadata says `x402.payment.status: payment-required` and carries the `PaymentRequired` in `x402.payment.required` | Read from the peer's JSON as sent (the SDK's types blank every `metadata`). A send's reply, or a delegation's stream or poll, that shows such a task stops there and hands it to the loop. With no `x402.payment.required` (the embedded flow: the request inside an AP2 mandate in the artifacts) nothing is paid. |
+| The client answers on the task: `taskId`, metadata `payment-submitted` and the `PaymentPayload` in `x402.payment.payload` | One `SendMessage` on the peer's task and in its context, marked with the extension, `returnImmediately` and `historyLength: 0`, on the connection that asked — the card's tenant, the credentials, the trace. |
+| The peer's status messages carry `x402.payment.receipts`, every settlement of the task so far; the final one MUST | The receipts after those the asking message carried are this payment's; the last of them is read. A send follows the task (`GetTask` with `historyLength: 0`, retried until the step's `timeout`) until one comes; a delegation until the task ends. |
+| `payment-failed`, an error code, the task asking again | The receipt as on MCP. No receipt: `payment-failed` is `refused`; a new status message asking to be paid again is `refused`; an HTTP 4xx, or a JSON-RPC error other than `-32603`, to the payment message is `refused`; no answer, one agentd cannot read, an HTTP 5xx or `-32603` is `unknown`; no receipt by the step's `timeout` is `unknown`. |
+
+The payment request's `resource` is recorded, not held to anything: an
+A2A peer names a URL of its own (the transport's example names an HTTP
+URL), and the payment goes back on the peer's own task, over the connection
+that asked, so it pays for nothing else. The record's `url` is the peer's
+endpoint.
+
+The task the step keeps carries no `x402.payment.payload`, wherever the
+peer put one. A task's history holds the payment message, and a peer may
+return it whatever `historyLength` asked; agentd asks for none and takes
+every payload out, so the signed payment is in no step's output, log line
+or model's context.
+
+A step with no `payment` field fails at once on a task that asks to be paid,
+saying so — a delegation no longer follows it until its `timeout` — in every
+build with `a2a`.
+
+*Not done:* agentd does not answer a refused or declined payment with
+`payment-rejected`; the peer's task is left in `input-required`, the step
+failed. The extension describes that message, and a peer gains nothing from
+it that the task's expiry does not give it.
+
+**The extension and A2A 1.0.1 disagree, and so do its two documents.** What
+agentd does, and why:
+
+1. *The activation header.* a2a-x402 (v0.1 §8, v0.2 §8) and the x402 v2
+   A2A transport name `X-A2A-Extensions`; A2A 1.0.1 names `A2A-Extensions`
+   [A2A §14.2.2]. agentd sends `A2A-Extensions` alone: it speaks A2A
+   1.0.1, and keeps no second spelling.
+2. *The x402 version.* The extension's v0.2 examples carry `x402Version: 1`,
+   with version 1's fields (`maxAmountRequired`, network `base`); the x402
+   v2 A2A transport carries `x402Version: 2` with CAIP-2 networks. agentd
+   speaks x402 v2: a version 1 payment request is no payment request.
+3. *The URI.* The x402 v2 transport names
+   `https://github.com/google-a2a/a2a-x402/v0.1` (the extension's v0.1);
+   the extension's v0.2 names
+   `https://github.com/google-agentic-commerce/a2a-x402/blob/main/spec/v0.2`.
+   agentd activates both, and takes a card that requires either.
+4. *The A2A shapes.* Both documents' examples are A2A 0.3 JSON (`kind`,
+   `role: "user"`, `message/send`, `input-required`); agentd speaks A2A
+   1.0.1's (`ROLE_USER`, `SendMessage`, `TASK_STATE_INPUT_REQUIRED`). The
+   metadata keys are the same in both.
+
+A note for upstream, drafted here for the user to file (agentd files
+nothing; RFC 0048 §5.6) — to google-agentic-commerce/a2a-x402, with a copy
+for `specs/transports-v2/a2a.md` in x402-foundation/x402:
+
+> **Align a2a-x402 with A2A 1.0.1 and x402 v2.** A2A 1.0.1 activates an
+> extension with the `A2A-Extensions` header (§14.2.2); the extension's §8,
+> and the x402 v2 A2A transport after it, name `X-A2A-Extensions`. A client
+> that follows A2A 1.0.1 sends only `A2A-Extensions`, so a server that reads
+> only `X-A2A-Extensions` never sees it activated. We propose naming
+> `A2A-Extensions`. Second, the extension's v0.2 examples carry
+> `x402Version: 1` payloads, while the x402 v2 transport carries version 2
+> under the extension's v0.1 URI: a version of the extension that names
+> x402 v2's payloads, under one URI that both documents use, would let a
+> client tell from a card which payload a peer expects. Third, the examples
+> use A2A 0.3's JSON names; A2A 1.0.1's ProtoJSON names (`ROLE_USER`,
+> `SendMessage`, `TASK_STATE_INPUT_REQUIRED`) are what current SDKs send
+> and read.
+
+### 7.3 Not in either unit
+
 - **Not in either unit:** the `upto`, `batch-settlement` and
   `auth-capture` schemes, Permit2 and ERC-7710, the other networks, the
   facilitator and discovery APIs, and the extensions x402 lists (each echoed
@@ -393,7 +500,7 @@ audit, unchanged. Where unit 2 plugs in:
 | A payment whose outcome is unknown is never made a second time | D4 and D9: the `unknown` state is final, on the disk before the request leaves, and a restart turns `sending` into it. |
 | A feature off by default | D1: `x402`, outside the release set. |
 
-## 9. Exit criteria (unit 1)
+## 9. Exit criteria
 
 - Unit tests: EIP-712 hashing against the specification's own `Mail`
   example (type hash, struct hash, domain separator, digest) and its
@@ -427,10 +534,34 @@ audit, unchanged. Where unit 2 plugs in:
   node registry, telemetry, the external signer, features,
   interoperability; the strip lists x402 v2 as a preview.
 
+**Unit 2, MCP and A2A:**
+
+- Unit tests: a payment request read from `structuredContent` and from
+  `content[0].text`, and nothing else read as one; the settlement kept in a
+  result's `_meta`; a task that asks to be paid only in `input-required`
+  with `payment-required`, and its last receipt; a server's verification
+  of a payment as agentd signs it, and of none other (`payments::mock::verify`,
+  which the mock x402 server, `mock.paid` and the charging peer share); `payment` a field of
+  the four paying kinds alone, literal, never beside `detach` or `input`.
+- The mock MCP server's `mock.paid` (`mcp::mock_x402`), which asks to be
+  paid, verifies the payment as a server does (`payments::mock::verify`), and
+  settles, refuses, fails, stalls, answers `settlement_pending` or no
+  settlement at all, as the call says.
+- End to end (`crates/agentd-cli/tests/x402_transports_e2e.rs`), against
+  `mock.paid` and a charging A2A peer: an `mcp.tool` step, an `a2a.delegate`
+  step and an `a2a.send` step pay within the policy and get the answer; the
+  paid call carries the first call's `_meta`, the peer's task is answered
+  on its own context with a2a-x402 activated; refused unsent for an unlisted
+  payee or network, past `per_payment`, past the step's `max`; asked above
+  `approve_above`, paying on the approver's approval and not on a decline;
+  never twice after an unknown outcome, over either transport; a step with
+  no `payment` field fails on a tool or a peer that charges, at once; the
+  signature in no log line, no output and no audit record.
+
 ## 10. Solana: the `exact` scheme on SVM
 
 The user's decision (RFC 0048 §6 Q3) was x402 on EVM *and* Solana. This
-section is what agentd builds for Solana, in the `http` step, behind the
+section is what agentd builds for Solana, for every paying step, behind the
 same feature and under the same spend policy, ledger, custody, approval gate
 and audit records as EVM. No crate is added: Ed25519 is `ring`'s, base58 and
 the curve check are by hand.

@@ -27,8 +27,10 @@ pub const DEFAULT_MAX_VALIDITY: std::time::Duration = std::time::Duration::from_
 /// The most decimals an asset may declare: amounts are kept in 128 bits.
 pub const MAX_DECIMALS: u8 = 36;
 /// The step kinds that take `payment`: each one's transport hands a payment
-/// request to `Runtime::pay_for` (RFC 0049 §3).
-pub const PAYING_KINDS: &[&str] = &["http"];
+/// request to `Runtime::pay_for` (RFC 0049 §3, §7) — an `http` step's 402,
+/// an `mcp.tool` step's tool result, an `a2a.send` or `a2a.delegate` step's
+/// peer task.
+pub const PAYING_KINDS: &[&str] = &["http", "mcp.tool", "a2a.send", "a2a.delegate"];
 
 /// `security.payments`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -644,14 +646,14 @@ pub fn pays_json(def: &Value) -> bool {
 /// configuration did not write.
 pub fn not_configured(workflow: &str, step: &str) -> String {
     format!(
-        "workflow {workflow:?} step {step:?}: an http step's payment is declared only in the operator's own configuration — never in an instruction document's workflow, nor in a definition workflow.create or workflow.update stored (RFC 0049 D2)"
+        "workflow {workflow:?} step {step:?}: a step's payment is declared only in the operator's own configuration — never in an instruction document's workflow, nor in a definition workflow.create or workflow.update stored (RFC 0049 D2)"
     )
 }
 
 /// The refusal of an instruction document's workflow that would pay.
 pub fn document_pays(workflow: &str) -> String {
     format!(
-        "workflow {workflow:?}: an instruction document's workflow has an http step with a payment — a served document configures no payment (RFC 0042; RFC 0049 D2), only the operator's own configuration declares a paying step"
+        "workflow {workflow:?}: an instruction document's workflow has a step with a payment — a served document configures no payment (RFC 0042; RFC 0049 D2), only the operator's own configuration declares a paying step"
     )
 }
 
@@ -719,13 +721,13 @@ pub fn workflow_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Ve
         let at = format!("workflow {:?} step {id:?}", w.name);
         if !cfg!(feature = "x402") {
             out.push(format!(
-                "{at}: an http step's payment needs the `x402` feature (build with --features x402)"
+                "{at}: a step's payment needs the `x402` feature (build with --features x402)"
             ));
             continue;
         }
         if !s.security.payments.declared() {
             out.push(format!(
-                "{at}: an http step's payment needs security.payments, the spend policy it pays within (RFC 0049 §4)"
+                "{at}: a step's payment needs security.payments, the spend policy it pays within (RFC 0049 §4)"
             ));
             continue;
         }
@@ -1059,5 +1061,35 @@ workflows:
         )
         .unwrap_err();
         assert!(e.contains("usdc-base"), "{e}");
+    }
+
+    /// An MCP tool's call and an A2A peer's task are paid for as an HTTP
+    /// request is: each one's `payment` is a paying step's, found in the
+    /// definition and in its JSON alike.
+    #[test]
+    fn mcp_and_a2a_steps_pay_too() {
+        use serde_json::json;
+        let pay = json!({"wallet": "ops", "max": "0.1 usdc"});
+        let def = |step: &Value| {
+            json!({"name": "w", "steps": {"s": {"kind": "manual"}, "pay": step,
+                   "f": {"kind": "finish", "depends_on": ["pay"]}}})
+        };
+        for (kind, rest) in [
+            ("mcp.tool", json!({"server": "m", "tool": "paid"})),
+            ("a2a.send", json!({"to": "p", "parts": "hi"})),
+            ("a2a.delegate", json!({"peer": "p", "objective": "do"})),
+        ] {
+            let mut step = rest.clone();
+            step["kind"] = json!(kind);
+            step["depends_on"] = json!(["s"]);
+            step["payment"] = pay.clone();
+            let w = crate::engine::model::parse_workflow(&def(&step))
+                .unwrap_or_else(|e| panic!("{kind}: {e:?}"));
+            let found = paying_steps(&w);
+            assert_eq!(found, vec![("pay".to_string(), pay.clone())], "{kind}");
+            assert!(pays_json(&def(&step)), "{kind}");
+            step.as_object_mut().unwrap().remove("payment");
+            assert!(!pays_json(&def(&step)), "{kind}");
+        }
     }
 }

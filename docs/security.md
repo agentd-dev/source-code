@@ -1839,8 +1839,8 @@ refuses.
 
 ## Payments
 
-With the `x402` feature agentd pays for HTTP resources with x402, on EVM
-chains and Solana, and only
+With the `x402` feature agentd pays with x402 — for HTTP resources, MCP
+tool calls and A2A peers' tasks, on EVM chains and Solana — and only
 within the spend policy of `security.payments`
 ([RFC 0049](../rfcs/0049-paying-for-things.md), under
 [ADR 0003](../rfcs/adr/0003-no-payment-without-a-spend-policy.md)). An agent
@@ -1855,9 +1855,10 @@ before anything is signed:
   on the supervisor's loop, so two steps cannot both pass a cap the second
   one breaks.
 - **No model-facing paying tool.** A model's tool arguments come from text
-  that may be anyone's. A payment is made only by an `http` step of a
-  workflow in the operator's own configuration, whose `payment` field is
-  literal; a model reaches one only by starting a workflow the operator
+  that may be anyone's. A payment is made only by an `http`, `mcp.tool`,
+  `a2a.send` or `a2a.delegate` step of a workflow in the operator's own
+  configuration, whose `payment` field is literal (a model's own call of a
+  tool that charges reads the payment request as the tool's error); a model reaches one only by starting a workflow the operator
   exposed as a tool, and such a run asks the approver unless
   `ask_when_tainted` is off. An instruction
   document's paying step is refused at load, and a definition
@@ -1902,7 +1903,9 @@ before anything is signed:
   restart of the step fails before sending anything.
 - **The resource is the request's.** A `402` that asks to be paid for
   another URL than the one the step asked is refused, and no redirect is
-  followed.
+  followed; an MCP tool's payment request must name `mcp://tool/<the tool
+  called>`; an A2A peer is paid on its own task, over the connection that
+  asked. A delegated server's call is never paid.
 
 What it does not cover: a server that takes the payment and serves nothing
 (the `authorization` flow settles after the resource is served, and the

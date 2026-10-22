@@ -45,6 +45,9 @@ use crate::runtime::surface::{A2A_PROTOCOL_VERSION, COMMAND_EXTENSION, UNIX_BIND
 struct Outgoing {
     message: Message,
     documents: Vec<(usize, Value)>,
+    /// The `historyLength` asked of the task the reply carries; unset, the
+    /// peer's default.
+    history_length: Option<i32>,
 }
 
 impl Outgoing {
@@ -54,6 +57,7 @@ impl Outgoing {
         Outgoing {
             message,
             documents: Vec::new(),
+            history_length: None,
         }
     }
 
@@ -76,7 +80,7 @@ impl Outgoing {
             configuration: return_immediately.then_some(SendMessageConfiguration {
                 accepted_output_modes: None,
                 task_push_notification_config: None,
-                history_length: None,
+                history_length: self.history_length,
                 return_immediately: Some(true),
             }),
             metadata: None,
@@ -219,6 +223,35 @@ pub fn send_message_params_parts(
     Ok(out.into_params(tenant, true))
 }
 
+/// The `SendMessage` params of a message that answers the peer's task
+/// `task_id` with `text` and `metadata`, marked with `extensions`: how an
+/// extension that rides a task's metadata is answered (a2a-x402's payment).
+/// `returnImmediately`, as every unary send of agentd's is, and
+/// `historyLength: 0`: the task's history holds this message, which carries
+/// what the metadata does, and agentd reads none of it back. The metadata
+/// is placed after serialization, byte for byte, as a document is.
+pub fn send_message_params_on_task(
+    task_id: &str,
+    context: Option<&str>,
+    text: &str,
+    metadata: Value,
+    extensions: &[&str],
+    message_id: &str,
+    tenant: Option<&str>,
+) -> Value {
+    let mut out = Outgoing::new(message_id);
+    out.message.task_id = Some(task_id.to_string());
+    out.message.context_id = context.filter(|c| !c.is_empty()).map(str::to_string);
+    out.message.parts.push(Part::text(text.to_string()));
+    out.message.extensions = Some(extensions.iter().map(|e| e.to_string()).collect());
+    out.history_length = Some(0);
+    let mut v = out.into_params(tenant, true);
+    if let Some(m) = v.get_mut("message").and_then(Value::as_object_mut) {
+        m.insert("metadata".to_string(), metadata);
+    }
+    v
+}
+
 /// The extensions a `SendMessage` request's message is marked with — which are
 /// exactly the ones its `A2A-Extensions` header must activate. Read from the
 /// message itself so the header can never disagree with the mark.
@@ -236,6 +269,17 @@ pub fn get_task_params(task_id: &str, tenant: Option<&str>) -> Value {
     to_wire(&GetTaskRequest {
         id: task_id.to_string(),
         history_length: None,
+        tenant: tenant.filter(|t| !t.is_empty()).map(str::to_string),
+    })
+}
+
+/// [`get_task_params`] asking for none of the task's history
+/// (`historyLength: 0`): the poll of a task agentd answered with a message
+/// it reads nothing of back (a2a-x402's payment).
+pub fn get_task_params_without_history(task_id: &str, tenant: Option<&str>) -> Value {
+    to_wire(&GetTaskRequest {
+        id: task_id.to_string(),
+        history_length: Some(0),
         tenant: tenant.filter(|t| !t.is_empty()).map(str::to_string),
     })
 }

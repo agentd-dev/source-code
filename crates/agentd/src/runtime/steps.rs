@@ -2205,6 +2205,22 @@ impl Runtime {
                     self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
                     return;
                 }
+                // A step that may pay (RFC 0049 §7.1): what it paid, or may
+                // have, is read before anything is sent.
+                let paying = spec.contains_key("payment");
+                if paying {
+                    #[cfg(feature = "x402")]
+                    if let Err(e) = self.mcp_payment_precheck(run_id, step_id, &server) {
+                        self.payment_refused_before(run_id, step_id, e);
+                        return;
+                    }
+                    #[cfg(not(feature = "x402"))]
+                    {
+                        let e = "mcp.tool: payment needs the `x402` feature".to_string();
+                        self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                        return;
+                    }
+                }
                 // A delegated server's call goes the delegated way, as its
                 // tool (RFC 0044): the person's consent, a mint, the
                 // supervisor's pool — never a connection of the loop's.
@@ -2332,9 +2348,25 @@ impl Runtime {
                 // A call that becomes a task makes the step a durable wait on
                 // it (RFC 0050) — unless the server's open tasks and the
                 // declaring calls still out to it already reach the limit,
-                // when the call goes out without the extension.
-                let calling = self.mcp_task_slot(&server);
+                // when the call goes out without the extension. A paying
+                // call is never a task: x402 settles on the call's own
+                // result.
+                let calling = if paying {
+                    None
+                } else {
+                    self.mcp_task_slot(&server)
+                };
                 let tasks = calling.is_some();
+                #[cfg(feature = "x402")]
+                let paid_call = paying.then(|| super::payments::mcp::ToolCall {
+                    client: std::sync::Arc::clone(&client),
+                    server: server.clone(),
+                    tool: tool.clone(),
+                    args: args.clone(),
+                    meta: meta.clone(),
+                    timeout,
+                    trace: call.clone(),
+                });
                 self.executing
                     .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
                 std::thread::Builder::new()
@@ -2349,9 +2381,21 @@ impl Runtime {
                             tasks,
                         ) {
                             Ok(::mcp::wire::Called::Result(res)) => {
+                                #[cfg(feature = "x402")]
+                                if let Some(paid) = paid_call {
+                                    super::payments::mcp::answered(res, paid, r, s, start, &tx);
+                                    return;
+                                }
                                 let v = super::worker::tool_result_value(&res);
                                 if res.is_error() {
-                                    (v.clone(), true, Some(res.text()))
+                                    // A tool that asks to be paid, of a step
+                                    // that may not pay (RFC 0049 D2).
+                                    let e = if crate::mcp::x402::required_of(&res).is_some() {
+                                        crate::mcp::x402::unpaid_error(&tool)
+                                    } else {
+                                        res.text()
+                                    };
+                                    (v.clone(), true, Some(e))
                                 } else {
                                     (v, false, None)
                                 }

@@ -1795,7 +1795,8 @@
           "breaker",
           "rate",
           "auth_to",
-          "auth_timeout"
+          "auth_timeout",
+          "payment"
         ],
         "implemented": true,
         "required": [
@@ -1813,7 +1814,8 @@
           "timeout",
           "idempotency",
           "breaker",
-          "rate"
+          "rate",
+          "payment"
         ],
         "implemented": true,
         "required": [
@@ -2265,7 +2267,8 @@
           "breaker",
           "rate",
           "detach",
-          "input"
+          "input",
+          "payment"
         ],
         "implemented": true,
         "required": [

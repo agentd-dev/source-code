@@ -1837,6 +1837,43 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   transfer, for its mints, payees and maximum. The mock x402 server offers
   and settles Solana entries as a sponsor does, and answers
   `getLatestBlockhash` at `/_mock/rpc`.
+- `mcp.tool`, `a2a.send` and `a2a.delegate` steps pay with x402 within
+  `security.payments`, as an `http` step does (the `x402` feature, RFC 0049
+  §7.1, §7.2): `payment: {wallet, max, approve?}`. An `mcp.tool` step pays a
+  tool result that asks to be paid — `isError` with a `PaymentRequired` for
+  `mcp://tool/<tool>` — by making the call once more with the same
+  arguments and `_meta` and the payment in `_meta["x402/payment"]`, and
+  reads the settlement from the result's `_meta["x402/payment-response"]`.
+  A paying call is never made an MCP task: `detach` and `input` are refused
+  beside `payment`, and a delegated server's call is never paid. An
+  `a2a.send` or `a2a.delegate` step activates the a2a-x402 extension in
+  `A2A-Extensions`, answers a peer's task that asks to be paid with the
+  payment, on the connection that asked, and follows the task until its
+  receipt (a send) or its end (a delegation), asking for none of the task's
+  history once it pays; the task it keeps has every `x402.payment.payload`
+  taken out, so a peer that hands the payment message back puts no signed
+  payment in the output or the log. The approver's question quotes the
+  peer's task id, or the tool's name. A paying step's output is `{result,
+  payment}`. Each transport hands its payment request to
+  `Runtime::pay_for` as a `PaidCall`, so the policy, the approver's gate,
+  the ledger, the audit records and both chain families are the `http`
+  step's: such a payment is made at most once, and one whose outcome is
+  unknown never again.
+- A step with no `payment` field fails at once on a tool or a peer that asks
+  to be paid, saying so: an `a2a.delegate` step no longer follows such a
+  task until its `timeout`, and a peer whose card requires a2a-x402 is
+  refused before anything is sent to it.
+- The mock MCP server's `mock.paid` tool (debug and `internal-mocks` builds
+  with `x402`) asks to be paid, verifies a payment as a resource server
+  does, and settles, refuses, fails, stalls or answers `settlement_pending`
+  as the call says.
+- `agentd-core`: `mcp::x402` and `a2a::x402`, where x402 rides on each;
+  `a2a::peer::{send_message_params_on_task,
+  get_task_params_without_history}`; `mcp::a2a_client::{send_paying,
+  delegate_paying, Paying, PaidPeer, PaidAnswer, Reached}`;
+  `payments::x402::Settlement::from_value`; and, in debug and
+  `internal-mocks` builds, `payments::mock::verify`, the EVM check the mock
+  x402 server, `mock.paid` and the e2e suite's charging peer share.
 - `agentd --print-wallet-address <wallet>` prints a wallet's address, making
   its sealed key file `0600` when it is absent, or asking the external
   signer. The start is refused when a key file is a symlink, another user
@@ -1859,10 +1896,10 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   refuses, stalls, answers `settlement_pending`, no settlement, a 500 or a
   garbled one, or names another resource, as steered.
 - The `payments` conformance family (seven checks, each quoting the x402 or
-  ADR 0003 sentence it proves), `x402_e2e` end to end, the CI rows
-  `--features x402` and `--features x402,a2a`, and the guide
-  [Pay for things with x402](docs/pay-with-x402.md); agentd.dev's strip
-  lists x402 v2 as a preview.
+  ADR 0003 sentence it proves), `x402_e2e` and `x402_transports_e2e` end
+  to end, the CI rows `--features x402` and `--features x402,a2a`, and the
+  guide [Pay for things with x402](docs/pay-with-x402.md); agentd.dev's
+  strip lists x402 v2 as a preview.
 - `agentd-core`: `payments::{caip, eip712, evm, ledger, policy, scheme,
   wallet, x402, svm, ed25519, base58, mock, svm_mock}` and `Payments`; `payments::scheme::Family`, the one
   place that tells chain families apart;
@@ -1874,6 +1911,10 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Changed.**
 
+- **Breaking:** `agentd-mcp`'s `wire::CallToolResult` has a field `meta`,
+  the result's `_meta` as the server sent it: x402 over MCP reads a
+  payment's settlement there (RFC 0049 §7.1). The struct is not
+  `#[non_exhaustive]`, so a struct literal of it names `meta` too.
 - **Breaking:** a child's environment is an allow-list (RFC 0044 §7.1). A
   turn worker, subagent, think child or instance is started with the
   baseline (`PATH`, `HOME`, `TMPDIR`, `TZ`, `LANG`, `AGENTD_CRED_DIR`,

@@ -337,7 +337,15 @@ pub struct Settlement {
 
 impl Settlement {
     pub fn from_header(value: &str) -> Result<Settlement, String> {
-        let v = decode_header(value)?;
+        Settlement::from_value(&decode_header(value)?)
+    }
+
+    /// A `SettlementResponse` object, as MCP's `_meta` and an A2A task's
+    /// receipts carry it.
+    pub fn from_value(v: &Value) -> Result<Settlement, String> {
+        if !v.is_object() {
+            return Err("not a JSON object".into());
+        }
         Ok(Settlement {
             success: v["success"].as_bool().ok_or("no success")?,
             transaction: v["transaction"].as_str().unwrap_or_default().to_string(),

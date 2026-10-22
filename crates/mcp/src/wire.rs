@@ -325,6 +325,11 @@ pub struct CallToolResult {
     pub is_error: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_content: Option<Value>,
+    /// The result's `_meta`, as the server sent it: read beside the tool's
+    /// output, never part of it (x402 over MCP carries a payment's settlement
+    /// here, `x402/payment-response`).
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 impl CallToolResult {

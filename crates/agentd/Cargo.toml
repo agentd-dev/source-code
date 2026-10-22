@@ -158,9 +158,11 @@ companies = ["oauth", "tls"]
 # AES-256-GCM are the `ring` `oauth` already carries: no new crate. NOT in
 # the release feature set — ID-JAG is a draft and the extension moves.
 xaa = ["oauth"]
-# Paying for an HTTP resource with x402 v2 (RFC 0049), only within the spend
-# policy ADR 0003 asks for: the `http` step's `payment`, `security.payments`,
-# EIP-3009 authorizations signed on EVM chains by the supervisor alone.
+# Paying for an HTTP resource, an MCP tool's call or an A2A peer's task with
+# x402 v2 (RFC 0049), only within the spend policy ADR 0003 asks for: the
+# `payment` of the `http`, `mcp.tool`, `a2a.send` and `a2a.delegate` steps,
+# `security.payments`, EIP-3009 authorizations signed on EVM chains by the
+# supervisor alone.
 # Sealing the wallet keys and the external signer are `oauth`'s; secp256k1
 # and Keccak-256, which `ring` lacks, are `k256` and `sha3`, the two crates
 # the user approved for EVM signatures (RFC 0048 Q3). NOT in the release

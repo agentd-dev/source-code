@@ -46,6 +46,9 @@
 //! `mock.publish` edits `mock://instruction` (`… Edition <n>.`) and pushes
 //! nothing, so a test decides how the consumer hears of it.
 //!
+//! With the `x402` feature, `mock.paid` charges for its result as an x402
+//! resource server does over MCP (`mock_x402`). It is not listed.
+//!
 //! On the 2026-07-28 edge it also serves the MCP Tasks extension
 //! (`mock_tasks`): `mock.job` becomes a task for a call that declares it,
 //! `tasks/*` follow it, each held to the extension's rules (`Mcp-Name` the
@@ -1105,6 +1108,9 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
             let ops = state.ops.lock().unwrap_or_else(|e| e.into_inner()).clone();
             tool_ok(req.id, json!({"ops": ops}))
         }
+        // A tool that charges, as an x402 resource server does over MCP.
+        #[cfg(feature = "x402")]
+        Some("mock.paid") => Response::ok(req.id, super::mock_x402::paid(&params)),
         Some("state.put") => {
             let seq = args
                 .get("seq")

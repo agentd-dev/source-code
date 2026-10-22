@@ -406,7 +406,7 @@ export const DOCS = [
     "title": "Pay for things with x402",
     "group": "guides",
     "section": "integrate",
-    "blurb": "Let a workflow pay for an HTTP resource that asks to be paid with x402, from a wallet agentd holds, only within a spend policy you declare.",
+    "blurb": "Let a workflow pay with x402 for an HTTP resource, an MCP tool call or another agent's work, from a wallet agentd holds, only within a spend policy you declare.",
     "tag": "preview"
   },
   {

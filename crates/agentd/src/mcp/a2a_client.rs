@@ -57,6 +57,15 @@
 //! ([`PeerAuth::trace`]), sent as `traceparent` and `tracestate` on every
 //! request of the hop, so a peer that reads W3C Trace Context continues the
 //! caller's trace.
+//!
+//! Paying: a task that asks to be paid (a2a-x402) will not go on by itself,
+//! so a send or a delegation that may not pay ends there, saying so; one
+//! that may ([`paying`]) hands the task back on the connection it asked on.
+
+#[cfg(feature = "x402")]
+mod paying;
+#[cfg(feature = "x402")]
+pub use paying::{PaidAnswer, PaidPeer, Paying, Reached, delegate_paying, send_paying};
 
 use crate::a2a::peer::{self as a2a, PeerCard};
 use crate::config::A2aEndpoint;
@@ -189,11 +198,47 @@ pub fn delegate(
     deadline: Instant,
     follow: Follow<'_>,
 ) -> DelegateOutcome {
+    match delegate_with(
+        endpoint,
+        auth,
+        &[],
+        objective,
+        command,
+        output_contract,
+        message_id,
+        deadline,
+        &follow,
+    ) {
+        (_, Followed::Done(outcome)) => outcome,
+        // A peer that will not go on until it is paid has answered a
+        // delegation that does not pay.
+        (_, Followed::Asked(task)) => {
+            DelegateOutcome::Error(crate::a2a::x402::unpaid_error(&a2a::task_id_of(&task)))
+        }
+    }
+}
+
+/// [`delegate`], its connection activating `offered` on every request
+/// beyond what the peer's card requires, and handed back with what came of
+/// it — `None` when the endpoint gave none.
+#[allow(clippy::too_many_arguments)]
+fn delegate_with(
+    endpoint: &A2aEndpoint,
+    auth: PeerAuth,
+    offered: &[&str],
+    objective: &str,
+    command: Option<&Value>,
+    output_contract: Option<&str>,
+    message_id: Option<&str>,
+    deadline: Instant,
+    follow: &Follow<'_>,
+) -> (Option<HttpConn>, Followed) {
     let ep = match HttpEp::of(endpoint) {
         Ok(ep) => ep,
-        Err(e) => return DelegateOutcome::Error(e),
+        Err(e) => return (None, DelegateOutcome::Error(e).into()),
     };
     let mut conn = HttpConn::new(ep, auth);
+    conn.offered = offered.iter().map(|u| u.to_string()).collect();
     let objective = Objective {
         text: objective,
         command,
@@ -202,14 +247,27 @@ pub fn delegate(
             .map(str::to_string)
             .unwrap_or_else(mint_message_id),
     };
-    let outcome = delegate_on(&mut conn, &objective, deadline, &follow);
+    let followed = delegate_on(&mut conn, &objective, deadline, follow);
     // A failed delegation drops the card it used, so the next one reads
     // the peer as it is now: the card may be why it failed — a peer
     // that changed its terms, or a local port that changed hands.
-    if matches!(outcome, DelegateOutcome::Error(_)) {
+    if matches!(followed, Followed::Done(DelegateOutcome::Error(_))) {
         conn.forget_card();
     }
-    outcome
+    (Some(conn), followed)
+}
+
+/// What following a peer's task came to: its outcome, or the task, as the
+/// peer sent it, asking to be paid before it goes on (a2a-x402).
+enum Followed {
+    Done(DelegateOutcome),
+    Asked(Value),
+}
+
+impl From<DelegateOutcome> for Followed {
+    fn from(o: DelegateOutcome) -> Followed {
+        Followed::Done(o)
+    }
 }
 
 /// [`delegate`] over an open connection: the card, then the send — or, for
@@ -219,7 +277,7 @@ fn delegate_on(
     objective: &Objective,
     deadline: Instant,
     follow: &Follow<'_>,
-) -> DelegateOutcome {
+) -> Followed {
     // No card is not a refusal: the spec permits configuring a peer directly,
     // and a card is how a client DISCOVERS what a peer offers, not a
     // precondition for talking to it. Such a peer is dialled streaming first,
@@ -227,7 +285,7 @@ fn delegate_on(
     let streams = match conn.card(deadline) {
         Some(card) => match conn.adopt(&card) {
             Ok(()) => card.streams(),
-            Err(e) => return DelegateOutcome::Error(e),
+            Err(e) => return DelegateOutcome::Error(e).into(),
         },
         None => true,
     };
@@ -239,8 +297,8 @@ fn delegate_on(
         return delegate_unary(conn, objective, deadline, follow);
     }
     match conn.call_streaming(objective, deadline) {
-        Err(e) => DelegateOutcome::Error(e),
-        Ok(StreamOutcome::Done(outcome)) => outcome,
+        Err(e) => DelegateOutcome::Error(e).into(),
+        Ok(StreamOutcome::Done(outcome)) => outcome.into(),
         Ok(StreamOutcome::Recover(task_id)) => {
             let tenant = conn.tenant.clone();
             poll_task(conn, &task_id, tenant.as_deref(), deadline, follow)
@@ -260,7 +318,7 @@ fn delegate_unary(
     objective: &Objective,
     deadline: Instant,
     follow: &Follow<'_>,
-) -> DelegateOutcome {
+) -> Followed {
     let tenant = conn.tenant.clone();
     let reply = match conn.call(
         "SendMessage",
@@ -268,17 +326,20 @@ fn delegate_unary(
         deadline,
     ) {
         Ok(v) => v,
-        Err(e) => return DelegateOutcome::Error(e),
+        Err(e) => return DelegateOutcome::Error(e).into(),
     };
     if let Some(a2a::Reply::Message(_)) = a2a::reply_of(&reply) {
-        return DelegateOutcome::Distillate(a2a::reply_text_of(&reply));
+        return DelegateOutcome::Distillate(a2a::reply_text_of(&reply)).into();
+    }
+    if crate::a2a::x402::asks(&reply) {
+        return Followed::Asked(reply.get("task").cloned().unwrap_or(reply));
     }
     if let Some(outcome) = terminal_outcome(&reply) {
-        return outcome;
+        return outcome.into();
     }
     let task_id = a2a::task_id_of(&reply);
     if task_id.is_empty() {
-        return DelegateOutcome::Error("a2a: SendMessage reply named no task".into());
+        return DelegateOutcome::Error("a2a: SendMessage reply named no task".into()).into();
     }
     poll_task(conn, &task_id, tenant.as_deref(), deadline, follow)
 }
@@ -360,13 +421,16 @@ enum StreamOutcome {
 /// `follow.watch` with the peer's words when it starts and again when it
 /// ends, polled less often meanwhile, and followed up to
 /// `follow.auth_timeout` past the deadline.
+///
+/// A task in `TASK_STATE_INPUT_REQUIRED` that asks to be paid (a2a-x402)
+/// will not go on by itself: it is handed back as it is.
 fn poll_task<C: Caller>(
     conn: &mut C,
     task_id: &str,
     tenant: Option<&str>,
     deadline: Instant,
     follow: &Follow<'_>,
-) -> DelegateOutcome {
+) -> Followed {
     let get_params = a2a::get_task_params(task_id, tenant);
     let mut deadline = deadline;
     let mut extended = false;
@@ -379,7 +443,8 @@ fn poll_task<C: Caller>(
                 )
             } else {
                 format!("a2a: delegation to peer timed out (task {task_id} still running)")
-            });
+            })
+            .into();
         }
         let interval = if waiting {
             AUTH_POLL_INTERVAL
@@ -393,8 +458,11 @@ fn poll_task<C: Caller>(
         }
         let task = match conn.call("GetTask", get_params.clone(), deadline) {
             Ok(t) => t,
-            Err(e) => return DelegateOutcome::Error(e),
+            Err(e) => return DelegateOutcome::Error(e).into(),
         };
+        if crate::a2a::x402::asks(&task) {
+            return Followed::Asked(task);
+        }
         let auth = a2a::task_state_of(&task) == TaskState::AuthRequired;
         if auth && !waiting {
             waiting = true;
@@ -417,7 +485,7 @@ fn poll_task<C: Caller>(
             }
         }
         if let Some(outcome) = terminal_outcome(&task) {
-            return outcome;
+            return outcome.into();
         }
     }
 }
@@ -636,6 +704,10 @@ struct HttpConn {
     /// on every request rather than only on the ones that use them: a peer
     /// that requires an extension may refuse any request that lacks it.
     required: Vec<String>,
+    /// Extensions this connection's work implements beyond
+    /// [`CLIENT_EXTENSIONS`], activated on every request: a step that may pay
+    /// offers a2a-x402.
+    offered: Vec<String>,
 }
 
 impl HttpConn {
@@ -646,6 +718,7 @@ impl HttpConn {
             next_id: 1,
             tenant: None,
             required: Vec::new(),
+            offered: Vec::new(),
         }
     }
 
@@ -681,11 +754,11 @@ impl HttpConn {
     }
 
     /// The headers every request carries: the protocol version, the
-    /// extensions it activates (those the peer requires, plus `marked` — the
-    /// ones the message itself is marked with), the hop's W3C trace context,
-    /// the peer credential, and the signatures over this exact request. Taken
-    /// before the dial: a signature whose credential cannot be produced fails
-    /// the request unsent.
+    /// extensions it activates (those the peer requires, those the work
+    /// offers, plus `marked` — the ones the message itself is marked with),
+    /// the hop's W3C trace context, the peer credential, and the signatures
+    /// over this exact request. Taken before the dial: a signature whose
+    /// credential cannot be produced fails the request unsent.
     fn request_headers(
         &self,
         method: &str,
@@ -695,7 +768,7 @@ impl HttpConn {
     ) -> Result<Vec<(String, String)>, String> {
         let mut out = vec![("A2A-Version".to_string(), A2A_PROTOCOL_VERSION.to_string())];
         let mut active: Vec<&str> = self.required.iter().map(String::as_str).collect();
-        for uri in marked {
+        for uri in self.offered.iter().chain(marked) {
             if !active.contains(&uri.as_str()) {
                 active.push(uri);
             }
@@ -851,7 +924,14 @@ impl HttpConn {
         } else {
             card.select_interface(self.ep.socket.is_some(), &self.ep.url)?
         };
-        if let Some(uri) = card.requires_unknown_extension(CLIENT_EXTENSIONS) {
+        let mut implemented = CLIENT_EXTENSIONS.to_vec();
+        implemented.extend(self.offered.iter().map(String::as_str));
+        if let Some(uri) = card.requires_unknown_extension(&implemented) {
+            if crate::a2a::x402::EXTENSIONS.contains(&uri) {
+                return Err(format!(
+                    "a2a: peer requires the extension {uri} (a2a-x402: it charges), and this step has no payment field"
+                ));
+            }
             return Err(format!(
                 "a2a: peer requires the extension {uri}, which agentd does not implement"
             ));

@@ -55,7 +55,7 @@ pub mod mcp_events; // MCP Events (RFC 0045): occurrences into declared streams
 pub mod mcp_tasks; // MCP Tasks (RFC 0050): a step's or a turn's task, followed to its end
 pub mod nested;
 #[cfg(feature = "x402")]
-pub(crate) mod payments; // an http step's x402 payment: the policy, the approver's gate, the ledger (RFC 0049)
+pub(crate) mod payments; // a step's x402 payment over HTTP, MCP or A2A: the policy, the approver's gate, the ledger (RFC 0049)
 pub mod pressure; // disk/memory pressure: shed new work, drain what is in flight
 pub mod reactor;
 pub mod reload;

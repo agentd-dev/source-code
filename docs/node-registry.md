@@ -940,10 +940,10 @@ Calls a tool on a declared MCP server: the main way a workflow reaches the
 outside world.
 
 - **Fields:** **`server`**, **`tool`**, `args`, `idempotency`, `breaker`,
-  `rate`, `detach`, `input`.
+  `rate`, `detach`, `input`, `payment`.
 - **Output:** the tool's result. A result the server marks as an error
   fails the step. With `detach: true` and a call the server makes a task
-  of, `{task: {server, id, status}}`.
+  of, `{task: {server, id, status}}`. With `payment`, `{result, payment}`.
 - Every call carries a retry-stable `agent/idempotency_key` in `_meta`, with
   `agent/attempt` beside it. `idempotency: {value}` replaces the key with an
   application key.
@@ -978,6 +978,16 @@ outside world.
   take longer. The answer goes back to the server as the elicitation's
   `accept`. Without `input` the question is declined. `input` is taken as
   written, not templated.
+- `payment: {wallet, max, approve?}` lets the step pay for the call with
+  x402 (the `x402` feature), within `security.payments`: a tool result that
+  asks to be paid — `isError` with a `PaymentRequired` for
+  `mcp://tool/<tool>` — is paid and the call made again once, with the same
+  arguments and `_meta` and the payment in `_meta["x402/payment"]`.
+  `result` is the tool's result and `payment` what was paid, `null` when
+  nothing was asked. A paying call is never made a task: `detach` and
+  `input` are refused beside it at load. A delegated server's call is never
+  paid. Without `payment`, a tool that asks to be paid fails the step. See
+  [Pay with x402](pay-with-x402.md#pay-for-a-tool-on-an-mcp-server).
 
 ```yaml
 # fragment: under workflows[].steps
@@ -1119,11 +1129,17 @@ notify:
 Sends a message to a peer and continues: a notification.
 
 - **Fields:** **`to`**, `parts`, `command`, `args`, `context`, `timeout`,
-  `idempotency`, `breaker`, `rate`.
-- **Output:** the peer's answer to the send.
+  `idempotency`, `breaker`, `rate`, `payment`.
+- **Output:** the peer's answer to the send. With `payment`,
+  `{result, payment}`.
 - `to` names an `a2a.peers` entry. `command` with `args` sends the typed
   payload a peer's `a2a` start matches. `idempotency: true` pins the message
   id across retries so the peer can deduplicate. `timeout` defaults to 30 s.
+- `payment: {wallet, max, approve?}` lets the step pay a peer that asks to
+  be paid (a2a-x402, the `x402` feature), within `security.payments`: the
+  peer's task is answered with the payment and followed until its receipt,
+  up to `timeout`. Without `payment`, a peer that asks to be paid fails the
+  step. See [Pay with x402](pay-with-x402.md#pay-another-agent-over-a2a).
 - The request carries the send's span as `traceparent` and `tracestate`; an
   agentd peer continues it.
 - Needs the `a2a` build feature.
@@ -1139,8 +1155,17 @@ Delegates an objective to a peer and waits for the result: request and
 response.
 
 - **Fields:** **`peer`**, `objective`, `command`, `args`, `output_contract`,
-  `timeout`, `idempotency`, `breaker`, `rate`, `auth_to`, `auth_timeout`.
-- **Output:** the peer's result, parsed as JSON when it parses.
+  `timeout`, `idempotency`, `breaker`, `rate`, `auth_to`, `auth_timeout`,
+  `payment`.
+- **Output:** the peer's result, parsed as JSON when it parses. With
+  `payment`, `{result, payment}`.
+- `payment: {wallet, max, approve?}` lets the step pay a peer whose task
+  asks to be paid (a2a-x402, the `x402` feature), within
+  `security.payments`: the task is answered with the payment and followed
+  to its end, up to `timeout`. Without `payment`, a task that asks to be
+  paid ends the step at once, and a peer whose card requires a2a-x402 is
+  refused before anything is sent. See
+  [Pay with x402](pay-with-x402.md#pay-another-agent-over-a2a).
 - With `command` and `args`, the payload is typed and checked against the
   command's schema at the peer, and the step returns that command's run
   output. `timeout` defaults to 120 s.

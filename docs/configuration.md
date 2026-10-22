@@ -1620,7 +1620,8 @@ path is restart · op: a served document cannot set it, and a reload does not
 change it under a question the approver is reading.
 
 A step pays only with its own `payment` field — `{wallet, max, approve?}`
-on an `http` step ([node registry](node-registry.md#http)) — which is
+on an `http`, `mcp.tool`, `a2a.send` or `a2a.delegate` step ([node
+registry](node-registry.md#http)) — which is
 literal and names a wallet and assets of the policy; an instruction
 document's workflow with one is refused at load, and one `workflow.create`
 or `workflow.update` stored fails the step without paying. The guide is

@@ -309,9 +309,11 @@ impl crate::runtime::reactor::Runtime {
                             super::payments::Asked {
                                 run: r,
                                 step: s,
-                                header,
+                                required: crate::payments::x402::decode_header(&header).map_err(
+                                    |e| format!("http status 402, and its PAYMENT-REQUIRED is not one ({e})"),
+                                ),
                                 first: output,
-                                request,
+                                call: Box::new(request),
                             },
                         )));
                         return;
@@ -456,7 +458,7 @@ impl super::payments::PaidCall for Request {
         )
     }
 
-    fn send_paid(&self, payload: &Value, run: &str, step: &str) -> super::payments::Answer {
+    fn send_paid(&mut self, payload: &Value, run: &str, step: &str) -> super::payments::Answer {
         use crate::payments::x402;
         let start = crate::obs::otel::now_unix_nanos();
         let header = (
@@ -473,7 +475,9 @@ impl super::payments::PaidCall for Request {
                 let settlement = v["headers"]["payment-response"]
                     .as_str()
                     .map(x402::Settlement::from_header);
-                let declined = settlement.is_none() && matches!(status, 400 | 402);
+                let declined = (settlement.is_none() && matches!(status, 400 | 402)).then(|| {
+                    format!("the server answered {status} to the payment, and settled nothing")
+                });
                 let (output, is_error, error) = self.judge(v);
                 self.span(start, run, step, &output, is_error);
                 super::payments::Answer::Answered {

@@ -533,7 +533,7 @@ pub const KINDS: &[KindInfo] = &[
     // ---- integration ----
     // `detach` finishes the step once its call becomes an MCP task, which
     // the run then owns; `input` puts the task's question to a person
-    // (RFC 0054).
+    // (RFC 0054); `payment` lets it pay for the call (RFC 0049).
     k(
         "mcp.tool",
         false,
@@ -546,6 +546,7 @@ pub const KINDS: &[KindInfo] = &[
             "rate",
             "detach",
             "input",
+            "payment",
         ],
         &["server", "tool"],
         true,
@@ -612,6 +613,7 @@ pub const KINDS: &[KindInfo] = &[
             "idempotency",
             "breaker",
             "rate",
+            "payment",
         ],
         &["to"],
         true,
@@ -632,6 +634,7 @@ pub const KINDS: &[KindInfo] = &[
             "rate",
             "auth_to",
             "auth_timeout",
+            "payment",
         ],
         &["peer"],
         true,
@@ -2405,11 +2408,12 @@ fn parse_step(
         }
     }
     // `payment: {wallet, max, approve?}` lets a step pay for its call with
-    // x402, within the spend policy (RFC 0049 D2) — a field of the kinds
-    // `config::settings::payments::PAYING_KINDS` names, each listing it
-    // above. Literal: a template in it would let run data raise what the
-    // step may spend. The wallet and the assets are the policy's to name,
-    // at load.
+    // x402, within the spend policy (RFC 0049 D2, §7): an `http` step's
+    // request, an `mcp.tool` step's call, an `a2a.send` or `a2a.delegate`
+    // step's peer task — the kinds `config::settings::payments::PAYING_KINDS`
+    // names, each listing it above. Literal: a template in it would let run
+    // data raise what the step may spend. The wallet and the assets are the
+    // policy's to name, at load.
     if let Some(p) = spec.get("payment") {
         let max_ok = |m: &Value| match m {
             Value::String(s) => !s.trim().is_empty(),
@@ -2431,18 +2435,27 @@ fn parse_step(
         });
         if !ok {
             errs.push(format!(
-                "{at}: payment takes {{wallet: <name>, max: \"<amount> <asset>\" or a list of them, approve: true|false}}"
+                "{at}: {kind} payment takes {{wallet: <name>, max: \"<amount> <asset>\" or a list of them, approve: true|false}}"
             ));
         }
         if p.to_string().contains("{{") {
             errs.push(format!(
-                "{at}: payment is literal — a template in it would let run data decide what the step may spend"
+                "{at}: {kind} payment is literal — a template in it would let run data decide what the step may spend"
             ));
         }
         if kind == "http" && spec.get("auth").is_some() {
             errs.push(format!(
                 "{at}: http payment does not apply to an http step that calls a Company's API (auth kind company)"
             ));
+        }
+        // A paying call is never made an MCP task (RFC 0049 §7.1): there is
+        // no task to detach, and no task's question to put to anyone.
+        for f in ["detach", "input"] {
+            if kind == "mcp.tool" && spec.get(f).is_some() {
+                errs.push(format!(
+                    "{at}: mcp.tool payment does not go with `{f}` — a paying call is never made an MCP task"
+                ));
+            }
         }
     }
     // `idempotency` shapes. Validated per kind because the transports differ:
@@ -3814,6 +3827,51 @@ pub fn workflow_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// `payment` is a field of the kinds that pay (RFC 0049 §7): an MCP
+    /// tool's call and an A2A peer's task as an HTTP request, literal, and a
+    /// paying MCP call is never detached nor its task asked about.
+    #[test]
+    fn payment_is_a_field_of_the_kinds_that_pay() {
+        use serde_json::json;
+        let def = |step: &serde_json::Value| {
+            json!({"name": "w", "steps": {"s": {"kind": "manual"}, "p": step,
+                   "f": {"kind": "finish", "depends_on": ["p"]}}})
+        };
+        let pay = json!({"wallet": "ops", "max": "0.05 usdc"});
+        for step in [
+            json!({"kind": "mcp.tool", "server": "m", "tool": "t", "payment": pay, "depends_on": ["s"]}),
+            json!({"kind": "a2a.send", "to": "p", "payment": pay, "depends_on": ["s"]}),
+            json!({"kind": "a2a.delegate", "peer": "p", "objective": "o", "payment": pay, "depends_on": ["s"]}),
+        ] {
+            assert!(parse_workflow(&def(&step)).is_ok(), "{step}");
+        }
+        for (step, says) in [
+            (
+                json!({"kind": "mcp.tool", "server": "m", "tool": "t", "detach": true, "payment": pay, "depends_on": ["s"]}),
+                "does not go with `detach`",
+            ),
+            (
+                json!({"kind": "mcp.tool", "server": "m", "tool": "t", "input": {"to": "operator"}, "payment": pay, "depends_on": ["s"]}),
+                "does not go with `input`",
+            ),
+            (
+                json!({"kind": "a2a.send", "to": "p", "payment": {"wallet": "ops", "max": "{{ inputs.max }}"}, "depends_on": ["s"]}),
+                "a2a.send payment is literal",
+            ),
+            (
+                json!({"kind": "a2a.delegate", "peer": "p", "objective": "o", "payment": {"wallet": "ops"}, "depends_on": ["s"]}),
+                "a2a.delegate payment takes",
+            ),
+            (
+                json!({"kind": "mcp.resource", "server": "m", "op": "list", "payment": pay, "depends_on": ["s"]}),
+                "payment",
+            ),
+        ] {
+            let errs = parse_workflow(&def(&step)).unwrap_err();
+            assert!(errs.iter().any(|e| e.contains(says)), "{step}: {errs:?}");
+        }
+    }
+
     /// `output_schema` is both a cross-cutting step field and a field several
     /// kinds declare for themselves. The kind's reading must win. `extract`
     /// REQUIRES it and the required-field check reads `spec`, so if the

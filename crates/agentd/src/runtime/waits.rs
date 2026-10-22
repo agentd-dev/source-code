@@ -2033,6 +2033,39 @@ impl Runtime {
         Ok((endpoint, auth))
     }
 
+    /// Before an `a2a.send` or `a2a.delegate` step that may pay sends
+    /// anything (RFC 0049 §7.2): what it paid, or may have, is read first,
+    /// and a step refused ends here. Whether it was.
+    #[cfg(feature = "a2a")]
+    fn a2a_payment_refused(
+        &mut self,
+        paying: bool,
+        run_id: &str,
+        step_id: &str,
+        kind: &str,
+    ) -> bool {
+        if !paying {
+            return false;
+        }
+        #[cfg(feature = "x402")]
+        {
+            let _ = kind;
+            match self.payment_precheck(run_id, step_id) {
+                Ok(()) => false,
+                Err(why) => {
+                    self.payment_refused_before(run_id, step_id, why);
+                    true
+                }
+            }
+        }
+        #[cfg(not(feature = "x402"))]
+        {
+            let e = format!("{kind}: payment needs the `x402` feature");
+            self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+            true
+        }
+    }
+
     /// `a2a.send {to, parts, context?, timeout?}` — notify a peer, do not wait.
     ///
     /// The step completes when the peer ACCEPTS the message, not when it has
@@ -2090,6 +2123,10 @@ impl Runtime {
             .and_then(crate::engine::model::duration_ms_opt)
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(30));
+        let paying = spec.contains_key("payment");
+        if self.a2a_payment_refused(paying, run_id, step_id, "a2a.send") {
+            return;
+        }
         let (endpoint, mut auth) = match self.a2a_peer_conn(&peer_name, timeout, "a2a.send") {
             Ok(v) => v,
             Err(e) => {
@@ -2116,14 +2153,61 @@ impl Runtime {
             .spawn(move || {
                 let start = crate::obs::otel::now_unix_nanos();
                 let deadline = std::time::Instant::now() + timeout;
-                let (output, is_error, error) = match crate::mcp::a2a_client::send(
+                // A step that may pay offers a2a-x402, and a task that asks
+                // to be paid goes to the loop (RFC 0049 §7.2).
+                #[cfg(feature = "x402")]
+                let answered = if paying {
+                    use crate::mcp::a2a_client::Paying;
+                    match crate::mcp::a2a_client::send_paying(
+                        &endpoint,
+                        auth,
+                        &parts,
+                        context.as_deref(),
+                        message_id.as_deref(),
+                        deadline,
+                    ) {
+                        Paying::Answered(a) => a,
+                        Paying::Asked(paid, task) => {
+                            let call = super::payments::a2a::PeerTask {
+                                peer: peer_name,
+                                paid,
+                                delegate: false,
+                                timeout,
+                                hop,
+                            };
+                            let _ = tx.send(super::events::Event::PaymentRequired(Box::new(
+                                super::payments::a2a::asked(r, st, task, call),
+                            )));
+                            return;
+                        }
+                    }
+                } else {
+                    crate::mcp::a2a_client::send(
+                        &endpoint,
+                        auth,
+                        &parts,
+                        context.as_deref(),
+                        message_id.as_deref(),
+                        deadline,
+                    )
+                };
+                #[cfg(not(feature = "x402"))]
+                let answered = crate::mcp::a2a_client::send(
                     &endpoint,
                     auth,
                     &parts,
                     context.as_deref(),
                     message_id.as_deref(),
                     deadline,
-                ) {
+                );
+                let (output, is_error, error) = match answered {
+                    // A peer that will not act on the message until it is
+                    // paid, and a step that may not pay (RFC 0049 D2).
+                    Ok(v) if crate::a2a::x402::asks(&v) => {
+                        let e = crate::a2a::x402::unpaid_error(&crate::a2a::peer::task_id_of(&v));
+                        (v, true, Some(e))
+                    }
+                    Ok(v) if paying => (json!({"result": v, "payment": null}), false, None),
                     Ok(v) => (v, false, None),
                     Err(e) => (Value::Null, true, Some(e)),
                 };
@@ -2325,6 +2409,10 @@ impl Runtime {
             .and_then(crate::engine::model::duration_ms_opt)
             .map(Duration::from_millis)
             .unwrap_or(Duration::from_secs(120));
+        let paying = spec.contains_key("payment");
+        if self.a2a_payment_refused(paying, run_id, step_id, "a2a.delegate") {
+            return;
+        }
         let (endpoint, mut auth) = match self.a2a_peer_conn(&peer_name, timeout, "a2a.delegate") {
             Ok(v) => v,
             Err(e) => {
@@ -2375,7 +2463,55 @@ impl Runtime {
                         wait,
                     });
                 };
-                let (output, is_error, error) = match crate::mcp::a2a_client::delegate(
+                let follow = crate::mcp::a2a_client::Follow {
+                    watch: Some(&watch),
+                    auth_timeout,
+                    resume,
+                };
+                // A step that may pay offers a2a-x402, and a task that asks
+                // to be paid goes to the loop (RFC 0049 §7.2).
+                #[cfg(feature = "x402")]
+                let outcome = if paying {
+                    use crate::mcp::a2a_client::Paying;
+                    match crate::mcp::a2a_client::delegate_paying(
+                        &endpoint,
+                        auth,
+                        &objective,
+                        command_env.as_ref(),
+                        contract.as_deref(),
+                        message_id.as_deref(),
+                        deadline,
+                        follow,
+                    ) {
+                        Paying::Answered(o) => o,
+                        Paying::Asked(paid, task) => {
+                            let call = super::payments::a2a::PeerTask {
+                                peer: peer_name,
+                                paid,
+                                delegate: true,
+                                timeout,
+                                hop,
+                            };
+                            let _ = tx.send(super::events::Event::PaymentRequired(Box::new(
+                                super::payments::a2a::asked(r, s, task, call),
+                            )));
+                            return;
+                        }
+                    }
+                } else {
+                    crate::mcp::a2a_client::delegate(
+                        &endpoint,
+                        auth,
+                        &objective,
+                        command_env.as_ref(),
+                        contract.as_deref(),
+                        message_id.as_deref(),
+                        deadline,
+                        follow,
+                    )
+                };
+                #[cfg(not(feature = "x402"))]
+                let outcome = crate::mcp::a2a_client::delegate(
                     &endpoint,
                     auth,
                     &objective,
@@ -2383,17 +2519,17 @@ impl Runtime {
                     contract.as_deref(),
                     message_id.as_deref(),
                     deadline,
-                    crate::mcp::a2a_client::Follow {
-                        watch: Some(&watch),
-                        auth_timeout,
-                        resume,
-                    },
-                ) {
-                    crate::mcp::a2a_client::DelegateOutcome::Distillate(text) => (
-                        serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
-                        false,
-                        None,
-                    ),
+                    follow,
+                );
+                let (output, is_error, error) = match outcome {
+                    crate::mcp::a2a_client::DelegateOutcome::Distillate(text) => {
+                        let v = serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text));
+                        if paying {
+                            (json!({"result": v, "payment": null}), false, None)
+                        } else {
+                            (v, false, None)
+                        }
+                    }
                     crate::mcp::a2a_client::DelegateOutcome::Error(e) => {
                         (Value::Null, true, Some(e))
                     }

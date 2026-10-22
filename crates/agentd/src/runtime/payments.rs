@@ -7,11 +7,11 @@
 //!
 //! **Transports.** A step's call goes out as it is; when it is answered
 //! with a payment request, its transport hands the loop the
-//! `PaymentRequired` and the call itself, as a [`PaidCall`], through
-//! [`Runtime::pay_for`] — the one entry point. The `http` step's 402 is
-//! unit 1's ([`Asked`]); the MCP and A2A transports of unit 2 call the same
-//! entry with their own [`PaidCall`]. Nothing below asks which transport it
-//! pays on.
+//! `PaymentRequired` and the call itself, as a [`PaidCall`], in an
+//! [`Asked`], through [`Runtime::pay_for`] — the one entry point: an `http`
+//! step's 402 (`http_node::Request`), an `mcp.tool` step's tool result
+//! ([`mcp::ToolCall`]), an `a2a.send` or `a2a.delegate` step's peer task
+//! (`a2a::PeerTask`). Nothing below asks which transport it pays on.
 //!
 //! **The exchange.** The loop holds the request to the step and the policy
 //! — the resource it names must be the call's, the definition the
@@ -36,6 +36,10 @@
 //! lands. A gate a previous life left open ends its step at the next start,
 //! nothing paid.
 
+#[cfg(feature = "a2a")]
+pub(crate) mod a2a;
+pub(crate) mod mcp;
+
 use serde_json::{Value, json};
 
 use super::reactor::Runtime;
@@ -59,8 +63,8 @@ pub(super) const SAID_SHOWN: usize = 300;
 
 /// A paying step's call, as its transport made it: what a payment for it is
 /// held to, and how it is made once more carrying the payment. The `http`
-/// step's request is one; unit 2's MCP tool call and A2A message are the
-/// others.
+/// step's request is one, the `mcp.tool` step's tool call and the A2A
+/// steps' peer task the others.
 pub(crate) trait PaidCall: Send {
     /// Whether `url`, a `PaymentRequired`'s `resource.url`, names this
     /// call's resource: a payment for another resource is never made.
@@ -77,7 +81,7 @@ pub(crate) trait PaidCall: Send {
     /// Make the call once more, carrying `payload` — the `PaymentPayload`,
     /// which the transport puts where it carries one — and read what came
     /// back. On a thread of its own: it may take the call's timeout.
-    fn send_paid(&self, payload: &Value, run: &str, step: &str) -> Answer;
+    fn send_paid(&mut self, payload: &Value, run: &str, step: &str) -> Answer;
 }
 
 /// What came back from a paid call.
@@ -89,9 +93,11 @@ pub(crate) enum Answer {
         /// The settlement it carried, read; `Err` when what it carried is
         /// none.
         settlement: Option<Result<Settlement, String>>,
-        /// It said, with no settlement, that it took no payment (on HTTP a
-        /// 400 or a 402).
-        declined: bool,
+        /// It said, with no settlement, that it took no payment — on HTTP a
+        /// 400 or a 402, over MCP its payment request again, from an A2A
+        /// peer `payment-failed` or a request to be paid again — and why,
+        /// in agentd's words.
+        declined: Option<String>,
         /// What the step makes of the answer when it is not one it expects.
         error: Option<String>,
     },
@@ -99,18 +105,20 @@ pub(crate) enum Answer {
     Unanswered { why: String, may_have_sent: bool },
 }
 
-/// A 402 an `http` step that may pay was answered with.
+/// A payment request a step that may pay was answered with, for the loop.
 pub struct Asked {
     pub(crate) run: String,
     pub(crate) step: String,
-    /// The `PAYMENT-REQUIRED` header's value.
-    pub(crate) header: String,
-    /// The 402 response, as a step's output.
+    /// The `PaymentRequired`, read from where its transport carries it — or
+    /// why what it carries is none.
+    pub(crate) required: Result<Value, String>,
+    /// The answer that asked, as a step's output.
     pub(crate) first: Value,
-    pub(crate) request: super::http_node::Request,
+    /// The call it answered.
+    pub(crate) call: Box<dyn PaidCall>,
 }
 
-/// Named by its step alone: a request's headers carry its credentials.
+/// Named by its step alone: a call carries its credentials.
 impl std::fmt::Debug for Asked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Asked({}/{})", self.run, self.step)
@@ -221,15 +229,14 @@ fn outcome(answer: Answer) -> (Sent, Option<Value>, Option<String>) {
                     Sent::Refused(Some(s), why)
                 }
                 Some(Err(e)) => Sent::Unknown(None, format!("a settlement that is not one ({e})")),
-                None if declined => Sent::Refused(
-                    None,
-                    "the server answered that it took no payment, and settled nothing".into(),
-                ),
-                None => Sent::Unknown(
-                    None,
-                    "the server answered with no settlement, so whether it settled is not known"
-                        .into(),
-                ),
+                None => match declined {
+                    Some(why) => Sent::Refused(None, why),
+                    None => Sent::Unknown(
+                        None,
+                        "the server answered with no settlement, so whether it settled is not known"
+                            .into(),
+                    ),
+                },
             };
             (sent, Some(output), error)
         }
@@ -330,19 +337,17 @@ impl Runtime {
         self.payment_refused(run, step, None, why, target);
     }
 
-    /// A 402 asking a paying `http` step to pay: its `PAYMENT-REQUIRED`
-    /// read, then [`Runtime::pay_for`].
+    /// A payment request a paying step's transport handed the loop:
+    /// [`Runtime::pay_for`].
     pub(crate) fn on_payment_required(&mut self, a: Asked) {
         let Asked {
             run,
             step,
-            header,
+            required,
             first,
-            request,
+            call,
         } = a;
-        let required = x402::decode_header(&header)
-            .map_err(|e| format!("http status 402, and its PAYMENT-REQUIRED is not one ({e})"));
-        self.pay_for(&run, &step, required, Box::new(request), first);
+        self.pay_for(&run, &step, required, call, first);
     }
 
     /// Pay for `required` — the `PaymentRequired` a paying step's `call`
@@ -619,6 +624,7 @@ impl Runtime {
             .insert(format!("{run}/{step}"), std::time::Instant::now());
         let tx = self.events_tx.clone();
         let wallet = step_payment.wallet;
+        let mut call = call;
         std::thread::Builder::new()
             .name("step:pay".into())
             .spawn(move || {

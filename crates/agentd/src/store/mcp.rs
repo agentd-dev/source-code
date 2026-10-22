@@ -309,6 +309,7 @@ mod tests {
             content: vec![json!({"type": "text", "text": v.to_string()})],
             is_error: Some(false),
             structured_content: None, // text-JSON only, like the mock
+            meta: None,
         }
     }
     fn err(msg: &str) -> CallToolResult {
@@ -316,6 +317,7 @@ mod tests {
             content: vec![json!({"type": "text", "text": msg})],
             is_error: Some(true),
             structured_content: None,
+            meta: None,
         }
     }
 

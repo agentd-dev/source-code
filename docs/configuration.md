@@ -543,7 +543,7 @@ live · doc, except where a row says op.
 | `mcp.servers[].endpoint` | URL | required unless `service` | `https://host[:port][/path]`, or a loopback `http://`. Reached over Streamable HTTP; agentd spawns no process. |
 | `mcp.servers[].service` | string | — | A `services:` entry to inherit endpoint, credential and tags from. `endpoint`, `auth` and `headers` beside it are refused. |
 | `mcp.servers[].headers` | map | `{}` | Extra headers. A credential-shaped one needs a reference. Headers the MCP client sets itself (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`, `Mcp-Session-Id`, `Last-Event-ID`) are refused. |
-| `mcp.servers[].tags` | map: glob → list of `untrusted_input \| sensitive \| egress` | `{}` | Capability tags for the Rule of Two. The union applies to every tool of the server; an untagged server counts as `untrusted_input`. |
+| `mcp.servers[].tags` | map: glob → list of `untrusted_input \| sensitive \| egress \| trusted` | `{}` | Capability tags for the Rule of Two. The union applies to every tool of the server. An untagged server counts as `untrusted_input`, in the check and at runtime: its results taint the work that reads them. `trusted` is no leg: it marks a server whose results are not outside text, and changes nothing beside `untrusted_input`. Refused on a delegated server (`auth.trusted_output` says it there) and in an instruction document, whose servers count as `untrusted_input` unless a `services:` entry with tags vouches for them. |
 | `mcp.servers[].ns` | string | — | A namespace prefix: tools register as `<ns>.<tool>`. |
 | `mcp.servers[].allow` | list of globs | all | Admit only the advertised tools that match. |
 | `mcp.servers[].exclude` | list of globs | `[]` | Never admit these; beats `allow`. |
@@ -615,7 +615,7 @@ All `services` paths are live · op.
 | `services.<name>.kind` | `mcp \| intelligence \| peer \| http \| company` | `mcp` | The surface the entry serves. Matching is by kind. `company` needs the `companies` feature; see [Companies](#companies). |
 | `services.<name>.endpoint` | URL | required | The connection URL, and the match base (scheme, authority and path prefix on segment boundaries). |
 | `services.<name>.auth`, `.headers`, `.timeout` | — | — | Connection settings consumers inherit. |
-| `services.<name>.tags` | map | `{}` | Authoritative tags, unioned into every server whose endpoint matches, referencing or not. |
+| `services.<name>.tags` | map | `{}` | Authoritative tags, unioned into every server whose endpoint matches, referencing or not. `trusted` is refused on a `kind: company` entry. |
 | `services.<name>.allow` | list of globs | all | The tool ceiling; a consumer may only narrow it. |
 | `services.<name>.exclude` | list of globs | `[]` | Never admitted, for every consumer. |
 | `services.<name>.rate` | rate | — | Pacing toward the service, shared by every consumer in each process. |
@@ -1526,7 +1526,7 @@ reload swaps whole or not at all ([Reload classes](#reload-classes)).
 | `security.policies[].match.principal` | glob | — | The principal id, for calls that carry one. |
 | `security.policies[].match.args` | CEL | — | A predicate over `args`, `tool` and `caller`. Needs `cel`. |
 | `security.policies[].match.delegated` | bool | — | The call is made with an enrolled person's grant. |
-| `security.policies[].match.tainted` | bool | — | The work making the call has read outside text — a delegated server's result (unless `trusted_output`), an `untrusted_input` tool's, a webhook's or a non-operator principal's message (a person's own, or a per-person operator's, only to work not acting with their grant), a peer's answer, an `http` step's response, knowledge context, a served instruction, a tainted memory entry ([Security model](security.md#acting-for-an-enrolled-person)). |
+| `security.policies[].match.tainted` | bool | — | The work making the call has read outside text — a delegated server's result (unless `trusted_output`), an `untrusted_input` tool's or an untagged server's, a server's skill, a webhook's or a non-operator principal's message (a person's own, or a per-person operator's, only to work not acting with their grant), a peer's answer, an `http` step's response, knowledge context, a served instruction, a tainted memory entry ([Security model](security.md#acting-for-an-enrolled-person)). |
 | `security.policies[].match.holds_delegated_data` | bool | — | A delegated server's result has reached the work making the call. |
 | `security.policies[].match.any_tags` | list of tags | — | At least one listed tag is on the tool. |
 | `security.policies[].match.unattended` | bool | — | Nobody is there to answer: a trigger started the work (a schedule, a webhook, a stream), not a principal's request. |

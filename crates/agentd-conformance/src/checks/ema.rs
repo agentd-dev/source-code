@@ -226,6 +226,11 @@ pub fn checks() -> Vec<Check> {
             p2b::taint_gates_write_and_egress,
         ),
         check(
+            "ema/an-untagged-servers-read-gates-the-delegated-write",
+            "a server that declares no tags counts as untrusted_input: after a run reads it, the delegated sensitive write asks under the tainted rule, naming the server, and denied is never made; after a read of a server tagged trusted the same write goes ahead unasked",
+            p2b::untagged_read_gates_the_delegated_write,
+        ),
+        check(
             "ema/trusted-output-holds-data-and-taints-nothing",
             "with auth.trusted_output, a delegated read leaves the run holding the person's data and untainted: the sensitive write and the http POST after it go ahead unasked",
             p2b::trusted_output_taints_nothing,
@@ -807,6 +812,9 @@ struct Opts {
     /// which is their own authorization server (`grant: token_exchange`,
     /// M1b), for the grant's subject.
     exchange: bool,
+    /// More MCP servers, entries under `mcp.servers` after the delegated
+    /// ones.
+    mcp_extra: String,
     extra: String,
 }
 
@@ -833,6 +841,7 @@ impl Default for Opts {
             provider_extra: "",
             server_extra: "",
             exchange: false,
+            mcp_extra: String::new(),
             extra: String::new(),
         }
     }
@@ -984,13 +993,14 @@ fn config(x: &Xaa, dir: &Path, sock: &Path, o: &Opts) -> String {
         "{log_level: info}".to_string()
     };
     format!(
-        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {observability}\na2a:\n  listen: \"unix://{}\"\n  principals:\n    - {{match: {{uid: {person_uid}}}, role: operator, id: alice, idp_subject: {{iss: \"{}\", sub: {}}}}}\nsecurity:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{}\"\n      client_id: agentd-idp\n      {idp_auth}\n      subject: {}\n{}  delegation:\n{delegation}mcp:\n  servers:\n{servers}workflows:\n{workflows}{}",
+        "agent: {{name: ema, preflight: never}}\nintelligence: {{endpoints: \"mock:final\", model: m}}\nstore: {{kind: file, file: {{path: \"{d}/state\"}}}}\nobservability: {observability}\na2a:\n  listen: \"unix://{}\"\n  principals:\n    - {{match: {{uid: {person_uid}}}, role: operator, id: alice, idp_subject: {{iss: \"{}\", sub: {}}}}}\nsecurity:\n  experimental: {{id_jag: true}}\nidentity:\n  providers:\n    okta:\n      issuer: \"{}\"\n      client_id: agentd-idp\n      {idp_auth}\n      subject: {}\n{}  delegation:\n{delegation}mcp:\n  servers:\n{servers}{}workflows:\n{workflows}{}",
         sock.display(),
         x.idp,
         o.sub,
         x.idp,
         o.subject,
         o.provider_extra,
+        o.mcp_extra,
         o.extra
     )
 }

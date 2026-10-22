@@ -94,6 +94,8 @@ struct Setup<'a> {
     approve_above: Option<&'a str>,
     /// No `security.payments` at all.
     no_policy: bool,
+    /// The `tags` of the server `shop`, written under it when set.
+    shop_tags: Option<&'a str>,
 }
 
 /// A configuration: the durable store, the audit chain and the spend policy
@@ -107,6 +109,9 @@ fn config(dir: &str, setup: &Setup, workflows: &str) -> String {
     );
     if let Some(m) = setup.mcp {
         c += &format!("mcp:\n  servers:\n    - name: shop\n      endpoint: {m}/mcp\n");
+        if let Some(t) = setup.shop_tags {
+            c += &format!("      tags: {{\"*\": {t}}}\n");
+        }
     }
     if setup.listen.is_some() || setup.peer.is_some() {
         c += "a2a:\n";
@@ -367,6 +372,56 @@ fn a_tool_that_asks_again_took_no_payment() {
     assert_eq!(outcomes, ["authorized", "failed"], "{audit}");
     assert_eq!(records[1]["target"]["state"], "refused", "{audit}");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server that declares no tags is untrusted: a run that read it before
+/// it pays has read outside text, so the payment waits for the approver —
+/// here there is no listener to ask them over, and it is refused unsent.
+/// Tagged `trusted`, the same read leaves the run clean and it pays.
+#[test]
+fn a_payment_after_reading_an_untagged_server_waits_for_the_approver() {
+    let mock = common::spawn_mock_mcp("mock://res", false);
+    let wf = "  - name: buy\n    steps:\n      s: {kind: once}\n\
+              \x20     r: {kind: mcp.tool, depends_on: [s], server: shop, tool: mock.ops}\n\
+              \x20     pay: {kind: mcp.tool, depends_on: [r], server: shop, tool: mock.paid, args: {amount: \"10000\"}, payment: {wallet: ops, max: \"0.05 usdc\"}}\n\
+              \x20     f: {kind: finish, depends_on: [pay], status: completed, output: \"{{ steps.pay.output }}\"}\n";
+    for tags in [None, Some("[trusted]")] {
+        let (dir, _) = wallet("x402-mcp-untagged");
+        let setup = Setup {
+            mcp: Some(&mock.uri()),
+            shop_tags: tags,
+            ..Setup::default()
+        };
+        let (code, log) = life("x402-mcp-untagged", &config(&dir, &setup, wf));
+        assert!(code.is_some(), "{log}");
+        let e = step_done(&log, "pay");
+        if tags.is_none() {
+            assert_eq!(e["status"], "failed", "{log}");
+            let err = e["err"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("no_approver") && err.contains("a result of the untagged server shop"),
+                "{e}"
+            );
+            let (audit, records) = payment_records(&dir);
+            assert!(
+                records.iter().all(|r| r["outcome"] != "authorized"),
+                "nothing was signed:\n{audit}"
+            );
+        } else {
+            assert_eq!(e["status"], "done", "{log}");
+            assert_eq!(
+                events(&log, "run.done")[0]["output"]["payment"]["state"],
+                "settled",
+                "{log}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    assert_eq!(
+        marked(&mock.log(), "MOCK_X402_PAID").len(),
+        1,
+        "the vouched-for run alone paid"
+    );
 }
 
 /// A daemon killed when the test lets go of it.

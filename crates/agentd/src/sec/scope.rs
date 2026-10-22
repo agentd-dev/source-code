@@ -181,6 +181,12 @@ pub enum TrifectaTag {
     Egress,
 }
 
+/// The tag an operator writes on an MCP server whose results are not outside
+/// text: no leg of the Rule of Two, it says only that the server was judged,
+/// so it is not an untagged one (`McpServer::counted_tags`). Beside
+/// `untrusted_input` it changes nothing.
+pub const TRUSTED: &str = "trusted";
+
 impl TrifectaTag {
     /// Parse an operator-declared tag string (`--mcp-tags name=…`). Snake-case,
     /// matching the serde wire form; unknown tags return `None`.

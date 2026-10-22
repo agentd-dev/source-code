@@ -277,7 +277,8 @@ mcp:
 
 Tag every server you add beside `exec`. The trifecta check below counts a
 server with no tags as untrusted input, so an untagged server next to
-`exec` stops the daemon from starting.
+`exec` stops the daemon from starting. A server that carries no leg at all
+is tagged `trusted`.
 
 A useful mix is `exec` for reading and running the tests, and an MCP server
 for writes. You can also keep the `exec` tool and move where it runs:

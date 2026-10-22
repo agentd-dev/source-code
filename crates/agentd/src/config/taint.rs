@@ -337,14 +337,16 @@ struct RunTaint {
     reads: BTreeSet<(String, String)>,
     /// Where the outside text it carries entered: an outside caller's route
     /// (a direct start, a relayed signal, or an `into:` onto a stream it
-    /// reads), or a mirrored stream. A result is withheld from a reader only
+    /// reads), the resources of the server a `subscribe` start read, or a
+    /// mirrored stream. A result is withheld from a reader only
     /// for an origin the reader does not hold already — a route's own run
     /// reading back what it handed a child, or what a consumer made of the
     /// text its own route put on a stream, reads back nothing it was not
     /// given (`runtime::withhold`).
     origins: BTreeSet<String>,
     /// What an outside caller handed the run directly: a webhook or A2A
-    /// start, a `wait {on: webhook}`, a relayed signal, or a start by a run
+    /// start, a `wait {on: webhook}`, a relayed signal, a `subscribe` start
+    /// on a server that counts as `untrusted_input`, or a start by a run
     /// carrying only that. The operator who opened that route decided what
     /// its own run may do with it (`examples/startup/sre.yaml`: alerts from
     /// the operator's own monitoring drive the remediation), so such a run is
@@ -519,6 +521,35 @@ fn route_origin(name: &str) -> String {
     format!("the route of workflow {name:?}")
 }
 
+/// What a `subscribe` start of `w` hands its run directly, by step: the
+/// resource it read, the answer of a server that counts as
+/// `untrusted_input` — tagged so, or untagged (`McpServer::counted_tags`) —
+/// with the origin of that server's text.
+fn subscribed(w: &Workflow, s: &Settings) -> Vec<(String, String)> {
+    w.start_steps()
+        .into_iter()
+        .filter(|st| st.kind == "subscribe")
+        .filter_map(|st| {
+            let server = st.field_str("server")?;
+            s.mcp
+                .servers
+                .iter()
+                .find(|srv| srv.name == server)
+                .filter(|srv| srv.counted_tags().contains(&TrifectaTag::UntrustedInput))?;
+            Some((
+                format!("a `subscribe` start {:?} on mcp server {server:?}", st.id),
+                resource_origin(server),
+            ))
+        })
+        .collect()
+}
+
+/// The origin of the resources mcp server `server` serves, when a
+/// `subscribe` start hands one to a run ([`RunTaint::origins`]).
+fn resource_origin(server: &str) -> String {
+    format!("the resources of mcp server {server:?}")
+}
+
 /// What [`propagate`] settles.
 struct Propagation<'w> {
     streams: BTreeMap<String, StreamTaint>,
@@ -687,10 +718,7 @@ fn propagate<'w>(ctx: &Reach, workflows: &[&'w Workflow]) -> Propagation<'w> {
     // untagged — the rule the root-grant fold applies to the server itself.
     // Whatever writes into the watched upstream writes into the stream.
     for srv in &ctx.s.mcp.servers {
-        let mut tags = srv.tag_set().unwrap_or_default();
-        if tags.is_empty() {
-            tags.push(TrifectaTag::UntrustedInput);
-        }
+        let tags = srv.counted_tags();
         let declared = srv
             .events
             .iter()
@@ -727,6 +755,14 @@ fn propagate<'w>(ctx: &Reach, workflows: &[&'w Workflow]) -> Propagation<'w> {
             union(&mut run.tags, &untrusted);
             run.outside.insert(why);
             run.origins.insert(route_origin(&w.name));
+        }
+        // A `subscribe` start hands its run the resource it read, as a
+        // direct start hands its run the request.
+        for (why, origin) in subscribed(w, ctx.s) {
+            let run = runs.entry(w.name.clone()).or_default();
+            union(&mut run.tags, &untrusted);
+            run.outside.insert(why);
+            run.origins.insert(origin);
         }
         // A webhook start's `signal:` relays the request body into every run
         // listening for that signal — the same text a direct start hands its
@@ -2208,6 +2244,64 @@ mod tests {
             "f": {"kind": "finish", "depends_on": ["a"], "status": "completed"}
         }}));
         assert!(check(&s, &[own]).is_empty());
+    }
+
+    /// A `subscribe` start hands its run the resource it read: from a
+    /// server that declares no tag, or tags it `untrusted_input`, that is
+    /// outside text, which what the run emits carries on — named by the
+    /// server — and which its own run, holding both legs, may act on, as a
+    /// route's own run may. A server the operator tagged with its legs, or
+    /// `trusted`, hands it nothing.
+    #[test]
+    fn a_subscribe_start_hands_its_run_its_servers_resource() {
+        let watch = |acts: bool| {
+            let mut steps = json!({
+                "s": {"kind": "subscribe", "server": "feed", "uri": "feed://items"},
+                "e": {"kind": "emit", "depends_on": ["s"], "stream": "inbox", "subject": "item"},
+                "f": {"kind": "finish", "depends_on": ["e"], "status": "completed"}
+            });
+            if acts {
+                steps["a"] = json!({"kind": "agent", "depends_on": ["s"], "instruction": "x",
+                                    "servers": ["mail"], "tools": ["mail.*"]});
+            }
+            wf(json!({"name": "watch", "steps": steps}))
+        };
+        let with = |tags: Value| {
+            let mut s = servers(json!({}));
+            let mut feed = json!({"name": "feed", "endpoint": "https://feed.invalid/mcp"});
+            if !tags.is_null() {
+                feed["tags"] = json!({"*": tags});
+            }
+            s.mcp
+                .servers
+                .push(serde_json::from_value(feed).expect("server"));
+            s
+        };
+        for tags in [Value::Null, json!(["untrusted_input"])] {
+            let s = with(tags.clone());
+            let errs = check(&s, &[watch(false), consumer("inbox", &["mail"])]);
+            assert_eq!(errs.len(), 1, "{tags}: {errs:?}");
+            assert!(
+                errs[0].contains("fed by `emit` at workflow \"watch\" step \"e\""),
+                "{}",
+                errs[0]
+            );
+            let w = withheld(&s, &[watch(false)]);
+            assert_eq!(
+                w.run("watch").map(|t| t.origins.clone()),
+                Some(BTreeSet::from([resource_origin("feed")])),
+                "{tags}"
+            );
+            assert!(check(&s, &[watch(true)]).is_empty(), "{tags}: its own run");
+        }
+        for tags in [json!(["sensitive"]), json!(["trusted"])] {
+            let s = with(tags.clone());
+            assert!(
+                check(&s, &[watch(false), consumer("inbox", &["mail"])]).is_empty(),
+                "{tags}"
+            );
+            assert_eq!(withheld(&s, &[watch(false)]).run("watch"), None, "{tags}");
+        }
     }
 
     #[test]

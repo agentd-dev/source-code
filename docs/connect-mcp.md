@@ -282,6 +282,33 @@ to start an agent that holds all three unless you allow it explicitly.
   tags: {"*": [untrusted_input, sensitive]}
 ```
 
+A server with no tags is untrusted: it counts as `untrusted_input` in the
+check, and whatever it answers taints the work that reads it — a turn that
+calls one of its tools, a `tool`, `mcp.tool` or `mcp.resource` step (its
+`server:` a template or not), a `memory.*` or `artifact.*` step that
+`tools.overrides` maps onto it, a `wait` on one of its resources, the run a
+`subscribe` start on one fires — so a
+policy matching `tainted`, a person's consent rules and a payment's
+approval treat that work as having read outside text. Tag every server you
+trust with the legs it carries and leave `untrusted_input` out; a server
+that carries none of them, such as a calculator or your own read-only
+lookup, is tagged `trusted`:
+
+```yaml
+# fragment: under mcp.servers:
+- name: units
+  endpoint: https://units.internal.example/mcp
+  tags: {"*": [trusted]}
+```
+
+`trusted` is no leg of the Rule of Two and says only that you judged the
+server. Beside `untrusted_input` it changes nothing. A delegated server
+says the same with `auth.trusted_output`, and a Company entry cannot say
+it at all. Neither can an instruction document: a server it declares
+counts as `untrusted_input` whatever legs it names, unless the
+`services:` entry it names, or whose endpoint it gives, carries your tags. A skill a server serves taints whatever the server is tagged
+([Load skills from a server](#load-skills-from-a-server)).
+
 > **Limit.** `tags` is written as a map from a tool pattern to tags, but
 > agentd applies the union of every listed tag to every tool of the server.
 > Use the key `"*"`, and split tools with different risk onto separate
@@ -490,7 +517,9 @@ nothing the server wrote leaves that block: the catalogue gives each skill
 one line, the server and URI are escaped, and a URI holding a space, a line
 break, a quote or an angle bracket is declined. It grants no tool, its
 `allowed-tools` is ignored, and nothing in `scripts/` is run. Each server under `skills.sources` counts as `untrusted_input` in
-the [lethal-trifecta check](security.md#tool-tags-and-the-rule-of-two), whatever its tags.
+the [lethal-trifecta check](security.md#tool-tags-and-the-rule-of-two), whatever its tags,
+and a skill it serves taints the conversation, run or subagent that loads
+or reads it, whatever its tags.
 
 A skill is declined, and the reason logged as `skills.declined`, when its
 entry is invalid (no `resources`, a malformed digest, a file outside the

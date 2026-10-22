@@ -83,6 +83,11 @@ fn config(endpoint: &str, server_extra: &str, steps: &str, extra: &str) -> Strin
 
 const MEMORY: &str = "store:\n  kind: memory\n";
 
+/// The mock tagged `trusted`, for a test whose gate the operator's stand-in
+/// answers: an untagged server's question is outside text, which the judge
+/// never answers for the operator.
+const TRUSTED: &str = "      tags: {\"*\": [trusted]}\n";
+
 /// Run a config to its exit; (exit code, log).
 fn life(tag: &str, cfg: &str) -> (Option<i32>, String) {
     let path = common::unique_path(tag, "yaml");
@@ -530,7 +535,7 @@ fn a_turns_task_puts_its_question_to_the_gate_and_the_answer_reaches_the_server(
     );
     let steps = "      a: {kind: agent, depends_on: [s], instruction: \"run the job\"}\n\
                  \x20     f: {kind: finish, depends_on: [a], status: completed, output: \"{{ steps.a.output }}\"}\n";
-    let (code, log) = life("tasks-ask", &config(&mock.uri(), "", steps, &extra));
+    let (code, log) = life("tasks-ask", &config(&mock.uri(), TRUSTED, steps, &extra));
     let _ = std::fs::remove_file(&play);
     assert_eq!(code, Some(0), "{log}\nmock:\n{}", mock.log());
     // The worker's connection declares elicitation: the question went to the
@@ -933,7 +938,7 @@ fn a_tasks_question_goes_to_the_gate_and_its_answer_reaches_the_server() {
                  \x20     bg: {kind: tool, depends_on: [s], name: mock.job, detach: true, input: {}, args: {script: ask, poll_ms: 200}}\n\
                  \x20     w: {kind: wait, depends_on: [bg], on: mcp_task, task: \"{{ steps.bg.output.task.id }}\", timeout: 30s}\n\
                  \x20     f: {kind: finish, depends_on: [own, w], status: completed, output: {own: \"{{ steps.own.output }}\", bg: \"{{ steps.w.output }}\"}}\n";
-    let (code, log) = life("tasks-input", &config(&mock.uri(), "", steps, &extra));
+    let (code, log) = life("tasks-input", &config(&mock.uri(), TRUSTED, steps, &extra));
     let _ = std::fs::remove_file(&play);
     assert_eq!(code, Some(0), "{log}\nmock:\n{}", mock.log());
     let out = &events(&log, "run.done")[0]["output"];

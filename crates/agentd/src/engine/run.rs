@@ -106,6 +106,13 @@ pub struct StepState {
     /// §5.9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company: Option<String>,
+    /// The MCP server this attempt's `mcp.tool`, `mcp.resource` or `wait`
+    /// named, as rendered: a templated `server:` names one only once the
+    /// attempt's spec is, and what that server answers taints the run as the
+    /// step finishes (`runtime::taint`). Durable, because a wait it names
+    /// can outlive the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -546,6 +553,7 @@ impl RunState {
             st.wait = st.wait.take().filter(|w| w["kind"] == "peer_auth");
             st.cache_key = None;
             st.company = None;
+            st.server = None;
             st.span = Some(crate::obs::trace::new_span_id());
             // `forced` stays: a routed step caught running by a crash is
             // replayed as routed — past its dependencies, as the edge sent it.

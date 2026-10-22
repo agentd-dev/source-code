@@ -379,10 +379,12 @@ pub struct McpServerSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<(String, String)>,
     /// Operator-declared capability tags (`--mcp-tags`) for the Rule-of-Two
-    /// trifecta check. Travels in the spawn payload so a child's narrowed grant
-    /// carries the same tags. Empty = untagged, and the check treats an
-    /// untagged server conservatively as `untrusted_input` — so forgetting to
-    /// tag a server can only tighten the gate, never loosen it.
+    /// trifecta check: the legs only. Travels in the spawn payload so a
+    /// child's narrowed grant carries the same tags. Empty for a server tagged
+    /// only `trusted` and for an untagged one, which the load-time check and
+    /// the taint engine count as `untrusted_input` from its configuration
+    /// (`McpServer::counted_tags`) — so forgetting to tag a server can only
+    /// tighten the gate, never loosen it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<TrifectaTag>,
     /// Sign requests to THIS server with the AAuth agent identity.

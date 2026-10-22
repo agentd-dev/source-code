@@ -697,8 +697,8 @@ grant itself stays: the person signs in again for new work.
 (*tainted*) and which holds the person's delegated data. A delegated
 server's results are both — anyone can write a Linear issue body — unless
 the operator sets `auth.trusted_output: true` on it, when they hold data and
-taint nothing; an `untrusted_input` tool's result, a webhook's or a
-non-operator's message, a peer's answer and the rest taint
+taint nothing; an `untrusted_input` tool's result or an untagged server's,
+a webhook's or a non-operator's message, a peer's answer and the rest taint
 ([Security model](security.md#acting-for-an-enrolled-person)). A person's
 own message — sent through a session whose principal is the grant's, a
 device session having itself signed in as the identity its name is bound

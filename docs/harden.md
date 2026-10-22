@@ -159,7 +159,11 @@ Three traps:
   carry both tags. To keep a reader and a sender apart, declare them as two
   servers.
 - **An untagged server counts as `untrusted_input`.** Leaving tags off is not
-  neutral.
+  neutral: the server is a leg in the check, and its results taint the work
+  that reads them, so policies on `tainted`, the person's consent rules and
+  payment approvals all apply to it. Tag a server that carries no leg
+  `trusted` (`tags: {"*": [trusted]}`) once you have judged that nobody
+  outside writes what it answers.
 - **The budget is the whole instance.** The load folds every declared server
   together. An instance with a reader, a secrets server and a sender does not
   start, even if you meant to hand each to a different subagent. Split it into

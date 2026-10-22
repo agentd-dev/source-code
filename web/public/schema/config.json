@@ -632,11 +632,13 @@
               "enum": [
                 "untrusted_input",
                 "sensitive",
-                "egress"
+                "egress",
+                "trusted"
               ]
             },
             "type": "array"
           },
+          "description": "the Rule-of-Two legs the server carries, the union applying to every tool; a server with no tag at all counts as untrusted_input and its results taint the work that reads them — `trusted`, no leg, marks one whose results are not outside text",
           "type": "object"
         },
         "tasks": {
@@ -995,12 +997,13 @@
               "enum": [
                 "untrusted_input",
                 "sensitive",
-                "egress"
+                "egress",
+                "trusted"
               ]
             },
             "type": "array"
           },
-          "description": "authoritative — unioned into any consumer whose endpoint matches, referencing or inline, open or closed",
+          "description": "authoritative — unioned into any consumer whose endpoint matches, referencing or inline, open or closed; `trusted` (kind: mcp only) marks the endpoint's results as not outside text",
           "type": "object"
         },
         "timeout": {
@@ -5695,7 +5698,7 @@
                     "type": "array"
                   },
                   "tainted": {
-                    "description": "the work making the call has read outside text: an untrusted_input tool's result, a delegated server's (unless trusted_output), a webhook's or a non-operator's A2A message, a peer's answer, knowledge context, a served instruction, a tainted memory entry",
+                    "description": "the work making the call has read outside text: an untrusted_input tool's result or an untagged server's, a server's skill, a delegated server's (unless trusted_output), a webhook's or a non-operator's A2A message, a peer's answer, knowledge context, a served instruction, a tainted memory entry",
                     "type": "boolean"
                   },
                   "tool": {

@@ -89,10 +89,11 @@ Each MCP server is tagged by the operator with the risks it carries:
 An agent may hold at most two of the three. A configuration that gives one
 agent all three — the "lethal trifecta" that turns an injected instruction
 into exfiltration — does not start, and a server with no tags counts as
-`untrusted_input`. The check runs again when an agent spawns a child, and over
-every workflow that text from a webhook, an A2A caller or an upstream event can
-reach. Overriding it takes an explicit `security.allow_trifecta`, which a hot
-reload cannot change.
+`untrusted_input`: what it answers taints the work that reads it, until the
+operator tags it, `trusted` for a server that carries no leg. The check runs
+again when an agent spawns a child, and over every workflow that text from a
+webhook, an A2A caller or an upstream event can reach. Overriding it takes
+an explicit `security.allow_trifecta`, which a hot reload cannot change.
 
 ## Untrusted input stays where it was read
 

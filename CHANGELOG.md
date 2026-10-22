@@ -1908,6 +1908,8 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `x402` adds the RustCrypto crates `k256` (secp256k1 ECDSA, `ecdsa` alone)
   and `sha3` (Keccak-256), optional and enabled by `x402` alone, with their
   28 dependencies; none is in the release graph.
+- `agentd-core`: `config::settings::McpServer::{untagged, counted_tags}`,
+  the one rule for what an MCP server counts as, and `sec::scope::TRUSTED`.
 
 **Changed.**
 
@@ -2374,6 +2376,54 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 - An inbound issuer's metadata is read from every discovery document that
   answers, the first filling in what a later one adds — Okta's org server
   names its key set only in the OpenID document.
+- **Breaking:** an MCP server that declares no tags is untrusted at
+  runtime, as the Rule of Two already counted it: what it answers taints
+  the work that reads it, as an `untrusted_input` server's does — a turn or
+  a subagent calling one of its tools, a `tool` or `search.*` step on one,
+  a `memory.*` or `artifact.*` step `tools.overrides` maps onto one, an
+  `mcp.tool` or `mcp.resource` step at it (its `server:` judged as it
+  renders), a `wait {on: resource}` on one of its resources, the run a
+  `subscribe` start on one fires. So a `security.policies` rule matching
+  `tainted: true`, the person's consent rules
+  (`egress_from_tainted_work_holding_delegated_data`,
+  `delegated_call_from_tainted_work`), a payment's approval under
+  `ask_when_tainted`, and the judge that answers a gate for the operator —
+  which answers none that carries outside text — now hold work that read
+  such a server, where they let it through before. A server whose results
+  nobody outside writes is tagged with the legs it carries and not
+  `untrusted_input`, or, when it carries none, with the new tag `trusted`:
+  `tags: {"*": [trusted]}` (`--mcp-tags name=trusted`). `trusted` is no
+  leg of the Rule of Two and changes nothing beside `untrusted_input`; it
+  is refused on a delegated server, whose results `auth.trusted_output`
+  vouches for, and on a Company entry. Tools an embedder registers in code
+  taint nothing, and a Company's servers carry its entry's tags, or
+  `untrusted_input` and `egress`, as before.
+- **Breaking:** the resource a `wait {on: resource}` reads from an
+  `untrusted_input` server, as from an untagged one, taints the run, as an
+  `mcp.resource` step's read does; it was not recorded.
+- **Breaking:** an `mcp.tool` or `mcp.resource` step, or a resource `wait`,
+  whose `server:` is a template taints its run by the server it renders to;
+  it was judged by the template's text, which names no server, and tainted
+  nothing. A `memory.*` or `artifact.*` step that `tools.overrides` maps
+  onto an `untrusted_input` or untagged server taints its run, as the same
+  call through a `tool` step does.
+- **Breaking:** a `subscribe` start on an `untrusted_input` or untagged
+  server fires a run that carries the resource it read: tainted from its
+  start, and, in the stream-taint check, outside text it hands on to the
+  streams it emits onto and the runs it starts, as a webhook start's run is.
+- **Breaking:** an instruction document, and a subagent template's
+  machinery, vouch for none of the servers they declare: each counts as
+  `untrusted_input` beside the legs it names, in the Rule of Two and at
+  runtime, unless the operator's `kind: mcp` catalog entry it names with
+  `service:`, or whose endpoint it gives, declares tags. A document that
+  declared a server with `sensitive` and `egress` inline is refused as the
+  lethal trifecta; `trusted` on a document's server is refused.
+- **Breaking:** a skill an MCP server serves taints the conversation, run
+  or subagent that loads or reads it — `skills.load`, `skills.read`, a
+  reference in the instruction or a message, preflight's choice, a step's
+  `skills:` — whatever the server is tagged, as the Rule of Two counts
+  every skills source `untrusted_input`. A skill from a folder or the
+  instruction taints nothing.
 
 **Fixed.**
 

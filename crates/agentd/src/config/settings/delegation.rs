@@ -1867,6 +1867,15 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             )),
             _ => {}
         }
+        if m.tags
+            .values()
+            .flatten()
+            .any(|t| t == crate::sec::scope::TRUSTED)
+        {
+            err(format!(
+                "{at}: `trusted` is not a delegated server's tag — `auth.trusted_output: true` says nobody outside writes what it answers"
+            ));
+        }
         if m.oauth.is_some() || m.aauth == Some(true) {
             err(format!(
                 "{at}: grant {grant} with `oauth:` or `aauth:` on the same server — one credential per server"
@@ -2712,6 +2721,16 @@ mcp:
                 "untagged",
                 Box::new(|y| y.replace("      tags: {\"*\": [sensitive]}\n", "")),
                 "id_jag_untagged",
+            ),
+            (
+                "tagged trusted",
+                Box::new(|y| {
+                    y.replace(
+                        "      tags: {\"*\": [sensitive]}\n",
+                        "      tags: {\"*\": [sensitive, trusted]}\n",
+                    )
+                }),
+                "`auth.trusted_output: true` says",
             ),
             (
                 "a public client",

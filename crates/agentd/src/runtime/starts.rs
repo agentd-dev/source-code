@@ -435,7 +435,19 @@ impl Runtime {
                             o.remove("pending_payload")
                         });
                         self.set_start_state(&workflow, &node, st2);
-                        self.fire_start(&workflow, &node, &spec, payload, "subscribe");
+                        let server = spec.get("server").and_then(Value::as_str).unwrap_or("");
+                        let carries = self.subscribe_carries(server);
+                        self.fire_start_carrying(
+                            &workflow,
+                            &node,
+                            &spec,
+                            payload,
+                            "subscribe",
+                            &carries,
+                            None,
+                            None,
+                            None,
+                        );
                     }
                 }
                 _ => {}
@@ -443,7 +455,7 @@ impl Runtime {
         }
     }
 
-    /// A `loop`/`schedule`/`subscribe` start fires: accepts a durable start
+    /// A `loop`/`schedule`/`event` start fires: accepts a durable start
     /// event, applying the per-start `inputs` mapping.
     pub(crate) fn fire_start(
         &mut self,
@@ -511,8 +523,9 @@ impl Runtime {
     }
 
     /// Like [`Runtime::fire_start`], for a firing that hands the run text
-    /// another run, child or peer carried (a signal): the start records it,
-    /// and the run carries it (`withhold`). The run continues `parent`, the
+    /// another run, child or peer carried (a signal), or a server answered
+    /// (a `subscribe` start's read): the start records it, and the run
+    /// carries it (`withhold`). The run continues `parent`, the
     /// trace of the signal that fired it. `authority` is the principal the
     /// TRANSPORT authenticated — the A2A message's sender, the signal's — and
     /// the run is theirs, acting through `session` when they sent it through
@@ -1013,7 +1026,19 @@ impl Runtime {
                 st["pending_payload"] = payload;
                 self.set_start_state(&workflow, &node, st);
             } else {
-                self.fire_start(&workflow, &node, &spec, payload, "subscribe");
+                // The read is the server's answer, which the run starts with.
+                let carries = self.subscribe_carries(server);
+                self.fire_start_carrying(
+                    &workflow,
+                    &node,
+                    &spec,
+                    payload,
+                    "subscribe",
+                    &carries,
+                    None,
+                    None,
+                    None,
+                );
             }
         }
     }

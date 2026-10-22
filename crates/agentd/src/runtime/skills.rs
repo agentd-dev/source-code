@@ -7,6 +7,7 @@
 
 use super::reactor::Runtime;
 use super::tools::{ToolCaller, ToolOutcome};
+use super::withhold::Reader;
 use crate::config::settings::{DynamicSkills, Settings};
 use crate::context::skills::{self, Catalogue, LoadError, ReadError, Scope, SkillServer};
 use crate::mcp::client::McpClient;
@@ -233,6 +234,8 @@ impl Runtime {
                         );
                         problems.push((r.clone(), format!("skills.load.refused: {r:?}: {e}")));
                     } else {
+                        let reader = Reader::Conversation(Some(ctx_id.to_string()));
+                        self.taint_skill(&reader, &body.id, &body.reference);
                         tlog.info("skills.loaded", loaded(ctx_id, &body));
                     }
                 }
@@ -264,6 +267,7 @@ impl Runtime {
         for r in refs {
             match self.skills.load(r, &servers, trace.as_ref()) {
                 Ok(b) => {
+                    self.taint_skill(&Reader::Run(run_id.to_string()), &b.id, &b.reference);
                     log.info("skills.loaded", {
                         let mut f = loaded("", &b);
                         if let Value::Object(m) = &mut f {
@@ -359,6 +363,9 @@ impl Runtime {
                 let c = self.context_for(&ctx_id, caller.principal.as_deref());
                 match c.load_skill(&body.reference, &body.hash, &body.id, max_loaded) {
                     Ok(()) => {
+                        if let Some(r) = self.reader_of(caller) {
+                            self.taint_skill(&r, &body.id, &body.reference);
+                        }
                         tlog.info("skills.loaded", loaded(&ctx_id, &body));
                         let mut v = json!({"loaded": true, "name": body.reference, "skill": body.name,
                                            "origin": body.id.fields(), "hash": body.hash,
@@ -409,6 +416,9 @@ impl Runtime {
         let servers = self.skill_servers();
         match self.skills.read_file(&key, &path, &servers, trace.as_ref()) {
             Ok(f) => {
+                if let Some(r) = self.reader_of(caller) {
+                    self.taint_skill(&r, &key.0, &name);
+                }
                 let mut v =
                     json!({"name": name, "path": f.path, "size": f.size, "origin": key.0.fields()});
                 match f.text {

@@ -137,7 +137,16 @@ tags matter when you assign them:
   tools `untrusted_input` and `egress`. The only real split is one MCP server
   per tag profile.
 - **An untagged server counts as `untrusted_input`**, the conservative
-  default.
+  default, in the check and at runtime: what it answers taints the work that
+  reads it ([Taint is tracked](#acting-for-an-enrolled-person)), as an
+  `untrusted_input` server's does. A server with no tag at all is untagged,
+  and so is one whose lists are empty. To vouch that a server's results are
+  not outside text, tag it with the legs it does carry and leave
+  `untrusted_input` out, or, when it carries none of the three, tag it
+  `trusted`: `tags: {"*": [trusted]}`. `trusted` is no leg; beside
+  `untrusted_input` it changes nothing. It may not be written on a delegated
+  server, whose results `auth.trusted_output` vouches for, nor on a Company
+  entry, whose content is always outside text.
 - **`tools.narrow.<tool>.tags` adds tags to one tool**, and can never remove
   one. Those per-tool tags reach the [policy](#policies-a-verdict-on-each-call)
   matcher, not the load-time Rule-of-Two check.
@@ -152,7 +161,7 @@ through a stream ([below](#outside-input-that-arrives-through-streams)).
 flowchart TB
   A["mcp.servers tags"] -->|"flattened per server"| B{"Server untagged?"}
   B -->|"yes"| C["Counts as untrusted_input"]
-  B -->|"no"| D["Counts its declared tags"]
+  B -->|"no, or tagged trusted"| D["Counts its declared legs"]
   C -->|"into the fold"| E["Check 1 at load: every declared server"]
   D -->|"into the fold"| E
   E -->|"three legs"| F["Exit 2: the daemon never starts"]
@@ -1141,7 +1150,11 @@ treats it.
   catalogue gives each skill one line, the server and URI are escaped, a
   `<skill_content` or `</skill_content` in the body is made inert, and a
   URI holding a space, a line break, a quote or an angle bracket is
-  declined. The server counts as `untrusted_input` in the Rule-of-Two fold.
+  declined. The server counts as `untrusted_input` in the Rule-of-Two fold,
+  and a skill of it loaded or read — by `skills.load` or `skills.read`, a
+  reference the instruction, a message or preflight makes, or a step's
+  `skills:` — taints the conversation, run or subagent it reaches, whatever
+  the server is tagged.
 - **Removing a source takes its skills back.** A reload that removes a
   skills source, or narrows what it admits, unloads that server's skills
   from every context (`skills.unloaded`), and `skills.read` reads only from
@@ -1523,10 +1536,18 @@ What holds:
   a built-in `search.*` step — a webhook's or a stream's events, a
   non-operator principal's A2A message or a per-person operator's (each
   but to work acting with their own grant, below), an A2A peer's answer, an `http`
-  step's response, an `mcp.tool` or `mcp.resource` result from a server
-  whose `tags` name `untrusted_input` (whether or not it serves a tool),
-  knowledge context or a `knowledge.*` step's result, a served instruction,
-  or a memory entry or an artifact tainted work wrote. It *holds delegated
+  step's response, an `mcp.tool` or `mcp.resource` result, or the resource
+  a `wait {on: resource}` reads, from a server whose `tags` name
+  `untrusted_input` (whether or not it serves a tool), knowledge context or a `knowledge.*` step's result, a skill an MCP server
+  serves (whatever the server is tagged), a served instruction,
+  or a memory entry or an artifact tainted work wrote. A server that
+  declares no tags counts as `untrusted_input` here as in the Rule of Two:
+  what it answers taints the same ways, until the operator tags it — with its legs, or `trusted`
+  ([Tool tags](#tool-tags-and-the-rule-of-two)). Tools an embedder
+  registers in code (the reserved server `code`) are its own program and
+  taint nothing; a delegated server must carry tags and is judged as above;
+  a Company's servers carry its entry's tags, or `untrusted_input` and
+  `egress` when it declares none. It *holds delegated
   data* once a delegated server's result reached it, trusted or not. Both
   are recorded before the text is read, durably, and carried wherever the
   work's text goes: into what it starts, spawns, signals or steers, the
@@ -1693,6 +1714,12 @@ What holds:
   server, by any spelling of it — a reference is compared by what it
   resolves to, a `*_file` field's path as a file (RFC 0042, as RFC 0044
   §5.14.1 amends it).
+- **Documents cannot vouch for a server.** A server any of them declares
+  counts as `untrusted_input` beside the legs it names, in the check and at
+  runtime, unless the operator's `kind: mcp` catalog entry it names with
+  `service:`, or whose endpoint it gives, declares tags; `trusted` on it is
+  refused. A document can make a server look more dangerous than the
+  operator did, never less.
 
 - **Workers under a uid of their own.** With `spawn.uid` and `spawn.gid`
   every turn worker, subagent and think child, an instance child's own

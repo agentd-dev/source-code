@@ -490,9 +490,9 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
     let mut total = followed;
     let mut webhook_modes: Vec<(String, &super::McpServer)> = Vec::new();
     for srv in &declared {
-        let untrusted = srv.tag_set().is_ok_and(|tags| {
-            tags.is_empty() || tags.contains(&crate::sec::scope::TrifectaTag::UntrustedInput)
-        });
+        let untrusted = srv
+            .counted_tags()
+            .contains(&crate::sec::scope::TrifectaTag::UntrustedInput);
         if srv.events.len() > MAX_BINDINGS_PER_SERVER {
             d.errors.push(format!(
                 "mcp.servers[{}].events: {} bindings, at most {MAX_BINDINGS_PER_SERVER} per server",

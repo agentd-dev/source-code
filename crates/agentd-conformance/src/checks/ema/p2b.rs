@@ -166,6 +166,70 @@ pub(super) fn trusted_output_taints_nothing(h: &Harness) -> Outcome {
         .and(|| Outcome::require(!asked(&s), "trusted results taint nothing, so nothing asks"))
 }
 
+/// A workflow that reads the agent-mode server `server`, then makes the
+/// delegated `sensitive` write.
+fn read_then_write(server: &str) -> String {
+    format!(
+        "  - name: {server}-write\n    steps:\n      start: {{kind: manual}}\n      read: {{kind: mcp.tool, depends_on: [start], server: {server}, tool: mock.ops, args: {{}}}}\n      call: {{kind: mcp.tool, depends_on: [read], server: linear, tool: create_issue, args: {{title: \"From agentd\"}}}}\n      done: {{kind: finish, depends_on: [call]}}\n"
+    )
+}
+
+/// An MCP server that declares no tags counts as `untrusted_input`, at
+/// runtime as in the Rule of Two: after a run reads it, the delegated
+/// `sensitive` write asks under the tainted rule, naming the server, and
+/// denied it is never made. The same read from the same server tagged
+/// `trusted` leaves the run clean, and the write goes ahead unasked.
+pub(super) fn untagged_read_gates_the_delegated_write(h: &Harness) -> Outcome {
+    let s = Setup::new(h, json!({}), &Opts::default());
+    let docs = h.spawn_mock_mcp(&s.tmp.path().join("docs.addr"), "mock://res", false);
+    let at = format!("{}/mcp", docs.endpoint());
+    s.reconfigure(&Opts {
+        tag_map: Some(TAGS),
+        mcp_extra: format!(
+            "    - {{name: docs, endpoint: \"{at}\"}}\n    - {{name: vouched, endpoint: \"{at}\", tags: {{\"*\": [trusted]}}}}\n"
+        ),
+        extra: read_then_write("docs") + &read_then_write("vouched"),
+        ..Opts::default()
+    });
+    let _d = s.daemon(h);
+    tryo!(s.login(h));
+    let vouched = tryo!(s.run("vouched-write"));
+    let o = completed(&vouched)
+        .and(|| {
+            Outcome::require(
+                s.calls_of("create_issue") == 1,
+                "the write after the vouched-for read reaches the server",
+            )
+        })
+        .and(|| Outcome::require(!asked(&s), "a trusted server's read taints nothing"));
+    if !o.passed {
+        return o;
+    }
+    let n = s.start("docs-write");
+    let (gate, g) = tryo!(open_gate(h, &s));
+    let r = &g["rendered"];
+    let o = Outcome::require(
+        r["rule"] == "delegated_call_from_tainted_work"
+            && r["tainted"] == true
+            && r["taint"].as_array().is_some_and(|t| {
+                t.iter()
+                    .any(|x| x == "a result of the untagged server docs")
+            }),
+        format!("the write's gate is the tainted rule's, naming the untagged server: {g}"),
+    );
+    if !o.passed {
+        return o;
+    }
+    let _ = s.cli(h, &["--delegation-deny", &gate]);
+    let denied = tryo!(s.ended("docs-write", n, Duration::from_secs(30)));
+    failed_with(&denied, "policy_denied").and(|| {
+        Outcome::require(
+            s.calls_of("create_issue") == 1,
+            "the denied write is never made",
+        )
+    })
+}
+
 /// A consent gate is the person's alone (§5.10 rules 1–2, T7, T8): a
 /// message on the task that waits behind it — the person's own, which an
 /// upstream agent holding their token could send as well — is refused and

@@ -150,8 +150,8 @@ reader who meets a word another page assumes. Configuration keys are in the
 
 | Term | Meaning |
 |---|---|
-| **tags** | The capability labels an operator puts on an MCP server: `untrusted_input`, `sensitive`, `egress`. The trifecta check reads them; nothing the model or a server says does. See [Security model](security.md). |
-| **taint** | The `untrusted_input` a stream carries because of what feeds it, such as a webhook body. A workflow that reads a tainted stream into steps holding `sensitive` and `egress` is refused at load. See [Security model](security.md). |
+| **tags** | The capability labels an operator puts on an MCP server: `untrusted_input`, `sensitive`, `egress`, and `trusted`, which is no leg and marks a server whose results are not outside text. The trifecta check and the taint engine read them; nothing the model or a server says does. See [Security model](security.md). |
+| **taint** | The `untrusted_input` a stream carries because of what feeds it, such as a webhook body. A workflow that reads a tainted stream into steps holding `sensitive` and `egress` is refused at load. At runtime, work is tainted once outside text reached it: an `untrusted_input` or untagged server's result, a webhook's body, a peer's answer. See [Security model](security.md). |
 | **task** | The A2A unit of work a message creates: it has a state (`working`, `input-required`, `completed`, …) and is visible to its owner and to operators. See [A2A API reference](a2a-reference.md). |
 | **template** | An operator-declared subagent definition, `subagents.templates.<name>`, with the only parameters the model may fill. See [Subagents and delegation](subagents.md). |
 | **tool** | A callable the model may use: an MCP server's tool, one of agentd's internal tools (`memory.*`, `workflow.*`, …), a code-registered tool, or a workflow registered as a tool. See [MCP: tools and context](mcp.md). |
@@ -164,7 +164,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 
 | Term | Meaning |
 |---|---|
-| **untrusted_input** | One of the three capability tags: the tool returns content from a source nobody controls, such as web pages or inbound mail. An untagged server counts as one. See [Security model](security.md). |
+| **untrusted_input** | One of the three capability tags: the tool returns content from a source nobody controls, such as web pages or inbound mail. An untagged server counts as one, and its results taint the work that reads them. See [Security model](security.md). |
 | **warm subagent** | A subagent in `warm` mode: it stays alive and takes one turn per message (`subagent.send`). See [Subagents and delegation](subagents.md). |
 | **webhook** | An inbound HTTP request on `webhooks.listen` that fires a `webhook` start node, answers a `wait`, or appends to a stream. See [React to changes and events](react-to-events.md). |
 | **workflow** | A named, validated graph of steps whose execution state is checkpointed before each side effect, so a run survives a crash. See [Workflows: how runs work](workflows.md). |

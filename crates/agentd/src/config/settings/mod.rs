@@ -2425,6 +2425,84 @@ impl ServiceKind {
     }
 }
 
+/// What a document's configuration `fragment` vouches for, which only the
+/// operator may: a server it declares tagged `trusted`, named as the
+/// document wrote it. What a document's server answers is outside text
+/// unless the operator's catalog vouches for it
+/// ([`untrust_document_servers`]).
+pub fn document_vouched(fragment: &Map<String, Value>) -> Vec<String> {
+    let trusted = crate::sec::scope::TRUSTED;
+    let mut out = Vec::new();
+    for (i, srv) in fragment
+        .get("mcp")
+        .and_then(|m| m.get("servers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for (pattern, tags) in srv
+            .get("tags")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            if tags
+                .as_array()
+                .is_some_and(|t| t.iter().any(|t| t == trusted))
+            {
+                out.push(format!("mcp.servers[{i}].tags[{pattern:?}]: {trusted}"));
+            }
+        }
+    }
+    out
+}
+
+/// Count every server a document's configuration `fragment` declares as
+/// `untrusted_input`, whatever legs it declares, by adding the tag: a
+/// document can make a server look more dangerous than the operator did,
+/// never less. Not one the operator's catalog `services` vouches for — the
+/// `kind: mcp` entry it names with `service:`, or whose endpoint its own
+/// matches, declares tags, which the server takes ([`resolve_services`]).
+pub fn untrust_document_servers(
+    fragment: &mut Map<String, Value>,
+    services: &BTreeMap<String, Service>,
+) {
+    let untrusted = "untrusted_input";
+    let Some(servers) = fragment
+        .get_mut("mcp")
+        .and_then(|m| m.get_mut("servers"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for srv in servers.iter_mut().filter_map(Value::as_object_mut) {
+        let entry = match srv.get("service").and_then(Value::as_str) {
+            Some(name) => services.get(name),
+            None => srv
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .and_then(|e| service_match(services, ServiceKind::Mcp, e))
+                .map(|(_, e)| e),
+        };
+        if entry.is_some_and(|e| e.kind == ServiceKind::Mcp && !e.tags.values().all(Vec::is_empty))
+        {
+            continue;
+        }
+        // A shape that is not a map of lists is the typed parse's to refuse.
+        if let Some(all) = srv
+            .entry("tags")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .map(|t| t.entry("*").or_insert_with(|| json!([])))
+            .and_then(Value::as_array_mut)
+            && !all.iter().any(|t| t == untrusted)
+        {
+            all.push(json!(untrusted));
+        }
+    }
+}
+
 /// Resolve `service:` references against the catalog and apply the
 /// unconditional tag floor. Mutates `mcp.servers` in place — after this, every
 /// server carries its effective endpoint, auth, headers, admission lists and
@@ -2753,12 +2831,13 @@ pub struct McpServer {
 
 impl McpServer {
     /// The flattened, deduplicated trifecta tag set across every tool-pattern
-    /// key. An unknown tag name is an error rather than a silent drop, since
-    /// a typo'd tag would otherwise read as "this server is untagged".
+    /// key — the legs it declares; `trusted` is none. An unknown tag name is
+    /// an error rather than a silent drop, since a typo'd tag would otherwise
+    /// read as "this server is untagged".
     pub fn tag_set(&self) -> Result<Vec<crate::sec::scope::TrifectaTag>, String> {
         let mut out = Vec::new();
         for list in self.tags.values() {
-            for t in list {
+            for t in list.iter().filter(|t| *t != crate::sec::scope::TRUSTED) {
                 let tag = crate::sec::scope::TrifectaTag::parse(t).ok_or_else(|| {
                     format!("mcp server '{}' has unknown trifecta tag '{t}'", self.name)
                 })?;
@@ -2768,6 +2847,22 @@ impl McpServer {
             }
         }
         Ok(out)
+    }
+
+    /// Whether this server declares no tag at all — no leg and not
+    /// `trusted`: its results count as `untrusted_input`.
+    pub fn untagged(&self) -> bool {
+        self.tags.values().all(Vec::is_empty)
+    }
+
+    /// The legs this server counts as, in the Rule of Two and for the taint
+    /// its results carry: those it declares, and `untrusted_input` when it is
+    /// [`untagged`](Self::untagged), so leaving the tags off never trusts it.
+    pub fn counted_tags(&self) -> Vec<crate::sec::scope::TrifectaTag> {
+        if self.untagged() {
+            return vec![crate::sec::scope::TrifectaTag::UntrustedInput];
+        }
+        self.tag_set().unwrap_or_default()
     }
 
     /// Lower to the runtime spec the MCP client and the spawn payload carry.
@@ -5522,6 +5617,13 @@ impl Settings {
                             events.join(", ")
                         ));
                     }
+                    let vouched = document_vouched(&ex.config);
+                    if !vouched.is_empty() {
+                        return Err(format!(
+                            "{source}: the instruction declares {} — vouching for a server is the operator's: what a server a document declares answers is outside text unless the operator's service catalog vouches for it",
+                            vouched.join(", ")
+                        ));
+                    }
                     let acting = delegation::document_act_for(
                         ex.workflows.iter().chain(
                             ex.config
@@ -5564,6 +5666,14 @@ impl Settings {
                     }
                     document_grants = granted.clone();
                     let mut fragment = ex.config.clone();
+                    // The document's servers are untrusted unless the
+                    // operator's catalog vouches for them; a catalog that
+                    // will not parse vouches for none.
+                    let catalog: BTreeMap<String, Service> = doc
+                        .get("services")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default();
+                    untrust_document_servers(&mut fragment, &catalog);
                     if let Some(o) = doc.as_object_mut() {
                         if fragment.contains_key("intelligence") {
                             let operator = o.get("intelligence").cloned().unwrap_or(json!({}));
@@ -8815,7 +8925,18 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
         for list in svc.tags.values() {
             for t in list {
-                if crate::sec::scope::TrifectaTag::parse(t).is_none() {
+                if t == crate::sec::scope::TRUSTED {
+                    // What a Company says is its text, whatever its entry
+                    // is tagged (RFC 0047 §6.3).
+                    if svc.kind == ServiceKind::Company {
+                        err(
+                            &mut d,
+                            format!(
+                                "services.{name}: `trusted` marks an MCP server's results; a Company's content is outside text whatever its entry says"
+                            ),
+                        );
+                    }
+                } else if crate::sec::scope::TrifectaTag::parse(t).is_none() {
                     err(
                         &mut d,
                         format!("services.{name} has unknown trifecta tag '{t}'"),
@@ -10026,11 +10147,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // trifecta over the root grant
     let mut tags = Vec::new();
     for srv in &s.mcp.servers {
-        match srv.tag_set() {
-            Ok(t) if t.is_empty() => tags.push(crate::sec::scope::TrifectaTag::UntrustedInput),
-            Ok(t) => tags.extend(t),
-            Err(_) => {}
-        }
+        tags.extend(srv.counted_tags());
         // A skill a server serves is untrusted model input whatever the
         // server is tagged (RFC 0051 D4).
         if s.skills.sources.iter().any(|src| src.server == srv.name) {
@@ -11791,6 +11908,90 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{e}").contains("lethal-trifecta refused"), "{e}");
+    }
+
+    /// A server counts as `untrusted_input` until it declares a tag — empty
+    /// lists declare none — and `trusted` declares one that is no leg, which
+    /// beside `untrusted_input` changes nothing.
+    #[test]
+    fn a_server_counts_as_untrusted_input_until_it_declares_a_tag() {
+        use crate::sec::scope::TrifectaTag as T;
+        let srv = |tags: Value| {
+            serde_json::from_value::<McpServer>(
+                json!({"name": "s", "endpoint": "https://s.example/mcp", "tags": tags}),
+            )
+            .unwrap()
+        };
+        for none in [json!({}), json!({"*": []})] {
+            assert!(srv(none.clone()).untagged(), "{none}");
+            assert_eq!(srv(none).counted_tags(), [T::UntrustedInput]);
+        }
+        let vouched = srv(json!({"*": ["trusted"]}));
+        assert!(!vouched.untagged());
+        assert!(vouched.counted_tags().is_empty() && vouched.tag_set().unwrap().is_empty());
+        assert_eq!(
+            srv(json!({"*": ["trusted", "sensitive"]})).counted_tags(),
+            [T::Sensitive]
+        );
+        assert_eq!(
+            srv(json!({"*": ["trusted"], "get_*": ["untrusted_input"]})).counted_tags(),
+            [T::UntrustedInput]
+        );
+        assert!(srv(json!({"*": ["trustd"]})).tag_set().is_err());
+
+        // In the root fold: an untagged server is the third leg beside a
+        // sensitive and an egress one; tagged `trusted` it is none.
+        let validate = |tags: &str| {
+            let f = write_tmp(
+                &format!(
+                    "store: {{kind: memory}}\n\
+                     mcp:\n  servers:\n    - name: ops\n      endpoint: https://mcp-ops.internal/mcp\n      tags: {{\"*\": [sensitive, egress]}}\n\
+                     \x20   - name: calc\n      endpoint: https://mcp-calc.internal/mcp\n{tags}"
+                ),
+                "yaml",
+            );
+            load(
+                &args(&["--config", f.path().to_str().unwrap(), "--validate-config"]),
+                &base_env(),
+            )
+        };
+        for third in [
+            "",
+            "      tags: {\"*\": []}\n",
+            "      tags: {\"*\": [trusted, untrusted_input]}\n",
+        ] {
+            let e = validate(third).unwrap_err();
+            assert!(
+                format!("{e}").contains("lethal-trifecta refused"),
+                "{third:?}: {e}"
+            );
+        }
+        validate("      tags: {\"*\": [trusted]}\n").expect("`trusted` is no leg");
+    }
+
+    /// `trusted` is an MCP server's tag: a `kind: mcp` catalog entry may
+    /// carry it, a Company entry may not — what a Company says is its text.
+    #[test]
+    fn trusted_is_refused_on_a_company_entry() {
+        let validate = |kind: &str| {
+            let f = write_tmp(
+                &format!(
+                    "store: {{kind: memory}}\n\
+                     services:\n  calc:\n    kind: {kind}\n    endpoint: https://calc.example\n    tags: {{\"*\": [trusted]}}\n"
+                ),
+                "yaml",
+            );
+            load(
+                &args(&["--config", f.path().to_str().unwrap(), "--validate-config"]),
+                &base_env(),
+            )
+        };
+        validate("mcp").expect("an MCP service may be vouched for");
+        let e = validate("company").unwrap_err();
+        assert!(
+            format!("{e}").contains("services.calc: `trusted` marks an MCP server's results"),
+            "{e}"
+        );
     }
 
     /// `local` is the origin agentd's own skills answer to in a reference: a
@@ -17442,6 +17643,84 @@ mod tests {
         assert!(
             e.contains("intelligence.routes.cheap") && e.contains("operator configuration"),
             "{e}"
+        );
+    }
+
+    /// A document vouches for none of its servers: `trusted` on one is
+    /// refused, and each it declares counts `untrusted_input` beside the
+    /// legs it names — unless the operator's catalog entry it names, or
+    /// whose endpoint it restates, declares tags.
+    #[test]
+    fn a_documents_servers_are_untrusted_unless_the_operators_catalog_vouches() {
+        use crate::sec::scope::TrifectaTag as T;
+        let frag = json!({"mcp": {"servers": [
+            {"name": "a", "endpoint": "https://a", "tags": {"*": ["trusted"]}},
+            {"name": "b", "endpoint": "https://b", "tags": {"*": ["sensitive"]}},
+            {"name": "c", "endpoint": "https://c", "tags": {"get_*": ["trusted"]}}]}});
+        assert_eq!(
+            document_vouched(frag.as_object().unwrap()),
+            [
+                "mcp.servers[0].tags[\"*\"]: trusted",
+                "mcp.servers[2].tags[\"get_*\"]: trusted"
+            ]
+        );
+        // Through the instruction's own fold.
+        let dir = tempfile::tempdir().unwrap();
+        let instr = dir.path().join("servers.md");
+        let load = |block: &str, services: Value| {
+            std::fs::write(
+                &instr,
+                format!("You are the desk.\n\n:::!mcp{{name=gh}}\n{block}:::\n"),
+            )
+            .unwrap();
+            Settings::from_document(
+                json!({"agent": {"name": "a", "preflight": "never",
+                              "instruction": {"file": instr.to_str().unwrap()}},
+                    "store": {"kind": "memory"}, "services": services}),
+                "t",
+            )
+        };
+        let e = load(
+            "endpoint: https://mcp.example/mcp\ntags: {\"*\": [trusted]}\n",
+            json!({}),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("mcp.servers[0].tags[\"*\"]: trusted")
+                && e.contains("vouching for a server is the operator's"),
+            "{e}"
+        );
+        // The server as it resolves against the catalog.
+        let declared = |block: &str, services: Value| {
+            let mut s = load(block, services).unwrap();
+            assert!(resolve_services(&mut s).is_empty());
+            s.mcp.servers.into_iter().find(|m| m.name == "gh").unwrap()
+        };
+        // Untagged, or tagged with legs alone: untrusted all the same.
+        let srv = declared("endpoint: https://mcp.example/mcp\n", json!({}));
+        assert_eq!(srv.counted_tags(), [T::UntrustedInput]);
+        let srv = declared(
+            "endpoint: https://mcp.example/mcp\ntags: {\"*\": [sensitive]}\n",
+            json!({}),
+        );
+        assert_eq!(srv.counted_tags(), [T::Sensitive, T::UntrustedInput]);
+        // The operator's catalog vouches: by `service:`, or by the endpoint
+        // its entry names.
+        let vouched = json!({"gh": {"kind": "mcp", "endpoint": "https://mcp.example/mcp",
+                                    "tags": {"*": ["trusted"]}}});
+        for block in ["service: gh\n", "endpoint: https://mcp.example/mcp/v1\n"] {
+            let srv = declared(block, vouched.clone());
+            assert!(
+                !srv.untagged() && srv.counted_tags().is_empty(),
+                "{block}: {:?}",
+                srv.tags
+            );
+        }
+        // An entry that declares no tags vouches for nothing.
+        let bare = json!({"gh": {"kind": "mcp", "endpoint": "https://mcp.example/mcp"}});
+        assert_eq!(
+            declared("service: gh\n", bare).counted_tags(),
+            [T::UntrustedInput]
         );
     }
 

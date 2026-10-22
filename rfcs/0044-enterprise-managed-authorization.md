@@ -4257,7 +4257,19 @@ the engine. The engine replaces it.
   server judged by its declared `tags` as well as its tools', so one that
   serves only resources is judged by what it declares; a built-in
   `search.*` step's result from an `untrusted_input` tool, and a
-  `knowledge.*` step's, as knowledge context is. **Not a source, a design
+  `knowledge.*` step's, as knowledge context is. **Untagged is untrusted**
+  (the user's decision of 2026-10-22): a server that declares no tag at
+  all is an `untrusted_input` one here as in the Rule of Two — its tools'
+  results through a turn, a subagent or a `tool` or `search.*` step, and
+  its `mcp.tool` and `mcp.resource` results, taint as theirs do. The
+  operator vouches for a server by tagging it: with the legs it carries,
+  `untrusted_input` left out, or with `trusted`, which is no leg and is
+  refused on a delegated server (`auth.trusted_output` says it there) and
+  on a Company entry. `code`, the tools an embedder registers in its
+  program, is declared nowhere and taints nothing. A skill an MCP server
+  serves taints what loads or reads it, whatever the server is tagged, as
+  the fold counts every skills source `untrusted_input` (RFC 0051 D4).
+  **Not a source, a design
   change:** an MCP elicitation's answer. It reaches only the server that
   asked, never a model, and the server's result after it is judged as that
   server's. A person's answer to a `human` step or an `ask_human` needs no
@@ -4501,11 +4513,12 @@ something to a workflow:
 | `sec::worker` units `workers_run_as_another_uid_only_where_agentd_can_drop_to_it`, `a_child_runs_as_the_worker_uid` and `a_child_keeps_no_capability_the_supervisor_held` (both root); settings unit `a_worker_uid_is_held_to_its_rules` | every refusal, `CAP_KILL`'s among them, as any uid; a real child runs as the uid with no supplementary group and no capability in any set, also where the kernel kept the supervisor's capabilities across the change of uid |
 | `sec::policy` unit `an_ask_gate_shows_what_the_work_chose_escaped`; `companies::carry` unit `the_gate_text_is_fixed_and_the_companies_quoted` | a policy `ask`'s `{{args}}` and `{{tool}}`, and the cross-Company gate's arguments, in printable ASCII, capped |
 | `runtime::artifacts` unit `create_get_list_delete_and_restore`; `delegation` unit `no_personal_key_is_made_for_a_principal_without_a_grant` | an artifact keeps its maker's record across a restore; no personal key is made, and nothing sealed, for a principal holding no grant |
-| e2e `taint_e2e` (default) | an `untrusted_input` server's result taints its run and the `tainted` fact denies its `memory.set`, while a clean run's goes ahead; a run that reads a tainted entry, or a tainted artifact, in a later life of the daemon is tainted, and one that reads a clean one is not; a `search.fetch` step and an `mcp.resource` read from a server serving no tool taint their runs; a run handed a cached output is tainted by what the run that produced it read |
+| e2e `taint_e2e` (default) | an `untrusted_input` server's result taints its run and the `tainted` fact denies its `memory.set`, while a clean run's goes ahead; a run that reads a tainted entry, or a tainted artifact, in a later life of the daemon is tainted, and one that reads a clean one is not; a `search.fetch` step and an `mcp.resource` read from a server serving no tool taint their runs; a run handed a cached output is tainted by what the run that produced it read; an untagged server's `mcp.tool`, `mcp.resource`, `tool` and resource-`wait` results and a turn's call of its tool taint, a `trusted`-tagged server's and one tagged `sensitive` alone do not; a server's skill taints the step that loads it, a folder skill does not |
 | e2e `worker_uid_e2e` (root; skips cleanly otherwise) | a real turn worker runs as uid 65534 with no supplementary group and cannot open the audit chain; an `exec` command runs as it (`exec`); as a non-root uid the load refuses, naming why |
 | e2e `hitl_e2e::a_policy_gate_is_badged_and_a_models_ask_is_not` (`a2a`) | a policy `ask`'s task carries `securityGate`, a model's `ask_human` does not |
 | e2e `companies_e2e::the_seal_key_held_by_the_external_signer_keeps_the_user_across_restarts` (`companies`) | a real daemon with the reference signer holding the seal key: the signer is asked to `derive` and `wrap`, the store holds no User ID in the clear, and the next life opens the same User through `unwrap` |
 | `ema/taint-gates-the-delegated-write-and-the-egress` | a delegated read followed by a delegated write gates (`delegated_call_from_tainted_work`), and followed by an agent-mode `http` egress gates (the first rule); a run that read nothing writes unasked |
+| `ema/an-untagged-servers-read-gates-the-delegated-write` | a read from an agent-mode server that declares no tags, followed by a delegated write, gates (`delegated_call_from_tainted_work`), naming the server; after a read of a server tagged `trusted` the write goes ahead unasked |
 | `ema/trusted-output-holds-data-and-taints-nothing` | `auth.trusted_output`: the run holds the data, is not tainted, and neither call asks |
 | `ema/consent-is-the-persons-alone` | a message on the gate's task and an operator's answer are both refused, recorded and decide nothing; the gate denies at its deadline and the call is never made |
 | `ema/the-signer-signs-only-an-assertion` | a non-assertion payload is denied; the resource key signing for another audience is denied, the call fails `signer_unavailable`, nothing reaches the authorization server |

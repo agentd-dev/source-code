@@ -1080,11 +1080,7 @@ fn events_tool_tags(settings: &Settings) -> Vec<TrifectaTag> {
         if !s.event_grants.iter().any(|g| g.tools) {
             continue;
         }
-        let mut tags = s.tag_set().unwrap_or_default();
-        if tags.is_empty() {
-            tags.push(TrifectaTag::UntrustedInput);
-        }
-        for t in tags {
+        for t in s.counted_tags() {
             if !out.contains(&t) {
                 out.push(t);
             }

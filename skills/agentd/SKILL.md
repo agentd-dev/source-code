@@ -159,6 +159,12 @@ path**, agentd refuses to start unless `--allow-trifecta` is passed. That is the
 exfiltration shape. Never add the flag to silence a startup error without
 saying, in words, which of the three legs the operator is accepting.
 
+An MCP server with no `tags` counts as untrusted input, and what it answers
+taints the work that reads it, so `tainted` policies, consent gates and
+payment approvals hold that work. Tag every server with the legs it carries;
+one that carries none, and whose results nobody outside writes, is tagged
+`trusted` (`tags: {"*": [trusted]}`).
+
 ## Attaching a UI
 
 ```sh

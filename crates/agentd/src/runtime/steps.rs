@@ -1760,6 +1760,20 @@ impl Runtime {
                 }
             }
         }
+        // The server a call or read of this attempt names, as rendered:
+        // what it answers taints the run as the step finishes
+        // (`runtime::taint`).
+        if matches!(step.kind.as_str(), "mcp.tool" | "mcp.resource" | "wait")
+            && let Some(st) = self
+                .runs
+                .get_mut(run_id)
+                .and_then(|r| r.steps.get_mut(step_id))
+        {
+            st.server = spec
+                .get("server")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
         match step.kind.as_str() {
             "checkpoint" => {
                 // Documented as "force a durable checkpoint here rather than at
@@ -3419,7 +3433,12 @@ impl Runtime {
         // untrusted_input tool's result — taints its run before any step
         // after it reads it (`runtime::taint`).
         if matches!(status, StepStatus::Done | StepStatus::Failed) {
-            self.taint_step(run_id, &step.kind, &step.spec);
+            let server = self
+                .runs
+                .get(run_id)
+                .and_then(|r| r.step(step_id))
+                .and_then(|s| s.server.clone());
+            self.taint_step(run_id, &step.kind, &step.spec, server.as_deref());
         }
         self.end_step_span(
             run_id,

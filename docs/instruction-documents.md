@@ -609,6 +609,7 @@ own disk, or in the configuration itself.
 | An `::include` in the document | The model reads `(included instruction not available)`. | Inline the text, or serve the document from a registry that resolves includes. |
 | A misspelled family in `document_capabilities` | It grants nothing, and it is not refused. | Use the exact names; see [Grants](directives-reference.md#grants). |
 | A trust pin's key file path is wrong | The pin cannot be enforced; under `warn` the document loads unverified. | `unenforceable: refuse`. |
+| A `:::!mcp` server tagged with its legs | It counts as `untrusted_input` all the same: what it answers taints the work that reads it. `trusted` on it is refused. | Catalog the server under `services:` with its tags, and name it with `service:` in the document. |
 
 ## Next steps
 

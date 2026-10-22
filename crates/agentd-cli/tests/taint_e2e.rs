@@ -4,8 +4,11 @@
 //! `search.*` step or `mcp.resource` — marks it tainted before any later
 //! step reads it; a memory entry, an artifact or a cached step output the
 //! run leaves keeps that, and a run that reads it in another life of the
-//! daemon is tainted by it. The policy fact `tainted` holds exactly that
-//! work, and leaves clean work alone.
+//! daemon is tainted by it. A server that declares no tag is an
+//! `untrusted_input` one, through a step or a turn, until the operator tags
+//! it — `trusted`, or its legs without `untrusted_input`; a server's skill
+//! taints whatever the server is tagged. The policy fact `tainted` holds
+//! exactly that work, and leaves clean work alone.
 #![cfg(unix)]
 
 mod common;
@@ -244,5 +247,425 @@ fn a_cached_output_keeps_its_taint() {
         log.contains(DENIED),
         "and is tainted by what the run that produced it read\n{log}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A configuration whose servers `servers` — `(name, tags)` pairs, each at
+/// `uri` under the namespace of its name, `tags` written under it unless
+/// empty — sit beside the rule that refuses `memory.set` to tainted work,
+/// with `extra` at the top and `workflows`.
+fn served(uri: &str, servers: &[(&str, &str)], extra: &str, workflows: &str) -> String {
+    let servers: String = servers
+        .iter()
+        .map(|(name, tags)| {
+            let tags = if tags.is_empty() {
+                String::new()
+            } else {
+                format!(", tags: {{ \"*\": {tags} }}")
+            };
+            format!("\x20   - {{ name: {name}, ns: {name}, endpoint: \"{uri}\"{tags} }}\n")
+        })
+        .collect();
+    format!(
+        "agent: {{ name: taint }}\n\
+         store: {{ kind: file, file: {{ path: __STATE__ }} }}\n\
+         observability: {{ log_level: info }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 1s }}\n{extra}\
+         mcp:\n  servers:\n{servers}\
+         security:\n  policies:\n\
+         \x20   - match: {{ tool: \"memory.set\", tainted: true }}\n      action: deny\n\
+         workflows:\n{workflows}"
+    )
+}
+
+/// The servers every case below is offered: one that declares no tag, one
+/// the operator vouched for with `trusted`, and one tagged with the leg it
+/// carries, `untrusted_input` left out.
+const SERVERS: [(&str, &str); 3] = [
+    ("plain", ""),
+    ("vouched", "[trusted]"),
+    ("inner", "[sensitive]"),
+];
+
+/// A server that declares no tag is untrusted by default: what it answers
+/// an `mcp.tool`, an `mcp.resource` or a `tool` step, and the resource a
+/// `wait {on: resource}` reads from it, taints the run, as an
+/// `untrusted_input` server's does — while one tagged `trusted`, or tagged
+/// with its legs and not `untrusted_input`, leaves the run clean.
+#[test]
+fn an_untagged_servers_result_taints_its_run_and_a_vouched_ones_does_not() {
+    let mock = common::spawn_mock_mcp("mock://res", false);
+    let dir = common::unique_path("taint-untagged", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (server, tags) in SERVERS {
+        for (i, step) in [
+            format!("{{ kind: mcp.tool, server: {server}, tool: mock.ops, depends_on: [s] }}"),
+            format!(
+                "{{ kind: mcp.resource, server: {server}, op: read, uri: \"mock://res\", depends_on: [s] }}"
+            ),
+            format!("{{ kind: tool, name: {server}.mock.ops, depends_on: [s] }}"),
+            format!(
+                "{{ kind: wait, on: resource, server: {server}, uri: \"mock://res\", timeout: 20s, depends_on: [s] }}"
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = format!("{dir}/{server}-{i}");
+            std::fs::create_dir_all(&dir).unwrap();
+            let wf = format!(
+                "  - name: read\n    steps:\n\
+                 \x20     s: {{ kind: once }}\n\
+                 \x20     q: {step}\n\
+                 \x20     m: {{ kind: memory.set, key: k, value: v, depends_on: [q] }}\n\
+                 \x20     f: {{ kind: finish, depends_on: [m], status: completed }}\n"
+            );
+            // The wait's server alone, on a mock of its own that says the
+            // resource changed once the wait subscribes: its one push goes
+            // down whichever stream asks first.
+            let emitting = step
+                .contains("kind: wait")
+                .then(|| common::spawn_mock_mcp("mock://res", true));
+            let cfg = match &emitting {
+                Some(e) => served(&e.uri(), &[(server, tags)], "", &wf),
+                None => served(&mock.uri(), &SERVERS, "", &wf),
+            };
+            let (_, log) = run(&dir, &cfg);
+            assert!(
+                log.lines()
+                    .any(|l| l.contains("\"step\":\"q\"") && l.contains("\"status\":\"done\"")),
+                "{server} {step}: the read itself went ahead\n{log}"
+            );
+            assert_eq!(
+                log.contains(DENIED),
+                server == "plain",
+                "{server} {step}: only the untagged server's result taints\n{log}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A step whose `server:` is a template is judged by the server it names
+/// once rendered: an untagged one's result taints the run, through
+/// `mcp.tool`, `mcp.resource` and a resource `wait`, as when the definition
+/// names it.
+#[test]
+fn a_templated_server_is_judged_by_the_server_it_renders_to() {
+    let mock = common::spawn_mock_mcp("mock://res", false);
+    let dir = common::unique_path("taint-templated", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (server, tags) in SERVERS {
+        for (i, step) in [
+            "{ kind: mcp.tool, server: \"{{ inputs.srv }}\", tool: mock.ops, depends_on: [s] }",
+            "{ kind: mcp.resource, server: \"{{ inputs.srv }}\", op: read, uri: \"mock://res\", depends_on: [s] }",
+            "{ kind: wait, on: resource, server: \"{{ inputs.srv }}\", uri: \"mock://res\", timeout: 20s, depends_on: [s] }",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = format!("{dir}/{server}-{i}");
+            std::fs::create_dir_all(&dir).unwrap();
+            let wf = format!(
+                "  - name: read\n    steps:\n\
+                 \x20     s: {{ kind: once, inputs: {{ srv: {server} }} }}\n\
+                 \x20     q: {step}\n\
+                 \x20     m: {{ kind: memory.set, key: k, value: v, depends_on: [q] }}\n\
+                 \x20     f: {{ kind: finish, depends_on: [m], status: completed }}\n"
+            );
+            let emitting = step
+                .contains("kind: wait")
+                .then(|| common::spawn_mock_mcp("mock://res", true));
+            let cfg = match &emitting {
+                Some(e) => served(&e.uri(), &[(server, tags)], "", &wf),
+                None => served(&mock.uri(), &SERVERS, "", &wf),
+            };
+            let (_, log) = run(&dir, &cfg);
+            assert!(
+                log.lines()
+                    .any(|l| l.contains("\"step\":\"q\"") && l.contains("\"status\":\"done\"")),
+                "{server} {step}: the read itself went ahead\n{log}"
+            );
+            assert_eq!(
+                log.contains(DENIED),
+                server == "plain",
+                "{server} {step}: only the untagged server's result taints\n{log}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `memory.*` or `artifact.*` step that `tools.overrides` maps onto a
+/// server is that server's call: an untagged one's result taints the run,
+/// as the same call through a `tool` step does, and one tagged `trusted`
+/// leaves it clean.
+#[test]
+fn a_contract_step_mapped_onto_an_untagged_server_taints_its_run() {
+    let mock = common::spawn_mock_mcp("mock://res", false);
+    let dir = common::unique_path("taint-mapped", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    for server in ["plain", "vouched"] {
+        let extra = "tools:\n  overrides:\n\
+                     \x20   memory.get: { server: SERVER, tool: mock.ops, result: \"{\\\"found\\\": true, \\\"value\\\": {{result.structuredContent}}}\" }\n\
+                     \x20   artifact.get: { server: SERVER, tool: mock.ops, result: \"{\\\"id\\\": \\\"a\\\", \\\"content\\\": {{result.structuredContent}}}\" }\n"
+            .replace("SERVER", server);
+        for (i, step) in [
+            "{ kind: memory.get, key: k, depends_on: [s] }",
+            "{ kind: artifact.get, id: a, depends_on: [s] }",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = format!("{dir}/{server}-{i}");
+            std::fs::create_dir_all(&dir).unwrap();
+            let wf = format!(
+                "  - name: recall\n    steps:\n\
+                 \x20     s: {{ kind: once }}\n\
+                 \x20     q: {step}\n\
+                 \x20     m: {{ kind: memory.set, key: k2, value: v, depends_on: [q] }}\n\
+                 \x20     f: {{ kind: finish, depends_on: [m], status: completed }}\n"
+            );
+            let (_, log) = run(&dir, &served(&mock.uri(), &SERVERS, &extra, &wf));
+            assert!(
+                log.lines()
+                    .any(|l| l.contains("\"step\":\"q\"") && l.contains("\"status\":\"done\"")),
+                "{server} {step}: the mapped call went ahead\n{log}"
+            );
+            assert_eq!(
+                log.contains(DENIED),
+                server == "plain",
+                "{server} {step}: only the untagged server's result taints\n{log}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `subscribe` start fires its run with the resource it read, the
+/// server's answer: from a server that declares no tag the run carries it
+/// from its start — the read itself and, as the configuration says, the
+/// server's resources — and a `tainted` rule holds the run; from a server
+/// tagged `trusted`, or with its legs, the run is clean.
+#[test]
+fn a_subscribe_starts_run_carries_an_untagged_servers_resource() {
+    let dir = common::unique_path("taint-subscribe", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (server, tags) in SERVERS {
+        let dir = format!("{dir}/{server}");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mock = common::spawn_mock_mcp("mock://res", true);
+        let wf = format!(
+            "  - name: watch\n    steps:\n\
+             \x20     s: {{ kind: subscribe, server: {server}, uri: \"mock://res\", inputs: {{ c: \"{{{{ payload.content }}}}\" }} }}\n\
+             \x20     t: {{ kind: tool, name: workflow.status, args: {{ run: \"{{{{ run.id }}}}\" }}, depends_on: [s] }}\n\
+             \x20     m: {{ kind: memory.set, key: k, value: \"{{{{ inputs.c }}}}\", depends_on: [t], on_error: continue }}\n\
+             \x20     f: {{ kind: finish, depends_on: [m], status: completed, output: \"{{{{ steps.t.output.runs.0.taint }}}}\" }}\n"
+        );
+        let cfg = served(&mock.uri(), &[(server, tags)], "", &wf).replace(
+            "observability: { log_level: info }",
+            "observability: { log_level: info, log_content: true }",
+        );
+        let (_, log) = run(&dir, &cfg);
+        let done: Vec<serde_json::Value> = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["event"] == "run.done")
+            .collect();
+        assert_eq!(done.len(), 1, "{server}: the start fired once\n{log}");
+        let facts = &done[0]["output"];
+        assert_eq!(
+            facts["tainted"],
+            server == "plain",
+            "{server}: {facts}\n{log}"
+        );
+        assert_eq!(
+            log.contains(DENIED),
+            server == "plain",
+            "{server}: only the untagged server's resource taints\n{log}"
+        );
+        if server == "plain" {
+            let taint: Vec<&str> = facts["taint"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|t| t.as_str())
+                .collect();
+            for source in [
+                "a result of the untagged server plain",
+                "the resources of mcp server \"plain\"",
+            ] {
+                assert!(taint.contains(&source), "{source}: {facts}");
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server an instruction document declares vouches for nothing: what it
+/// answers taints the run whatever legs the document names, `trusted` on
+/// it is refused at load, and only the operator's catalog entry it names
+/// vouches for it.
+#[test]
+fn a_documents_server_is_untrusted_unless_the_operators_catalog_vouches() {
+    let mock = common::spawn_mock_mcp("mock://res", false);
+    let dir = common::unique_path("taint-document", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let uri = mock.uri();
+    let catalog = format!(
+        "services:\n  docs: {{ kind: mcp, endpoint: \"{uri}\", tags: {{ \"*\": [trusted] }} }}\n"
+    );
+    for (i, (block, services, tainted)) in [
+        (format!("endpoint: \"{uri}\"\n"), String::new(), true),
+        (
+            format!("endpoint: \"{uri}\"\ntags: {{\"*\": [sensitive]}}\n"),
+            String::new(),
+            true,
+        ),
+        ("service: docs\n".to_string(), catalog, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = format!("{dir}/{i}");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            format!("{dir}/AGENT.md"),
+            format!("Read the feed.\n\n:::!mcp{{name=docsrv}}\nns: docsrv\n{block}:::\n"),
+        )
+        .unwrap();
+        let cfg = format!(
+            "agent: {{ name: taint, instruction: {{ file: \"{dir}/AGENT.md\" }} }}\n\
+             store: {{ kind: file, file: {{ path: __STATE__ }} }}\n\
+             observability: {{ log_level: info }}\n\
+             lifecycle: {{ run_until: idle, idle_grace: 1s }}\n{services}\
+             security:\n  policies:\n\
+             \x20   - match: {{ tool: \"memory.set\", tainted: true }}\n      action: deny\n\
+             workflows:\n\
+             \x20 - name: read\n    steps:\n\
+             \x20     s: {{ kind: once }}\n\
+             \x20     q: {{ kind: mcp.tool, server: docsrv, tool: mock.ops, depends_on: [s] }}\n\
+             \x20     m: {{ kind: memory.set, key: k, value: v, depends_on: [q] }}\n\
+             \x20     f: {{ kind: finish, depends_on: [m], status: completed }}\n"
+        );
+        let (_, log) = run(&dir, &cfg);
+        assert!(
+            log.lines()
+                .any(|l| l.contains("\"step\":\"q\"") && l.contains("\"status\":\"done\"")),
+            "{block}: the call went ahead\n{log}"
+        );
+        assert_eq!(log.contains(DENIED), tainted, "{block}\n{log}");
+    }
+    // A document saying `trusted` of its own server is refused.
+    std::fs::write(
+        format!("{dir}/AGENT.md"),
+        format!("Read the feed.\n\n:::!mcp{{name=docsrv}}\nendpoint: \"{uri}\"\ntags: {{\"*\": [trusted]}}\n:::\n"),
+    )
+    .unwrap();
+    let cfg = format!(
+        "agent: {{ name: taint, instruction: {{ file: \"{dir}/AGENT.md\" }} }}\n\
+         store: {{ kind: file, file: {{ path: __STATE__ }} }}\n"
+    );
+    let (code, log) = run(&dir, &cfg);
+    assert_ne!(code, Some(0), "{log}");
+    assert!(
+        log.contains("mcp.servers[0].tags[")
+            && log.contains("vouching for a server is the operator's"),
+        "{log}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A model's call of a tool an untagged server serves taints the work the
+/// turn does, before its result is read: the turn's next call, `memory.set`,
+/// meets the rule. The same call on the server tagged `trusted` does not.
+#[test]
+fn a_turns_call_of_an_untagged_servers_tool_taints_it() {
+    let mock = common::spawn_mock_mcp("mock://res", false);
+    let dir = common::unique_path("taint-turn", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    for (server, tainted) in [("plain", true), ("vouched", false)] {
+        let dir = format!("{dir}/{server}");
+        std::fs::create_dir_all(&dir).unwrap();
+        let play = format!("{dir}/play.json");
+        std::fs::write(
+            &play,
+            serde_json::json!({"turns": [
+                {"tool_calls": [{"name": format!("{server}.mock.ops"), "arguments": {}}]},
+                {"tool_calls": [{"name": "memory.set", "arguments": {"key": "k", "value": "v"}}]},
+                {"content": "done"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let extra = format!("intelligence:\n  endpoints: \"mock:file:{play}\"\n  model: mock\n");
+        let wf = "  - name: turn\n    steps:\n\
+                  \x20     s: { kind: once }\n\
+                  \x20     a: { kind: agent, instruction: \"read, then remember\", depends_on: [s] }\n\
+                  \x20     f: { kind: finish, depends_on: [a], status: completed }\n";
+        let (_, log) = run(&dir, &served(&mock.uri(), &SERVERS, &extra, wf));
+        assert!(
+            log.contains(&format!("\"tool\":\"{server}.mock.ops\"")),
+            "{server}: the turn called the server's tool\n{log}"
+        );
+        assert_eq!(
+            log.contains("\"event\":\"tool.policy.refused\""),
+            tainted,
+            "{server}: the turn's memory.set meets the tainted rule only after the untagged server's tool\n{log}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A skill an MCP server serves is the server's text whatever the server is
+/// tagged — here `trusted` — so a step that loads it is tainted; a skill of
+/// the operator's own folder taints nothing.
+#[test]
+fn a_servers_skill_taints_the_step_that_loads_it_and_a_folder_skill_does_not() {
+    let mock = common::spawn_mock_mcp_at("2026-07-28", "mock://res", false);
+    let dir = common::unique_path("taint-skill", "d");
+    std::fs::create_dir_all(format!("{dir}/skills/notes")).unwrap();
+    std::fs::write(
+        format!("{dir}/skills/notes/SKILL.md"),
+        "---\nname: notes\ndescription: The folder's\n---\n\nTake notes.\n",
+    )
+    .unwrap();
+    let play = format!("{dir}/play.json");
+    std::fs::write(
+        &play,
+        serde_json::json!({"turns": [{"content": "{\"ok\": true}"}]}).to_string(),
+    )
+    .unwrap();
+    let extra = format!(
+        "intelligence:\n  endpoints: \"mock:file:{play}\"\n  model: mock\n\
+         skills:\n  dir: {dir}/skills\n  sources:\n    - {{ server: vouched }}\n"
+    );
+    for (i, (skill, tainted)) in [("vouched/handbook", true), ("local/notes", false)]
+        .into_iter()
+        .enumerate()
+    {
+        let run_dir = format!("{dir}/{i}");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let wf = format!(
+            "  - name: skill\n    steps:\n\
+             \x20     s: {{ kind: once }}\n\
+             \x20     t: {{ kind: think, prompt: p, skills: [\"{skill}\"], depends_on: [s] }}\n\
+             \x20     m: {{ kind: memory.set, key: k, value: v, depends_on: [t] }}\n\
+             \x20     f: {{ kind: finish, depends_on: [m], status: completed }}\n"
+        );
+        let (_, log) = run(
+            &run_dir,
+            &served(&mock.uri(), &[("vouched", "[trusted]")], &extra, &wf),
+        );
+        assert!(
+            log.contains("\"event\":\"skills.loaded\""),
+            "{skill}: the step loaded it\n{log}"
+        );
+        assert_eq!(
+            log.contains(DENIED),
+            tainted,
+            "{skill}: only the server's skill taints\n{log}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -12,15 +12,22 @@
 //! the record says:
 //!
 //! - **tainted** — it holds an origin of outside text (a webhook's or an
-//!   A2A start's route, an A2A peer agent's text, a Company's content, an
-//!   untrusted delegated result, a run or child no longer on record) or a
-//!   taint source the withholding does not follow: an `untrusted_input`
-//!   tool's result, a non-operator principal's A2A message, an A2A peer's
-//!   answer to a step, an `http` step's response, an `untrusted_input`
-//!   server's `mcp.tool` or `mcp.resource` result, knowledge context, a
-//!   memory entry tainted work wrote. A deployment whose instruction is
-//!   served (a URL, an OCI artifact, an MCP resource) has every unit
-//!   tainted: every turn's prompt holds that text.
+//!   A2A start's route, the resources a `subscribe` start reads from an
+//!   `untrusted_input` server, an A2A peer agent's text, a Company's
+//!   content, an untrusted delegated result, a run or child no longer on
+//!   record) or a taint source the withholding does not follow: an
+//!   `untrusted_input` tool's result, a non-operator principal's A2A
+//!   message, an A2A peer's answer to a step, an `http` step's response, an
+//!   `untrusted_input` server's `mcp.tool` or `mcp.resource` result or the
+//!   resource a `wait` or a `subscribe` start reads from it, knowledge
+//!   context, a server's skill, a memory entry tainted work wrote. A server
+//!   that declares no tag at all — no leg, not `trusted` — is an
+//!   `untrusted_input` one: what it answers taints as theirs does. So is
+//!   one an instruction document declares, whatever legs it names, unless
+//!   the operator's catalog vouches for it
+//!   (`config::settings::untrust_document_servers`). A deployment whose
+//!   instruction is served (a URL, an OCI artifact, an MCP resource) has
+//!   every unit tainted: every turn's prompt holds that text.
 //! - **holds delegated data** — a delegated server's result reached it,
 //!   trusted (`auth.trusted_output`) or not.
 //!
@@ -37,6 +44,7 @@
 use super::reactor::{Runtime, Target};
 use super::tools::ToolCaller;
 use super::withhold::Reader;
+use crate::context::skills::SkillId;
 use crate::engine::run::Carries;
 use crate::sec::scope::TrifectaTag;
 use crate::supervisor::tree::NodeId;
@@ -319,23 +327,33 @@ impl Runtime {
         }
     }
 
-    /// Whether the registry's tool `name` is tagged `untrusted_input`.
-    fn untrusted_tool(&self, name: &str) -> bool {
-        self.registry
+    /// The taint source of the registry's tool `name`'s result, when it is
+    /// outside text: the tool is tagged `untrusted_input`, or a server that
+    /// declares no tag serves it ([`Self::untagged_server`]).
+    fn tool_taint(&self, name: &str) -> Option<String> {
+        if self
+            .registry
             .tags_of(std::slice::from_ref(&name.to_string()))
             .contains(&TrifectaTag::UntrustedInput)
+        {
+            return Some(tool_source(name));
+        }
+        let server = self.registry.get(name)?.server.as_deref()?;
+        self.untagged_server(server)
+            .then(|| format!("the tool {name} of the untagged server {server}"))
     }
 
     /// The child `node` announced a call to `tool`: an `untrusted_input`
-    /// tool's result taints the unit it is read into — recorded now, before
-    /// the call is made, so before its result is read.
+    /// tool's result, or an untagged server's, taints the unit it is read
+    /// into — recorded now, before the call is made, so before its result is
+    /// read.
     pub(crate) fn taint_announced(&mut self, node: NodeId, tool: &str) {
-        if !self.untrusted_tool(tool) {
+        let Some(source) = self.tool_taint(tool) else {
             return;
-        }
+        };
         let reader = self.reader_at(&Target::Child(node, 0));
         let mut c = Carries::default();
-        c.taint([tool_source(tool)]);
+        c.taint([source]);
         self.hand_reader(&reader, &c);
     }
 
@@ -380,11 +398,30 @@ impl Runtime {
         }
     }
 
-    /// Whether `server`'s results are outside text: its declared `tags`
-    /// name `untrusted_input`, for any tool or for every one, or a registry
-    /// tool it serves carries it — so a server that serves only resources
-    /// is judged by what it declares.
-    fn untrusted_server(&self, server: &str) -> bool {
+    /// Whether `server` is one the configuration declares with no tag at all
+    /// — no leg, not `trusted` — whose results count as `untrusted_input`
+    /// (`McpServer::counted_tags`). None of agentd's own is: `code`, the tools
+    /// an embedder registers in its own program, is declared nowhere (the name
+    /// is reserved); a delegated server must carry a leg (`id_jag_untagged`),
+    /// and the call that made it records its result; a Company's servers take
+    /// its entry's tags, or `untrusted_input` and `egress` when it declares
+    /// none, and what they answer is the Company's origin besides.
+    fn untagged_server(&self, server: &str) -> bool {
+        !self.delegated(server)
+            && self
+                .settings
+                .mcp
+                .servers
+                .iter()
+                .any(|s| s.name == server && s.untagged())
+    }
+
+    /// The taint source of a result of `server`, when it is outside text: its
+    /// declared `tags` name `untrusted_input`, for any tool or for every one,
+    /// or a registry tool it serves carries it — so a server that serves only
+    /// resources is judged by what it declares — or it declares no tag at all
+    /// ([`Self::untagged_server`]).
+    fn server_taint(&self, server: &str) -> Option<String> {
         let declared = self
             .settings
             .mcp
@@ -393,20 +430,37 @@ impl Runtime {
             .find(|s| s.name == server)
             .and_then(|s| s.tag_set().ok())
             .is_some_and(|t| t.contains(&TrifectaTag::UntrustedInput));
-        declared
+        if declared
             || self.registry.iter().any(|t| {
                 t.server.as_deref() == Some(server) && t.tags.contains(&TrifectaTag::UntrustedInput)
             })
+        {
+            return Some(format!("a result of the untrusted_input server {server}"));
+        }
+        self.untagged_server(server)
+            .then(|| format!("a result of the untagged server {server}"))
     }
 
-    /// What a finished step of `kind`, run with `spec`, hands its run of
+    /// What a finished step of `kind`, defined with `spec`, hands its run of
     /// outside text, if anything: an `http` step's response, an A2A peer's
-    /// answer, an `untrusted_input` tool's result through a `tool` step or
-    /// a built-in `search.*` step, a `knowledge.*` step's result (as
-    /// knowledge context taints a turn), and an `mcp.tool` or `mcp.resource`
-    /// result from an `untrusted_input` server ([`Self::untrusted_server`]).
-    /// A delegated server's result is recorded by the call that made it.
-    pub(crate) fn taint_step(&mut self, run_id: &str, kind: &str, spec: &Map<String, Value>) {
+    /// answer, an `untrusted_input` tool's result, or an untagged server's,
+    /// through a `tool` step, a `memory.*` or `artifact.*` step a
+    /// `tools.overrides` entry maps onto a server, or a built-in `search.*`
+    /// step, a `knowledge.*` step's result (as knowledge context taints a
+    /// turn), and an `mcp.tool` or `mcp.resource` result, or the resource a
+    /// `wait {on: resource}` reads, from an `untrusted_input` or untagged
+    /// server ([`Self::server_taint`]) — the one the attempt named, rendered
+    /// (`server`), or, for a step that ended before it was dispatched, the
+    /// one its definition names. A delegated server's result is recorded by
+    /// the call that made it.
+    pub(crate) fn taint_step(
+        &mut self,
+        run_id: &str,
+        kind: &str,
+        spec: &Map<String, Value>,
+        server: Option<&str>,
+    ) {
+        let server = server.or_else(|| spec.get("server").and_then(Value::as_str));
         let source = match kind {
             "http" => Some(format!(
                 "the response of an http step to {}",
@@ -422,8 +476,7 @@ impl Runtime {
             "tool" => spec
                 .get("name")
                 .and_then(Value::as_str)
-                .filter(|t| self.untrusted_tool(t))
-                .map(tool_source),
+                .and_then(|t| self.tool_taint(t)),
             k if k.starts_with("knowledge.") => Some(format!(
                 "knowledge context from {}",
                 self.settings
@@ -432,13 +485,22 @@ impl Runtime {
                     .as_deref()
                     .unwrap_or("the knowledge server")
             )),
-            k if k.starts_with("search.") => self.untrusted_tool(k).then(|| tool_source(k)),
-            "mcp.tool" | "mcp.resource" => spec
-                .get("server")
-                .and_then(Value::as_str)
+            // A contract agentd implements itself serves no server and
+            // carries no `untrusted_input`: only one a server implements
+            // taints.
+            k if k.starts_with("search.")
+                || k.starts_with("memory.")
+                || k.starts_with("artifact.") =>
+            {
+                self.tool_taint(k)
+            }
+            "mcp.tool" | "mcp.resource" => server
                 .filter(|s| !self.delegated(s))
-                .filter(|s| self.untrusted_server(s))
-                .map(|s| format!("a result of the untrusted_input server {s}")),
+                .and_then(|s| self.server_taint(s)),
+            // What a resource wait resolves with is the resource, read.
+            "wait" if spec.get("on").and_then(Value::as_str) == Some("resource") => {
+                server.and_then(|s| self.server_taint(s))
+            }
             _ => None,
         };
         if let Some(s) = source {
@@ -446,6 +508,32 @@ impl Runtime {
             c.taint([s]);
             self.hand_run(run_id, &c);
         }
+    }
+
+    /// What the run a `subscribe` start fires carries of the resource it
+    /// fires with: that read is `server`'s answer, so an `untrusted_input`
+    /// or untagged server's taints the run from its start
+    /// ([`Self::server_taint`]).
+    pub(crate) fn subscribe_carries(&self, server: &str) -> Carries {
+        let mut c = Carries::default();
+        if let Some(s) = self.server_taint(server) {
+            c.taint([s]);
+        }
+        c
+    }
+
+    /// The skill `id`, read as `reference`, reached `reader`: one an MCP
+    /// server serves is that server's text whatever the server is tagged
+    /// (RFC 0051 D4) — recorded before its body is handed over. A skill of
+    /// the operator's own, from a folder or the instruction, is
+    /// configuration.
+    pub(crate) fn taint_skill(&mut self, reader: &Reader, id: &SkillId, reference: &str) {
+        let SkillId::Server { server, .. } = id else {
+            return;
+        };
+        let mut c = Carries::default();
+        c.taint([format!("the skill {reference} of the MCP server {server}")]);
+        self.hand_reader(reader, &c);
     }
 
     /// Knowledge context from `server` reached conversation `ctx`'s turn.

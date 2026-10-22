@@ -247,10 +247,11 @@ The approver is asked, over A2A, about a payment:
 - of a step that says `approve: true`;
 - of work that has read outside text — an `http` response, a webhook's
   payload, an A2A peer's answer, the result of an MCP server tagged
-  `untrusted_input` — or that a model asked for, with `ask_when_tainted:
-  true` (the default). Such work may have been steered to the request. An
-  MCP server's results count only when its `tags` say `untrusted_input`, so
-  tag every server whose results someone else writes.
+  `untrusted_input` or not tagged at all — or that a model asked for, with
+  `ask_when_tainted: true` (the default). Such work may have been steered to
+  the request. An MCP server's results count unless its `tags` leave
+  `untrusted_input` out, so tag a server whose results nobody outside
+  writes with the legs it carries, or `trusted` when it carries none.
 
 The question is a task of its own, owned by the approver, in
 `input-required`, marked as agentd's own security gate. Its text is

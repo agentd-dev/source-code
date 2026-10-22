@@ -133,7 +133,7 @@ fn compile_one(
     // `:::unless{host="agentd"}` is decided as the same block in the agent's
     // own instruction — the operator's answers, which no document chooses.
     let facts = template_facts(s, t);
-    let (ex, gate_channels) = match idoc::parse(&t.instruction).and_then(|doc| {
+    let (mut ex, gate_channels) = match idoc::parse(&t.instruction).and_then(|doc| {
         let mut ex = idoc::fold_full(
             &doc,
             &idoc::all_families(),
@@ -147,6 +147,10 @@ fn compile_one(
         Ok(folded) => folded,
         Err(es) => return Err(es.iter().map(|e| at(e.to_string())).collect()),
     };
+    // The servers the machinery declares are untrusted unless the catalog
+    // the child inherits vouches for them, as the agent's own document's
+    // are: judged so here, and by the child.
+    settings::untrust_document_servers(&mut ex.config, &s.services);
     let has_config = !ex.config.is_empty();
     let tier = if has_config || !ex.workflows.is_empty() {
         Tier::Instance
@@ -444,6 +448,13 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
         errs.push(at(format!(
             "machinery declares {} — MCP Events bindings and grants are the operator's to declare (RFC 0045 §5.11.6)",
             events.join(", ")
+        )));
+    }
+    let vouched = crate::config::settings::document_vouched(&ex.config);
+    if !vouched.is_empty() {
+        errs.push(at(format!(
+            "machinery declares {} — vouching for a server is the operator's: what a server a document declares answers is outside text unless the operator's service catalog vouches for it",
+            vouched.join(", ")
         )));
     }
     let acting = crate::config::settings::delegation::document_act_for(
@@ -844,6 +855,51 @@ mod tests {
         );
         let c = compile_templates(&s).expect("a template may configure what describes the child");
         assert_eq!(c["room"].fragment["limits"]["max_runs"], json!(4));
+    }
+
+    /// A template's machinery vouches for none of its servers either:
+    /// `trusted` on one is refused, and the child gets each it declares
+    /// counted `untrusted_input` beside its legs — so one the machinery tags
+    /// `sensitive` and `egress` composes the trifecta — unless the catalog
+    /// the child inherits vouches for it.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a_templates_servers_are_untrusted_unless_the_catalog_vouches() {
+        let room = |server: &str| {
+            let doc: Value = crate::config::yaml::parse(&format!(
+                "services:\n  crm: {{kind: mcp, endpoint: \"https://crm.example/mcp\", tags: {{\"*\": [sensitive, egress]}}}}\n\
+                 subagents:\n  templates:\n    room:\n      instruction: |\n        Be the room.\n        :::!mcp{{name=crm}}\n        {server}\n        :::\n"
+            ))
+            .unwrap();
+            compile_templates(&serde_json::from_value(doc).unwrap())
+        };
+        let e = room("endpoint: https://other.example/mcp\n        tags: {\"*\": [trusted]}")
+            .unwrap_err();
+        assert!(
+            e.iter()
+                .any(|m| m.contains("mcp.servers[0].tags[\"*\"]: trusted")
+                    && m.contains("vouching for a server is the operator's")),
+            "{e:?}"
+        );
+        let c = room("endpoint: https://other.example/mcp\n        tags: {\"*\": [sensitive]}")
+            .unwrap();
+        assert_eq!(
+            c["room"].fragment["mcp"]["servers"][0]["tags"]["*"],
+            json!(["sensitive", "untrusted_input"])
+        );
+        let e =
+            room("endpoint: https://other.example/mcp\n        tags: {\"*\": [sensitive, egress]}")
+                .unwrap_err();
+        assert!(e.iter().any(|m| m.contains("lethal trifecta")), "{e:?}");
+        // The catalog's entry is the operator's word on the server.
+        let c = room("service: crm").unwrap();
+        assert!(
+            c["room"].fragment["mcp"]["servers"][0]
+                .get("tags")
+                .is_none(),
+            "{}",
+            c["room"].fragment
+        );
     }
 
     /// A child's workflows are one name, one definition too, and a collision

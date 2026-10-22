@@ -10,9 +10,9 @@ you choose.
 
 > **Preview.** agentd pays as a client of x402 v2, pinned at the
 > specification's commit `e7a3b4ff47`: over HTTP, with the `exact` scheme on
-> EVM chains and an EIP-3009 authorization. It is behind the `x402` build
-> feature, which no release binary or image carries. Paying over MCP and
-> A2A, and on Solana, is designed and not built.
+> EVM chains (an EIP-3009 authorization) and on Solana (an SPL transfer). It
+> is behind the `x402` build feature, which no release binary or image
+> carries. Paying over MCP and A2A is designed and not built.
 
 ## What it is
 
@@ -26,8 +26,8 @@ spend policy.
 
 | Term | Meaning |
 |---|---|
-| Wallet | An EVM account agentd pays from, by a name you give it. Its key is sealed in a file only the supervisor opens, or held by an [external signer](external-signer.md). |
-| Asset | A token agentd may pay in, named by its CAIP-19 id (`eip155:8453/erc20:0x8335…2913`), which also names its chain. Each has its own caps. |
+| Wallet | An account agentd pays from, on EVM chains or on Solana, by a name you give it. Its key is sealed in a file only the supervisor opens, or held by an [external signer](external-signer.md). |
+| Asset | A token agentd may pay in, named by its CAIP-19 id (`eip155:8453/erc20:0x8335…2913`, `solana:5eyk…KKdp/token:EPjF…Dt1v`), which also names its chain. Each has its own caps. |
 | Payee | An address agentd may pay, by a name you give it. |
 | Spend policy | `security.payments`: the wallets, assets and payees, the caps, and who approves. A payment outside it is refused before anything is signed. |
 | Approver | The one person asked about a payment above `approve_above`. Nobody else answers, and no model or judge does. |
@@ -36,8 +36,8 @@ spend policy.
 ## When to use it
 
 Use it when a resource answers `402` with an x402 v2 `PAYMENT-REQUIRED`
-offering `exact` on an EVM chain — USDC on Base, say — and you want a
-workflow you wrote to pay for it.
+offering `exact` on an EVM chain or on Solana — USDC on Base or on Solana,
+say — and you want a workflow you wrote to pay for it.
 
 Use something else when:
 
@@ -46,9 +46,9 @@ Use something else when:
   tool](author-workflows.md#expose-a-workflow-as-a-tool): you choose the
   request, the bounds and the wallet, and the model only starts it — and the
   approver is asked about every payment of such a run.
-- **The server takes Permit2, `upto`, a facilitator's API or Solana.**
-  agentd pays only `exact` with EIP-3009 on EVM chains, and passes every
-  other entry over.
+- **The server takes Permit2, `upto` or a facilitator's API.** agentd pays
+  only `exact` — with EIP-3009 on EVM chains, with an SPL transfer on
+  Solana — and passes every other entry over.
 - **Nobody can approve.** A payment above `approve_above`, or one of work
   that read outside text, waits for the approver over A2A. Without an A2A
   listener it is refused.
@@ -63,8 +63,8 @@ cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,h
 ```
 
 `x402` brings `oauth` with it, and two crates no other feature uses: `k256`
-for secp256k1 signatures and `sha3` for Keccak-256. Keep `a2a`: the approver
-answers over it. [Build features and crates](features.md) lists every
+for secp256k1 signatures and `sha3` for Keccak-256. Solana adds none: its
+Ed25519 signatures are `ring`'s. Keep `a2a`: the approver answers over it. [Build features and crates](features.md) lists every
 feature.
 
 A binary without the feature refuses the configuration at load, with exit
@@ -285,14 +285,111 @@ payments:
 agentd checks that every signature recovers to the wallet's address before
 it sends it.
 
+## Pay on Solana
+
+On Solana, x402's `exact` scheme moves an SPL token — USDC, say — from your
+wallet's token account to the server's, in a transaction your wallet signs
+and the server's sponsor completes. The sponsor is the fee payer the
+server's entry names: it pays the network fee and signs last, so your
+wallet holds the token and needs no SOL. agentd signs only the transfer the
+entry asks for, and only when the spend policy allows it.
+
+```yaml
+# fragment: under security:
+payments:
+  approver: operator
+  seal_key: "{{secret-file:/run/secrets/agentd-payments-seal}}"
+  wallets:
+    sol: {chain: solana, key_file: /var/lib/agentd/wallets/sol.key}
+  assets:
+    usdc-solana:
+      asset: "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      decimals: 6
+      token_program: spl-token
+      limits: {per_payment: "0.10", per_run: "1.00", per_day: "20.00", per_payee: "5.00"}
+      approve_above: "0.25"
+  payees:
+    weather: {address: "2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4"}
+  rpc:
+    "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp": "https://api.mainnet-beta.solana.com"
+```
+
+```yaml
+# fragment: a step of a workflow in your own configuration
+fetch:
+  kind: http
+  url: https://api.example.com/weather
+  payment: {wallet: sol, max: "0.05 usdc-solana"}
+```
+
+- **`chain: solana`** makes the wallet an Ed25519 key. A step pays from it
+  only in assets on Solana; a step that names an EVM asset with it is
+  refused at load.
+- **`asset`** is the token's CAIP-19 id: the network (`solana:` and the
+  first 32 characters of the genesis hash; the line above is mainnet) and
+  the mint. **`decimals`** must be the mint's: the transfer states them, and
+  the token program refuses a transfer whose decimals are wrong.
+- **`token_program`** is the program the mint belongs to: `spl-token` (the
+  default; USDC and USDT) or `token-2022`. It decides both token accounts'
+  addresses and the program that moves the token.
+- **`payees`** take a Solana address in base58. A payee is paid at its
+  associated token account for the mint, the account the server checks.
+- **`rpc`** names, by network, the endpoint agentd asks for a recent
+  blockhash (`getLatestBlockhash`, at `finalized`) when the server's entry
+  gives none. It may hold a `{{secret:NAME}}` reference, resolved when it is
+  dialled, and is logged without its query. Without an endpoint for the
+  network, an entry with no blockhash is passed over.
+
+`agentd -c agentd.yaml --print-wallet-address sol` makes the key file and
+prints the base58 address. Send the token to it from any wallet: that
+creates the wallet's associated token account, the transfer's source.
+
+The transaction is a version-0 message with the server's `extra.feePayer`
+as fee payer and your wallet as the second signer, and exactly these
+instructions, in this order:
+
+| Instruction | What it does |
+|---|---|
+| SetComputeUnitLimit 20 000 | the compute budget the sponsor pays for |
+| SetComputeUnitPrice 1 microlamport | the priority fee the sponsor pays |
+| `TransferChecked` | `amount` of the mint at `decimals`, from your wallet's associated token account to `payTo`'s, your wallet the authority |
+| Memo | the server's `extra.memo`, or 16 random bytes in hex |
+
+The fee payer appears in no instruction, so its signature can move nothing
+of its own, and agentd never pays a fee. agentd reads the message it built
+back before it signs — anything but this shape is refused, unsigned — signs
+it, leaves the fee payer's signature empty, and sends the transaction in
+base64 as the payment's `transaction`. Besides the reasons any entry is
+passed over, a Solana entry is passed over when `extra.feePayer` is missing
+or not an address, `extra.memo` is not a string of at most 256 bytes, it
+has no blockhash and no `rpc` endpoint is named for its network, or the
+amount is past 64 bits; and refused unsigned when `extra.feePayer` is your
+wallet itself.
+
+A Solana transfer has no expiry time of its own — its blockhash expires
+about 60 to 90 seconds after it — so a payment the server says it did not
+settle counts against your caps for five minutes, the time agentd allows
+for that blockhash to expire. The record's nonce is the transfer's memo.
+
+Under `key_custody: external` the signer holds the wallet's Ed25519 key
+(`sol: {chain: solana, key: agentd-sol-2026}`): agentd asks it for the
+key's public JWK (`EdDSA`) to learn the address, sends it the transaction's
+message to sign (`sign_solana_transaction`), and verifies the signature
+under the wallet's address before it sends anything.
+
 ## What it does not do
 
-- **It pays no one else's way.** Only `exact` with EIP-3009 on EVM chains:
-  Permit2, ERC-7710, `upto`, `batch-settlement`, `auth-capture`, Solana and
-  the facilitator and discovery APIs are not built. Entries of another
-  scheme, method or flow are passed over.
-- **It does not settle.** agentd talks to no chain and no facilitator: the
-  server settles. A server that takes the payment and serves nothing is
+- **It pays no one else's way.** Only `exact`, with EIP-3009 on EVM chains
+  and an SPL transfer on Solana: Permit2, ERC-7710, `upto`,
+  `batch-settlement`, `auth-capture` and the facilitator and discovery APIs
+  are not built. Entries of another scheme, method or flow are passed over.
+- **On Solana, a plain wallet only.** agentd builds and reads no address
+  lookup table, pays from no smart wallet (Squads, Swig) and creates no
+  token account: a `payTo` whose token account does not exist makes a
+  transfer the sponsor refuses, and nothing is paid.
+- **It does not settle.** agentd talks to no facilitator, and to a chain
+  only through a Solana `rpc` endpoint, for a blockhash: the server
+  settles. A server that takes the payment and serves nothing is
   beyond reach — the `authorization` flow settles after the resource is
   served, and the audit chain keeps what a dispute needs.
 - **It follows no redirect,** and pays only for the URL the step asked.

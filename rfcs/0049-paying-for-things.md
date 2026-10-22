@@ -1,10 +1,10 @@
 # RFC 0049: Paying for things — x402 as a paying client, only within a spend policy
 
-**Status:** Accepted 2026-10-22, as track P of RFC 0048 (§5.6); unit 1 (HTTP, EVM) implemented, unit 2 (MCP, A2A, Solana) to come
+**Status:** Accepted 2026-10-22, as track P of RFC 0048 (§5.6); unit 1 (HTTP, EVM) and Solana for it (§10) implemented, unit 2 (MCP, A2A) to come
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-22
 **Builds on:** ADR 0003 (no payment without a spend policy — binding here), RFC 0044 P2a (the external signer, the audit chain, Landlock over supervisor-only paths), RFC 0047 (gates addressed to one person that no judge or operator answers, sealed records), RFC 0042 (what a served document may set), RFC 0054 (capabilities reach workflows first)
-**Standards:** x402 v2 (x402 Foundation), pinned at [`e7a3b4ff47`](https://github.com/x402-foundation/x402/tree/e7a3b4ff47dd67c3a3a7521307ed071d34ce9527/specs) (2026-10-22, the latest commit to touch `specs/`): the core specification `x402-specification-v2.md` [X], the HTTP transport `transports-v2/http.md` [X-HTTP], the MCP transport `transports-v2/mcp.md` [X-MCP], the A2A transport `transports-v2/a2a.md` [X-A2A], the `exact` scheme `schemes/exact/scheme_exact.md` [EXACT] and its EVM and SVM bindings `scheme_exact_evm.md` [EXACT-EVM] and `scheme_exact_svm.md` [EXACT-SVM]. RFC 0048 surveyed `1566e13f3d` (2026-10-06); the two commits since change the core specification's wording only (a §9 link, an Express API name) and the SVM `batch-settlement` scheme, which agentd does not use. [EIP-712](https://eips.ethereum.org/EIPS/eip-712) (typed structured data hashing and signing), [EIP-3009](https://eips.ethereum.org/EIPS/eip-3009) (`transferWithAuthorization`), [EIP-55](https://eips.ethereum.org/EIPS/eip-55) (checksummed addresses), [CAIP-2](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-2.md) (chain ids) and [CAIP-19](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-19.md) (asset ids), RFC 6979 (deterministic ECDSA), SEC 1 (secp256k1).
+**Standards:** x402 v2 (x402 Foundation), pinned at [`e7a3b4ff47`](https://github.com/x402-foundation/x402/tree/e7a3b4ff47dd67c3a3a7521307ed071d34ce9527/specs) (2026-10-22, the latest commit to touch `specs/`): the core specification `x402-specification-v2.md` [X], the HTTP transport `transports-v2/http.md` [X-HTTP], the MCP transport `transports-v2/mcp.md` [X-MCP], the A2A transport `transports-v2/a2a.md` [X-A2A], the `exact` scheme `schemes/exact/scheme_exact.md` [EXACT] and its EVM and SVM bindings `scheme_exact_evm.md` [EXACT-EVM] and `scheme_exact_svm.md` [EXACT-SVM]. RFC 0048 surveyed `1566e13f3d` (2026-10-06); the two commits since change the core specification's wording only (a §9 link, an Express API name) and the SVM `batch-settlement` scheme, which agentd does not use. [EIP-712](https://eips.ethereum.org/EIPS/eip-712) (typed structured data hashing and signing), [EIP-3009](https://eips.ethereum.org/EIPS/eip-3009) (`transferWithAuthorization`), [EIP-55](https://eips.ethereum.org/EIPS/eip-55) (checksummed addresses), [CAIP-2](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-2.md) (chain ids) and [CAIP-19](https://github.com/ChainAgnostic/CAIPs/blob/main/CAIPs/caip-19.md) (asset ids), RFC 6979 (deterministic ECDSA), SEC 1 (secp256k1); for Solana (§10), RFC 8032 (Ed25519), RFC 8037 (the `OKP` JWK), Solana's transaction format (version-0 messages, compact-u16 lengths), the SPL Token, Token-2022, associated token account, compute-budget and Memo programs, and Bitcoin's base58 alphabet.
 
 agentd paths are relative to `crates/agentd/src` unless they start with
 `crates/`, `docs/` or `rfcs/`.
@@ -38,7 +38,8 @@ three transports and both chain families, and splits the build in two:
 | Unit | Transport | Chain family | Status |
 |---|---|---|---|
 | 1 | HTTP — the `http` workflow step | EVM: `exact` with EIP-3009 | implemented |
-| 2 | MCP — the `mcp.tool` step; A2A — `a2a.send` and `a2a.delegate` | Solana: `exact` on SVM | designed here (§7) |
+| 1 | HTTP — the `http` workflow step | Solana: `exact` on SVM | implemented (§10) |
+| 2 | MCP — the `mcp.tool` step; A2A — `a2a.send` and `a2a.delegate` | both | designed here (§7) |
 
 The spend policy, the ledger, custody, the approval gate and the audit
 records are built once, in unit 1, for both.
@@ -115,7 +116,8 @@ MCP and A2A calls are two more `PaidCall`s (§7). The chain family is the
 same kind of seam: `payments::scheme::Family`, read from the network's
 CAIP-2 namespace, alone reads an operator's asset and payee, an entry's
 token, `payTo` and `extra`, fixes a payment's nonce and window before its
-record is written, and signs it.
+record is written, and signs it: EVM's EIP-3009 authorization, and
+Solana's SPL transfer (§10).
 
 **D4. The paid request, and never twice.** A paid request is the run's step:
 its idempotency key (`engine::run::idempotency_key(run, step)`), stable
@@ -276,12 +278,14 @@ payments:
   An asset's caps are its own: amounts of two assets are never added.
 - **Assets** are allow-listed by CAIP-19 (`eip155:<chain>/erc20:<contract>`),
   which also names the network, by CAIP-2: an entry on a network or for an
-  asset no asset names is passed over (`network`, `asset`). Unit 1 takes
-  `eip155` chains and `erc20` assets; `solana` and `token` (SPL) come with
-  unit 2.
+  asset no asset names is passed over (`network`, `asset`). agentd takes
+  `eip155` chains with `erc20` assets, and `solana` with `token` (SPL)
+  assets (§10).
 - **Payees** are allow-listed by address, each optionally to some assets
-  (`assets: [usdc-base]`); `payTo` is compared as 20 bytes, whatever its
-  case. An entry for another payee is passed over (`payee`).
+  (`assets: [usdc-base]`, each on the address's chain family); `payTo` is
+  compared as 20 bytes on an EVM chain, whatever its case, and as the 32
+  bytes its base58 is on Solana. An entry for another payee is passed over
+  (`payee`).
 - **Caps.** `per_payment` bounds one payment; `per_run` the payments of one
   run; `per_day` all payments in any 24 hours; `per_payee` all payments to
   one payee in any 24 hours — each counted from the ledger over every
@@ -303,9 +307,11 @@ approve something else than what they read.
 ## 5. What is sent, what is logged
 
 - **Sent:** to the resource server, the step's request, then the same with
-  `PAYMENT-SIGNATURE`. To the external signer, the typed data. Nothing else
-  leaves for a payment — agentd talks to no facilitator and no chain: the
-  server settles [X §7].
+  `PAYMENT-SIGNATURE`. To the external signer, the typed data, or a Solana
+  transaction's message. On Solana, when the server's entry gives no
+  blockhash, `getLatestBlockhash` to the network's `rpc` endpoint, which
+  carries nothing of the payment (§10). Nothing else leaves for a payment —
+  agentd talks to no facilitator: the server settles [X §7].
 - **Logged:** `payment.required` (the 402 read: the entries, never a
   signature), `payment.refused`, `payment.asked`, `payment.approved`,
   `payment.declined`, `payment.interrupted`, `payment.sent`,
@@ -333,7 +339,7 @@ Out of reach: a server that takes the payment and serves nothing (x402's
 `authorization` flow settles after the handler; agentd keeps the record a
 dispute needs), and a chain or token contract that misbehaves.
 
-## 7. Unit 2: MCP, A2A and Solana
+## 7. Unit 2: MCP and A2A
 
 Designed here; built next, on unit 1's policy, ledger, custody, gate and
 audit, unchanged. Where unit 2 plugs in:
@@ -368,22 +374,9 @@ audit, unchanged. Where unit 2 plugs in:
   `A2A-Extensions`; agentd sends what A2A 1.0.1 defines, and the mismatch is
   drafted as a note for upstream, locally, for the user to file (RFC 0048
   §5.6).
-- **Solana** [EXACT-SVM]: assets `solana:<genesis>/token:<mint>`, payees by
-  base58 address. The client builds the versioned transaction the binding
-  describes — compute-budget instructions, an SPL `TransferChecked` of
-  `amount` from the wallet's associated token account to `payTo`'s, a Memo
-  (`extra.memo`, else a random nonce) — with `extra.feePayer` as fee payer,
-  signs it with Ed25519 (`ring`, no new crate) and sends it partially
-  signed. A recent blockhash comes from `extra.recentBlockhash`, else from
-  `getLatestBlockhash` at an RPC endpoint the operator names for the
-  network. The external signer gains `sign_solana_transaction`, holding the
-  message to that shape. Two things unit 2 settles: deriving an associated
-  token account needs an off-curve check of an Ed25519 point, which `ring`
-  does not expose (hand-rolled field arithmetic, as `config::decrypt` does
-  for X25519, or a decision for the user); and a Solana authorization has no
-  `validBefore` — its blockhash expires in about 60 to 90 seconds — so the
-  ledger's "until it can no longer land" is the blockhash's last valid block
-  height, read from the RPC.
+- **Solana** [EXACT-SVM]: built for the `http` step, on unit 1's policy,
+  ledger, custody, gate and audit — §10. The MCP and A2A steps take it as
+  they take EVM.
 - **Not in either unit:** the `upto`, `batch-settlement` and
   `auth-capture` schemes, Permit2 and ERC-7710, the other networks, the
   facilitator and discovery APIs, and the extensions x402 lists (each echoed
@@ -433,3 +426,120 @@ audit, unchanged. Where unit 2 plugs in:
 - Docs: `docs/pay-with-x402.md` (the guide), configuration, security, the
   node registry, telemetry, the external signer, features,
   interoperability; the strip lists x402 v2 as a preview.
+
+## 10. Solana: the `exact` scheme on SVM
+
+The user's decision (RFC 0048 §6 Q3) was x402 on EVM *and* Solana. This
+section is what agentd builds for Solana, in the `http` step, behind the
+same feature and under the same spend policy, ledger, custody, approval gate
+and audit records as EVM. No crate is added: Ed25519 is `ring`'s, base58 and
+the curve check are by hand.
+
+| [EXACT-SVM] asks | agentd |
+|---|---|
+| `asset` the mint, `payTo` the merchant's key, `amount` atomic units; `extra.feePayer` the sponsor that pays the fee and signs last (MAY be `payTo`) | Read as base58 keys. An entry with no `feePayer`, or one that is not a key, is passed over; a `feePayer` that is the wallet itself is refused unsigned — agentd pays no network fee. |
+| `extra.memo`: when present the client MUST use it as the Memo's data, at most 256 bytes; else a random nonce of at least 16 bytes, hex-encoded | `extra.memo` when it is a string of at most 256 bytes (anything else is a reason); else 16 bytes of the record's nonce, from the kernel's CSPRNG, in hex. |
+| `extra.recentBlockhash`: SHOULD be used when present and valid; when absent or malformed the client MUST fetch its own; `lastValidBlockHeight` is a hint MAY be ignored | Used when it reads as 32 bytes of base58; else `getLatestBlockhash` (`finalized`) at the network's `security.payments.rpc` endpoint; with no endpoint the entry is passed over. `lastValidBlockHeight` is ignored. |
+| A transfer of the asset to `payTo`'s associated token account by SPL Token or Token-2022 `TransferChecked`; the fee payer in no instruction and no authority [EXACT-SVM §1, §2.1] | Exactly four instructions, in order: `SetComputeUnitLimit` 20 000, `SetComputeUnitPrice` 1 microlamport (the reference client's; the sponsor pays them, and §2.2.1's fast path caps the price at 5 lamports a unit), `TransferChecked` of `amount` at the asset's `decimals` from the wallet's associated token account to `payTo`'s, the wallet the authority, and the Memo. Two signers: the fee payer, then the wallet. The fee payer is in no instruction's accounts. |
+| A versioned transaction, partially signed, base64 in `payload.transaction` | A version-0 message, no address lookup table; accounts ordered as `@solana/web3.js` compiles them (writable signers with the fee payer first, read-only signers, writable, read-only, each in first-seen order). The wallet's signature in the second slot, the first left zero for the sponsor; standard base64. |
+| `SettlementResponse`: `transaction` the base58 signature, `network`, `payer` | Read as for EVM (§2); the transaction id is the fee payer's signature. |
+
+**S1. Associated token accounts and the curve check.** An associated token
+account is a program-derived address: SHA-256 of the owner, the token
+program, the mint, a bump seed, the associated token account program's id
+and `"ProgramDerivedAddress"`, for the first bump from 255 down whose hash is
+*not* a point of Ed25519 — so no key can sign for it. `ring` signs and
+verifies Ed25519 but decodes no point, so the check is hand-rolled
+(`payments::ed25519`): field arithmetic modulo 2^255 − 19 in five 51-bit
+limbs, as `config::decrypt`'s X25519 has, and Euler's criterion — the bytes
+are a point when `(y² − 1)·(d·y² + 1)` is zero or a square. It is the Solana
+runtime's rule (curve25519-dalek's `decompress`): the sign bit is not read,
+and a `y` written past `p` is read modulo `p`. That is the one piece of
+curve code agentd owns for Solana, under 200 lines, held to `@solana/web3.js`
+on two dozen values and to `@solana/spl-token`'s derivations, including owners
+whose first bumps, from 255 down to 249, all land on the curve.
+
+**S2. What agentd signs is what it reads back.** The message is built,
+serialised, and read back with `Transfer::read` before it is signed:
+exactly the shape above — two signers, eight keys each in one role, the
+four instructions, the fee payer in none, the source the wallet's own
+associated token account — or nothing. The external signer's policy and the
+mock sponsor hold a message to the same reader.
+
+**S3. Custody.** A wallet says `chain: solana` (the default is `eip155`). Under
+local custody its key file seals the 32-byte Ed25519 seed exactly as an EVM
+key file seals its key (D5), bound to the wallet and its base58 address; it
+is opened for one signature, and `ring`'s key pair, made from it, is dropped
+after — `ring` does not promise to wipe it, which is said plainly in
+`payments::wallet`. Under external custody the signer answers `public_key`
+with `alg: "EdDSA"` and an `OKP` `Ed25519` JWK (RFC 8037), whose `x` is the
+address, and a new op, `sign_solana_transaction {key, message}` → `{sig}`,
+the 64-byte signature of the message bytes, sent whole so the signer reads
+the transfer before it signs. No version field: the protocol is agentd's. A
+signer MUST sign only the transfer of S2 with the key as its authority, for a
+mint configured for that key; SHOULD hold the destination to its payees'
+token accounts and the amount to a maximum; and answers anything else
+`denied`. agentd verifies every Ed25519 signature under the wallet's address
+before it is sent.
+
+**S4. The policy.** As §4, with: the asset by its CAIP-19
+`solana:<genesis hash prefix>/token:<mint>` and its `token_program`
+(`spl-token`, the default, or `token-2022`: it decides the token accounts'
+addresses and the program that moves the token); the payee by base58; an
+amount past 64 bits passed over; and the Solana reasons of the first table.
+A step's `max` may name only assets on its wallet's chain family, checked at
+load. `transfer_method` and the EIP-712 `extra.name`/`extra.version` are
+EVM's and not asked of a Solana entry.
+
+**S5. The blockhash and the RPC endpoint.** `security.payments.rpc` maps a
+Solana network (CAIP-2) to an endpoint — `https://`, or `http://` to this
+host, refused at load otherwise or when no asset is on that network — that
+may hold `{{secret:NAME}}` references, resolved when it is dialled, by name
+as an operator-configured endpoint, within 10 s. It is asked only for
+`getLatestBlockhash`; what it is sent carries nothing of the payment, and an
+error names it without its query.
+
+**S6. The ledger.** A Solana transfer has no `validBefore`: its blockhash
+expires 150 blocks after it, about 60 to 90 seconds at the 400 ms slot.
+agentd reads no block height, so a record's `valid_before` is 300 seconds
+after the signature — five times the 60 seconds — and a `refused` transfer
+counts against the caps until then. The record's `nonce` is the memo the
+transaction carries. "Never twice" (D4) holds as for EVM: the same record,
+the same states.
+
+**S7. Not built.** Address lookup tables (agentd builds and reads none, so
+§2.1.2's resolution never arises); smart wallets (Squads, Swig: the
+reference sponsor's Path 2); creating a token account; Lighthouse
+instructions; the `upfront` flow; a block-height bound on the ledger window.
+
+**S8. Exit criteria (Solana).** Unit tests: base58 against Bitcoin Core's
+vectors and Solana's program ids; compact-u16; the curve check against
+`@solana/web3.js` and RFC 8032's `d`; associated token accounts against
+`@solana/spl-token` under both programs; the transaction byte for byte as
+`@solana/web3.js` compiles, serialises and signs it (the specification's
+example entry, a fixed seed — Ed25519 is deterministic), and verifying; the
+reader refusing every other shape; an entry's terms; the RPC call against a
+local endpoint; the sealed Solana key file; the policy refusing an unlisted
+mint, payee or network, an entry with no blockhash and no endpoint, and an
+EVM wallet paying a Solana asset; configuration refusals by name. The mock
+sponsor (`payments::svm_mock`, which the mock x402 server calls) verifies a
+payload as [EXACT-SVM §2.1, §3.1] asks — the entry echoed, the fee payer's
+slot empty, the wallet's signature, the transfer's mint, destination,
+amount, decimals and memo, the compute price — refuses each that is not
+the one it offered, settles by signing as the fee payer, and refuses a
+duplicate settlement; the mock x402 server offers a Solana entry with the
+sponsor as fee payer and answers `getLatestBlockhash` at `/_mock/rpc`; an
+end-to-end run (`x402_e2e`) pays an `http` step on Solana from a sealed
+key file, the blockhash asked of that endpoint, the transfer verified and
+settled once; and the reference signer, end to end over its socket,
+signs only the transfer its policy allows.
+
+**A note for upstream, drafted here for the user to file** (RFC 0048 §5.6:
+agentd files nothing itself). `specs/schemes/exact/scheme_exact_svm.md`,
+"`SettlementResponse`", describes `payer` as "base58 encoded public address
+of the transaction fee payer". The core specification (§5.3) has `payer` as
+the paying client's address, and the reference facilitator
+(`GetTokenPayerFromTransaction` in `go/mechanisms/svm/utils.go`) sets it to
+the transfer's authority — the client — not the fee payer. Suggested
+wording: "base58 encoded public address of the client that paid (the
+transfer's authority)".

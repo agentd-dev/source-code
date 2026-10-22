@@ -14,7 +14,9 @@
 //! The caps count every payment that left agentd or may have (`sending`,
 //! `unknown`, `settled`), and a `refused` one until its `validBefore`: its
 //! authorization is still signed and valid, held by a server that said it
-//! did not settle.
+//! did not settle. A Solana transfer has none — its blockhash expires — so
+//! its record's is [`super::svm::LANDS_WITHIN_S`] after it was signed, and
+//! its nonce is the memo it carries.
 //!
 //! Records are `cred` entries under `payment/ledger/<request>.<attempt>`,
 //! plain — the nonce, the amount and the payee are no secret — and kept

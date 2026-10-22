@@ -1218,7 +1218,7 @@ fn record_target(r: &Record) -> Value {
 fn gate_text(
     policy: &crate::payments::policy::Policy,
     pending: &Pending,
-    from: Option<crate::payments::evm::Address>,
+    from: Option<crate::payments::scheme::Account>,
     workflow: &str,
     why: &[String],
 ) -> String {
@@ -1234,7 +1234,7 @@ fn gate_text(
         c.pay_to,
         pending.call.describe(),
         pending.step_payment.wallet,
-        from.map_or_else(String::new, |a| format!(" ({})", a.checksummed())),
+        from.map_or_else(String::new, |a| format!(" ({a})")),
         pending.run,
         pending.step,
         why.join("; and "),

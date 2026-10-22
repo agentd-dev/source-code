@@ -9,24 +9,33 @@
 //!
 //! - A request with no `PAYMENT-SIGNATURE` is answered 402 with a
 //!   `PAYMENT-REQUIRED`: one `exact` entry of `price` atomic units of
-//!   `asset` on `network` to `pay_to`, the token's EIP-712 domain in
-//!   `extra` — or the `accepts` a test gives — for `resource.url` the URL
-//!   asked, or `resource_url` when a test names another.
+//!   `asset` on `network` to `pay_to` — on an EVM chain the token's EIP-712
+//!   domain in `extra`, on Solana the sponsor's key as `extra.feePayer`
+//!   with `memo` and `blockhash` — or the `accepts` a test gives, for
+//!   `resource.url` the URL asked, or `resource_url` when a test names
+//!   another.
 //! - A request with one is held to what it was offered: `x402Version` 2,
 //!   `accepted` one of the entries offered, exactly; `resource` the one
-//!   offered; the authorization's `to` the entry's `payTo` and `value` its
-//!   `amount`, `validAfter` past and `validBefore` to come, a 32-byte nonce
-//!   it has not seen; and a signature that recovers to `from` over the
-//!   EIP-3009 typed data under the entry's token domain — the check an
-//!   EIP-3009 token makes on chain. A payment that fails one is answered 402
-//!   with a `PAYMENT-RESPONSE` naming x402's error code for it.
+//!   offered. On an EVM chain ([`verify`]): the authorization's `to` the
+//!   entry's `payTo` and `value` its `amount`, `validAfter` past and
+//!   `validBefore` to come, a 32-byte nonce it has not seen; and a
+//!   signature that recovers to `from` over the EIP-3009 typed data under
+//!   the entry's token domain — the check an EIP-3009 token makes on chain.
+//!   On Solana, as the sponsor verifies a transfer
+//!   ([`super::svm_mock::Sponsor::verify`]), a transaction it has not seen.
+//!   A payment that fails one is answered 402 with a `PAYMENT-RESPONSE`
+//!   naming x402's error code for it.
 //! - A payment that holds is answered as `settle` says: `ok` (200, the
-//!   resource, `success: true` with a transaction and the payer), `fail`
+//!   resource, `success: true` with a transaction and the payer — on
+//!   Solana the sponsor's signature, having signed as the fee payer), `fail`
 //!   (402, `insufficient_funds`, no transaction), `pending` (200,
 //!   `settlement_pending` with a transaction), `none` (200, no
 //!   `PAYMENT-RESPONSE`), `error` (500, none), `garbled` (200, a
 //!   `PAYMENT-RESPONSE` that is not base64 JSON) or `stall` (no answer for
 //!   `stall_ms`, then the connection closed).
+//!
+//! `POST /_mock/rpc` answers a Solana RPC's `getLatestBlockhash` with the
+//! `rpc_blockhash` knob, for a client whose entry carried none.
 //!
 //! Every request is recorded (`GET /_mock/record`) — its method, path,
 //! whether it carried a payment, the header and the payment as sent, what
@@ -41,6 +50,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{Value, json};
 
 use super::evm::{self, Address};
+use super::svm_mock::Sponsor;
 use super::x402::{self, Authorization};
 
 /// The headers of [X-HTTP], written here as the transport names them
@@ -50,8 +60,12 @@ const REQUIRED: &str = "PAYMENT-REQUIRED";
 const SIGNATURE: &str = "PAYMENT-SIGNATURE";
 const RESPONSE: &str = "PAYMENT-RESPONSE";
 
+/// The seed of the sponsor that pays the fee of a Solana payment.
+const SPONSOR_SEED: [u8; 32] = [5; 32];
+
 /// What a test can change, and the defaults: USDC on Base Sepolia, as
-/// x402's own examples have it.
+/// x402's own examples have it. On a `solana:` network `asset` is the mint
+/// and `pay_to` a base58 key.
 pub fn default_knobs() -> Value {
     json!({
         "price": "10000",
@@ -61,6 +75,14 @@ pub fn default_knobs() -> Value {
         "name": "USDC",
         "version": "2",
         "max_timeout": 60,
+        // Solana: the mint's decimals, the entry's memo, and its
+        // recentBlockhash in base58 (null: none, so the client asks its RPC
+        // endpoint).
+        "decimals": 6,
+        "memo": null,
+        "blockhash": "EZ3rST5dvHmbanh75jc4PuLfV96vp9fEYBVeNk4FfM1k",
+        // What `/_mock/rpc` answers `getLatestBlockhash` with.
+        "rpc_blockhash": "4uQeVj5tqViQh7yWWGStvkEG1Zmhx6uasJtWCJziofM",
         "description": "Access to premium market data",
         // The entries offered, when not the one above.
         "accepts": null,
@@ -79,6 +101,7 @@ struct State {
     origin: String,
     nonces: BTreeSet<String>,
     record: Vec<Value>,
+    sponsor: Arc<Sponsor>,
 }
 
 /// The running mock.
@@ -118,11 +141,13 @@ pub fn start(knobs: &Value) -> std::io::Result<Mock> {
     let url = format!("http://{}", listener.local_addr()?);
     let mut k = default_knobs();
     merge(&mut k, knobs);
+    let sponsor = Sponsor::new(&SPONSOR_SEED).map_err(std::io::Error::other)?;
     let state = Arc::new(Mutex::new(State {
         knobs: k,
         origin: url.clone(),
         nonces: BTreeSet::new(),
         record: Vec::new(),
+        sponsor: Arc::new(sponsor),
     }));
     let s = Arc::clone(&state);
     std::thread::Builder::new()
@@ -230,13 +255,27 @@ fn write(mut stream: &TcpStream, status: u16, headers: &[(&str, String)], body: 
 /// The `PaymentRequired` offered for `target`.
 fn required(s: &State, target: &str) -> Value {
     let k = &s.knobs;
+    let extra = if k["network"]
+        .as_str()
+        .is_some_and(|n| n.starts_with("solana:"))
+    {
+        let mut e = json!({"feePayer": s.sponsor.fee_payer().to_string()});
+        for (knob, member) in [("memo", "memo"), ("blockhash", "recentBlockhash")] {
+            if !k[knob].is_null() {
+                e[member] = k[knob].clone();
+            }
+        }
+        e
+    } else {
+        json!({"name": k["name"], "version": k["version"]})
+    };
     let accepts = if k["accepts"].is_array() {
         k["accepts"].clone()
     } else {
         json!([{
             "scheme": "exact", "network": k["network"], "amount": k["price"],
             "asset": k["asset"], "payTo": k["pay_to"], "maxTimeoutSeconds": k["max_timeout"],
-            "extra": {"name": k["name"], "version": k["version"]},
+            "extra": extra,
         }])
     };
     let url = k["resource_url"]
@@ -261,6 +300,18 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
         write(&stream, 200, &[], rec.to_string().as_bytes());
         return;
     }
+    if req.target == "/_mock/rpc" && req.method == "POST" {
+        let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
+        let answer = {
+            let mut s = lock(state);
+            s.record
+                .push(json!({"method": req.method, "path": req.target, "rpc": v["method"], "params": v["params"]}));
+            json!({"jsonrpc": "2.0", "id": v["id"], "result": {"context": {"slot": 1},
+                   "value": {"blockhash": s.knobs["rpc_blockhash"], "lastValidBlockHeight": 150}}})
+        };
+        write(&stream, 200, &[], answer.to_string().as_bytes());
+        return;
+    }
     if req.target == "/_mock/control" && req.method == "POST" {
         let v: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
         merge(&mut lock(state).knobs, &v);
@@ -283,23 +334,25 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
         return;
     };
     let payment = x402::decode_header(header);
-    let (offer, settle, stall_ms, network) = {
+    let (offer, settle, stall_ms, network, decimals, sponsor) = {
         let s = lock(state);
         (
             required(&s, &req.target),
             s.knobs["settle"].as_str().unwrap_or("ok").to_string(),
             s.knobs["stall_ms"].as_u64().unwrap_or(10_000),
             s.knobs["network"].clone(),
+            s.knobs["decimals"].as_u64().unwrap_or(6) as u8,
+            Arc::clone(&s.sponsor),
         )
     };
     let checked = payment
         .as_ref()
         .map_err(|_| "invalid_payload".to_string())
-        .and_then(|p| check(p, &offer));
+        .and_then(|p| check(p, &offer, &sponsor, decimals));
     // A nonce is taken once: a second payment with it is a replay.
-    let checked = checked.and_then(|(from, nonce)| {
-        if lock(state).nonces.insert(nonce.clone()) {
-            Ok((from, nonce))
+    let checked = checked.and_then(|c| {
+        if lock(state).nonces.insert(c.seen.clone()) {
+            Ok(c)
         } else {
             Err("invalid_payload".into())
         }
@@ -312,22 +365,31 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
             let r = json!({"success": false, "errorReason": code, "transaction": "", "network": network});
             (402, Some(x402::encode_header(&r)), b"{}".to_vec())
         }
-        Ok((from, nonce)) => {
+        Ok(c) => {
+            let (from, nonce) = (&c.paid.payer, &c.paid.nonce);
             entry["valid"] = json!(true);
-            entry["from"] = json!(from.checksummed());
+            entry["from"] = json!(from);
             entry["nonce"] = json!(nonce);
-            let tx = evm::hex0x(&evm::keccak256(nonce.as_bytes()));
-            let resource = json!({"data": "premium market data", "paid_by": from.checksummed()})
+            let tx = match &c.transfer {
+                // On Solana the transaction's id is the sponsor's
+                // signature, made as it settles.
+                Some(v) => sponsor.settle(v, network.as_str().unwrap_or_default())["transaction"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                None => evm::hex0x(&evm::keccak256(nonce.as_bytes())),
+            };
+            let resource = json!({"data": "premium market data", "paid_by": from})
                 .to_string()
                 .into_bytes();
             let ok = json!({"success": true, "transaction": tx, "network": network,
-                            "payer": from.checksummed()});
+                            "payer": from});
             match settle.as_str() {
                 "fail" => (
                     402,
                     Some(x402::encode_header(
                         &json!({"success": false, "errorReason": "insufficient_funds",
-                        "transaction": "", "network": network, "payer": from.checksummed()}),
+                        "transaction": "", "network": network, "payer": from}),
                     )),
                     b"{}".to_vec(),
                 ),
@@ -335,7 +397,7 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
                     200,
                     Some(x402::encode_header(
                         &json!({"success": false, "errorReason": "settlement_pending",
-                        "transaction": tx, "network": network, "payer": from.checksummed()}),
+                        "transaction": tx, "network": network, "payer": from}),
                     )),
                     resource,
                 ),
@@ -361,9 +423,19 @@ fn serve(stream: TcpStream, state: &Arc<Mutex<State>>) {
     write(&stream, status, &headers, &body);
 }
 
-/// Hold `p`, a `PaymentPayload`, to the `offer` it answers; the payer and
-/// the nonce, or x402's error code for what does not hold [X §9].
-fn check(p: &Value, offer: &Value) -> Result<(Address, String), String> {
+/// A payment the mock took: who paid and its nonce, what the replay check
+/// keeps, and on Solana the transfer the sponsor settles.
+#[derive(Debug)]
+struct Checked {
+    paid: Verified,
+    seen: String,
+    transfer: Option<super::svm_mock::Verified>,
+}
+
+/// Hold `p`, a `PaymentPayload`, to the `offer` it answers — on Solana as
+/// `sponsor` holds a transfer of a mint of `decimals` — or x402's error code
+/// for what does not hold [X §9].
+fn check(p: &Value, offer: &Value, sponsor: &Sponsor, decimals: u8) -> Result<Checked, String> {
     if p["x402Version"].as_u64() != Some(x402::VERSION) {
         return Err("invalid_x402_version".into());
     }
@@ -379,6 +451,56 @@ fn check(p: &Value, offer: &Value) -> Result<(Address, String), String> {
     }
     if accepted["scheme"] != "exact" {
         return Err("invalid_scheme".into());
+    }
+    if accepted["network"]
+        .as_str()
+        .is_some_and(|n| n.starts_with("solana:"))
+    {
+        let v = sponsor.verify(accepted, p, decimals)?;
+        let nonce = String::from_utf8_lossy(&v.transfer.memo).into_owned();
+        return Ok(Checked {
+            paid: Verified {
+                payer: v.payer.to_string(),
+                value: u128::from(v.transfer.amount),
+                nonce,
+            },
+            seen: format!("svm:{}", super::base58::encode(&v.signature)),
+            transfer: Some(v),
+        });
+    }
+    let paid = verify(accepted, p, crate::state::now_ms() / 1000)?;
+    Ok(Checked {
+        seen: paid.nonce.clone(),
+        paid,
+        transfer: None,
+    })
+}
+
+/// A payment that verifies: who paid, how much, and its nonce — on Solana,
+/// the memo its transfer carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    pub payer: String,
+    pub value: u128,
+    pub nonce: String,
+}
+
+/// What a server verifies of `p`, a `PaymentPayload` for `accepted`, the
+/// `accepts` entry on an EVM chain it answers, at `now_s` [X §5.2;
+/// EXACT-EVM]: `accepted` echoed exactly; an EIP-3009 authorization to the
+/// entry's `payTo` of exactly its `amount`, valid now, with a 32-byte
+/// nonce, whose signature under the token's EIP-712 domain (`extra.name`
+/// and `extra.version`, the network's chain id, `asset`) recovers to its
+/// `from`; else x402's error code for what does not hold. The mock's
+/// resource server holds a payment to it, as do the mock MCP server's tool
+/// that charges and the e2e suites' peers that do. Never agentd's own path:
+/// agentd pays, it does not take payments.
+pub fn verify(accepted: &Value, p: &Value, now_s: u64) -> Result<Verified, String> {
+    if p["x402Version"].as_u64() != Some(x402::VERSION) {
+        return Err("invalid_x402_version".into());
+    }
+    if p["accepted"] != *accepted {
+        return Err("invalid_payment_requirements".into());
     }
     let chain_id = super::caip::ChainId::parse(accepted["network"].as_str().unwrap_or_default())
         .ok()
@@ -407,7 +529,7 @@ fn check(p: &Value, offer: &Value) -> Result<(Address, String), String> {
     if Some(value) != num(&accepted["amount"]) {
         return Err("invalid_exact_evm_payload_authorization_value_mismatch".into());
     }
-    let now = u128::from(crate::state::now_ms() / 1000);
+    let now = u128::from(now_s);
     if after > now {
         return Err("invalid_exact_evm_payload_authorization_valid_after".into());
     }
@@ -438,7 +560,11 @@ fn check(p: &Value, offer: &Value) -> Result<(Address, String), String> {
         .and_then(|s| evm::unhex0x(s).ok())
         .ok_or("invalid_exact_evm_payload_signature")?;
     match evm::recover(&digest, &sig) {
-        Ok(signer) if signer == from => Ok((from, nonce_hex)),
+        Ok(signer) if signer == from => Ok(Verified {
+            payer: from.checksummed(),
+            value,
+            nonce: nonce_hex,
+        }),
         _ => Err("invalid_exact_evm_payload_signature".into()),
     }
 }
@@ -477,25 +603,32 @@ mod tests {
         )
     }
 
-    /// The mock takes a payment that holds, and answers each one that does
-    /// not with x402's code for it: another payee, another amount, a window
-    /// that is over, a signature by someone else, an entry it never offered,
-    /// a nonce taken twice.
-    #[test]
-    fn the_mock_holds_a_payment_to_what_it_offered() {
-        let st = State {
-            knobs: default_knobs(),
+    fn state(knobs: &Value) -> State {
+        let mut k = default_knobs();
+        merge(&mut k, knobs);
+        State {
+            knobs: k,
             origin: "http://127.0.0.1:1".into(),
             nonces: BTreeSet::new(),
             record: Vec::new(),
-        };
+            sponsor: Arc::new(Sponsor::new(&SPONSOR_SEED).unwrap()),
+        }
+    }
+
+    /// The mock takes a payment that holds, and answers each one that does
+    /// not with x402's code for it: another payee, another amount, a window
+    /// that is over, a signature by someone else, an entry it never offered,
+    /// another version.
+    #[test]
+    fn the_mock_holds_a_payment_to_what_it_offered() {
+        let st = state(&json!({}));
         let offer = required(&st, "/data");
         assert_eq!(offer["resource"]["url"], "http://127.0.0.1:1/data");
         let key = key_from_bytes(&[0x42; 32]).unwrap();
         let none = |_: &mut Authorization| {};
-        let (from, _) = check(&pay(&offer, &key, [1; 32], &none), &offer).unwrap();
-        assert_eq!(from, address_of_key(&key));
-        let code = |p: Value| check(&p, &offer).unwrap_err();
+        let c = check(&pay(&offer, &key, [1; 32], &none), &offer, &st.sponsor, 6).unwrap();
+        assert_eq!(c.paid.payer, address_of_key(&key).checksummed());
+        let code = |p: Value| check(&p, &offer, &st.sponsor, 6).unwrap_err();
         assert_eq!(
             code(pay(&offer, &key, [2; 32], &|a| a.to = Address([7; 20]))),
             "invalid_exact_evm_payload_recipient_mismatch"
@@ -518,5 +651,55 @@ mod tests {
         let mut v1 = pay(&offer, &key, [7; 32], &none);
         v1["x402Version"] = json!(1);
         assert_eq!(code(v1), "invalid_x402_version");
+    }
+
+    /// On Solana the mock offers the sponsor as fee payer, with the memo and
+    /// blockhash it is given, and takes the transfer the entry asks for —
+    /// its payer the wallet, its nonce the memo — and no other.
+    #[test]
+    fn on_solana_the_mock_takes_the_transfer_it_offered() {
+        use crate::payments::svm::{self, Pubkey, TokenProgram, tests as t};
+        let st = state(
+            &json!({"network": t::MAINNET, "asset": t::USDC, "pay_to": t::PAY_TO,
+                               "memo": "inv-1"}),
+        );
+        let offer = required(&st, "/data");
+        let e = &offer["accepts"][0];
+        assert_eq!(e["extra"]["feePayer"], st.sponsor.fee_payer().to_string());
+        assert_eq!(e["extra"]["recentBlockhash"], st.knobs["blockhash"]);
+        let kp = svm::key_pair(&[9; 32]).unwrap();
+        let owner = svm::pubkey_of(&kp);
+        let pay = |amount: u64, memo: &[u8]| {
+            let terms = svm::Terms {
+                mint: Pubkey::parse(t::USDC).unwrap(),
+                program: TokenProgram::Spl,
+                decimals: 6,
+                pay_to: Pubkey::parse(t::PAY_TO).unwrap(),
+                fee_payer: st.sponsor.fee_payer(),
+                memo: None,
+                blockhash: None,
+                rpc: None,
+            };
+            let m = terms
+                .message(&owner, amount, memo, [3; 32])
+                .unwrap()
+                .serialize();
+            let tx = svm::transaction(&[[0; 64], svm::sign(&kp, &m)], &m);
+            x402::payload(&offer, e, json!({"transaction": crate::b64::std_pad(&tx)}))
+        };
+        let c = check(&pay(10_000, b"inv-1"), &offer, &st.sponsor, 6).unwrap();
+        assert_eq!(
+            (c.paid.payer.as_str(), c.paid.nonce.as_str(), c.paid.value),
+            (owner.to_string().as_str(), "inv-1", 10_000)
+        );
+        assert!(c.transfer.is_some() && c.seen.starts_with("svm:"));
+        let code = |p: Value| check(&p, &offer, &st.sponsor, 6).unwrap_err();
+        assert_eq!(code(pay(9_999, b"inv-1")), "amount_mismatch");
+        assert_eq!(code(pay(10_000, b"inv-2")), "memo_mismatch");
+        assert_eq!(
+            check(&pay(10_000, b"inv-1"), &offer, &st.sponsor, 9).unwrap_err(),
+            "amount_mismatch",
+            "a transfer at other decimals"
+        );
     }
 }

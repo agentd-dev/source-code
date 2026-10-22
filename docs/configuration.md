@@ -1590,15 +1590,18 @@ reload swaps whole or not at all ([Reload classes](#reload-classes)).
 | `security.payments.key_custody` | `local \| external` | `local` | Who holds the wallet keys: agentd, each key file sealed under `seal_key`, or the external signer `signer` names ([The external signer protocol](external-signer.md#wallet-keys)). |
 | `security.payments.seal_key` | secret reference | — | 32 random bytes, hex or base64: every wallet key file is sealed under it. A single `{{secret-file:…}}` reference, never inline and never the environment. Required under `key_custody: local`; refused under `external`. |
 | `security.payments.signer` | `{socket, uid, timeout}` | — | `key_custody: external` only (required there): the signer's unix socket (an absolute path), the uid its process runs as (agentd's own is a load warning) and the bound on a request (`5s`, at most `60s`). |
+| `security.payments.wallets.<name>.chain` | `eip155 \| solana` | `eip155` | The chain family it pays on: a secp256k1 key on EVM chains, an Ed25519 key on Solana. A step's `max` may name only assets of its wallet's family. |
 | `security.payments.wallets.<name>.key_file` | absolute path | — | `key_custody: local`: the sealed key file, made `0600` by `agentd --print-wallet-address <name>` when absent. The start is refused when it is a symlink, another user owns it or can read it, or it does not open to its address. |
 | `security.payments.wallets.<name>.key` | string | — | `key_custody: external`: the signer's key id. |
-| `security.payments.wallets.<name>.address` | address | — | The wallet's address; a key of another address refuses the start. |
-| `security.payments.assets.<name>.asset` | CAIP-19 id | required | `eip155:<chain id>/erc20:<contract>`: the token, and the network it is on. |
+| `security.payments.wallets.<name>.address` | address | — | The wallet's address — EVM, or base58 on Solana; a key of another address refuses the start. |
+| `security.payments.assets.<name>.asset` | CAIP-19 id | required | `eip155:<chain id>/erc20:<contract>`, or `solana:<genesis hash prefix>/token:<mint>`: the token, and the network it is on. |
+| `security.payments.assets.<name>.token_program` | `spl-token \| token-2022` | `spl-token` | A Solana token's program, which decides its token accounts and moves it. Refused on an EVM asset. |
 | `security.payments.assets.<name>.decimals` | int, 0–36 | required | The token's decimals: `"1"` is 10^decimals atomic units. |
 | `security.payments.assets.<name>.limits` | `{per_payment, per_run, per_day, per_payee}` | `per_run`, `per_day`, `per_payee` required | Caps, each a decimal in whole units: one payment, one run's payments, every payment in any 24 hours, every payment to one payee in any 24 hours. |
 | `security.payments.assets.<name>.approve_above` | decimal | — | Above this amount the approver is asked. |
-| `security.payments.payees.<name>.address` | address | required | The address paid (`payTo`). A mixed-case address is held to its EIP-55 checksum. |
-| `security.payments.payees.<name>.assets` | list of asset names | every asset | The assets it may be paid in. |
+| `security.payments.payees.<name>.address` | address | required | The address paid (`payTo`): an EVM address — a mixed-case one is held to its EIP-55 checksum — or a Solana address in base58. |
+| `security.payments.payees.<name>.assets` | list of asset names | every asset | The assets it may be paid in, each on the address's chain family. |
+| `security.payments.rpc.<network>` | URL | — | By Solana network (CAIP-2), the RPC endpoint asked for a recent blockhash (`getLatestBlockhash`) when a server's entry gives none: `https://`, or `http://` to this host, its `{{secret:NAME}}` references resolved when it is dialled. A network no asset is on is refused. |
 
 The model these keys enforce is [Security model](security.md); the checklist is
 [Harden a deployment](harden.md).

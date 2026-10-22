@@ -204,7 +204,7 @@
     "name": "x402",
     "version": "v2",
     "mark": "preview",
-    "full": "x402 v2, paying for an HTTP resource with an EIP-3009 authorization on an EVM chain, only within a spend policy the operator declares: a build-from-source preview",
+    "full": "x402 v2, paying for an HTTP resource with an EIP-3009 authorization on an EVM chain or an SPL transfer on Solana, only within a spend policy the operator declares: a build-from-source preview",
     "href": "/docs/pay-with-x402/",
     "tier": 2
   },

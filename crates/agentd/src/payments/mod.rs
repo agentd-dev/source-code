@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Paying for things: agentd as a paying client of x402 v2, only within the
-//! spend policy ADR 0003 asks for (RFC 0049). Unit 1: an HTTP resource, on
-//! an EVM chain, with the `exact` scheme and an EIP-3009 authorization.
+//! spend policy ADR 0003 asks for (RFC 0049): a resource over HTTP, an MCP
+//! tool or an A2A peer, paid with the `exact` scheme on an EVM chain (an
+//! EIP-3009 authorization) or on Solana (an SPL transfer).
 //!
 //! The pieces, each its own module:
 //!
@@ -9,7 +10,7 @@
 //!   `SettlementResponse` as base64 JSON headers, and the authorization as
 //!   EIP-712 typed data;
 //! - [`scheme`] — the chain families agentd pays on with `exact`, the one
-//!   place that tells them apart: EVM here, Solana in unit 2;
+//!   place that tells them apart: EVM and Solana;
 //! - [`eip712`], [`evm`], [`caip`] — typed-data hashing, secp256k1 keys,
 //!   addresses and recovery, chain and asset ids;
 //! - [`policy`] — which entry of a 402's `accepts` the step and the spend
@@ -19,14 +20,20 @@
 //!   made a second time;
 //! - [`wallet`] — the keys: sealed files opened per signature, or the
 //!   external signer;
-//! - `mock` — a resource server that asks to be paid, for tests (debug and
-//!   `internal-mocks` builds).
+//! - [`svm`], [`base58`], [`ed25519`] — the `exact` scheme on Solana (RFC
+//!   0049 §10): the SPL transfer's transaction, associated token accounts
+//!   and the curve check they need, and base58;
+//! - `mock` — a resource server that asks to be paid, on EVM and Solana,
+//!   and `svm_mock`, the Solana sponsor it settles through, for tests
+//!   (debug and `internal-mocks` builds).
 //!
 //! The runtime's half — a paying step's exchange on any transport, the
 //! approver's gate, the audit records — is `runtime::payments`. Everything
 //! here runs in the supervisor: no worker builds, signs or sends a payment.
 
+pub mod base58;
 pub mod caip;
+pub mod ed25519;
 pub mod eip712;
 pub mod evm;
 pub mod ledger;
@@ -34,6 +41,9 @@ pub mod ledger;
 pub mod mock;
 pub mod policy;
 pub mod scheme;
+pub mod svm;
+#[cfg(any(feature = "internal-mocks", debug_assertions))]
+pub mod svm_mock;
 pub mod wallet;
 pub mod x402;
 
@@ -96,7 +106,7 @@ impl Payments {
             if let Some(a) = wallets.known(name) {
                 log.info(
                     "payment.wallet",
-                    json!({"wallet": name, "address": a.checksummed(),
+                    json!({"wallet": name, "address": a.to_string(),
                            "custody": if p.external().is_some() { "external" } else { "local" }}),
                 );
             }
@@ -127,22 +137,24 @@ pub fn print_wallet_address(settings: &Settings, wallet: &str) -> Result<String,
         .wallets
         .get(wallet)
         .ok_or_else(|| format!("{wallet:?} is not a security.payments.wallets entry"))?;
+    use crate::config::settings::payments::Chain;
     match (p.external(), &w.key_file) {
         (None, Some(f)) => {
             let seal = wallet::seal_key(p)?;
             let path = std::path::Path::new(f);
-            let address = if std::fs::symlink_metadata(path).is_ok() {
-                wallet::read(path, &seal, wallet)?.0
-            } else {
-                wallet::create(path, &seal, wallet)?
-            };
-            Ok(address.checksummed())
+            let exists = std::fs::symlink_metadata(path).is_ok();
+            Ok(match (w.chain, exists) {
+                (Chain::Eip155, true) => wallet::read(path, &seal, wallet)?.0.checksummed(),
+                (Chain::Eip155, false) => wallet::create(path, &seal, wallet)?.checksummed(),
+                (Chain::Solana, true) => wallet::read_svm(path, &seal, wallet)?.0.to_string(),
+                (Chain::Solana, false) => wallet::create_svm(path, &seal, wallet)?.to_string(),
+            })
         }
         _ => {
             let (wallets, _) = wallet::Wallets::open(p).map_err(|e| e.to_string())?;
             wallets
                 .address(wallet)
-                .map(|a| a.checksummed())
+                .map(|a| a.to_string())
                 .map_err(|e| e.to_string())
         }
     }

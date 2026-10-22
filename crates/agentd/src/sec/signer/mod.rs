@@ -27,7 +27,11 @@
 //! - `sign_typed_data {key, typed_data}` → `{sig}`: an EVM key's 65-byte
 //!   `r ‖ s ‖ v` over the EIP-712 digest of `typed_data`, which the signer
 //!   computes itself — an x402 payment's EIP-3009 authorization (RFC 0049
-//!   D8); `public_key` answers such a key `ES256K`, a secp256k1 JWK.
+//!   D8); `public_key` answers such a key `ES256K`, a secp256k1 JWK;
+//! - `sign_solana_transaction {key, message}` → `{sig}`: a Solana key's
+//!   64-byte Ed25519 signature of `message`, a Solana transaction's message
+//!   the signer reads whole before it signs — an x402 payment's SPL transfer
+//!   (RFC 0049 §10); `public_key` answers such a key `EdDSA`, an Ed25519 JWK.
 //!
 //! **What a signer signs** is its own policy, and `docs/external-signer.md`
 //! asks it to sign only what a client assertion is: agentd sends the JWS
@@ -215,6 +219,27 @@ impl Signer {
                 "sign_typed_data",
                 key,
                 &format!("a signature of {} bytes, not 65", sig.len()),
+            )
+        })
+    }
+
+    /// The 64-byte Ed25519 signature, by the Solana key `key`, of a
+    /// transaction's `message` (RFC 0049 §10): the bytes signed, sent whole,
+    /// so the signer reads the transfer before it signs.
+    #[cfg(feature = "x402")]
+    pub fn sign_solana_transaction(
+        &self,
+        key: &str,
+        message: &[u8],
+    ) -> Result<[u8; 64], SignerError> {
+        let a = self.call(json!({"op": "sign_solana_transaction", "key": key,
+                                 "message": b64::url_nopad(message)}))?;
+        let sig = self.bytes(&a, "sig", "sign_solana_transaction", key)?;
+        <[u8; 64]>::try_from(sig.as_slice()).map_err(|_| {
+            self.malformed(
+                "sign_solana_transaction",
+                key,
+                &format!("a signature of {} bytes, not 64", sig.len()),
             )
         })
     }

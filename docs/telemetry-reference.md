@@ -666,8 +666,9 @@ its `jti`.
 
 ### payment
 
-None of these carries a signature, a signed authorization or a key. The
-nonce, which the chain makes public once a payment settles, is in each.
+None of these carries a signature, a signed authorization or transaction, or
+a key. The nonce — on Solana the memo the transfer carries — which the chain
+makes public once a payment settles, is in each.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|

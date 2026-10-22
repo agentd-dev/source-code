@@ -1814,6 +1814,29 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `.declined`, `.interrupted`, `.sent`, `.settled`, `.failed`, `.unknown`,
   `.ledger.restored`, `.ledger.swept`, `.wallet`, `.signer.unavailable`;
   none carries a signature or a key.
+- x402 on Solana (RFC 0049 §10): the `exact` scheme's SPL transfer, for the
+  same steps under the same policy, ledger, gate and audit. A wallet with
+  `chain: solana` is an Ed25519 key — its seed sealed in its key file as an
+  EVM key is, or held by the external signer — and pays assets
+  `solana:<genesis hash prefix>/token:<mint>` (`token_program: spl-token`,
+  the default, or `token-2022`) to payees by base58 address. agentd builds
+  the binding's version-0 transaction — SetComputeUnitLimit 20 000,
+  SetComputeUnitPrice 1, `TransferChecked` from the wallet's associated
+  token account to `payTo`'s, a Memo of `extra.memo` or 16 random bytes —
+  with the server's `extra.feePayer` as fee payer and in no instruction,
+  reads it back before it signs, verifies the signature under the wallet's
+  address, and leaves the fee payer's signature to the sponsor. A blockhash
+  comes from `extra.recentBlockhash`, else from `getLatestBlockhash` at the
+  network's `security.payments.rpc` endpoint (`https://`, or `http://` to
+  this host); with neither, the entry is passed over. A refused transfer
+  counts against the caps for 300 s, and its record's nonce is the memo.
+  No crate is added: Ed25519 is `ring`'s; base58 and the curve check of
+  associated token accounts are by hand. The external signer gains
+  `sign_solana_transaction {key, message}` → `{sig}` and answers an
+  Ed25519 key's `public_key` `EdDSA`; the reference signer signs only that
+  transfer, for its mints, payees and maximum. The mock x402 server offers
+  and settles Solana entries as a sponsor does, and answers
+  `getLatestBlockhash` at `/_mock/rpc`.
 - `agentd --print-wallet-address <wallet>` prints a wallet's address, making
   its sealed key file `0600` when it is absent, or asking the external
   signer. The start is refused when a key file is a symlink, another user
@@ -1841,9 +1864,9 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   [Pay for things with x402](docs/pay-with-x402.md); agentd.dev's strip
   lists x402 v2 as a preview.
 - `agentd-core`: `payments::{caip, eip712, evm, ledger, policy, scheme,
-  wallet, x402, mock}` and `Payments`; `payments::scheme::Family`, the one
+  wallet, x402, svm, ed25519, base58, mock, svm_mock}` and `Payments`; `payments::scheme::Family`, the one
   place that tells chain families apart;
-  `sec::signer::Signer::sign_typed_data`;
+  `sec::signer::Signer::{sign_typed_data, sign_solana_transaction}`;
   `config::settings::payments::{Payments, StepPayment, PAYING_KINDS}`.
   `x402` adds the RustCrypto crates `k256` (secp256k1 ECDSA, `ecdsa` alone)
   and `sha3` (Keccak-256), optional and enabled by `x402` alone, with their

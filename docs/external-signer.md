@@ -20,7 +20,7 @@ behind that socket. The key words MUST, SHOULD and MAY are as in RFC 2119.
 | The key-encryption key | wraps and unwraps each grant's data key, and each person's personal key | `identity.delegation.signer.seal_key` (and `seal_key_previous`) |
 | The companies' key-encryption key | wraps and unwraps the data key of each User ID, Account Token and ledger record | `security.companies.signer.seal_key` |
 | The companies' derivation key | derives the key each Company store's record ids are made under | `security.companies.signer.derive_key` |
-| Each wallet's key | signs the EIP-3009 authorization of an x402 payment ([Wallet keys](#wallet-keys)) | `security.payments.wallets.<name>.key` |
+| Each wallet's key | signs an x402 payment: the EIP-3009 authorization on an EVM chain, the SPL transfer's transaction message on Solana ([Wallet keys](#wallet-keys)) | `security.payments.wallets.<name>.key` |
 
 A key is named by its id, and a signing key's id is also the `kid` its
 assertions carry, so register the public key at the IdP under that `kid`.
@@ -124,6 +124,7 @@ Every request carries an `op`, and every answer `ok`.
 | `unwrap` | `key`, `wrapped`, `aad` | `plaintext`: the data key, only when `wrapped` was made under `key` and the same `aad` |
 | `derive` | `key`, `data` (1 to 256 bytes) | `mac`: HMAC-SHA256 of `data` under the derivation key `key`, 32 bytes |
 | `sign_typed_data` | `key`, `typed_data`: EIP-712 typed data as JSON, `{types, primaryType, domain, message}` as `eth_signTypedData_v4` takes it | `sig`: the 65-byte `r ‖ s ‖ v` over the typed data's EIP-712 digest, which the signer computes itself — RFC 6979, `s` in the lower half of the order, `v` 27 or 28 |
+| `sign_solana_transaction` | `key`, `message`: a Solana transaction's message, the bytes signed | `sig`: the 64-byte Ed25519 signature of `message`. `public_key` answers such a key `alg` `EdDSA` and an `OKP` `Ed25519` JWK (RFC 8037), whose `x` is the wallet's address |
 
 The associated data binds a wrapped key to what it seals, each part with a
 four-byte big-endian length: for a grant the parts `delegation-grant-key`,
@@ -158,7 +159,7 @@ from it, and needs no other field. A signer:
   and derive only under one configured as a derivation key;
 - SHOULD derive only the labels agentd asks for: `agentd company-user record
   id`, `agentd company-account record id`, `agentd company-account index id`
-  and `agentd company-ledger record id`.
+  and `agentd company-ledger record id`;
 
 What it refuses it answers `denied`, naming the rule and never the data.
 agentd treats a refused signature as an unavailable signer
@@ -209,12 +210,32 @@ A signer:
   maximum;
 - MUST sign nothing with a wallet key that has no token configured.
 
+A Solana wallet (`chain: solana`) names an Ed25519 key, whose
+`public_key` is `EdDSA` and an `OKP` `Ed25519` JWK (RFC 8037) whose `x` is
+the wallet's address. agentd sends `sign_solana_transaction` the
+transaction's message — the bytes signed, which the signer reads whole —
+and verifies every signature it is given under the wallet's address. A
+signer:
+
+- MUST sign with a Solana wallet key only a version-0 message, with no
+  address lookup table, of exactly the transfer an x402 payment makes: two
+  signers, the fee payer first and the key second; the compute-budget
+  program's SetComputeUnitLimit and SetComputeUnitPrice, the SPL Token
+  or Token-2022 program's `TransferChecked` and a Memo of at most 256 bytes
+  of UTF-8, in that order and nothing else; the fee payer in no
+  instruction's accounts; the transfer's authority the key itself and its
+  source the key's own associated token account for the mint; and the mint
+  one configured for that key;
+- SHOULD hold the transfer's destination to the associated token accounts of
+  its payees, and its amount to a maximum.
+
 What it refuses it answers `denied`; agentd fails the payment unsent
 (`payment not sent: …`), and the ledger lets the step pay again later.
 The reference signer's wallet keys are `{"alg": "ES256K", "assets":
 [<CAIP-19 id>, …], "payees": [<address>, …], "max_value": "<atomic>",
-"max_validity": <seconds>}` (`"hex"` gives the key's 32 bytes), each held to
-every rule above.
+"max_validity": <seconds>}` and, for Solana, `{"alg": "EdDSA", "assets":
+[…], "payees": […], "max_value": "<atomic>"}` (`"hex"` gives the key's 32
+bytes, or the Ed25519 seed), each held to every rule above.
 
 ## Errors
 

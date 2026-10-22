@@ -29,7 +29,11 @@
 //!   one is given), `seal` (wrap) and `derive` (derive). With `x402`,
 //!   `{"alg": "ES256K", "assets": [...], "payees": [...], "max_value": …,
 //!   "max_validity": …}` is a secp256k1 wallet key (`"hex"` its 32 bytes),
-//!   which signs only the EIP-3009 typed data its policy allows ([`transfer`]).
+//!   which signs only the EIP-3009 typed data its policy allows ([`transfer`]);
+//!   `{"alg": "EdDSA", "assets": [...], "payees": [...], "max_value": …}` is
+//!   a Solana wallet key (`"hex"` its 32-byte seed), which signs only the
+//!   transaction message of an SPL transfer its policy allows
+//!   ([`solana_transfer`]).
 //! - `record`: a file each request is appended to as `{"op", "key"}`, and
 //!   each refusal of the policy as `{"op", "key", "denied"}` — never its
 //!   data.
@@ -76,6 +80,10 @@ enum Kind {
     /// A secp256k1 wallet key (RFC 0049 D8): it signs EIP-3009 typed data.
     #[cfg(feature = "x402")]
     Es256k(Box<k256::ecdsa::SigningKey>),
+    /// A Solana wallet key (RFC 0049 §10): it signs an SPL transfer's
+    /// transaction message.
+    #[cfg(feature = "x402")]
+    Ed25519(Box<ring::signature::Ed25519KeyPair>),
 }
 
 /// One key and what it may be used for.
@@ -151,6 +159,15 @@ fn keys_of(knobs: &Value) -> Result<BTreeMap<String, Key>, String> {
             #[cfg(not(feature = "x402"))]
             {
                 return Err(format!("key {id}: ES256K needs the x402 feature"));
+            }
+        } else if k["alg"] == "EdDSA" {
+            #[cfg(feature = "x402")]
+            {
+                Kind::Ed25519(Box::new(crate::payments::svm::key_pair(&raw_key(id, k)?)?))
+            }
+            #[cfg(not(feature = "x402"))]
+            {
+                return Err(format!("key {id}: EdDSA needs the x402 feature"));
             }
         } else if k["alg"] == "RS256" {
             let pem = std::fs::read_to_string(k["pem_file"].as_str().unwrap_or_default())
@@ -403,7 +420,28 @@ fn answer_of(req: &Value, s: &State) -> Value {
                     &format!("not an EIP-3009 authorization this signer signs: {why}"),
                 ),
             },
-            "sign" | "wrap" | "unwrap" | "derive" => {
+            "sign" | "wrap" | "unwrap" | "derive" | "sign_solana_transaction" => {
+                refuse("wrong_use", &format!("{id} is not a key for {op}"))
+            }
+            _ => refuse("bad_request", &format!("no op {op:?}")),
+        };
+    }
+    #[cfg(feature = "x402")]
+    if let Kind::Ed25519(kp) = &key.kind {
+        use crate::payments::svm;
+        return match op {
+            "public_key" => ok(json!({"alg": "EdDSA", "jwk": svm::jwk_of(&svm::pubkey_of(kp))})),
+            "sign_solana_transaction" => match field(req, "message") {
+                None => refuse("bad_request", "no base64url message"),
+                Some(m) => match solana_transfer(&m, id, key, kp) {
+                    Ok(()) => ok(json!({"sig": b64::url_nopad(&svm::sign(kp, &m))})),
+                    Err(why) => refuse(
+                        "denied",
+                        &format!("not an SPL transfer this signer signs: {why}"),
+                    ),
+                },
+            },
+            "sign" | "wrap" | "unwrap" | "derive" | "sign_typed_data" => {
                 refuse("wrong_use", &format!("{id} is not a key for {op}"))
             }
             _ => refuse("bad_request", &format!("no op {op:?}")),
@@ -412,6 +450,10 @@ fn answer_of(req: &Value, s: &State) -> Value {
     #[cfg(feature = "x402")]
     if op == "sign_typed_data" {
         return refuse("wrong_use", &format!("{id} is not an EVM key"));
+    }
+    #[cfg(feature = "x402")]
+    if op == "sign_solana_transaction" {
+        return refuse("wrong_use", &format!("{id} is not a Solana key"));
     }
     if op == "sign" && matches!(key.kind, Kind::Es256(_) | Kind::Rs256(_)) {
         if req["alg"] != alg_of(key) {
@@ -496,6 +538,8 @@ fn alg_of(k: &Key) -> &'static str {
         Kind::Derive(_) => "HS256",
         #[cfg(feature = "x402")]
         Kind::Es256k(_) => "ES256K",
+        #[cfg(feature = "x402")]
+        Kind::Ed25519(_) => "EdDSA",
     }
 }
 
@@ -555,6 +599,59 @@ fn transfer(
         ));
     }
     crate::payments::eip712::digest(td)
+}
+
+/// Whether `message` is the transaction message of an SPL transfer the
+/// Solana wallet key `key` (id `id`) signs, held to the policy
+/// `docs/external-signer.md` asks of a signer: exactly x402's exact
+/// transfer (`payments::svm::Transfer::read` — the fee payer in no
+/// instruction, the source the key's own token account), the key its
+/// authority, of a mint among the key's `assets`, paying one of its `payees`
+/// when it has them, at most its `max_value`. A key with no `assets` signs
+/// nothing. `Err` says why not — never with what it held.
+#[cfg(feature = "x402")]
+fn solana_transfer(
+    message: &[u8],
+    id: &str,
+    key: &Key,
+    kp: &ring::signature::Ed25519KeyPair,
+) -> Result<(), String> {
+    use crate::payments::{caip::AssetId, svm};
+    let mints: Vec<svm::Pubkey> = strings(&key.wallet["assets"])
+        .iter()
+        .filter_map(|a| svm::mint_of(&AssetId::parse(a).ok()?))
+        .collect();
+    if mints.is_empty() {
+        return Err(format!(
+            "key {id} has no asset configured, so it signs nothing"
+        ));
+    }
+    let t = svm::Transfer::read(&svm::Message::parse(message)?)?;
+    if t.owner != svm::pubkey_of(kp) {
+        return Err(format!(
+            "the transfer's authority is not key {id}'s address"
+        ));
+    }
+    if !mints.contains(&t.mint) {
+        return Err(format!("the mint is not an asset key {id} signs for"));
+    }
+    let payees: Vec<svm::Pubkey> = strings(&key.wallet["payees"])
+        .iter()
+        .filter_map(|p| svm::Pubkey::parse(p).ok())
+        .collect();
+    if !payees.is_empty() && !payees.iter().any(|p| t.pays(p)) {
+        return Err(format!(
+            "the destination is no payee's token account key {id} signs for"
+        ));
+    }
+    if let Some(max) = key.wallet["max_value"]
+        .as_str()
+        .and_then(|m| m.parse::<u64>().ok())
+        && t.amount > max
+    {
+        return Err(format!("the amount is more than key {id} signs for"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

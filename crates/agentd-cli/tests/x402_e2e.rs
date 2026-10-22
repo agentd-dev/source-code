@@ -230,12 +230,18 @@ fn paid(m: &agentd::payments::mock::Mock) -> Vec<Value> {
 /// `agentd --print-wallet-address ops`: the address it prints.
 #[cfg(feature = "x402")]
 fn wallet_address(cfg: &Path) -> String {
+    address_of(cfg, "ops")
+}
+
+/// `agentd --print-wallet-address <wallet>`: the address it prints.
+#[cfg(feature = "x402")]
+fn address_of(cfg: &Path, wallet: &str) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args([
             "--config",
             &cfg.display().to_string(),
             "--print-wallet-address",
-            "ops",
+            wallet,
         ])
         // The bearers an A2A configuration here names.
         .env("OPS", "ops-bearer-x402")
@@ -436,6 +442,98 @@ fn a_workflow_pays_once_and_gets_the_resource() {
     }
 }
 
+/// On Solana: a workflow pays for an HTTP resource with an SPL transfer
+/// from a Solana wallet. The server's entry names no blockhash, so agentd
+/// asks the network's RPC endpoint for one; it signs the transfer the
+/// entry asks for, the sponsor verifies it — its payer the wallet `agentd
+/// --print-wallet-address` printed, its memo the record's nonce — and
+/// settles it; the chain has `authorized` then `settled`; and the seed and
+/// the signed transaction are in no log line and no file but the key's.
+#[cfg(feature = "x402")]
+#[test]
+fn a_workflow_pays_on_solana_and_gets_the_resource() {
+    const MAINNET: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+    const MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const PAY_TO: &str = "2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4";
+    let dir = scratch();
+    let m = mock(json!({"network": MAINNET, "asset": MINT, "pay_to": PAY_TO, "blockhash": null}));
+    let d = dir.path().display();
+    let payments = format!(
+        "    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n\
+         \x20   wallets: {{sol: {{chain: solana, key_file: \"{d}/sol.key\"}}}}\n\
+         \x20   assets:\n      usdc-sol:\n        asset: \"{MAINNET}/token:{MINT}\"\n        decimals: 6\n\
+         \x20       token_program: spl-token\n\
+         \x20       limits: {{per_payment: \"0.05\", per_run: \"0.10\", per_day: \"1\", per_payee: \"1\"}}\n\
+         \x20   payees:\n      weather: {{address: \"{PAY_TO}\"}}\n\
+         \x20   rpc:\n      \"{MAINNET}\": \"{}/_mock/rpc\"\n",
+        m.url
+    );
+    let steps = format!(
+        "      get: {{kind: http, depends_on: [s], url: \"{}/premium-data\", allow_private: true, payment: {{wallet: sol, max: \"0.02 usdc-sol\"}}}}\n      done: {{kind: finish, depends_on: [get], output: \"{{{{ steps.get.output }}}}\"}}\n",
+        m.url
+    );
+    let cfg = config(dir.path(), &payments, "", "buy", &steps);
+    let address = address_of(&cfg, "sol");
+    assert!(
+        (32..=44).contains(&address.len()) && !address.starts_with("0x"),
+        "a base58 address: {address}"
+    );
+    let mut daemon = Daemon::spawn(&cfg, &[]);
+    let done = daemon.wait("run.done", |d| d.events("run.done").into_iter().next());
+    assert_eq!(done["status"], "completed", "{}", daemon.read());
+    let p = &done["output"]["payment"];
+    assert_eq!(p["state"], "settled", "{p}");
+    assert_eq!(p["payer"], address.as_str());
+    assert_eq!(p["pay_to"], PAY_TO);
+    assert_eq!(p["network"], MAINNET);
+    assert_eq!(daemon.exits(), Some(0));
+
+    // The RPC was asked for a blockhash, then the server saw the request
+    // unpaid and paid by the wallet, for the transfer it offered.
+    let rec = m.record();
+    assert_eq!(rec.len(), 3, "{rec:#?}");
+    assert_eq!(rec[0]["paid"], false);
+    assert_eq!(rec[1]["rpc"], "getLatestBlockhash", "{:#?}", rec[1]);
+    assert_eq!(rec[1]["params"][0]["commitment"], "finalized");
+    assert_eq!(rec[2]["valid"], true, "{:#?}", rec[2]);
+    assert_eq!(rec[2]["from"], address.as_str());
+    assert_eq!(p["transaction"], rec[2]["response"]["transaction"]);
+    assert_eq!(
+        p["nonce"], rec[2]["nonce"],
+        "the record's nonce is the memo"
+    );
+    assert_eq!(
+        p["nonce"].as_str().unwrap().len(),
+        32,
+        "16 random bytes in hex"
+    );
+    assert_eq!(outcomes(dir.path()), ["authorized", "settled"]);
+
+    // The seed and the signed transaction are nowhere but the key file.
+    let seal = agentd::auth::seal::SealKey::new(&[7u8; 32]).unwrap();
+    let key_file = dir.path().join("sol.key");
+    assert!(agentd::payments::wallet::read_svm(&key_file, &seal, "sol").is_ok());
+    let transaction = rec[2]["payment"]["payload"]["transaction"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut files = Vec::new();
+    every_file(dir.path(), &mut files);
+    files.push((daemon.log.clone(), daemon.read()));
+    for (path, text) in &files {
+        if *path == key_file || *path == dir.path().join("seal") {
+            continue;
+        }
+        for s in [&transaction, rec[2]["header"].as_str().unwrap()] {
+            assert!(
+                !text.contains(s),
+                "{} holds the signed transaction",
+                path.display()
+            );
+        }
+    }
+}
+
 /// ADR 0003: "a payment outside them refused unsent". Each entry the policy
 /// does not allow — past the run's cap, over a payment's cap and the
 /// step's `max`, for a payee, an asset or a network not on its lists, or
@@ -466,6 +564,11 @@ fn a_payment_outside_the_policy_is_refused_unsent() {
         (
             "solana",
             mock(json!({"network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp"})),
+            "no allowed asset is on it",
+        ),
+        (
+            "bitcoin",
+            mock(json!({"network": "bip122:000000000019d6689c085ae165831e93"})),
             "no chain of this kind",
         ),
         ("too_much", mock(json!({"price": "60000"})), "per_payment:"),

@@ -1839,7 +1839,8 @@ refuses.
 
 ## Payments
 
-With the `x402` feature agentd pays for HTTP resources with x402, and only
+With the `x402` feature agentd pays for HTTP resources with x402, on EVM
+chains and Solana, and only
 within the spend policy of `security.payments`
 ([RFC 0049](../rfcs/0049-paying-for-things.md), under
 [ADR 0003](../rfcs/adr/0003-no-payment-without-a-spend-policy.md)). An agent
@@ -1870,15 +1871,26 @@ before anything is signed:
   No judge answers it and no operator but the approver; unanswered, it
   declines. The policy is checked again when the approval lands.
 - **The key stays with the supervisor.** A wallet's key file holds the key
-  sealed under AES-256-GCM with a seal key read from a mounted file, bound to
-  the wallet's name and address. The supervisor opens it for one signature
-  and wipes it after; the key file, the seal key, the store root (where the
-  ledger is) and the signer's socket are supervisor-only paths under
-  Landlock. Under `key_custody: external` agentd holds no wallet key, and
-  the [signer](external-signer.md#wallet-keys) is sent the typed data to
-  read before it signs. No key, signature or signed authorization is in a
-  log line, a model's context or a child's payload, and every signature is
-  recovered to the wallet's address before it is sent.
+  — secp256k1, or a Solana wallet's Ed25519 seed — sealed under AES-256-GCM
+  with a seal key read from a mounted file, bound to the wallet's name and
+  address. The supervisor opens it for one signature and wipes it after
+  (`ring`'s Ed25519 key pair, made from the seed, is dropped after one
+  signature; `ring` does not promise to wipe it); the key file, the seal
+  key, the store root (where the ledger is) and the signer's socket are
+  supervisor-only paths under Landlock. Under `key_custody: external` agentd
+  holds no wallet key, and the [signer](external-signer.md#wallet-keys) is
+  sent the typed data, or a Solana transaction's message, to read before it
+  signs. No key, signature, signed authorization or signed transaction is in
+  a log line, a model's context or a child's payload, and every signature is
+  recovered to, or verified under, the wallet's address before it is sent.
+- **On Solana, only the transfer asked for.** agentd builds the one
+  transaction x402's `exact` scheme describes — the token's
+  `TransferChecked` to the payee's token account, compute-budget and Memo
+  instructions, the server's sponsor as fee payer and in no instruction —
+  reads it back before it signs, and signs nothing else; it pays no network
+  fee. When the server's entry gives no blockhash it asks the RPC endpoint
+  the operator names for the network (`security.payments.rpc`), which is
+  sent nothing of the payment.
 - **Every payment an audit record.** Each step of a payment is a `payment`
   record in the [audit chain](#the-audit-chain), flushed to the disk before
   the payment goes on; the `authorized` record is written before the signed

@@ -56,6 +56,10 @@ pub struct Payments {
     pub wallets: BTreeMap<String, Wallet>,
     pub assets: BTreeMap<String, Asset>,
     pub payees: BTreeMap<String, Payee>,
+    /// By Solana network (CAIP-2), the RPC endpoint asked for a recent
+    /// blockhash when a server's entry gives none: a URL, `{{secret:…}}`
+    /// references in it resolved when it is dialled.
+    pub rpc: BTreeMap<String, String>,
 }
 
 /// `security.payments.signer`.
@@ -79,10 +83,32 @@ impl Signer {
     }
 }
 
+/// The chain family a wallet pays on, by its CAIP-2 namespace.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Chain {
+    /// EVM chains: a secp256k1 key, EIP-3009 authorizations.
+    #[default]
+    Eip155,
+    /// Solana: an Ed25519 key, SPL transfers.
+    Solana,
+}
+
+impl Chain {
+    pub fn namespace(self) -> &'static str {
+        match self {
+            Chain::Eip155 => "eip155",
+            Chain::Solana => "solana",
+        }
+    }
+}
+
 /// `security.payments.wallets.<name>`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Wallet {
+    /// The chain family it pays on: `eip155` (the default) or `solana`.
+    pub chain: Chain,
     /// The sealed key file (`key_custody: local`): made `0600` by `agentd
     /// --print-wallet-address <name>` when absent.
     pub key_file: Option<String>,
@@ -97,10 +123,13 @@ pub struct Wallet {
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Asset {
-    /// The CAIP-19 asset type: `eip155:<chain>/erc20:<contract>`.
+    /// The CAIP-19 asset type: `eip155:<chain>/erc20:<contract>`, or
+    /// `solana:<genesis hash prefix>/token:<mint>`.
     pub asset: String,
     /// The token's decimals: `"1"` is 10^decimals atomic units.
     pub decimals: u8,
+    /// A Solana token's program: `spl-token` (the default) or `token-2022`.
+    pub token_program: Option<String>,
     pub limits: Limits,
     /// Above this amount the approver is asked.
     pub approve_above: Option<String>,
@@ -242,6 +271,53 @@ pub fn is_name(s: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
+/// Whether `s` is written in base58's alphabet.
+fn is_base58(s: &str) -> bool {
+    s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() && !matches!(b, b'0' | b'O' | b'I' | b'l'))
+}
+
+/// A Solana address: 32 bytes in base58.
+fn solana_address(s: &str) -> Result<(), String> {
+    #[cfg(feature = "x402")]
+    {
+        crate::payments::svm::Pubkey::parse(s).map(|_| ())
+    }
+    #[cfg(not(feature = "x402"))]
+    {
+        if (32..=44).contains(&s.len()) && is_base58(s) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{s:?} is not a Solana address (32 bytes in base58)"
+            ))
+        }
+    }
+}
+
+/// An account on a chain of `namespace`: an EVM address, or a Solana one.
+fn address_on(namespace: &str, s: &str) -> Result<(), String> {
+    match namespace {
+        "solana" => solana_address(s),
+        _ => evm_address(s),
+    }
+}
+
+/// The CAIP-2 namespace an address is written for: `0x` and hex is
+/// `eip155`, anything else is read as Solana's base58.
+fn namespace_of_address(s: &str) -> &'static str {
+    if s.starts_with("0x") {
+        "eip155"
+    } else {
+        "solana"
+    }
+}
+
+/// The CAIP-2 namespace of an asset's id: the text before its first `:`.
+fn namespace_of_asset(asset: &str) -> &str {
+    asset.split(':').next().unwrap_or_default()
+}
+
 /// An EVM address: `0x` and 40 hex digits (EIP-55's checksum held when mixed).
 fn evm_address(s: &str) -> Result<(), String> {
     #[cfg(feature = "x402")]
@@ -261,25 +337,38 @@ fn evm_address(s: &str) -> Result<(), String> {
     }
 }
 
-/// An ERC-20 asset's CAIP-19 id: `eip155:<chain>/erc20:<contract>`.
-fn erc20_asset(s: &str) -> Result<(), String> {
+/// An asset's CAIP-19 id: an ERC-20 token, `eip155:<chain>/erc20:<contract>`,
+/// or an SPL token, `solana:<genesis hash prefix>/token:<mint>`.
+fn asset_id(s: &str) -> Result<(), String> {
     let bad = || {
         format!(
-            "{s:?} is not an ERC-20 asset's CAIP-19 id (eip155:<chain id>/erc20:<contract>); unit 1 of RFC 0049 pays on EVM chains"
+            "{s:?} is not the CAIP-19 id of an ERC-20 token (eip155:<chain id>/erc20:<contract>) or an SPL token (solana:<genesis hash prefix>/token:<mint>)"
         )
     };
     let (chain, asset) = s.split_once('/').ok_or_else(bad)?;
     let (ns, id) = chain.split_once(':').ok_or_else(bad)?;
-    let chain_ok = ns == "eip155"
-        && !id.is_empty()
-        && id.len() <= 32
-        && id.bytes().all(|b| b.is_ascii_digit())
-        && !id.starts_with('0');
-    let (ans, contract) = asset.split_once(':').ok_or_else(bad)?;
-    if !chain_ok || ans != "erc20" {
-        return Err(bad());
+    let (ans, reference) = asset.split_once(':').ok_or_else(bad)?;
+    match (ns, ans) {
+        ("eip155", "erc20") => {
+            let chain_ok = !id.is_empty()
+                && id.len() <= 32
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && !id.starts_with('0');
+            if !chain_ok {
+                return Err(bad());
+            }
+            evm_address(reference).map_err(|e| format!("{s:?}: {e}"))
+        }
+        ("solana", "token") => {
+            // CAIP-2's reference for Solana: the genesis hash's first 32
+            // base58 characters.
+            if id.len() != 32 || !is_base58(id) {
+                return Err(bad());
+            }
+            solana_address(reference).map_err(|e| format!("{s:?}: {e}"))
+        }
+        _ => Err(bad()),
     }
-    evm_address(contract).map_err(|e| format!("{s:?}: {e}"))
 }
 
 /// Every check RFC 0049 makes at load on `security.payments`.
@@ -397,9 +486,12 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
             )),
         }
         if let Some(a) = &w.address
-            && let Err(e) = evm_address(a)
+            && let Err(e) = address_on(w.chain.namespace(), a)
         {
-            err(format!("{at}.address: {e}"));
+            err(format!(
+                "{at}.address: {e} — a {} wallet's address",
+                w.chain.namespace()
+            ));
         }
     }
     for (name, a) in &p.assets {
@@ -409,8 +501,18 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
                 "{at}: an asset's name is 1 to 32 of a-z, 0-9, - and _"
             ));
         }
-        if let Err(e) = erc20_asset(&a.asset) {
+        if let Err(e) = asset_id(&a.asset) {
             err(format!("{at}.asset: {e}"));
+        }
+        match (namespace_of_asset(&a.asset), a.token_program.as_deref()) {
+            (_, None) | ("solana", Some("spl-token" | "token-2022")) => {}
+            ("solana", Some(t)) => err(format!(
+                "{at}.token_program: {t:?} is not spl-token or token-2022"
+            )),
+            (_, Some(_)) => err(format!(
+                "{at}.token_program: a Solana token's program; {:?} is no Solana asset",
+                a.asset
+            )),
         }
         if a.decimals > MAX_DECIMALS {
             err(format!("{at}.decimals: at most {MAX_DECIMALS}"));
@@ -458,15 +560,44 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
                 "{at}: a payee's name is 1 to 32 of a-z, 0-9, - and _"
             ));
         }
-        if let Err(e) = evm_address(&payee.address) {
+        let family = namespace_of_address(&payee.address);
+        if let Err(e) = address_on(family, &payee.address) {
             err(format!("{at}.address: {e}"));
         }
         for asset in payee.assets.iter().flatten() {
-            if !p.assets.contains_key(asset) {
-                err(format!(
+            match p.assets.get(asset) {
+                None => err(format!(
                     "{at}.assets: {asset:?} is not a security.payments.assets entry"
-                ));
+                )),
+                Some(a) if namespace_of_asset(&a.asset) != family => err(format!(
+                    "{at}.assets: {asset:?} is on {} chains, and the payee's address is a {family} one",
+                    namespace_of_asset(&a.asset)
+                )),
+                Some(_) => {}
             }
+        }
+    }
+    for (network, url) in &p.rpc {
+        let at = format!("security.payments.rpc.{network}");
+        if !p.assets.values().any(|a| {
+            namespace_of_asset(&a.asset) == "solana" && a.asset.split('/').next() == Some(network)
+        }) {
+            err(format!(
+                "{at}: no Solana asset is on {network:?} — rpc names the endpoint asked for a blockhash on a network an asset pays on"
+            ));
+        }
+        // The endpoint with its references stood in for: HTTPS, or HTTP to
+        // this host.
+        let shown = crate::sec::secret::refs_of(url)
+            .iter()
+            .fold(url.clone(), |u, r| u.replace(&format!("{{{{{r}}}}}"), "x"));
+        match crate::net::http::Url::parse(&shown) {
+            Ok(u) if u.is_tls() || crate::net::http::is_loopback_host(&u.host) => {}
+            Ok(_) => err(format!(
+                "{at}: {} is plain HTTP to another host — an RPC endpoint is https://, or http:// to this host",
+                super::url_locator(url)
+            )),
+            Err(e) => err(format!("{at}: not a URL ({e})")),
         }
     }
     // Asked of a person who can be asked.
@@ -551,6 +682,7 @@ pub fn step_payment(p: &Payments, v: &Value) -> Result<StepPayment, String> {
         Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
         _ => return Err("payment.max is not set".into()),
     };
+    let chain = p.wallets[wallet].chain;
     let mut max = Vec::new();
     for m in maxes {
         let (amount, asset) = m.trim().split_once(' ').ok_or_else(|| {
@@ -559,6 +691,13 @@ pub fn step_payment(p: &Payments, v: &Value) -> Result<StepPayment, String> {
         let a = p.assets.get(asset.trim()).ok_or_else(|| {
             format!("payment.max {m:?}: {asset:?} is not a security.payments.assets entry")
         })?;
+        if namespace_of_asset(&a.asset) != chain.namespace() {
+            return Err(format!(
+                "payment.max {m:?}: {asset:?} is on {} chains, and wallet {wallet:?} pays on {} ones (security.payments.wallets.{wallet}.chain)",
+                namespace_of_asset(&a.asset),
+                chain.namespace()
+            ));
+        }
         let atomic = parse_amount(amount, a.decimals).map_err(|e| format!("payment.max: {e}"))?;
         if max.iter().any(|(x, _)| x == asset.trim()) {
             return Err(format!("payment.max names {asset:?} twice"));
@@ -744,7 +883,7 @@ workflows:
             ),
             (
                 Box::new(|y: String| y.replace("eip155:8453/erc20:", "eip155:8453/slip44:")),
-                "not an ERC-20 asset",
+                "is not the CAIP-19 id of an ERC-20 token",
             ),
             (
                 Box::new(|y: String| y.replace("max: \"0.05 usdc\"", "max: \"0.05 eurc\"")),
@@ -795,5 +934,130 @@ workflows:
         assert!(!pays_json(
             &serde_json::json!({"steps": {"a": {"kind": "http", "url": "https://x"}}})
         ));
+    }
+
+    /// Solana in `security.payments`: an SPL asset with its token program,
+    /// a base58 payee and wallet, and an RPC endpoint for the asset's
+    /// network load; a token program on an EVM asset, a payee held to an
+    /// asset of the other family, a wallet address of the other family, an
+    /// RPC endpoint for a network no asset is on or over plain HTTP to
+    /// another host, and a step paying a Solana asset from an EVM wallet
+    /// are each refused by name.
+    #[cfg(feature = "x402")]
+    #[test]
+    fn solana_assets_payees_wallets_and_rpc_validate() {
+        use serde_json::json;
+        const MAINNET: &str = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+        let base = json!({
+            "seal_key": "{{secret-file:/run/k}}",
+            "wallets": {"sol": {"chain": "solana", "key_file": "/var/lib/agentd/sol.key",
+                                "address": "GmaDrppBC7P5ARKV8g3djiwP89vz1jLK23V2GBjuAEGB"},
+                        "ops": {"key_file": "/var/lib/agentd/ops.key"}},
+            "assets": {
+                "usdc-sol": {"asset": format!("{MAINNET}/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"),
+                             "decimals": 6, "token_program": "spl-token",
+                             "limits": {"per_run": "1", "per_day": "1", "per_payee": "1"}},
+                "usdc-base": {"asset": "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                              "decimals": 6, "limits": {"per_run": "1", "per_day": "1", "per_payee": "1"}}},
+            "payees": {"weather": {"address": "2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4",
+                                   "assets": ["usdc-sol"]}},
+            "rpc": {MAINNET: "https://rpc.example/?api-key={{secret:SOLANA_RPC_KEY}}"}
+        });
+        let errors = |v: &Value| {
+            let mut s = Settings::default();
+            s.security.payments = serde_json::from_value(v.clone()).unwrap();
+            let mut d = Diagnostics::default();
+            validate(&s, &mut d);
+            // The audit chain and the store are other checks'.
+            d.errors
+                .into_iter()
+                .filter(|e| {
+                    !e.contains("observability.audit.chain") && !e.contains("durable store")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(errors(&base).is_empty(), "{:?}", errors(&base));
+        let with = |f: &dyn Fn(&mut Value)| {
+            let mut v = base.clone();
+            f(&mut v);
+            v
+        };
+        for (v, want) in [
+            (
+                with(&|v| v["assets"]["usdc-base"]["token_program"] = json!("spl-token")),
+                "no Solana asset",
+            ),
+            (
+                with(&|v| v["assets"]["usdc-sol"]["token_program"] = json!("token-2023")),
+                "token_program",
+            ),
+            (
+                with(&|v| {
+                    v["assets"]["usdc-sol"]["asset"] = json!(format!("{MAINNET}/token:0x00"))
+                }),
+                "usdc-sol.asset",
+            ),
+            (
+                with(&|v| {
+                    v["assets"]["usdc-sol"]["asset"] =
+                        json!("solana:mainnet/token:EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+                }),
+                "usdc-sol.asset",
+            ),
+            (
+                with(&|v| v["payees"]["weather"]["assets"] = json!(["usdc-base"])),
+                "eip155 chains",
+            ),
+            (
+                with(&|v| {
+                    v["payees"]["weather"]["address"] = json!("2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PP")
+                }),
+                "weather.address",
+            ),
+            (
+                with(&|v| {
+                    v["wallets"]["sol"]["address"] =
+                        json!("0x209693Bc6afc0C5328bA36FaF03C514EF312287C")
+                }),
+                "sol.address",
+            ),
+            (
+                with(&|v| {
+                    v["wallets"]["ops"]["address"] =
+                        json!("2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4")
+                }),
+                "ops.address",
+            ),
+            (
+                with(&|v| {
+                    v["rpc"] =
+                        json!({"solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1": "https://rpc.example"})
+                }),
+                "no Solana asset is on",
+            ),
+            (
+                with(&|v| v["rpc"][MAINNET] = json!("http://rpc.example/")),
+                "plain HTTP",
+            ),
+            (
+                with(&|v| v["rpc"][MAINNET] = json!("not a url")),
+                "not a URL",
+            ),
+        ] {
+            let e = errors(&v).join("; ");
+            assert!(e.contains(want), "{want}: {e}");
+        }
+        let local = with(&|v| v["rpc"][MAINNET] = json!("http://127.0.0.1:8899"));
+        assert!(errors(&local).is_empty(), "{:?}", errors(&local));
+        let p: Payments = serde_json::from_value(base).unwrap();
+        assert!(step_payment(&p, &json!({"wallet": "sol", "max": "0.05 usdc-sol"})).is_ok());
+        let e = step_payment(&p, &json!({"wallet": "ops", "max": "0.05 usdc-sol"})).unwrap_err();
+        assert!(e.contains("solana chains") && e.contains("eip155"), "{e}");
+        let e = step_payment(
+            &p,
+            &json!({"wallet": "sol", "max": ["0.05 usdc-sol", "0.05 usdc-base"]}),
+        )
+        .unwrap_err();
+        assert!(e.contains("usdc-base"), "{e}");
     }
 }

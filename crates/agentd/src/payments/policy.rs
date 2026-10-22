@@ -3,14 +3,17 @@
 //! may pay, or why none.
 //!
 //! An entry is taken only when every check holds: the `exact` scheme and
-//! the `authorization` flow; a network of a family agentd pays on, and what
-//! that family asks of `extra` ([`super::scheme::Family::terms`]); a token
+//! the `authorization` flow; a network of a family agentd pays on; a token
 //! an allowed asset names on that network; a `payTo` an allowed payee is,
-//! for that asset; an amount within the step's `max`, the asset's
-//! `per_payment`, and — counting what the ledger says was paid or may have
-//! been — its `per_run`, `per_day` and `per_payee`. The first entry, in the
-//! server's order, that holds is the one paid; every one passed over is
-//! named with each reason, so a refusal says everything at once.
+//! for that asset; what that family asks of the entry
+//! ([`super::scheme::Family::terms`]: on EVM the `eip3009` transfer method
+//! and the token's EIP-712 name and version, on Solana the sponsor's
+//! `feePayer` and a blockhash to build on); an amount within the step's
+//! `max`, the asset's `per_payment`, and — counting what the ledger says
+//! was paid or may have been — its `per_run`, `per_day` and `per_payee`.
+//! The first entry, in the server's order, that holds is the one paid;
+//! every one passed over is named with each reason, so a refusal says
+//! everything at once.
 
 use std::collections::BTreeMap;
 
@@ -69,6 +72,8 @@ pub struct Policy {
     pub max_validity: std::time::Duration,
     pub assets: BTreeMap<String, Asset>,
     pub payees: BTreeMap<String, Payee>,
+    /// By Solana network, the RPC endpoint asked for a blockhash.
+    pub rpc: BTreeMap<String, String>,
 }
 
 impl Policy {
@@ -81,7 +86,9 @@ impl Policy {
             let id = AssetId::parse(&a.asset).map_err(|e| format!("{at}.asset: {e}"))?;
             let family = Family::of(&id.chain)
                 .ok_or_else(|| format!("{at}.asset: agentd pays on no chain of {}", id.chain))?;
-            let token = family.token(&id).map_err(|e| format!("{at}.asset: {e}"))?;
+            let token = family
+                .token(&id, a.token_program.as_deref())
+                .map_err(|e| format!("{at}.asset: {e}"))?;
             let amount = |k: &str, v: &Option<String>| -> Result<Option<u128>, String> {
                 v.as_deref()
                     .map(|v| parse_amount(v, a.decimals).map_err(|e| format!("{at}.{k}: {e}")))
@@ -127,6 +134,7 @@ impl Policy {
             max_validity: p.max_validity(),
             assets,
             payees,
+            rpc: p.rpc.clone(),
         })
     }
 }
@@ -244,13 +252,6 @@ fn one(
             None
         }
     };
-    let terms = family.and_then(|f| match f.terms(&e.extra) {
-        Ok(t) => Some(t),
-        Err(reasons) => {
-            why.extend(reasons);
-            None
-        }
-    });
     // The token: an asset the operator names, on that network.
     let asset = match (&network, family) {
         (Ok(n), Some(f)) => {
@@ -266,22 +267,16 @@ fn one(
                 ));
                 None
             } else {
-                match f.entry_token(n, &e.asset) {
-                    Ok(t) => {
-                        let found = on_network.into_iter().find(|a| a.token == t);
-                        if found.is_none() {
-                            why.push(format!(
-                                "asset {:?}: not an allowed asset on {}",
-                                e.asset, e.network
-                            ));
-                        }
-                        found
-                    }
-                    Err(err) => {
-                        why.push(format!("asset: {err}"));
-                        None
-                    }
+                let found = on_network
+                    .into_iter()
+                    .find(|a| a.family == f && a.token.is(&e.asset));
+                if found.is_none() {
+                    why.push(format!(
+                        "asset {:?}: not an allowed asset on {}",
+                        e.asset, e.network
+                    ));
                 }
+                found
             }
         }
         _ => None,
@@ -321,6 +316,18 @@ fn one(
         }
         None => None,
     };
+    // What the family asks of the entry, beyond them.
+    let terms = family.and_then(|f| {
+        let to = pay_to.as_ref().and_then(|p| p.as_ref().ok());
+        let rpc = policy.rpc.get(&e.network).map(String::as_str);
+        match f.terms(&e, asset, to, rpc) {
+            Ok(t) => Some(t),
+            Err(reasons) => {
+                why.extend(reasons);
+                None
+            }
+        }
+    });
     if let (Some(a), Some(amount)) = (asset, amount) {
         if let Some(m) = step_max
             && amount > m
@@ -497,8 +504,12 @@ pub(crate) mod tests {
             ),
             (with(&|e| e["network"] = json!("eip155:1")), "network"),
             (
-                with(&|e| e["network"] = json!("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp")),
+                with(&|e| e["network"] = json!("bip122:000000000019d6689c085ae165831e93")),
                 "no chain of this kind",
+            ),
+            (
+                with(&|e| e["network"] = json!("solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp")),
+                "no allowed asset is on it",
             ),
             (with(&|e| e["network"] = json!("eip155")), "not a CAIP-2"),
             (

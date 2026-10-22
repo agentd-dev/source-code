@@ -5452,7 +5452,7 @@
                     "type": "string"
                   },
                   "asset": {
-                    "description": "the CAIP-19 asset type, eip155:<chain id>/erc20:<contract>: names the network (CAIP-2) and the token",
+                    "description": "the CAIP-19 asset type, eip155:<chain id>/erc20:<contract> or solana:<genesis hash prefix>/token:<mint>: names the network (CAIP-2) and the token",
                     "type": "string"
                   },
                   "decimals": {
@@ -5488,6 +5488,13 @@
                       "per_payee"
                     ],
                     "type": "object"
+                  },
+                  "token_program": {
+                    "description": "a Solana token's program, whose transfer and associated token accounts it uses; default spl-token. Solana assets only",
+                    "enum": [
+                      "spl-token",
+                      "token-2022"
+                    ]
                   }
                 },
                 "required": [
@@ -5519,11 +5526,11 @@
                 "additionalProperties": false,
                 "properties": {
                   "address": {
-                    "description": "the payTo address (0x and 40 hex digits)",
+                    "description": "the payTo address: 0x and 40 hex digits on an EVM chain, 32 bytes in base58 on Solana",
                     "type": "string"
                   },
                   "assets": {
-                    "description": "the assets it may be paid in; default every asset",
+                    "description": "the assets it may be paid in, each on its address's chain family; default every asset",
                     "items": {
                       "type": "string"
                     },
@@ -5538,13 +5545,20 @@
               "description": "the addresses agentd may pay, by name",
               "type": "object"
             },
+            "rpc": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "by Solana network (CAIP-2, e.g. solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp), the RPC endpoint asked for a recent blockhash (getLatestBlockhash) when a server's entry gives no extra.recentBlockhash: https://, or http:// to this host; {{secret:NAME}} references in it resolved when it is dialled. Without one, an entry with no blockhash is passed over",
+              "type": "object"
+            },
             "seal_key": {
               "description": "32 random bytes as hex or base64, a single {{secret-file:PATH}} reference (never the environment): every wallet key file is sealed under it. key_custody local only",
               "type": "string"
             },
             "signer": {
               "additionalProperties": false,
-              "description": "the external signer that holds the wallet keys (key_custody external; docs/external-signer.md): it signs only EIP-712 typed data of an EIP-3009 TransferWithAuthorization its own policy allows",
+              "description": "the external signer that holds the wallet keys (key_custody external; docs/external-signer.md): it signs only EIP-712 typed data of an EIP-3009 TransferWithAuthorization, or a Solana transaction message of an SPL transfer, its own policy allows",
               "properties": {
                 "socket": {
                   "description": "the signer's unix socket, an absolute path",
@@ -5574,8 +5588,15 @@
                 "additionalProperties": false,
                 "properties": {
                   "address": {
-                    "description": "the wallet's address (0x and 40 hex digits); when given, a key of another address refuses the start",
+                    "description": "the wallet's address (0x and 40 hex digits on eip155, 32 bytes in base58 on solana); when given, a key of another address refuses the start",
                     "type": "string"
+                  },
+                  "chain": {
+                    "description": "the chain family it pays on, by CAIP-2 namespace: eip155 (the default; a secp256k1 key) or solana (an Ed25519 key); a step pays from it only in assets on that family's chains",
+                    "enum": [
+                      "eip155",
+                      "solana"
+                    ]
                   },
                   "key": {
                     "description": "key_custody external: the signer's key id",

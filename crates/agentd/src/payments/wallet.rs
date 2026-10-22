@@ -21,10 +21,21 @@
 //! agentd derives the address, and `sign_typed_data` is sent the EIP-712
 //! typed data — not a digest — so the signer reads what it signs.
 //!
-//! Either way agentd recovers the address from each signature before it is
-//! sent: a key file swapped under the same name, or a signer that signed
-//! with another key, is a refusal, never a payment from someone else.
-//! Nothing here logs; no error names a key, a signature or a sealed byte.
+//! **A Solana wallet** (`chain: solana`) is the same, with an Ed25519 key:
+//! its key file seals the 32-byte seed, bound to the base58 address, and is
+//! made by [`create_svm`] and read by [`read_svm`] under the same checks;
+//! `ring`'s key pair is made from it for one signature and dropped (`ring`
+//! does not promise to wipe it). Its signer key answers `public_key` with an
+//! Ed25519 JWK (`EdDSA`, RFC 8037), and `sign_solana_transaction` is sent
+//! the transaction's message — the bytes signed, which the signer reads
+//! whole — and answers the 64-byte signature.
+//!
+//! Either way agentd checks each signature against the wallet's address
+//! before it is sent — recovering the EVM address from it, verifying the
+//! Ed25519 one — so a key file swapped under the same name, or a signer
+//! that signed with another key, is a refusal, never a payment from someone
+//! else. Nothing here logs; no error names a key, a signature or a sealed
+//! byte.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -32,6 +43,8 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use super::evm::{self, Address};
+use super::scheme::Account;
+use super::svm::{self, Pubkey};
 use crate::auth::seal::{SealKey, associated_data};
 use crate::config::settings::payments as cfg;
 use crate::sec::signer::{Signer, SignerError};
@@ -60,12 +73,13 @@ enum Source {
     Signer(String),
 }
 
-/// One wallet: where its key is, the address the configuration names, and
-/// the address its key is once known.
+/// One wallet: where its key is, the chain family it pays on, the address
+/// the configuration names, and the address its key is once known.
 struct Wallet {
     source: Source,
-    want: Option<Address>,
-    address: std::sync::Mutex<Option<Address>>,
+    chain: cfg::Chain,
+    want: Option<Account>,
+    address: std::sync::Mutex<Option<Account>>,
 }
 
 /// Who holds the keys.
@@ -107,32 +121,27 @@ pub fn seal_key(p: &cfg::Payments) -> Result<SealKey, String> {
     key
 }
 
-/// What a wallet's key is sealed under: bound to the wallet and its address.
-fn ad(wallet: &str, address: &Address) -> Vec<u8> {
-    associated_data(&[
-        b"payment-wallet-key",
-        wallet.as_bytes(),
-        address.lower().as_bytes(),
-    ])
+/// What a wallet's key is sealed under: bound to the wallet and its address
+/// — an EVM address in lowercase hex, a Solana one in base58.
+fn ad(wallet: &str, address: &str) -> Vec<u8> {
+    associated_data(&[b"payment-wallet-key", wallet.as_bytes(), address.as_bytes()])
 }
 
-/// Make `path`, a new key file for `wallet` sealed under `seal`: a fresh
-/// key from the kernel's CSPRNG, written `0600` with `O_EXCL`. Its address.
-pub fn create(path: &Path, seal: &SealKey, wallet: &str) -> Result<Address, String> {
+/// Write `path`, a new key file of `wallet` naming `address` (as written in
+/// the file, and as bound, `bound`), its 32 bytes sealed under `seal`:
+/// `0600`, `O_EXCL`, synced.
+fn write_sealed(
+    path: &Path,
+    seal: &SealKey,
+    wallet: &str,
+    address: &str,
+    bound: &str,
+    raw: &[u8; 32],
+) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut raw = [0u8; 32];
-    let key = loop {
-        crate::sec::random::fill(&mut raw).map_err(|e| format!("no OS randomness: {e}"))?;
-        if let Ok(k) = evm::key_from_bytes(&raw) {
-            break k;
-        }
-    };
-    let address = evm::address_of_key(&key);
-    let sealed = seal.seal(&ad(wallet, &address), &raw);
-    crate::sec::harden::wipe(&mut raw);
-    let sealed = sealed?;
-    let body = json!({"wallet": wallet, "address": address.checksummed(),
+    let sealed = seal.seal(&ad(wallet, bound), raw)?;
+    let body = json!({"wallet": wallet, "address": address,
                       "sealed": crate::b64::url_nopad(&sealed)});
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -142,18 +151,57 @@ pub fn create(path: &Path, seal: &SealKey, wallet: &str) -> Result<Address, Stri
         .map_err(|e| format!("{}: {e}", path.display()))?;
     f.write_all(format!("{body}\n").as_bytes())
         .and_then(|()| f.sync_all())
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(address)
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// The address `path` names, and its key: a regular file of agentd's uid
-/// that no one else can read, sealed for `wallet` under `seal`, whose key's
-/// address is the one it names.
-pub fn read(
+/// Make `path`, a new key file for `wallet` sealed under `seal`: a fresh
+/// key from the kernel's CSPRNG, written `0600` with `O_EXCL`. Its address.
+pub fn create(path: &Path, seal: &SealKey, wallet: &str) -> Result<Address, String> {
+    let mut raw = [0u8; 32];
+    let key = loop {
+        crate::sec::random::fill(&mut raw).map_err(|e| format!("no OS randomness: {e}"))?;
+        if let Ok(k) = evm::key_from_bytes(&raw) {
+            break k;
+        }
+    };
+    let address = evm::address_of_key(&key);
+    let written = write_sealed(
+        path,
+        seal,
+        wallet,
+        &address.checksummed(),
+        &address.lower(),
+        &raw,
+    );
+    crate::sec::harden::wipe(&mut raw);
+    written.map(|()| address)
+}
+
+/// Make `path`, a new key file for the Solana wallet `wallet` sealed under
+/// `seal`: a fresh Ed25519 seed from the kernel's CSPRNG, written `0600`
+/// with `O_EXCL`. Its address.
+pub fn create_svm(path: &Path, seal: &SealKey, wallet: &str) -> Result<Pubkey, String> {
+    let mut seed = [0u8; 32];
+    crate::sec::random::fill(&mut seed).map_err(|e| format!("no OS randomness: {e}"))?;
+    let address = svm::key_pair(&seed).map(|kp| svm::pubkey_of(&kp));
+    let written = address.and_then(|a| {
+        let text = a.to_string();
+        write_sealed(path, seal, wallet, &text, &text, &seed).map(|()| a)
+    });
+    crate::sec::harden::wipe(&mut seed);
+    written
+}
+
+/// The address `path` names, as written, and its sealed 32 bytes: a
+/// regular file of agentd's uid that no one else can read, sealed for
+/// `wallet` under `seal`, bound to the address `bound` reads it as. The
+/// caller wipes the bytes.
+fn open_sealed(
     path: &Path,
     seal: &SealKey,
     wallet: &str,
-) -> Result<(Address, k256::ecdsa::SigningKey), String> {
+    bound: &dyn Fn(&str) -> Option<String>,
+) -> Result<(String, [u8; 32]), String> {
     use std::os::unix::fs::MetadataExt;
     let at = || {
         format!(
@@ -200,32 +248,69 @@ pub fn read(
             v["wallet"]
         ));
     }
-    let address = v["address"]
-        .as_str()
-        .and_then(|a| Address::parse(a).ok())
-        .ok_or_else(|| format!("{}: no address", at()))?;
+    let address = v["address"].as_str().unwrap_or_default().to_string();
+    let binding = bound(&address).ok_or_else(|| format!("{}: no address", at()))?;
     let sealed = v["sealed"]
         .as_str()
         .and_then(|s| crate::b64::url_decode(s).ok())
         .ok_or_else(|| format!("{}: no sealed key", at()))?;
-    let mut raw = seal.open(&ad(wallet, &address), &sealed).map_err(|_| {
+    let mut raw = seal.open(&ad(wallet, &binding), &sealed).map_err(|_| {
         format!(
             "{}: does not open under security.payments.seal_key — another seal key, or a file of another wallet or address",
             at()
         )
     })?;
-    let key = <[u8; 32]>::try_from(raw.as_slice())
-        .map_err(|_| format!("{}: the sealed key is not 32 bytes", at()))
-        .and_then(|b| evm::key_from_bytes(&b));
+    let bytes = <[u8; 32]>::try_from(raw.as_slice())
+        .map_err(|_| format!("{}: the sealed key is not 32 bytes", at()));
+    crate::sec::harden::wipe(&mut raw);
+    Ok((address, bytes?))
+}
+
+/// The address `path` names, and its key: a regular file of agentd's uid
+/// that no one else can read, sealed for `wallet` under `seal`, whose key's
+/// address is the one it names.
+pub fn read(
+    path: &Path,
+    seal: &SealKey,
+    wallet: &str,
+) -> Result<(Address, k256::ecdsa::SigningKey), String> {
+    let (text, mut raw) = open_sealed(path, seal, wallet, &|a| {
+        Address::parse(a).ok().map(|a| a.lower())
+    })?;
+    let key = evm::key_from_bytes(&raw);
     crate::sec::harden::wipe(&mut raw);
     let key = key?;
+    let address = Address::parse(&text)?;
     if evm::address_of_key(&key) != address {
         return Err(format!(
-            "{}: the key is not the key of the address the file names",
-            at()
+            "security.payments.wallets.{wallet}.key_file {}: the key is not the key of the address the file names",
+            path.display()
         ));
     }
     Ok((address, key))
+}
+
+/// The Solana address `path` names, and its key pair: [`read`]'s checks,
+/// for an Ed25519 seed.
+pub fn read_svm(
+    path: &Path,
+    seal: &SealKey,
+    wallet: &str,
+) -> Result<(Pubkey, ring::signature::Ed25519KeyPair), String> {
+    let (text, mut seed) = open_sealed(path, seal, wallet, &|a| {
+        Pubkey::parse(a).ok().map(|a| a.to_string())
+    })?;
+    let kp = svm::key_pair(&seed);
+    crate::sec::harden::wipe(&mut seed);
+    let kp = kp?;
+    let address = Pubkey::parse(&text)?;
+    if svm::pubkey_of(&kp) != address {
+        return Err(format!(
+            "security.payments.wallets.{wallet}.key_file {}: the key is not the key of the address the file names",
+            path.display()
+        ));
+    }
+    Ok((address, kp))
 }
 
 fn signer_error(e: SignerError) -> SignError {
@@ -259,11 +344,12 @@ impl Wallets {
                     )));
                 }
             };
-            let want = w.address.as_deref().and_then(|a| Address::parse(a).ok());
+            let want = w.address.as_deref().and_then(|a| Account::parse(a).ok());
             wallets.insert(
                 name.clone(),
                 Wallet {
                     source,
+                    chain: w.chain,
                     want,
                     address: std::sync::Mutex::new(None),
                 },
@@ -284,7 +370,7 @@ impl Wallets {
     /// The address `wallet` pays from: known, or read from its key file or
     /// asked of the signer now — off the loop, since a signer may take its
     /// timeout to answer.
-    pub fn address(&self, wallet: &str) -> Result<Address, SignError> {
+    pub fn address(&self, wallet: &str) -> Result<Account, SignError> {
         let w = self
             .wallets
             .get(wallet)
@@ -292,19 +378,30 @@ impl Wallets {
         if let Some(a) = *w.address.lock().unwrap_or_else(|e| e.into_inner()) {
             return Ok(a);
         }
-        let address = match (&self.custody, &w.source) {
-            (Custody::Local(seal), Source::File(path)) => {
-                read(path, seal, wallet).map_err(SignError::Refused)?.0
+        let address = match (&self.custody, &w.source, w.chain) {
+            (Custody::Local(seal), Source::File(path), cfg::Chain::Eip155) => {
+                Account::Evm(read(path, seal, wallet).map_err(SignError::Refused)?.0)
             }
-            (Custody::External(signer), Source::Signer(k)) => {
+            (Custody::Local(seal), Source::File(path), cfg::Chain::Solana) => {
+                Account::Svm(read_svm(path, seal, wallet).map_err(SignError::Refused)?.0)
+            }
+            (Custody::External(signer), Source::Signer(k), chain) => {
                 let pk = signer.public_key(k).map_err(signer_error)?;
-                if pk.alg != "ES256K" {
+                let (alg, what) = match chain {
+                    cfg::Chain::Eip155 => ("ES256K", "secp256k1"),
+                    cfg::Chain::Solana => ("EdDSA", "Ed25519"),
+                };
+                if pk.alg != alg {
                     return Err(SignError::Refused(format!(
-                        "security.payments.wallets.{wallet}: the signer's key {k:?} is {}, not ES256K (secp256k1)",
+                        "security.payments.wallets.{wallet}: the signer's key {k:?} is {}, not {alg} ({what})",
                         pk.alg
                     )));
                 }
-                evm::address_of_jwk(&pk.jwk).map_err(|e| {
+                let derived = match chain {
+                    cfg::Chain::Eip155 => evm::address_of_jwk(&pk.jwk).map(Account::Evm),
+                    cfg::Chain::Solana => svm::pubkey_of_jwk(&pk.jwk).map(Account::Svm),
+                };
+                derived.map_err(|e| {
                     SignError::Refused(format!(
                         "security.payments.wallets.{wallet}: the signer's key {k:?}: {e}"
                     ))
@@ -320,9 +417,7 @@ impl Wallets {
             && want != address
         {
             return Err(SignError::Refused(format!(
-                "security.payments.wallets.{wallet}: its key is {}'s, and the configuration says {}",
-                address.checksummed(),
-                want.checksummed()
+                "security.payments.wallets.{wallet}: its key is {address}'s, and the configuration says {want}"
             )));
         }
         *w.address.lock().unwrap_or_else(|e| e.into_inner()) = Some(address);
@@ -330,7 +425,7 @@ impl Wallets {
     }
 
     /// The address of `wallet` when it is known, without asking anyone.
-    pub fn known(&self, wallet: &str) -> Option<Address> {
+    pub fn known(&self, wallet: &str) -> Option<Account> {
         *self
             .wallets
             .get(wallet)?
@@ -343,7 +438,10 @@ impl Wallets {
     /// local key read and wiped, or the signer asked. It must recover to the
     /// wallet's address, or it is refused.
     pub fn sign_typed_data(&self, wallet: &str, typed_data: &Value) -> Result<[u8; 65], SignError> {
-        let address = self.address(wallet)?;
+        let address = self
+            .address(wallet)?
+            .evm()
+            .ok_or_else(|| SignError::Refused(format!("wallet {wallet} is not an EVM wallet")))?;
         let w = &self.wallets[wallet];
         let digest = super::eip712::digest(typed_data)
             .map_err(|e| SignError::Refused(format!("the typed data: {e}")))?;
@@ -368,6 +466,39 @@ impl Wallets {
                 "the signature is not wallet {wallet}'s ({})",
                 address.checksummed()
             ))),
+        }
+    }
+
+    /// The 64-byte Ed25519 signature of a Solana transaction's `message` by
+    /// `wallet`: the local key read and dropped, or the signer asked. It
+    /// must verify under the wallet's address, or it is refused.
+    pub fn sign_svm(&self, wallet: &str, message: &[u8]) -> Result<[u8; 64], SignError> {
+        let address = self
+            .address(wallet)?
+            .svm()
+            .ok_or_else(|| SignError::Refused(format!("wallet {wallet} is not a Solana wallet")))?;
+        let w = &self.wallets[wallet];
+        let sig = match (&self.custody, &w.source) {
+            (Custody::Local(seal), Source::File(path)) => {
+                let (now, kp) = read_svm(path, seal, wallet).map_err(SignError::Refused)?;
+                if now != address {
+                    return Err(SignError::Refused(format!(
+                        "security.payments.wallets.{wallet}: the key file now holds another address's key"
+                    )));
+                }
+                svm::sign(&kp, message)
+            }
+            (Custody::External(signer), Source::Signer(k)) => signer
+                .sign_solana_transaction(k, message)
+                .map_err(signer_error)?,
+            _ => return Err(SignError::Refused("no key for this custody".into())),
+        };
+        if svm::verify(&address, message, &sig) {
+            Ok(sig)
+        } else {
+            Err(SignError::Refused(format!(
+                "the signature is not wallet {wallet}'s ({address})"
+            )))
         }
     }
 }
@@ -424,6 +555,49 @@ mod tests {
         std::fs::write(&forged, v.to_string()).unwrap();
         std::fs::set_permissions(&forged, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(read(&forged, &seal(), "ops").is_err());
+    }
+
+    /// A Solana wallet's key file is made 0600 and opens to its base58
+    /// address, and to nothing else: not as an EVM key file, not for another
+    /// wallet, not under another seal key; its key signs as that address.
+    #[test]
+    fn a_solana_key_file_opens_only_as_itself() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sol.key");
+        let address = create_svm(&path, &seal(), "sol").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(&address.to_string()));
+        let (a, kp) = read_svm(&path, &seal(), "sol").unwrap();
+        assert_eq!(a, address);
+        let sig = svm::sign(&kp, b"message");
+        assert!(svm::verify(&address, b"message", &sig));
+        assert!(
+            create_svm(&path, &seal(), "sol").is_err(),
+            "never overwritten"
+        );
+        assert!(read(&path, &seal(), "sol").is_err(), "no EVM key");
+        assert!(read_svm(&path, &seal(), "other").is_err());
+        assert!(read_svm(&path, &SealKey::new(&[8u8; 32]).unwrap(), "sol").is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o604)).unwrap();
+        assert!(
+            read_svm(&path, &seal(), "sol")
+                .unwrap_err()
+                .contains("another user")
+        );
+        // An EVM key file is no Solana key.
+        let evm_path = dir.path().join("ops.key");
+        create(&evm_path, &seal(), "ops").unwrap();
+        assert!(read_svm(&evm_path, &seal(), "ops").is_err());
+        // A file naming another address than its key's.
+        let mut v: Value = serde_json::from_str(&text).unwrap();
+        v["address"] = json!("2wKupLR9q6wXYppw8Gr2NvWxKBUqm4PPJKkQfoxHDBg4");
+        let forged = dir.path().join("forged.key");
+        std::fs::write(&forged, v.to_string()).unwrap();
+        std::fs::set_permissions(&forged, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_svm(&forged, &seal(), "sol").is_err());
     }
 
     /// The seal key is 32 bytes, as hex or base64.

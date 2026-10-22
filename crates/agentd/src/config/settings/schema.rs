@@ -682,25 +682,29 @@ fn payments() -> Value {
             "key_custody": { "enum": ["local", "external"], "description": "who holds the wallet keys: agentd, each key file sealed under seal_key (local, the default), or the external signer (external, with signer and no seal_key)" },
             "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, a single {{secret-file:PATH}} reference (never the environment): every wallet key file is sealed under it. key_custody local only" },
             "signer": { "type": "object", "additionalProperties": false, "required": ["socket", "uid"],
-                "description": "the external signer that holds the wallet keys (key_custody external; docs/external-signer.md): it signs only EIP-712 typed data of an EIP-3009 TransferWithAuthorization its own policy allows",
+                "description": "the external signer that holds the wallet keys (key_custody external; docs/external-signer.md): it signs only EIP-712 typed data of an EIP-3009 TransferWithAuthorization, or a Solana transaction message of an SPL transfer, its own policy allows",
                 "properties": {
                 "socket": { "type": "string", "description": "the signer's unix socket, an absolute path" },
                 "uid": { "type": "integer", "minimum": 0, "description": "the uid the signer runs as: the socket's peer (SO_PEERCRED) must be it, or nothing is sent" },
                 "timeout": { "type": ["string", "integer"], "description": "the bound on one request, 1ms to 60s; default 5s" } } },
             "wallets": { "type": "object", "description": "the wallets agentd pays from, by name (1 to 32 of a-z, 0-9, - and _)", "additionalProperties": { "type": "object", "additionalProperties": false, "properties": {
+                "chain": { "enum": ["eip155", "solana"], "description": "the chain family it pays on, by CAIP-2 namespace: eip155 (the default; a secp256k1 key) or solana (an Ed25519 key); a step pays from it only in assets on that family's chains" },
                 "key_file": { "type": "string", "description": "key_custody local: the sealed key file, an absolute path, made 0600 by `agentd --print-wallet-address <name>` when absent; refused at start when another user can read it or it does not open to its address" },
                 "key": { "type": "string", "description": "key_custody external: the signer's key id" },
-                "address": { "type": "string", "description": "the wallet's address (0x and 40 hex digits); when given, a key of another address refuses the start" } } } },
+                "address": { "type": "string", "description": "the wallet's address (0x and 40 hex digits on eip155, 32 bytes in base58 on solana); when given, a key of another address refuses the start" } } } },
             "assets": { "type": "object", "description": "the assets agentd pays in, by name; amounts of two assets are never added", "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["asset", "decimals", "limits"], "properties": {
-                "asset": { "type": "string", "description": "the CAIP-19 asset type, eip155:<chain id>/erc20:<contract>: names the network (CAIP-2) and the token" },
+                "asset": { "type": "string", "description": "the CAIP-19 asset type, eip155:<chain id>/erc20:<contract> or solana:<genesis hash prefix>/token:<mint>: names the network (CAIP-2) and the token" },
                 "decimals": { "type": "integer", "minimum": 0, "maximum": 36, "description": "the token's decimals: \"1\" is 10^decimals atomic units" },
+                "token_program": { "enum": ["spl-token", "token-2022"], "description": "a Solana token's program, whose transfer and associated token accounts it uses; default spl-token. Solana assets only" },
                 "limits": { "type": "object", "additionalProperties": false, "required": ["per_run", "per_day", "per_payee"], "properties": {
                     "per_payment": amount, "per_run": amount, "per_day": amount, "per_payee": amount },
                     "description": "per_payment: one payment; per_run: one run's payments; per_day: all payments in any 24 hours; per_payee: all payments to one payee in any 24 hours — each counting every payment that left agentd or may have" },
                 "approve_above": { "type": "string", "description": "above this amount (whole units) the approver is asked" } } } },
             "payees": { "type": "object", "description": "the addresses agentd may pay, by name", "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["address"], "properties": {
-                "address": { "type": "string", "description": "the payTo address (0x and 40 hex digits)" },
-                "assets": { "type": "array", "items": { "type": "string" }, "description": "the assets it may be paid in; default every asset" } } } } } })
+                "address": { "type": "string", "description": "the payTo address: 0x and 40 hex digits on an EVM chain, 32 bytes in base58 on Solana" },
+                "assets": { "type": "array", "items": { "type": "string" }, "description": "the assets it may be paid in, each on its address's chain family; default every asset" } } } },
+            "rpc": { "type": "object", "additionalProperties": { "type": "string" },
+                "description": "by Solana network (CAIP-2, e.g. solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp), the RPC endpoint asked for a recent blockhash (getLatestBlockhash) when a server's entry gives no extra.recentBlockhash: https://, or http:// to this host; {{secret:NAME}} references in it resolved when it is dialled. Without one, an entry with no blockhash is passed over" } } })
 }
 
 /// A conversation's `context` (RFC 0047 §5.5.7): `security.companies.context`

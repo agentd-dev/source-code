@@ -17,6 +17,7 @@ pub mod companies;
 pub mod delegation;
 pub mod events;
 pub mod inbound;
+pub mod payments;
 pub mod schema;
 
 use super::file::{self, Format};
@@ -4431,6 +4432,9 @@ pub struct Security {
     /// Acting at Companies for one User (RFC 0047): who the User is, the
     /// client identity every Company sees, and the seal key.
     pub companies: companies::Companies,
+    /// Paying for things (RFC 0049): the spend policy every payment is held
+    /// to, the wallets and who holds their keys, and the approver.
+    pub payments: payments::Payments,
     /// Features built on drafts, each off until the operator turns it on.
     pub experimental: delegation::Experimental,
 }
@@ -4886,18 +4890,21 @@ impl Settings {
 
     /// What no child may open (RFC 0044 P2a, `sec::landlock`), where the
     /// configuration holds a supervisor-only key — a delegation is declared,
-    /// or the companies preview's records are sealed, by a key agentd reads
-    /// or one an external signer holds: the file store's root, where the
-    /// vault and the sealed records are; every `{{secret-file:…}}` a
-    /// supervisor-only secret is read from; each external signer's socket;
-    /// and the audit chain with its closed segments. With no such key, the
-    /// audit chain alone, when it is set; else nothing.
+    /// the companies preview's records are sealed, or payments are
+    /// configured (RFC 0049 D5), by a key agentd reads or one an external
+    /// signer holds: the file store's root, where the vault, the sealed
+    /// records and the payment ledger are; every `{{secret-file:…}}` a
+    /// supervisor-only secret is read from; each wallet's sealed key file;
+    /// each external signer's socket; and the audit chain with its closed
+    /// segments. With no such key, the audit chain alone, when it is set;
+    /// else nothing.
     pub fn supervisor_only_paths(&self) -> Vec<crate::sec::landlock::Protected> {
         use crate::sec::landlock::Protected;
         let mut out = Vec::new();
         let keyed = !self.identity.providers.is_empty()
             || delegation::delegated_servers(self).next().is_some()
-            || self.security.companies.sealed();
+            || self.security.companies.sealed()
+            || self.security.payments.declared();
         if keyed {
             if self.store.kind == StoreKind::File {
                 out.push(Protected {
@@ -4906,7 +4913,13 @@ impl Settings {
                 });
             }
             let mut refs = delegation::reserved_refs(self);
-            if let Some(Secret(s)) = &self.security.companies.seal_key {
+            for Secret(s) in [
+                &self.security.companies.seal_key,
+                &self.security.payments.seal_key,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 refs.extend(
                     crate::sec::secret::refs_of(s)
                         .iter()
@@ -4921,6 +4934,18 @@ impl Settings {
                     });
                 }
             }
+            for f in self
+                .security
+                .payments
+                .wallets
+                .values()
+                .filter_map(|w| w.key_file.as_deref())
+            {
+                out.push(Protected {
+                    path: std::path::PathBuf::from(f),
+                    with_suffixes: false,
+                });
+            }
             // The external signer's socket: a child can still connect to
             // it (no Landlock right covers that), and can neither remove it
             // nor bind another in its place.
@@ -4933,6 +4958,12 @@ impl Settings {
                 .chain(
                     self.security
                         .companies
+                        .external()
+                        .map(|sg| sg.socket.as_str()),
+                )
+                .chain(
+                    self.security
+                        .payments
                         .external()
                         .map(|sg| sg.socket.as_str()),
                 );
@@ -6226,6 +6257,10 @@ pub enum Ask {
     /// Metadata Document and key set (RFC 0052) into `dir`, for static
     /// hosting, creating the signing key when absent. Dials nothing.
     PrintClientMetadata(String),
+    /// `--print-wallet-address <wallet>`: the address of a
+    /// `security.payments` wallet, to fund (RFC 0049 D5) — its sealed key
+    /// file made when absent, or its external signer asked.
+    PrintWalletAddress(String),
     /// `--delegation-list`: the running daemon's delegation grants and open
     /// consent gates (RFC 0044).
     DelegationList,
@@ -6266,6 +6301,7 @@ fn ask_flag(flag: &str) -> Option<Ask> {
         "--extensions" => Ask::Extensions,
         "--print-company-client" => Ask::PrintCompanyClient(String::new()),
         "--print-client-metadata" => Ask::PrintClientMetadata(String::new()),
+        "--print-wallet-address" => Ask::PrintWalletAddress(String::new()),
         "--delegation-list" => Ask::DelegationList,
         "--delegation-approve" => Ask::DelegationApprove(String::new()),
         "--delegation-deny" => Ask::DelegationDeny(String::new()),
@@ -6453,6 +6489,14 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
                 Ask::PrintClientMetadata(_) => {
                     Ask::PrintClientMetadata(it.next().cloned().ok_or_else(|| {
                         usage("--print-client-metadata requires a directory to write into".into())
+                    })?)
+                }
+                Ask::PrintWalletAddress(_) => {
+                    Ask::PrintWalletAddress(it.next().cloned().ok_or_else(|| {
+                        usage(
+                            "--print-wallet-address requires a wallet (a security.payments.wallets name)"
+                                .into(),
+                        )
                     })?)
                 }
                 Ask::DelegationApprove(_) => {
@@ -8603,6 +8647,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // `identity.providers`, `identity.delegation` and the delegated servers.
     delegation::validate(s, &mut d);
     inbound::validate(s, &mut d);
+    // `security.payments`: the spend policy (RFC 0049).
+    payments::validate(s, &mut d);
 
     // mcp servers
     let mut names = std::collections::HashSet::new();
@@ -10053,6 +10099,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 err(&mut d, msg);
             }
         }
+        // A served document configures no payment (RFC 0042, RFC 0049 D2).
+        if s.agent.document_workflows.contains(&i) && payments::pays_json(w) {
+            let name = w.get("name").and_then(Value::as_str).unwrap_or("?");
+            err(&mut d, payments::document_pays(name));
+        }
     }
     let mut parsed = Vec::new();
     for w in &s.workflows {
@@ -10161,6 +10212,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 d.errors.extend(refused);
                 continue;
             }
+            if payments::pays_json(&def) {
+                let name = def.get("name").and_then(Value::as_str).unwrap_or("?");
+                d.errors.push(payments::document_pays(name));
+                continue;
+            }
         }
         match crate::engine::model::parse_workflow(&def) {
             Err(errs) => d.errors.extend(errs),
@@ -10197,6 +10253,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
         for e in companies::workflow_refusals(s, w) {
+            err(&mut d, e);
+        }
+        for e in payments::workflow_refusals(s, w) {
             err(&mut d, e);
         }
     }
@@ -10813,6 +10872,10 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "security.egress",
     "security.exec",
     "security.experimental",
+    // The spend policy, the wallets and the approver (RFC 0049 §4): what a
+    // payment is judged by, and the gate a reload would move under a
+    // question the approver is reading.
+    "security.payments",
     "security.tls_ca",
     "security.workflows",
     // The listener as a resource server (RFC 0044 §5.9): the resource and
@@ -11117,6 +11180,8 @@ pub fn help_text() -> String {
          \x20                            into <dir>, creating the signing key; dials nothing (needs oauth)\n\
          \x20 --print-company-client <dir>  write the client metadata document + key set Companies fetch\n\
          \x20                            into <dir>, creating the signing key; dials nothing (needs companies)\n\
+         \x20 --print-wallet-address <wallet>  print a security.payments wallet's address, to fund: its sealed\n\
+         \x20                            key file made 0600 when absent, or the external signer asked (needs x402)\n\
          \x20 --login idp:<name>[/<grant>]  the running daemon signs the per-person operator in at an IdP and\n\
          \x20                            keeps their delegation grant (needs xaa; unix A2A listener)\n\
          \x20 --delegation-list          the running daemon's delegation grants and open consent gates (needs xaa)\n\
@@ -11456,6 +11521,15 @@ mod tests {
                         json!({"phone": {"iss": "https://acme.okta.com", "sub": "00u1"}})
                     }
                     p if p.ends_with(".tool_scopes") => json!({"create_issue": ["write"]}),
+                    "security.payments.wallets" => json!({"ops": {"key_file": "/w/ops.key"}}),
+                    "security.payments.assets" => json!({"usdc": {
+                        "asset": "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                        "decimals": 6,
+                        "limits": {"per_run": "1", "per_day": "5", "per_payee": "2"}
+                    }}),
+                    "security.payments.payees" => {
+                        json!({"api": {"address": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"}})
+                    }
                     _ => json!({"k": "v"}),
                 },
                 paths::Kind::Any => match b.path.as_str() {
@@ -11475,6 +11549,7 @@ mod tests {
                         || p.ends_with("_interval")
                         || p.ends_with("_age")
                         || p.ends_with("_lifetime")
+                        || p.ends_with("_validity")
                         || p == "observability.audit.chain.retention" =>
                     {
                         json!("10s")

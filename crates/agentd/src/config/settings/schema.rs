@@ -456,6 +456,7 @@ fn top_level_properties(
                 "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open" },
                 "client": client(),
                 "companies": companies(),
+                "payments": payments(),
                 "experimental": { "type": "object", "additionalProperties": false, "description": "features built on drafts, each off until turned on",
                     "properties": { "id_jag": { "type": "boolean", "description": "allow `grant: id_jag` servers (RFC 0044; needs the xaa feature) until ID-JAG reaches IETF working-group last call" } } } } }));
 }
@@ -664,6 +665,42 @@ fn companies() -> Value {
                     "expires": { "type": "string", "description": "an RFC 3339 time it stops applying at" },
                     "uses": { "type": "integer", "minimum": 1, "description": "how many confirms it covers, each reserved before the confirm and given back when the Company refuses it; default no limit but expires" },
                     "accounts": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^[a-z0-9_-]{1,32}$" }, "description": "the labels of the User's accounts at the Company it covers, as a sign-in names them (agentd's own words, never sent); default the account labelled default alone, and the signed-out Session — so signing in to a second account never widens it" } } } } } })
+}
+
+/// `security.payments` (RFC 0049): the spend policy every payment is held
+/// to, the wallets and who holds their keys, the approver. Needs the `x402`
+/// feature.
+fn payments() -> Value {
+    let amount = json!({ "type": "string", "description": "a decimal in the asset's whole units (\"0.25\"), at most `decimals` digits after the point" });
+    json!({ "type": "object", "additionalProperties": false,
+        "description": "paying for things with x402 (RFC 0049; needs the x402 feature): the spend policy every payment is held to — assets by CAIP-19, payees by address, caps per payment, run, day and payee, the approver above a threshold — and the wallets. Restart-only, operator-only. Needs observability.audit.chain and a durable store",
+        "properties": {
+            "approver": { "type": "string", "description": "who approves a payment the policy asks about: `operator` (default: any operator principal) or one principal id `<role>:<id>`, the only one who can — no judge answers, and no operator but the approver" },
+            "approval_timeout": { "type": ["string", "integer"], "description": "how long the approver is waited for before the payment is declined, 1s to 7d; default 1h" },
+            "ask_when_tainted": { "type": "boolean", "description": "a payment from work that has read outside text, or that a model asked for, is asked of the approver whatever its amount; default true" },
+            "max_validity": { "type": ["string", "integer"], "description": "the longest an authorization agentd signs is valid (validBefore after now), 10s to 1h; the server's maxTimeoutSeconds when shorter; default 5m" },
+            "key_custody": { "enum": ["local", "external"], "description": "who holds the wallet keys: agentd, each key file sealed under seal_key (local, the default), or the external signer (external, with signer and no seal_key)" },
+            "seal_key": { "type": "string", "description": "32 random bytes as hex or base64, a single {{secret-file:PATH}} reference (never the environment): every wallet key file is sealed under it. key_custody local only" },
+            "signer": { "type": "object", "additionalProperties": false, "required": ["socket", "uid"],
+                "description": "the external signer that holds the wallet keys (key_custody external; docs/external-signer.md): it signs only EIP-712 typed data of an EIP-3009 TransferWithAuthorization its own policy allows",
+                "properties": {
+                "socket": { "type": "string", "description": "the signer's unix socket, an absolute path" },
+                "uid": { "type": "integer", "minimum": 0, "description": "the uid the signer runs as: the socket's peer (SO_PEERCRED) must be it, or nothing is sent" },
+                "timeout": { "type": ["string", "integer"], "description": "the bound on one request, 1ms to 60s; default 5s" } } },
+            "wallets": { "type": "object", "description": "the wallets agentd pays from, by name (1 to 32 of a-z, 0-9, - and _)", "additionalProperties": { "type": "object", "additionalProperties": false, "properties": {
+                "key_file": { "type": "string", "description": "key_custody local: the sealed key file, an absolute path, made 0600 by `agentd --print-wallet-address <name>` when absent; refused at start when another user can read it or it does not open to its address" },
+                "key": { "type": "string", "description": "key_custody external: the signer's key id" },
+                "address": { "type": "string", "description": "the wallet's address (0x and 40 hex digits); when given, a key of another address refuses the start" } } } },
+            "assets": { "type": "object", "description": "the assets agentd pays in, by name; amounts of two assets are never added", "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["asset", "decimals", "limits"], "properties": {
+                "asset": { "type": "string", "description": "the CAIP-19 asset type, eip155:<chain id>/erc20:<contract>: names the network (CAIP-2) and the token" },
+                "decimals": { "type": "integer", "minimum": 0, "maximum": 36, "description": "the token's decimals: \"1\" is 10^decimals atomic units" },
+                "limits": { "type": "object", "additionalProperties": false, "required": ["per_run", "per_day", "per_payee"], "properties": {
+                    "per_payment": amount, "per_run": amount, "per_day": amount, "per_payee": amount },
+                    "description": "per_payment: one payment; per_run: one run's payments; per_day: all payments in any 24 hours; per_payee: all payments to one payee in any 24 hours — each counting every payment that left agentd or may have" },
+                "approve_above": { "type": "string", "description": "above this amount (whole units) the approver is asked" } } } },
+            "payees": { "type": "object", "description": "the addresses agentd may pay, by name", "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["address"], "properties": {
+                "address": { "type": "string", "description": "the payTo address (0x and 40 hex digits)" },
+                "assets": { "type": "array", "items": { "type": "string" }, "description": "the assets it may be paid in; default every asset" } } } } } })
 }
 
 /// A conversation's `context` (RFC 0047 §5.5.7): `security.companies.context`

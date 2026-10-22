@@ -69,7 +69,7 @@ endpoints — or, for a `company:<name>` or `idp:<name>` target and the
 delegation commands, the running daemon's unix A2A listener. Every ask reads
 the configuration files you name, so a file that does not parse is exit 2 even
 for `--help`. Only `--validate-config`, `--capabilities`,
-`--effective-config`, `--print-client-metadata`, `--print-company-client`
+`--effective-config`, `--print-client-metadata`, `--print-company-client`, `--print-wallet-address`
 and the `--delegation-*` commands also run validation.
 
 | Flag | Prints | Stream | Exit |
@@ -97,6 +97,7 @@ and the `--delegation-*` commands also run validation.
 | `--delegation-lint` | Prints, from the configuration alone, the Resource connections each IdP must have for its templates to work — exactly those — and what would refuse or narrow a delegated call. Dials nothing. Needs the `xaa` feature. | stdout | 0, or 2 when a finding refuses delegated calls |
 | `--print-client-metadata <dir>` | Writes `client.json` (agentd's [Client ID Metadata Document](authentication.md#client-id-metadata-document)) and `jwks.json` (its key set, public halves only) for `security.client` into `<dir>`, for static hosting at the `client_id` and `jwks_uri`, and prints their paths. Creates the signing key `0600` when it is absent. Dials nothing. Needs the `oauth` feature. | stdout | 0, or 2 on an invalid configuration |
 | `--print-company-client <dir>` | Writes `client.json` (the client metadata document) and `jwks.json` (its key set, public halves only) for `security.companies.client` into `<dir>`, for static hosting at the `client_id` and `jwks_uri`, and prints their paths. Creates the signing key `0600` when it is absent. Dials nothing. Needs the `companies` feature. | stdout | 0, or 2 on an invalid configuration |
+| `--print-wallet-address <wallet>` | Prints the address of the `security.payments` wallet `<wallet>`, the address to fund. Under `key_custody: local` it makes the wallet's sealed key file `0600` when it is absent, from the kernel's random source, sealed under `security.payments.seal_key`; under `external` it asks the signer for the key's address. Dials nothing else. Needs the `x402` feature ([Pay for things with x402](pay-with-x402.md)). | stdout | 0, or 2 on an invalid configuration or a key file that does not open |
 
 > **Note.** `--validate-config` writes its verdict to **stderr**. A CI step
 > that captures stdout to check validity sees nothing; branch on the exit

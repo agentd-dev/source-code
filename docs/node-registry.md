@@ -1059,9 +1059,9 @@ One outbound HTTP request.
 
 - **Fields:** **`url`**, `method`, `headers`, `query`, `body`, `json`,
   `timeout`, `expect`, `allow_private`, `sign`, `idempotency`, `breaker`,
-  `rate`, `auth`.
+  `rate`, `auth`, `payment`.
 - **Output:** `{status, ok, headers, body, json}`; `json` is the body parsed,
-  or null.
+  or null. A paid request's adds `payment`.
 - `method` defaults to `GET`. Success is a status from 200 to 399 unless
   `expect` lists codes; any other status fails the step with the output
   still recorded. `timeout` defaults to 30 s.
@@ -1089,6 +1089,18 @@ One outbound HTTP request.
   `{status, json}`. `headers`, `body`, `sign`, `allow_private` and
   `idempotency` are refused with it. See
   [A Company's agent and its APIs](configuration.md#a-companys-agent-and-its-apis).
+- `payment: {wallet, max, approve?}` lets the step pay for its request with
+  x402 (the `x402` feature), within `security.payments`: `wallet` a
+  configured wallet, `max` `"<amount> <asset>"` or a list of them, `approve:
+  true` to ask the approver about every payment. Answered `402` with a
+  `PAYMENT-REQUIRED`, the step sends the same request once more with a
+  `PAYMENT-SIGNATURE`, and its output gains `payment: {state, wallet,
+  network, asset, amount, payee, pay_to, nonce, transaction, payer,
+  error_reason}`. The field is literal, and only the operator's own
+  configuration declares it; a request paid, or whose payment's outcome is
+  unknown, is never paid again — a retry fails sending nothing. Without
+  `payment`, a `402` fails the step with the request decoded into the output
+  as `payment_required`. See [Pay for things with x402](pay-with-x402.md).
 
 ```yaml
 # fragment: under workflows[].steps

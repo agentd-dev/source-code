@@ -71,11 +71,16 @@ pub enum Category {
     /// checks, the redemption, renewal and revocation, and the person's
     /// approvals — against a mock IdP, authorization server and MCP server.
     Ema,
+    /// Paying with x402 (RFC 0049) within ADR 0003's spend policy: the
+    /// HTTP transport's headers, the entries a client must skip, refusals
+    /// unsent, the approver's gate, never twice, the audit chain and the
+    /// key's custody — against the mock x402 resource server.
+    Payments,
 }
 
 impl Category {
     /// Every family, in report order: the one list the docs are held to.
-    pub const ALL: [Category; 14] = [
+    pub const ALL: [Category; 15] = [
         Category::Supervisor,
         Category::Security,
         Category::Store,
@@ -90,6 +95,7 @@ impl Category {
         Category::McpSkills,
         Category::Companies,
         Category::Ema,
+        Category::Payments,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -108,6 +114,7 @@ impl Category {
             Category::McpSkills => "mcp-skills",
             Category::Companies => "companies",
             Category::Ema => "ema",
+            Category::Payments => "payments",
         }
     }
 }
@@ -202,6 +209,7 @@ pub fn family(category: Category) -> Vec<Check> {
         Category::McpSkills => checks::mcp_skills::checks(),
         Category::Companies => checks::companies::checks(),
         Category::Ema => checks::ema::checks(),
+        Category::Payments => checks::payments::checks(),
     }
 }
 

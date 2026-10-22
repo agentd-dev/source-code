@@ -525,6 +525,20 @@ pub struct Runtime {
     /// Acting for the enrolled person at delegated servers (RFC 0044).
     #[cfg(feature = "xaa")]
     pub(crate) delegation: Option<Arc<crate::delegation::Delegation>>,
+    /// The spend policy, the wallets and the ledger (RFC 0049): `None`
+    /// when no payment is configured.
+    #[cfg(feature = "x402")]
+    pub(crate) payments: Option<Arc<crate::payments::Payments>>,
+    /// The payments waiting for the approver, by gate. In memory: a restart
+    /// ends each step that waited, nothing paid.
+    #[cfg(feature = "x402")]
+    pub(crate) payment_gates: BTreeMap<String, super::payments::Gate>,
+    /// The tasks of the gates closed lately, to refuse a late answer.
+    #[cfg(feature = "x402")]
+    pub(crate) payment_closed: std::collections::VecDeque<String>,
+    /// When the ledger was last swept.
+    #[cfg(feature = "x402")]
+    pub(crate) payments_swept_ms: u64,
     /// The inbound-token verifier the A2A listener and the webhook surface
     /// share (RFC 0044 §5.9), when `a2a.inbound_tokens` names an issuer.
     #[cfg(all(feature = "a2a", feature = "oauth"))]
@@ -934,6 +948,8 @@ impl Runtime {
             self.poll_company_gates();
             #[cfg(feature = "xaa")]
             self.delegation_tick();
+            #[cfg(feature = "x402")]
+            self.payments_tick();
             self.poll_mcp_notifications();
             #[cfg(feature = "mcp-events")]
             self.events_tick();
@@ -1152,6 +1168,10 @@ impl Runtime {
             Event::CompanyNotice(n) => self.on_company_notice(*n),
             #[cfg(feature = "companies")]
             Event::CompanyDirect { id, step } => self.on_company_direct(&id, step),
+            #[cfg(feature = "x402")]
+            Event::PaymentRequired(a) => self.on_payment_required(*a),
+            #[cfg(feature = "x402")]
+            Event::PaymentDone(p) => self.on_payment_done(*p),
             Event::Background { .. } | Event::Tick => {}
         }
     }

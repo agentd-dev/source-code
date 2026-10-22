@@ -299,6 +299,7 @@ pub const EVENT_FAMILIES: &[&str] = &[
     "metrics",
     "nested",
     "otel",
+    "payment",
     "plan",
     "preflight",
     "pressure",

@@ -137,6 +137,31 @@ revision of the draft but the pinned one.
 [Act at companies for a person](act-at-companies.md) is the guide, and
 [RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md) the design.
 
+## x402
+
+x402 is how a server asks to be paid for a request: it answers `402` with
+the ways it takes payment, and the client pays and asks again. agentd is a
+paying client, and only within a spend policy the operator declares. The
+support is a preview: it is not in the release binaries.
+
+| | Support |
+|---|---|
+| Version | x402 **v2** (`x402Version: 2`), pinned at the specification's commit `e7a3b4ff47`. A payment request of another version is refused. |
+| Build | the `x402` build feature, which no release binary or image carries; [Build features and crates](features.md) has the build. |
+| Role | the client that pays. Not a resource server and not a facilitator: agentd talks to no chain. |
+| Transport | HTTP: `PAYMENT-REQUIRED` read from a `402`, the request sent once more with `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE` read back; base64 JSON, standard or URL-safe. |
+| Scheme | `exact` on EVM chains (CAIP-2 `eip155`), ERC-20 tokens (CAIP-19 `erc20`), the `eip3009` transfer method and the `authorization` payment flow: an EIP-3009 `TransferWithAuthorization` signed as EIP-712 typed data, secp256k1 with RFC 6979 and a low `s`, addresses held to EIP-55. Other entries are passed over. |
+| Where it pays | a workflow's `http` step with `payment`, in the operator's own configuration. No tool a model calls pays. |
+| Spend policy | caps per payment, run, day and payee; allow-listed assets and payees; the approver's gate above a threshold; a ledger that never pays twice; every payment an audit record ([ADR 0003](../rfcs/adr/0003-no-payment-without-a-spend-policy.md)). |
+| Tested against | agentd's own mock resource server, which recovers each payment's signer, and the specification's own examples; the conformance suite's `payments` family. |
+
+**Not supported:** the MCP and A2A transports and the Solana binding
+(designed, not built); Permit2 and ERC-7710; the `upto`,
+`batch-settlement` and `auth-capture` schemes; the facilitator and discovery
+APIs; acting on x402 extensions, which are echoed as received.
+[Pay for things with x402](pay-with-x402.md) is the guide, and
+[RFC 0049](../rfcs/0049-paying-for-things.md) the design.
+
 ## Model providers
 
 agentd speaks four wire formats, chosen per connection with `dialect`. A

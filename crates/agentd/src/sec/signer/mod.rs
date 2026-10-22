@@ -23,7 +23,11 @@
 //! - `unwrap {key, wrapped, aad}` → `{plaintext}`;
 //! - `derive {key, data}` → `{mac}`: HMAC-SHA256 of `data` under the
 //!   derivation key `key` — the record-id keys of the companies preview's
-//!   stores (RFC 0047), each derived from a fixed label.
+//!   stores (RFC 0047), each derived from a fixed label;
+//! - `sign_typed_data {key, typed_data}` → `{sig}`: an EVM key's 65-byte
+//!   `r ‖ s ‖ v` over the EIP-712 digest of `typed_data`, which the signer
+//!   computes itself — an x402 payment's EIP-3009 authorization (RFC 0049
+//!   D8); `public_key` answers such a key `ES256K`, a secp256k1 JWK.
 //!
 //! **What a signer signs** is its own policy, and `docs/external-signer.md`
 //! asks it to sign only what a client assertion is: agentd sends the JWS
@@ -196,6 +200,23 @@ impl Signer {
         });
         crate::sec::harden::wipe(&mut mac);
         out
+    }
+
+    /// The 65-byte `r ‖ s ‖ v` signature, by the EVM key `key`, of the
+    /// EIP-712 typed data `typed_data` (RFC 0049 D8): sent whole, not as a
+    /// digest, so the signer computes the digest itself from what it read.
+    #[cfg(feature = "x402")]
+    pub fn sign_typed_data(&self, key: &str, typed_data: &Value) -> Result<[u8; 65], SignerError> {
+        let a =
+            self.call(json!({"op": "sign_typed_data", "key": key, "typed_data": typed_data}))?;
+        let sig = self.bytes(&a, "sig", "sign_typed_data", key)?;
+        <[u8; 65]>::try_from(sig.as_slice()).map_err(|_| {
+            self.malformed(
+                "sign_typed_data",
+                key,
+                &format!("a signature of {} bytes, not 65", sig.len()),
+            )
+        })
     }
 
     fn malformed(&self, op: &str, key: &str, why: &str) -> SignerError {

@@ -346,7 +346,8 @@
           "idempotency",
           "breaker",
           "rate",
-          "auth"
+          "auth",
+          "payment"
         ],
         "implemented": true,
         "required": [

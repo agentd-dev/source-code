@@ -15,9 +15,9 @@
 //!
 //! The pages describe the release binary, so the samples are checked against
 //! a build with the release feature set. A sample for a feature that set
-//! leaves out — `exec`, `companies`, `xaa` — is skipped there and checked
-//! by a build that adds it (`--features <release set>,companies`, or CI's
-//! `--all-features`).
+//! leaves out — `exec`, `companies`, `xaa`, `x402` — is skipped there and
+//! checked by a build that adds it (`--features <release set>,companies`, or
+//! CI's `--all-features`).
 #![cfg(all(
     unix,
     feature = "a2a",
@@ -145,6 +145,9 @@ fn every_complete_configuration_sample_in_the_docs_loads() {
             continue;
         }
         if !cfg!(feature = "xaa") && delegates(&doc) {
+            continue;
+        }
+        if !cfg!(feature = "x402") && doc.pointer("/security/payments").is_some() {
             continue;
         }
         let dir = scratch.join(format!("sample-{checked}"));

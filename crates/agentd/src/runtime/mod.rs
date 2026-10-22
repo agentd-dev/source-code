@@ -54,6 +54,8 @@ pub mod join; // servers down at boot join when they come up
 pub mod mcp_events; // MCP Events (RFC 0045): occurrences into declared streams
 pub mod mcp_tasks; // MCP Tasks (RFC 0050): a step's or a turn's task, followed to its end
 pub mod nested;
+#[cfg(feature = "x402")]
+pub(crate) mod payments; // an http step's x402 payment: the policy, the approver's gate, the ledger (RFC 0049)
 pub mod pressure; // disk/memory pressure: shed new work, drain what is in flight
 pub mod reactor;
 pub mod reload;
@@ -763,6 +765,19 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     };
     #[cfg(all(feature = "a2a", feature = "oauth"))]
     let inbound = crate::a2a::inbound::Inbound::build(&settings, &log);
+    // The spend policy, the wallets and the ledger (RFC 0049): a wallet key
+    // that does not open to its address refuses the start, and a payment
+    // still out when the last life stopped is unknown from here on.
+    #[cfg(feature = "x402")]
+    let (payments, payments_restored) =
+        match crate::payments::Payments::build(&settings, Arc::clone(&durable), &log) {
+            Ok(Some((p, restored))) => (Some(p), restored),
+            Ok(None) => (None, Vec::new()),
+            Err(e) => {
+                log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+                return crate::exit::USAGE;
+            }
+        };
     let mut rt = Runtime {
         instance: instance.clone(),
         run_id: run_id.clone(),
@@ -778,6 +793,14 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         company_directs: BTreeMap::new(),
         #[cfg(feature = "xaa")]
         delegation,
+        #[cfg(feature = "x402")]
+        payments,
+        #[cfg(feature = "x402")]
+        payment_gates: BTreeMap::new(),
+        #[cfg(feature = "x402")]
+        payment_closed: std::collections::VecDeque::new(),
+        #[cfg(feature = "x402")]
+        payments_swept_ms: 0,
         #[cfg(all(feature = "a2a", feature = "oauth"))]
         inbound,
         #[cfg(feature = "xaa")]
@@ -1032,6 +1055,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             link: None,
         });
     }
+    // A payment the last life left out is `unknown` from here on: its
+    // `authorized` record is closed in the chain (RFC 0049 D10).
+    #[cfg(feature = "x402")]
+    rt.payments_restored(payments_restored);
 
     // The instruction: either static text, or a resource URI that is read
     // now and subscribed to so later updates reach the agent. An `oci://`

@@ -54,13 +54,15 @@ fn binary() -> &'static PathBuf {
         // is agentd acting for an enrolled person, which the `ema` family
         // drives against its mock IdP, authorization server and MCP server;
         // `hot-reload` is the SIGHUP reload its template checks send; `exec`
-        // the local command its check runs beside a delegation, as root.
+        // the local command its check runs beside a delegation, as root;
+        // `x402` agentd paying, which the `payments` family holds to x402
+        // and ADR 0003 against its mock resource server.
         build(&[
             "build",
             "-p",
             "agentd-cli",
             "--features",
-            "a2a,cron,internal-mocks,oauth,companies,xaa,hot-reload,exec",
+            "a2a,cron,internal-mocks,oauth,companies,xaa,hot-reload,exec,x402",
         ]);
         let agentd = target_dir().join("agentd");
         assert!(

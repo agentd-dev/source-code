@@ -401,6 +401,15 @@ export const DOCS = [
     "tag": "preview"
   },
   {
+    "slug": "pay-with-x402",
+    "file": "docs/pay-with-x402.md",
+    "title": "Pay for things with x402",
+    "group": "guides",
+    "section": "integrate",
+    "blurb": "Let a workflow pay for an HTTP resource that asks to be paid with x402, from a wallet agentd holds, only within a spend policy you declare.",
+    "tag": "preview"
+  },
+  {
     "slug": "architecture",
     "file": "docs/architecture.md",
     "title": "Architecture",

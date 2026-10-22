@@ -27,7 +27,7 @@ a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,m
 can try an agent or a workflow in the released agentd with no provider
 account.
 
-Four features are never in a release binary:
+Five features are never in a release binary:
 
 - `exec`, the local command runner. agentd's default posture is that it runs
   no local code; you opt in at build time and again at run time.
@@ -43,11 +43,18 @@ Four features are never in a release binary:
   [RFC 0044](../rfcs/0044-enterprise-managed-authorization.md)). ID-JAG is
   an IETF draft and the MCP extension is young, so the feature stays out of
   the release set.
+- `x402`, agentd paying for HTTP resources with x402 within a spend
+  policy, a preview ([Pay for things with x402](pay-with-x402.md),
+  [RFC 0049](../rfcs/0049-paying-for-things.md)). No payment without an
+  operator who chose to build one in
+  ([ADR 0003](../rfcs/adr/0003-no-payment-without-a-spend-policy.md)), so
+  the feature stays out of the release set.
 - `internal-mocks`, the test scaffolding: the mock MCP servers and crash
   points the test suites drive, and, with `oauth` (and the default `tls`),
   the fake Company that `agentd-conformance` holds to the Personal Agent
-  Protocol draft, and, with `xaa`, the mock IdP, authorization server and
-  EMA MCP server its `ema` family drives. It includes `mock-models`.
+  Protocol draft, with `xaa`, the mock IdP, authorization server and
+  EMA MCP server its `ema` family drives, and, with `x402`, the mock x402
+  resource server of its `payments` family. It includes `mock-models`.
   Debug builds carry it automatically, so `cargo run` and the test suites
   need no flag.
 
@@ -72,18 +79,20 @@ Four features are never in a release binary:
 | `exec` | no | **no** | none | The guarded local `exec` tool, also gated by `security.exec.enabled`. |
 | `companies` | no | **no** | none new (reuses `ring`) | `services` entries of `kind: company` and `security.companies`: a Session at each declared Company, its MCP tools held by the supervisor under the strict privacy profile, the User's cross-Company gate, Device and Direct Sign-In at the User's own gate with each Account Token kept sealed — up to eight accounts at a Company, each by a label and in a Session of its own — conversations with a Company's agent (followed by readers into the stream `company.<name>`) and calls of its OpenAPI APIs, each allowed operation a tool of its own, operations confirmed only with the User's approval or a standing permission (`client.extensions: [operations]`), Direct Conversations the User joins at their own gate, `company.status`, `company.sign_in`, `company.sign_out`, `company.converse`, `company.read`, `company.handoff`, `company.close`, `company.api`, `company.api.describe`, `company.operation.get`, `company.operation.confirm`, `company.operation.cancel`, `company.direct`, the `http` step's `auth: {kind: company}`, `agentd --print-company-client`, `agentd --login`/`--logout company:<name>[/<label>]` (with `a2a`). Implies `oauth` and `tls`. |
 | `xaa` | no | **no** | none new (reuses `ring`) | `identity.providers`, `identity.delegation`, `security.experimental.id_jag`, `grant: id_jag` on an MCP server, and `a2a.principals[]` `match.uid` and `idp_subject`: the ID-JAG exchange at the person's IdP and its redemption at the server's authorization server, every check an ID-JAG is held to, the sealed grant vault, renewal, step-up and revocation, the person's consent gates, `agentd --login idp:<name>`, `--delegation-list`, `--delegation-approve`, `--delegation-deny`, `--delegation-revoke`, `--delegation-forget`, `--delegation-audit` (with `a2a`) and `--delegation-lint`. Implies `oauth`. |
+| `x402` | no | **no** | `k256`, `sha3` and 28 crates of theirs (RustCrypto) | `security.payments` and the `http` step's `payment`: x402 v2 as a paying client over HTTP, the `exact` scheme on EVM chains with an EIP-3009 authorization signed by the supervisor alone (secp256k1 with RFC 6979, Keccak-256), the spend policy's caps and allow-lists, the approver's gate (with `a2a`), the ledger, wallet keys sealed in files or held by the external signer, and `agentd --print-wallet-address`. Implies `oauth`. |
 | `mock-models` | no | yes | none | The mock model endpoint: `mock:final` and `mock:file:<playbook.json>`, scripted chat and decision answers. |
 | `internal-mocks` | no | **no** | none | Test scaffolding: the mock MCP servers, crash points and, with `oauth` (and the default `tls`), the fake Company. Implies `mock-models`. |
 
-Of the nineteen features, sixteen add no crate of their own: they gate code
+Of the twenty features, sixteen add no crate of their own: they gate code
 written in this repository, or reuse `ring`, which every build already links.
 Beyond the default `tls`, the dependency cost of the release set comes from
-`a2a` and `cel`; see [Crate counts](#crate-counts).
+`a2a` and `cel`; see [Crate counts](#crate-counts). `x402` adds the 30
+crates of `k256` and `sha3`, none of them in the release set.
 
 ## Configuration that needs a feature
 
 A release binary carries everything in this table except `exec`,
-`companies` and `xaa`. In a build
+`companies`, `xaa` and `x402`. In a build
 from source, the right-hand column is what you
 see when the feature is missing.
 
@@ -106,6 +115,7 @@ see when the feature is missing.
 | `security.exec.enabled: true` | `exec` | refused at load: `security.exec.enabled needs the exec build feature, …` |
 | a `services` entry of `kind: company`, `security.companies`, `agentd --print-company-client` | `companies` | refused at load: ``services.shop: `kind: company` needs the `companies` feature (build with --features companies)`` |
 | `identity.providers`, `identity.delegation`, `security.experimental.id_jag`, `grant: id_jag`, `a2a.principals[]` `match.uid` or `idp_subject` | `xaa` | refused at load: ``identity.providers, identity.delegation, security.experimental.id_jag, `grant: id_jag` and a2a.principals idp_subject/uid need the `xaa` feature (build with --features xaa)`` |
+| `security.payments`, an `http` step's `payment`, `agentd --print-wallet-address` | `x402` | refused at load: ``security.payments needs the `x402` feature (build with --features x402)`` |
 | `mock:` endpoints | `mock-models` (or a debug build) | refused at load: `mock: intelligence needs a build with --features mock-models` |
 
 Every path and its feature is in the [Configuration reference](configuration.md).
@@ -120,7 +130,8 @@ cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,h
 ```
 
 Add `exec` for the local command runner, `companies` to
-[act at Companies for a person](act-at-companies.md), or `internal-mocks` to
+[act at Companies for a person](act-at-companies.md), `x402` to
+[pay for things with x402](pay-with-x402.md), or `internal-mocks` to
 keep the test scaffolding in a release-profile build. `--no-default-features` drops `tls`;
 such a binary reaches `https://` only through a TLS-terminating sidecar.
 

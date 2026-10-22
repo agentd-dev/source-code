@@ -46,6 +46,8 @@ pub use ::net;
 pub mod obs; // logging, health, tracing, metrics
 #[cfg(feature = "oci")]
 pub mod oci; // instruction documents pulled from an OCI artifact registry (RFC 0040)
+#[cfg(feature = "x402")]
+pub mod payments; // paying for things with x402, only within a spend policy (RFC 0049)
 pub mod registry; // tool registry: internal > code > MCP, contracts, overrides, grants
 pub mod runtime; // the runtime: event loop, turn workers, lifecycle
 pub mod sec; // secrets, tool-scope, gated exec

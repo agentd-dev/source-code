@@ -20,8 +20,9 @@ core A2A surface, the observation feed of the events extension, the extension
 contract itself, the authentication the card declares, agentd as an OAuth
 client, agentd as a client of the MCP Tasks and Skills extensions, the
 fake Company agentd is tested against under the Personal Agent Protocol
-draft, and agentd acting for an enrolled person through their IdP
-(Enterprise-Managed Authorization, ID-JAG). Every check is
+draft, agentd acting for an enrolled person through their IdP
+(Enterprise-Managed Authorization, ID-JAG), and agentd paying with x402
+within ADR 0003's spend policy. Every check is
 registered in [`src/checks/`](crates/agentd-conformance/src/checks) as a
 `Check { id, category, desc, run }`, which both the test harness and the report
 runner pick up; the tables below are those registrations, and a unit test of
@@ -320,6 +321,18 @@ skip.
 | `ema/firing-ended-mid-call-mints-nothing` | a via ciba firing whose run ends while its approved call proves the grant alive mints nothing: the call keeps the firing it was admitted as, fails subject_expired, and never falls back to the person's refresh token |
 | `ema/work-a-firing-starts-acts-only-as-consented` | a run a firing's work starts is a firing of its own: one of a workflow declaring no act_for for the person fails unattended_suspended and mints nothing; once it declares one and they sign in again, it acts for them |
 | `ema/ciba-firing-waits-on-one-request-at-a-time` | a second call a via ciba firing makes while its request waits waits on that request, and both are made on one approval; once a firing's wait closes unanswered another firing of the workflow may ask, though the first firing's run goes on |
+
+### `payments`
+
+| Check | What it proves |
+|---|---|
+| `payments/pays-in-payment-signature-and-reads-payment-response` | [X-HTTP] "Clients send payment data using the `PAYMENT-SIGNATURE` HTTP header" and "Servers communicate payment settlement results using the `PAYMENT-RESPONSE` header": the server recovers the wallet from the signature, and the settlement is the step's |
+| `payments/skips-a-payment-flow-it-does-not-recognize` | [X §5.1.2] "Clients MUST NOT construct a payment for a `paymentFlow` they do not recognize, and SHOULD skip such `accepts[]` entries when selecting": an `upfront` entry is passed over and the next one paid, echoed exactly as `accepted` |
+| `payments/refused-unsent-outside-the-caps-and-allow-lists` | ADR 0003: "caps per run, per day and per payee, and an allow-list of payees and assets — a payment outside them is refused unsent": over a cap and to an unlisted payee, nothing reaches the server |
+| `payments/settlement-pending-is-never-paid-again` | ADR 0003: "a payment whose outcome is unknown is never made a second time"; [X §9] `settlement_pending` "the transaction may still confirm on chain": the step's retry sends nothing |
+| `payments/the-approver-alone-answers-above-the-threshold` | ADR 0003: "the User's approval above a threshold, through an addressed human gate no model or judge answers": an operator who is not the approver is refused, and the approver's approve pays once |
+| `payments/every-payment-is-an-audit-record` | ADR 0003: "every payment an audit record, tied to the request that asked for it": authorized before it is sent, then settled, in the hash-chained audit log, naming the run, the step and the nonce |
+| `payments/no-signature-in-a-log-or-a-childs-payload` | ADR 0003: "the signing key held by the supervisor alone, sealed at rest, never in a model's context, a child's payload or a log": the key file is sealed and 0600, and the signature and the signed header are in no log line and no frame to a child |
 
 ## Running it
 

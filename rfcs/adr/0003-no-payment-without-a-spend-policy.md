@@ -1,7 +1,7 @@
 # ADR 0003: No payment without a spend policy
 
-**Status:** Proposed, 2026-10-19
-**Context:** RFC 0048 §5.6; the RFC 0049 to come
+**Status:** Accepted, 2026-10-22 — the user's answer to RFC 0048 Q3 (2026-10-19, *"both"*: x402 on EVM and Solana) accepted payments under it; [RFC 0049](../0049-paying-for-things.md) §8 states how each rule is met
+**Context:** RFC 0048 §5.6; RFC 0049
 
 ## Context
 

@@ -1837,6 +1837,67 @@ with them, is the operator's part of an erasure.
 Moving the chain aside alone is a chain cut to nothing, which the store's head
 refuses.
 
+## Payments
+
+With the `x402` feature agentd pays for HTTP resources with x402, and only
+within the spend policy of `security.payments`
+([RFC 0049](../rfcs/0049-paying-for-things.md), under
+[ADR 0003](../rfcs/adr/0003-no-payment-without-a-spend-policy.md)). An agent
+that can pay can be talked into paying — by a prompt, a tool result or a
+server's own text — so each of ADR 0003's rules is a check agentd makes
+before anything is signed:
+
+- **Caps and allow-lists.** Assets by CAIP-19 id, payees by address, and
+  caps per payment, run, day and payee, counted from the ledger over every
+  payment that left agentd or may have. A payment outside them is refused
+  unsent, naming every reason. The check and the reservation are one step
+  on the supervisor's loop, so two steps cannot both pass a cap the second
+  one breaks.
+- **No model-facing paying tool.** A model's tool arguments come from text
+  that may be anyone's. A payment is made only by an `http` step of a
+  workflow in the operator's own configuration, whose `payment` field is
+  literal; a model reaches one only by starting a workflow the operator
+  exposed as a tool, and such a run asks the approver unless
+  `ask_when_tainted` is off. An instruction
+  document's paying step is refused at load, and a definition
+  `workflow.create` or `workflow.update` stored fails the step unpaid.
+- **The approver's gate.** Above `approve_above`, for a step that says
+  `approve: true`, and — with `ask_when_tainted`, the default — for work
+  that has read outside text or that a model asked for, the payment waits
+  for `security.payments.approver` on a task of their own, marked as
+  agentd's security gate, its text agentd's and what the step or the
+  server chose in it — the request, the server's words — quoted.
+  No judge answers it and no operator but the approver; unanswered, it
+  declines. The policy is checked again when the approval lands.
+- **The key stays with the supervisor.** A wallet's key file holds the key
+  sealed under AES-256-GCM with a seal key read from a mounted file, bound to
+  the wallet's name and address. The supervisor opens it for one signature
+  and wipes it after; the key file, the seal key, the store root (where the
+  ledger is) and the signer's socket are supervisor-only paths under
+  Landlock. Under `key_custody: external` agentd holds no wallet key, and
+  the [signer](external-signer.md#wallet-keys) is sent the typed data to
+  read before it signs. No key, signature or signed authorization is in a
+  log line, a model's context or a child's payload, and every signature is
+  recovered to the wallet's address before it is sent.
+- **Every payment an audit record.** Each step of a payment is a `payment`
+  record in the [audit chain](#the-audit-chain), flushed to the disk before
+  the payment goes on; the `authorized` record is written before the signed
+  request leaves, and a chain that cannot take it refuses the payment.
+- **Never twice.** The ledger record of a payment is on the disk, `sending`,
+  before the request leaves. A payment that settled, or whose outcome is
+  unknown — no answer, a timeout, a 5xx, `settlement_pending`, a restart
+  with the request out — is never made again: a retry, a replay or a
+  restart of the step fails before sending anything.
+- **The resource is the request's.** A `402` that asks to be paid for
+  another URL than the one the step asked is refused, and no redirect is
+  followed.
+
+What it does not cover: a server that takes the payment and serves nothing
+(the `authorization` flow settles after the resource is served, and the
+audit chain keeps what a dispute needs), a token contract or chain that
+misbehaves, and a wallet funded beyond what you mean it to spend — the caps
+bound agentd, not the wallet.
+
 ## What agentd does not protect against
 
 Stated plainly, so you size the surrounding environment correctly.

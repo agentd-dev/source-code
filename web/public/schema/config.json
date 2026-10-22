@@ -2116,7 +2116,8 @@
           "idempotency",
           "breaker",
           "rate",
-          "auth"
+          "auth",
+          "payment"
         ],
         "implemented": true,
         "required": [
@@ -5419,6 +5420,176 @@
             "id_jag": {
               "description": "allow `grant: id_jag` servers (RFC 0044; needs the xaa feature) until ID-JAG reaches IETF working-group last call",
               "type": "boolean"
+            }
+          },
+          "type": "object"
+        },
+        "payments": {
+          "additionalProperties": false,
+          "description": "paying for things with x402 (RFC 0049; needs the x402 feature): the spend policy every payment is held to — assets by CAIP-19, payees by address, caps per payment, run, day and payee, the approver above a threshold — and the wallets. Restart-only, operator-only. Needs observability.audit.chain and a durable store",
+          "properties": {
+            "approval_timeout": {
+              "description": "how long the approver is waited for before the payment is declined, 1s to 7d; default 1h",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "approver": {
+              "description": "who approves a payment the policy asks about: `operator` (default: any operator principal) or one principal id `<role>:<id>`, the only one who can — no judge answers, and no operator but the approver",
+              "type": "string"
+            },
+            "ask_when_tainted": {
+              "description": "a payment from work that has read outside text, or that a model asked for, is asked of the approver whatever its amount; default true",
+              "type": "boolean"
+            },
+            "assets": {
+              "additionalProperties": {
+                "additionalProperties": false,
+                "properties": {
+                  "approve_above": {
+                    "description": "above this amount (whole units) the approver is asked",
+                    "type": "string"
+                  },
+                  "asset": {
+                    "description": "the CAIP-19 asset type, eip155:<chain id>/erc20:<contract>: names the network (CAIP-2) and the token",
+                    "type": "string"
+                  },
+                  "decimals": {
+                    "description": "the token's decimals: \"1\" is 10^decimals atomic units",
+                    "maximum": 36,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "limits": {
+                    "additionalProperties": false,
+                    "description": "per_payment: one payment; per_run: one run's payments; per_day: all payments in any 24 hours; per_payee: all payments to one payee in any 24 hours — each counting every payment that left agentd or may have",
+                    "properties": {
+                      "per_day": {
+                        "description": "a decimal in the asset's whole units (\"0.25\"), at most `decimals` digits after the point",
+                        "type": "string"
+                      },
+                      "per_payee": {
+                        "description": "a decimal in the asset's whole units (\"0.25\"), at most `decimals` digits after the point",
+                        "type": "string"
+                      },
+                      "per_payment": {
+                        "description": "a decimal in the asset's whole units (\"0.25\"), at most `decimals` digits after the point",
+                        "type": "string"
+                      },
+                      "per_run": {
+                        "description": "a decimal in the asset's whole units (\"0.25\"), at most `decimals` digits after the point",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "per_run",
+                      "per_day",
+                      "per_payee"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "asset",
+                  "decimals",
+                  "limits"
+                ],
+                "type": "object"
+              },
+              "description": "the assets agentd pays in, by name; amounts of two assets are never added",
+              "type": "object"
+            },
+            "key_custody": {
+              "description": "who holds the wallet keys: agentd, each key file sealed under seal_key (local, the default), or the external signer (external, with signer and no seal_key)",
+              "enum": [
+                "local",
+                "external"
+              ]
+            },
+            "max_validity": {
+              "description": "the longest an authorization agentd signs is valid (validBefore after now), 10s to 1h; the server's maxTimeoutSeconds when shorter; default 5m",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "payees": {
+              "additionalProperties": {
+                "additionalProperties": false,
+                "properties": {
+                  "address": {
+                    "description": "the payTo address (0x and 40 hex digits)",
+                    "type": "string"
+                  },
+                  "assets": {
+                    "description": "the assets it may be paid in; default every asset",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "address"
+                ],
+                "type": "object"
+              },
+              "description": "the addresses agentd may pay, by name",
+              "type": "object"
+            },
+            "seal_key": {
+              "description": "32 random bytes as hex or base64, a single {{secret-file:PATH}} reference (never the environment): every wallet key file is sealed under it. key_custody local only",
+              "type": "string"
+            },
+            "signer": {
+              "additionalProperties": false,
+              "description": "the external signer that holds the wallet keys (key_custody external; docs/external-signer.md): it signs only EIP-712 typed data of an EIP-3009 TransferWithAuthorization its own policy allows",
+              "properties": {
+                "socket": {
+                  "description": "the signer's unix socket, an absolute path",
+                  "type": "string"
+                },
+                "timeout": {
+                  "description": "the bound on one request, 1ms to 60s; default 5s",
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                },
+                "uid": {
+                  "description": "the uid the signer runs as: the socket's peer (SO_PEERCRED) must be it, or nothing is sent",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "socket",
+                "uid"
+              ],
+              "type": "object"
+            },
+            "wallets": {
+              "additionalProperties": {
+                "additionalProperties": false,
+                "properties": {
+                  "address": {
+                    "description": "the wallet's address (0x and 40 hex digits); when given, a key of another address refuses the start",
+                    "type": "string"
+                  },
+                  "key": {
+                    "description": "key_custody external: the signer's key id",
+                    "type": "string"
+                  },
+                  "key_file": {
+                    "description": "key_custody local: the sealed key file, an absolute path, made 0600 by `agentd --print-wallet-address <name>` when absent; refused at start when another user can read it or it does not open to its address",
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "description": "the wallets agentd pays from, by name (1 to 32 of a-z, 0-9, - and _)",
+              "type": "object"
             }
           },
           "type": "object"

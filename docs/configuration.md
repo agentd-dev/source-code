@@ -1583,9 +1583,45 @@ reload swaps whole or not at all ([Reload classes](#reload-classes)).
 | `security.companies.context.locale` | language tag | — | Shared in a conversation message's `context` as `locale` (RFC 5646, `en-US`). Needs an entry that uses `agent`. |
 | `security.companies.context.time_zone` | IANA name | — | Shared as `time_zone` (`America/Los_Angeles`). |
 | `security.companies.context.share_availability` | bool | `false` | Share `user_available`: whether the User has a client attached to the observation feed now. |
+| `security.payments.approver` | `operator` or a principal id | `operator` | Who approves a payment the policy asks about: any operator principal, or that one principal (`user:alice`). A glob or a role is refused. Needs `x402`, like every `security.payments` path ([Payments](#payments)). |
+| `security.payments.approval_timeout` | duration, 1s–7d | `1h` | How long the approver is waited for; unanswered, the payment is declined. |
+| `security.payments.ask_when_tainted` | bool | `true` | Ask the approver about every payment of work that has read outside text, or that a model asked for, whatever its amount. |
+| `security.payments.max_validity` | duration, 10s–1h | `5m` | The longest an authorization agentd signs is valid; the server's `maxTimeoutSeconds` when shorter. |
+| `security.payments.key_custody` | `local \| external` | `local` | Who holds the wallet keys: agentd, each key file sealed under `seal_key`, or the external signer `signer` names ([The external signer protocol](external-signer.md#wallet-keys)). |
+| `security.payments.seal_key` | secret reference | — | 32 random bytes, hex or base64: every wallet key file is sealed under it. A single `{{secret-file:…}}` reference, never inline and never the environment. Required under `key_custody: local`; refused under `external`. |
+| `security.payments.signer` | `{socket, uid, timeout}` | — | `key_custody: external` only (required there): the signer's unix socket (an absolute path), the uid its process runs as (agentd's own is a load warning) and the bound on a request (`5s`, at most `60s`). |
+| `security.payments.wallets.<name>.key_file` | absolute path | — | `key_custody: local`: the sealed key file, made `0600` by `agentd --print-wallet-address <name>` when absent. The start is refused when it is a symlink, another user owns it or can read it, or it does not open to its address. |
+| `security.payments.wallets.<name>.key` | string | — | `key_custody: external`: the signer's key id. |
+| `security.payments.wallets.<name>.address` | address | — | The wallet's address; a key of another address refuses the start. |
+| `security.payments.assets.<name>.asset` | CAIP-19 id | required | `eip155:<chain id>/erc20:<contract>`: the token, and the network it is on. |
+| `security.payments.assets.<name>.decimals` | int, 0–36 | required | The token's decimals: `"1"` is 10^decimals atomic units. |
+| `security.payments.assets.<name>.limits` | `{per_payment, per_run, per_day, per_payee}` | `per_run`, `per_day`, `per_payee` required | Caps, each a decimal in whole units: one payment, one run's payments, every payment in any 24 hours, every payment to one payee in any 24 hours. |
+| `security.payments.assets.<name>.approve_above` | decimal | — | Above this amount the approver is asked. |
+| `security.payments.payees.<name>.address` | address | required | The address paid (`payTo`). A mixed-case address is held to its EIP-55 checksum. |
+| `security.payments.payees.<name>.assets` | list of asset names | every asset | The assets it may be paid in. |
 
 The model these keys enforce is [Security model](security.md); the checklist is
 [Harden a deployment](harden.md).
+
+### Payments
+
+`security.payments` is the spend policy every x402 payment is held to
+(the `x402` feature, which no release binary carries): the wallets agentd
+pays from and who holds their keys, the assets it may pay in with their
+caps, the payees it may pay, and the one person who approves a payment
+above an asset's `approve_above`. A payment outside it is refused before
+anything is signed. It needs `observability.audit.chain` — every payment is
+a record there, the one before it is sent flushed first — and a store that
+outlives the process (`file`, `mcp` or `http`), which keeps the ledger. Every
+path is restart · op: a served document cannot set it, and a reload does not
+change it under a question the approver is reading.
+
+A step pays only with its own `payment` field — `{wallet, max, approve?}`
+on an `http` step ([node registry](node-registry.md#http)) — which is
+literal and names a wallet and assets of the policy; an instruction
+document's workflow with one is refused at load, and one `workflow.create`
+or `workflow.update` stored fails the step without paying. The guide is
+[Pay for things with x402](pay-with-x402.md).
 
 ## vars
 
@@ -1740,6 +1776,7 @@ inline.
 | `a2a.bearer` | `config file: a2a.bearer carries an inline credential; …` |
 | `security.aauth.enroll_token` | `config file: security.aauth.enroll_token carries an inline credential; …` |
 | `security.companies.seal_key` | `config file: security.companies.seal_key carries an inline credential; …` |
+| `security.payments.seal_key` | `security.payments.seal_key: a single {{secret-file:PATH}} reference — never an inline key, and never the environment` (a `{{secret:…}}` reference too) |
 | `mcp.servers[].oauth.client_secret` | `config file: mcp server '<name>' oauth.client_secret carries an inline credential; …` |
 | `a2a.principals[].match.bearer_ref` | `config file: a2a.principals[0].match.bearer_ref carries an inline credential; …` |
 | a webhook verifier's `bearer`, `header.equals` and `hmac.secret`: `webhooks.default_auth`, and the `auth` of every `webhook` start and webhook wait | `config file: workflows[0].steps.hook.auth.hmac.secret carries an inline credential; …` |

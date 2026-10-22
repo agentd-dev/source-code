@@ -78,7 +78,7 @@ pub(crate) fn chain_record(
     log: &crate::obs::log::Logger,
 ) {
     let action = record["action"].as_str().unwrap_or_default().to_string();
-    let sync = action.starts_with("delegation.");
+    let sync = action.starts_with("delegation.") || action == "payment";
     if let Err(e) = chain.append(record, sync) {
         log.error("audit.chain.fail", json!({"action": action, "err": e}));
     }
@@ -96,6 +96,23 @@ impl Runtime {
     #[cfg(feature = "xaa")]
     pub(crate) fn audit_chained(&self, ev: AuditEvent<'_>) {
         self.audit_to(ev, true, false)
+    }
+
+    /// [`Runtime::audit`] of a record the action may not go on without
+    /// (RFC 0049 D10): appended to the audit chain and flushed to the disk
+    /// before this returns, or the chain's refusal — then to the other
+    /// sinks. No chain is a refusal too.
+    #[cfg(feature = "x402")]
+    pub(crate) fn audit_required(&self, ev: AuditEvent<'_>) -> Result<(), String> {
+        let chain = self
+            .audit_chain
+            .as_ref()
+            .ok_or("no audit chain is open (observability.audit.chain)")?;
+        chain
+            .append(record_of(&self.instance, &self.trace, &ev), true)
+            .map_err(|e| e.to_string())?;
+        self.audit_to(ev, true, false);
+        Ok(())
     }
 
     /// [`Runtime::audit`], saying whether the event is also mirrored onto the

@@ -1752,6 +1752,102 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `auth::idjag::AccessExchange::subject_token_type`.
   **Breaking:** `engine::run::Unattended::asked` is a map of grant to
   `Asked`, and `Delegation::firing_started` takes one.
+- Paying for an HTTP resource with x402 v2 (RFC 0049 unit 1, under ADR
+  0003), behind the new cargo feature `x402`, which no release binary
+  carries. An `http` step with `payment: {wallet, max, approve?}`, in a
+  workflow of the operator's own configuration, reads a `402`'s
+  `PAYMENT-REQUIRED`, takes the first `exact` entry on an EVM chain with the
+  `eip3009` transfer method and the `authorization` flow that the step's
+  `max` and `security.payments` allow, signs an EIP-3009
+  `TransferWithAuthorization` as EIP-712 typed data (secp256k1, RFC 6979,
+  low `s`, a random 32-byte nonce, valid from 30 s before now for the
+  server's `maxTimeoutSeconds` or `max_validity`, whichever is shorter) and
+  sends the same request once more with `PAYMENT-SIGNATURE`; the
+  `PAYMENT-RESPONSE` is read into the step's output as `payment` and into
+  the audit chain. A `402` that names another resource than the URL asked
+  is refused unsent (`resource_mismatch`), and no redirect is followed. A
+  step without `payment` answered `402` fails as before, its error saying
+  the server asks to be paid and, with `x402`, its output holding the
+  request as `payment_required`. The field is literal: a template in it is
+  refused at load, and so is an instruction document's workflow with a
+  paying step; a definition `workflow.create` or `workflow.update` stored
+  fails the step unpaid. No tool a model calls pays.
+- `security.payments`, the spend policy every payment is held to,
+  operator-only and restart-only: wallets, each a sealed key file
+  (`key_file`, the key sealed under AES-256-GCM with `seal_key`, a single
+  `{{secret-file:…}}` reference, bound to the wallet and its address, opened
+  for each signature and wiped after) or a key of the external signer
+  (`key_custody: external`); assets by CAIP-19 id with their `decimals`;
+  payees by address, held to EIP-55; caps `per_payment`, `per_run`,
+  `per_day` and `per_payee` in whole units read exactly into atomic units,
+  counted over every payment that left agentd or may have, and a refused
+  one until its authorization expires; `approve_above`; `approver`
+  (`operator`, or one principal id); `approval_timeout` (1h);
+  `ask_when_tainted` (true); `max_validity` (5m). It needs
+  `observability.audit.chain` and a store that outlives the process. A
+  payment outside the policy is refused unsent naming every entry's every
+  reason (`payment.refused`, and a `refused` record in the chain).
+- The approver's gate: a payment above an asset's `approve_above`, of a
+  step that says `approve: true`, or — with `ask_when_tainted` — of work
+  that has read outside text or that a model asked for, waits on an A2A
+  task of the approver's own, marked as agentd's security gate, its text
+  agentd's and the request and the server's description quoted and escaped
+  on one line. Only the approver's `approve` or `decline` answers it;
+  anyone else, an operator included, is refused and the gate stays open,
+  and no judge answers it. Unanswered within `approval_timeout` it
+  declines; the policy is checked again when an approval lands; a restart
+  ends the waiting step, nothing paid (`interrupted` in the audit chain).
+  With no A2A listener such a payment is refused unsent (`no_approver`),
+  and the load warns.
+- The payment ledger, in the store (`payment/ledger/<request>.<attempt>`):
+  each payment is `sending` on the disk before the signed request leaves,
+  then `settled`, `refused`, `unknown` or `unsent`; a restart reads a
+  `sending` record as `unknown` (`payment.ledger.restored`, and an
+  `unknown` record in the audit chain). A step whose request settled, or
+  whose payment's outcome is unknown — no answer, a timeout, a 5xx,
+  `settlement_pending`, a success with no `PAYMENT-RESPONSE` — is never
+  paid again: a `retry:`, a replay or a restart fails it (`payment_made`,
+  `payment_unknown`) before anything is sent. Every step of a payment is a
+  `payment` record in the audit chain, flushed before the payment goes on;
+  one the chain cannot take refuses the payment. The `payment` event
+  family: `payment.required`, `.refused`, `.asked`, `.approved`,
+  `.declined`, `.interrupted`, `.sent`, `.settled`, `.failed`, `.unknown`,
+  `.ledger.restored`, `.ledger.swept`, `.wallet`, `.signer.unavailable`;
+  none carries a signature or a key.
+- `agentd --print-wallet-address <wallet>` prints a wallet's address, making
+  its sealed key file `0600` when it is absent, or asking the external
+  signer. The start is refused when a key file is a symlink, another user
+  owns it or can read it, or it does not open to its address. The key file,
+  the seal key and the signer's socket are supervisor-only paths under
+  Landlock, beside the store root.
+- The external signer protocol: `public_key` answers a wallet key `ES256K`
+  with its secp256k1 JWK (RFC 8812), and a new op, `sign_typed_data {key,
+  typed_data}` → `{sig}`, signs EIP-712 typed data whole, so the signer
+  computes the digest from what it read. The reference signer
+  (`--internal-mock-signer`, now in `x402` builds too) takes wallet keys
+  `{"alg": "ES256K", "assets", "payees", "max_value", "max_validity"}` and
+  signs only an EIP-3009 authorization of exactly that shape, for a
+  configured token, from its own address, within its bounds. agentd
+  recovers every signature to the wallet's address before it sends it.
+- A mock x402 resource server, the hidden `--internal-mock-x402` mode of
+  debug and `internal-mocks` builds with `x402`: it answers `402` with a
+  `PAYMENT-REQUIRED`, recovers the signer of each `PAYMENT-SIGNATURE` and
+  holds it to what it offered, answers x402's error codes, and settles,
+  refuses, stalls, answers `settlement_pending`, no settlement, a 500 or a
+  garbled one, or names another resource, as steered.
+- The `payments` conformance family (seven checks, each quoting the x402 or
+  ADR 0003 sentence it proves), `x402_e2e` end to end, the CI rows
+  `--features x402` and `--features x402,a2a`, and the guide
+  [Pay for things with x402](docs/pay-with-x402.md); agentd.dev's strip
+  lists x402 v2 as a preview.
+- `agentd-core`: `payments::{caip, eip712, evm, ledger, policy, scheme,
+  wallet, x402, mock}` and `Payments`; `payments::scheme::Family`, the one
+  place that tells chain families apart;
+  `sec::signer::Signer::sign_typed_data`;
+  `config::settings::payments::{Payments, StepPayment, PAYING_KINDS}`.
+  `x402` adds the RustCrypto crates `k256` (secp256k1 ECDSA, `ecdsa` alone)
+  and `sha3` (Keccak-256), optional and enabled by `x402` alone, with their
+  28 dependencies; none is in the release graph.
 
 **Changed.**
 

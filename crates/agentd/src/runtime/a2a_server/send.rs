@@ -442,6 +442,20 @@ impl Runtime {
                 return self.company_direct_relay(&id, tid, principal, text, message);
             }
         }
+        // A payment's approval, the approver's alone to give (RFC 0049 D6);
+        // and a closed one, which takes no answer.
+        #[cfg(feature = "x402")]
+        if let Some((tid, _)) = &existing {
+            if let Some(id) = self.payment_gate_on(tid) {
+                return self.payment_answer(&id, tid, principal, text, message);
+            }
+            if self.payment_gate_closed(tid) {
+                return err_obj(
+                    ::mcp::rpc::INVALID_PARAMS,
+                    "this payment's approval has ended; nothing on this task answers anything now",
+                );
+            }
+        }
         // A person's consent gate on the addressed task's work (RFC 0044
         // §5.10 rule 1, T8): no message is a consent answer — not the
         // person's, not an upstream agent's holding their token — so it is

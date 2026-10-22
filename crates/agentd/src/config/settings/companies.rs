@@ -1772,7 +1772,7 @@ fn validate_context(at: &str, ctx: &Context, err: &mut impl FnMut(String)) {
 }
 
 /// `<role>:<id>`, the shape a principal id has.
-fn is_principal_id(id: &str) -> bool {
+pub(super) fn is_principal_id(id: &str) -> bool {
     id.split_once(':').is_some_and(|(role, rest)| {
         matches!(role, "operator" | "user" | "agent") && !rest.is_empty()
     })

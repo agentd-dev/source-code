@@ -593,6 +593,7 @@ pub const KINDS: &[KindInfo] = &[
             "breaker",
             "rate",
             "auth",
+            "payment",
         ],
         &["url"],
         true,
@@ -2400,6 +2401,47 @@ fn parse_step(
         if spec.get("headers").is_some() {
             errs.push(format!(
                 "{at}: `headers` does not apply to an http step that calls a Company's API (auth kind company): the operation's description says what it takes"
+            ));
+        }
+    }
+    // `payment: {wallet, max, approve?}` lets a step pay for its call with
+    // x402, within the spend policy (RFC 0049 D2) — a field of the kinds
+    // `config::settings::payments::PAYING_KINDS` names, each listing it
+    // above. Literal: a template in it would let run data raise what the
+    // step may spend. The wallet and the assets are the policy's to name,
+    // at load.
+    if let Some(p) = spec.get("payment") {
+        let max_ok = |m: &Value| match m {
+            Value::String(s) => !s.trim().is_empty(),
+            Value::Array(a) => {
+                !a.is_empty()
+                    && a.iter()
+                        .all(|x| x.as_str().is_some_and(|s| !s.trim().is_empty()))
+            }
+            _ => false,
+        };
+        let ok = p.as_object().is_some_and(|o| {
+            o.get("wallet")
+                .and_then(Value::as_str)
+                .is_some_and(|w| !w.is_empty())
+                && o.get("max").is_some_and(max_ok)
+                && o.get("approve").is_none_or(Value::is_boolean)
+                && o.keys()
+                    .all(|k| matches!(k.as_str(), "wallet" | "max" | "approve"))
+        });
+        if !ok {
+            errs.push(format!(
+                "{at}: payment takes {{wallet: <name>, max: \"<amount> <asset>\" or a list of them, approve: true|false}}"
+            ));
+        }
+        if p.to_string().contains("{{") {
+            errs.push(format!(
+                "{at}: payment is literal — a template in it would let run data decide what the step may spend"
+            ));
+        }
+        if kind == "http" && spec.get("auth").is_some() {
+            errs.push(format!(
+                "{at}: http payment does not apply to an http step that calls a Company's API (auth kind company)"
             ));
         }
     }

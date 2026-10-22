@@ -244,6 +244,39 @@ impl crate::runtime::reactor::Runtime {
             "http.request",
             json!({"run": run_id, "step": step_id, "method": method, "url": url}),
         );
+        // A step that may pay (RFC 0049): what it already paid, or may
+        // have, is read before anything is sent.
+        let paying = spec.get("payment").is_some();
+        if paying {
+            #[cfg(feature = "x402")]
+            if let Err(e) = self.payment_precheck(run_id, step_id) {
+                self.payment_refused_before(run_id, step_id, e);
+                return;
+            }
+            #[cfg(not(feature = "x402"))]
+            {
+                self.finish_step_pub(
+                    run_id,
+                    step_id,
+                    StepStatus::Failed,
+                    None,
+                    Some("http: payment needs the `x402` feature".into()),
+                    0,
+                );
+                return;
+            }
+        }
+        let request = Request {
+            url,
+            method,
+            query,
+            headers,
+            body,
+            timeout,
+            allow_private,
+            expect,
+            hop,
+        };
         let tx = self.events_tx.clone();
         let (r, s) = (run_id.to_string(), step_id.to_string());
         self.executing
@@ -252,42 +285,51 @@ impl crate::runtime::reactor::Runtime {
             .name("step:http".into())
             .spawn(move || {
                 let start = crate::obs::otel::now_unix_nanos();
-                let (output, is_error, error) = match do_http(
-                    &url,
-                    &method,
-                    &query,
-                    &headers,
-                    &body,
-                    timeout,
-                    allow_private,
-                ) {
-                    Ok(v) => {
-                        let status = v["status"].as_u64().unwrap_or(0);
-                        let ok = if expect.is_empty() {
-                            (200..400).contains(&status)
-                        } else {
-                            expect.contains(&status)
-                        };
-                        if ok {
-                            (v, false, None)
-                        } else {
-                            (v.clone(), true, Some(format!("http status {status}")))
-                        }
-                    }
-                    Err(e) => (Value::Null, true, Some(format!("http: {e}"))),
+                let answered = request.send(&[]);
+                // A 402 that asks for a payment: the step's to make when it
+                // may pay, else its error (RFC 0049 D2).
+                let asked = answered
+                    .as_ref()
+                    .ok()
+                    .filter(|v| v["status"] == 402)
+                    .and_then(|v| v["headers"]["payment-required"].as_str())
+                    .map(str::to_string);
+                // Only a build that reads x402 adds the payment request it
+                // was answered with to the output.
+                #[cfg_attr(not(feature = "x402"), allow(unused_mut))]
+                let (mut output, is_error, mut error) = match answered {
+                    Ok(v) => request.judge(v),
+                    Err(e) => (Value::Null, true, Some(format!("http: {}", e.why))),
                 };
-                crate::obs::otel::span(
-                    hop.as_ref(),
-                    &method,
-                    crate::obs::otel::Kind::Client,
-                    start,
-                )
-                .attr("http.request.method", method.as_str())
-                .attr("url.full", url.as_str())
-                .attr_opt("http.response.status_code", output["status"].as_u64())
-                .attr("agentd.run", r.as_str())
-                .attr("agentd.step", s.as_str())
-                .end(!is_error);
+                request.span(start, &r, &s, &output, is_error);
+                if let Some(header) = asked {
+                    #[cfg(feature = "x402")]
+                    if paying {
+                        let _ = tx.send(super::events::Event::PaymentRequired(Box::new(
+                            super::payments::Asked {
+                                run: r,
+                                step: s,
+                                header,
+                                first: output,
+                                request,
+                            },
+                        )));
+                        return;
+                    }
+                    // A step whose `expect` takes a 402 has it as its
+                    // answer; any other fails, saying why.
+                    if is_error {
+                        #[cfg(feature = "x402")]
+                        if let Ok(v) = crate::payments::x402::decode_header(&header) {
+                            output["payment_required"] = v;
+                        }
+                        error = Some(
+                            "http status 402: the server asks to be paid (x402), and this step has no payment field — it pays only with one, within security.payments (RFC 0049)".into(),
+                        );
+                    }
+                    #[cfg(not(feature = "x402"))]
+                    let _ = header;
+                }
                 let _ = tx.send(super::events::Event::StepDone {
                     run: r,
                     step: s,
@@ -298,6 +340,150 @@ impl crate::runtime::reactor::Runtime {
                 });
             })
             .ok();
+    }
+}
+
+/// An `http` step's request, as rendered: what it sends, and what a paid
+/// retry (RFC 0049 D3) sends again — the same method, URL, headers and
+/// body.
+pub(crate) struct Request {
+    pub url: String,
+    pub method: String,
+    pub query: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub timeout: Duration,
+    pub allow_private: bool,
+    /// The statuses that are `ok`; empty, 2xx and 3xx.
+    pub expect: Vec<u64>,
+    /// The step's call span, when it carries one.
+    pub hop: Option<crate::obs::trace::TraceContext>,
+}
+
+impl Request {
+    /// The URL as sent, its `query` appended: what a server's
+    /// `resource.url` is held to.
+    #[cfg(feature = "x402")]
+    pub fn full_url(&self) -> String {
+        if self.query.is_empty() {
+            self.url.clone()
+        } else if self.url.contains('?') {
+            format!("{}&{}", self.url, self.query)
+        } else {
+            format!("{}?{}", self.url, self.query)
+        }
+    }
+
+    /// Send it, with `extra` headers after its own.
+    pub fn send(&self, extra: &[(String, String)]) -> Result<Value, Unanswered> {
+        if extra.is_empty() {
+            return exchange(
+                &self.url,
+                &self.method,
+                &self.query,
+                &self.headers,
+                &self.body,
+                self.timeout,
+                self.allow_private,
+            );
+        }
+        let mut headers = self.headers.clone();
+        headers.extend(extra.iter().cloned());
+        exchange(
+            &self.url,
+            &self.method,
+            &self.query,
+            &headers,
+            &self.body,
+            self.timeout,
+            self.allow_private,
+        )
+    }
+
+    /// An answer as the step's outcome: `(output, is_error, error)`.
+    pub fn judge(&self, v: Value) -> (Value, bool, Option<String>) {
+        let status = v["status"].as_u64().unwrap_or(0);
+        let ok = if self.expect.is_empty() {
+            (200..400).contains(&status)
+        } else {
+            self.expect.contains(&status)
+        };
+        if ok {
+            (v, false, None)
+        } else {
+            (v, true, Some(format!("http status {status}")))
+        }
+    }
+
+    /// The CLIENT span of one exchange.
+    pub fn span(&self, start: u128, run: &str, step: &str, output: &Value, is_error: bool) {
+        crate::obs::otel::span(
+            self.hop.as_ref(),
+            &self.method,
+            crate::obs::otel::Kind::Client,
+            start,
+        )
+        .attr("http.request.method", self.method.as_str())
+        .attr("url.full", self.url.as_str())
+        .attr_opt("http.response.status_code", output["status"].as_u64())
+        .attr("agentd.run", run)
+        .attr("agentd.step", step)
+        .end(!is_error);
+    }
+}
+
+/// The `http` step's request as a paid call (RFC 0049 §2, [X-HTTP]): its
+/// resource is its URL, query included; the payment goes once more to the
+/// same URL, with the same method, headers and body, in a
+/// `PAYMENT-SIGNATURE` header; the settlement comes back in
+/// `PAYMENT-RESPONSE`. Like every request of the step, it follows no
+/// redirect.
+#[cfg(feature = "x402")]
+impl super::payments::PaidCall for Request {
+    fn is_resource(&self, url: &str) -> bool {
+        crate::payments::x402::same_resource(&self.full_url(), url)
+    }
+
+    fn shown(&self) -> String {
+        crate::config::settings::url_locator(&self.full_url())
+    }
+
+    /// The method and the URL, quoted: a run may template either.
+    fn describe(&self) -> String {
+        crate::sec::render::quoted(
+            &format!("{} {}", self.method, self.shown()),
+            super::payments::SAID_SHOWN,
+        )
+    }
+
+    fn send_paid(&self, payload: &Value, run: &str, step: &str) -> super::payments::Answer {
+        use crate::payments::x402;
+        let start = crate::obs::otel::now_unix_nanos();
+        let header = (
+            x402::PAYMENT_SIGNATURE.to_string(),
+            x402::encode_header(payload),
+        );
+        match self.send(std::slice::from_ref(&header)) {
+            Err(e) => super::payments::Answer::Unanswered {
+                why: e.why,
+                may_have_sent: e.may_have_sent,
+            },
+            Ok(v) => {
+                let status = v["status"].as_u64().unwrap_or(0);
+                let settlement = v["headers"]["payment-response"]
+                    .as_str()
+                    .map(x402::Settlement::from_header);
+                let declined = settlement.is_none() && matches!(status, 400 | 402);
+                let (output, is_error, error) = self.judge(v);
+                self.span(start, run, step, &output, is_error);
+                super::payments::Answer::Answered {
+                    output,
+                    settlement,
+                    declined,
+                    error,
+                }
+            }
+        }
     }
 }
 
@@ -349,7 +535,39 @@ pub(crate) fn do_http(
     timeout: Duration,
     allow_private: bool,
 ) -> Result<Value, String> {
-    let u = crate::net::http::Url::parse(url)?;
+    exchange(url, method, query, headers, body, timeout, allow_private).map_err(|e| e.why)
+}
+
+/// Why a request got no answer, and whether any of it may have reached the
+/// server: a URL that does not parse, a dial the SSRF guard refused, a
+/// connection or a TLS handshake that failed sent nothing; a failure once
+/// the request was being written may have. A paid request needs to know
+/// which (RFC 0049 D4).
+pub(crate) struct Unanswered {
+    pub why: String,
+    #[cfg_attr(not(feature = "x402"), allow(dead_code))]
+    pub may_have_sent: bool,
+}
+
+/// [`do_http`], saying of a failure whether the request may have left.
+pub(crate) fn exchange(
+    url: &str,
+    method: &str,
+    query: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    timeout: Duration,
+    allow_private: bool,
+) -> Result<Value, Unanswered> {
+    let unsent = |why: String| Unanswered {
+        why,
+        may_have_sent: false,
+    };
+    let sent = |why: String| Unanswered {
+        why,
+        may_have_sent: true,
+    };
+    let u = crate::net::http::Url::parse(url).map_err(unsent)?;
     let path = if query.is_empty() {
         u.path.clone()
     } else if u.path.contains('?') {
@@ -370,22 +588,24 @@ pub(crate) fn do_http(
     // carrying the same `SsrfError` text, so the `http: {e}` step error a
     // workflow surfaces reads as it always did.
     let tcp = crate::net::ssrf::connect_vetted(&u.host, u.port, timeout, allow_private)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| unsent(e.to_string()))?;
     let resp = if u.is_tls() {
         #[cfg(feature = "tls")]
         {
-            let mut s = crate::net::tls::connect(tcp, &u.host, None).map_err(|e| e.to_string())?;
+            let mut s =
+                crate::net::tls::connect(tcp, &u.host, None).map_err(|e| unsent(e.to_string()))?;
             crate::net::http::send(&mut s, &u.host_header(), method, &path, &hdr_refs, body)
-                .map_err(|e| e.to_string())?
+                .map_err(|e| sent(e.to_string()))?
         }
         #[cfg(not(feature = "tls"))]
         {
-            return Err("https requires the 'tls' build feature".into());
+            let _ = (tcp, sent);
+            return Err(unsent("https requires the 'tls' build feature".into()));
         }
     } else {
         let mut s = tcp;
         crate::net::http::send(&mut s, &u.host_header(), method, &path, &hdr_refs, body)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| sent(e.to_string()))?
     };
     let body_str = resp.body_str().to_string();
     let headers_obj: Map<String, Value> = resp

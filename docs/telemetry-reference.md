@@ -108,6 +108,7 @@ these names, and anything else is refused at load.
 | `metrics` | The probe and scrape listener |
 | `nested` | Fan-out bodies |
 | `otel` | OTLP export |
+| `payment` | Paying with x402 (the `x402` feature): payment requests read, refusals, the approver's gate, payments sent and their outcomes, the ledger and the wallets |
 | `plan` | Plan updates |
 | `preflight` | Preflight triage |
 | `pressure` | Resource pressure |
@@ -662,6 +663,27 @@ its `jti`.
 | `otel.export.failed` | warn | `endpoint`, `err`, `failures`, `signal` | A batch of `signal` (`traces`, `logs`) did not reach the collector and was dropped. Written when exports start failing, then at most once a minute while they keep failing; `failures` counts the batches lost since the signal's last `otel.export.recovered`. |
 | `otel.export.recovered` | info | `endpoint`, `failures`, `signal` | The collector took a batch after `failures` were lost. Written at most once a minute: after a failure inside that minute, which is logged at once, the next one waits for the first batch taken once the minute is up. |
 | `otel.logs.armed` | info | `endpoint` | OTLP log export is on. |
+
+### payment
+
+None of these carries a signature, a signed authorization or a key. The
+nonce, which the chain makes public once a payment settles, is in each.
+
+| Event | Level | Fields | Notes |
+|---|---|---|---|
+| `payment.required` | info | `accepts`, `call`, `resource`, `run`, `step` | A paying step's call was answered with a payment request: `accepts` as the server sent them, `resource` its `resource.url` without a query. |
+| `payment.refused` | warn | `detail`, `run`, `step`, `why` | Refused unsent: no entry the step and the policy allow (`detail.reasons` names each entry and every reason), another resource (`resource_mismatch`), nobody to ask (`no_approver`), a record the ledger or the audit chain did not keep, or a request already paid (`payment_made`) or of unknown outcome (`payment_unknown`). Nothing was signed. |
+| `payment.asked` | info | `amount`, `approver`, `asked_because`, `asset`, `network`, `payee`, `run`, `step`, `task`, `url`, `workflow` | The approver was asked, on `task`. |
+| `payment.approved`, `payment.declined` | info | `amount`, `approver`, `asset`, `by`, `payee`, `run`, `sid?`, `step`, `task` | The approver's answer; `by` `on_timeout` when nobody answered within `approval_timeout`. |
+| `payment.interrupted` | info | `run`, `step`, `task` | A gate a previous life left open ended its step, nothing paid. Also an audit record, `payment` (`interrupted`). |
+| `payment.sent` | info | `amount`, `approved_by`, `asset`, `attempt`, `network`, `nonce`, `payee`, `run`, `step`, `valid_before`, `wallet` | The ledger and the audit chain hold the payment; it is being signed and sent. |
+| `payment.settled` | info | `amount`, `asset`, `error_reason`, `nonce`, `payee`, `payer`, `run`, `step`, `transaction`, `why` | The server's settlement said `success`. |
+| `payment.failed` | warn | as `payment.settled` | The server said it did not settle, or the payment never left: the signer refused, the dial failed. |
+| `payment.unknown` | warn | as `payment.settled` | What landed is not known: no answer, a timeout, a 5xx, `settlement_pending`, an answer with no settlement. The request is never paid again. |
+| `payment.ledger.restored` | warn | `amount`, `asset`, `msg`, `nonce`, `payee`, `request`, `run`, `state`, `step`, `workflow` | At start: a payment was out when the last life stopped. Its outcome is unknown from here on. Also an audit record, `payment` (`unknown`). |
+| `payment.ledger.swept` | info | `records` | Records past every cap's window and every authorization's validity, of runs no longer live, were forgotten. |
+| `payment.wallet` | info | `address`, `custody`, `wallet` | At start: a wallet's address, read from its key file or asked of the signer. |
+| `payment.signer.unavailable` | warn | `error`, `msg` | At start: the external signer did not answer. No payment is made from its wallets until it names their addresses. |
 
 ### plan
 
@@ -1291,6 +1313,16 @@ signed-out Session's) in its `target`, so an approval and the confirm it
 sent read back as one — `company.standing` (`used`, naming the `account`
 too) and `company.direct` (`asked`,
 `join`, `decline`, `not_addressed`).
+Paying with x402 records `payment`, its `target` naming the run, step and
+workflow, the URL without its query, and — once an entry is chosen — the
+wallet, network, asset and its CAIP-19 id, payee and address, amount in
+atomic units, nonce, `validBefore`, attempt and approver: `refused`,
+`asked`, `not_addressed`, `approved`, `declined`, `withdrawn`,
+`interrupted` (a gate a restart ended), then `authorized` — appended and
+flushed before the payment is sent, or the payment is refused — and
+`settled` (with the transaction and payer), `failed`, `unknown` or
+`unsent`; `unknown` too at start, for a payment the last life left out.
+Every `payment` record is flushed to the disk before the payment goes on.
 
 | Sink | Where the record goes |
 |---|---|

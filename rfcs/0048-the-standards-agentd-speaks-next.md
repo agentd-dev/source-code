@@ -182,6 +182,8 @@ A new RFC (0049) before any code, under ADR 0003. Its scope:
   x402 is in use; Verifiable Intent as AP2's companion.
 
 *Size:* large. *Recommendation:* design now, build after Q3.
+*Designed:* [RFC 0049](0049-paying-for-things.md), 2026-10-22; unit 1 (HTTP, EVM)
+built, unit 2 (MCP, A2A, Solana) next.
 
 ## 6. Questions for the user, and the answers (2026-10-19)
 

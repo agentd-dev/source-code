@@ -1,12 +1,13 @@
 # The external signer protocol
 
 With `identity.delegation.key_custody: external`, agentd holds none of the
-keys an enrolled person's delegation rests on, and with
+keys an enrolled person's delegation rests on, with
 `security.companies.key_custody: external` none of the companies preview's
-seal key. A signer process you run holds them, and agentd asks it, over a
-unix socket, to sign client assertions, to wrap and unwrap the data keys the
-grant vault and the Company records are sealed with, and to derive the
-Company records' id keys. This page is the protocol's normative
+seal key, and with `security.payments.key_custody: external` none of its
+wallets' keys. A signer process you run holds them, and agentd asks it, over
+a unix socket, to sign client assertions, to wrap and unwrap the data keys
+the grant vault and the Company records are sealed with, to derive the
+Company records' id keys, and to sign a payment's EIP-712 typed data. This page is the protocol's normative
 specification, for operators who put a KMS, an HSM or a process of their own
 behind that socket. The key words MUST, SHOULD and MAY are as in RFC 2119.
 
@@ -19,6 +20,7 @@ behind that socket. The key words MUST, SHOULD and MAY are as in RFC 2119.
 | The key-encryption key | wraps and unwraps each grant's data key, and each person's personal key | `identity.delegation.signer.seal_key` (and `seal_key_previous`) |
 | The companies' key-encryption key | wraps and unwraps the data key of each User ID, Account Token and ledger record | `security.companies.signer.seal_key` |
 | The companies' derivation key | derives the key each Company store's record ids are made under | `security.companies.signer.derive_key` |
+| Each wallet's key | signs the EIP-3009 authorization of an x402 payment ([Wallet keys](#wallet-keys)) | `security.payments.wallets.<name>.key` |
 
 A key is named by its id, and a signing key's id is also the `kid` its
 assertions carry, so register the public key at the IdP under that `kid`.
@@ -116,11 +118,12 @@ Every request carries an `op`, and every answer `ok`.
 
 | Op | Request | Answer |
 |---|---|---|
-| `public_key` | `key` | `alg` (`ES256` or `RS256`) and `jwk`, the public JWK with no private member |
+| `public_key` | `key` | `alg` (`ES256`, `RS256`, or `ES256K` for a wallet key) and `jwk`, the public JWK with no private member — a wallet key's `kty: EC`, `crv: secp256k1` (RFC 8812) |
 | `sign` | `key`, `alg`, `data`: the JWS signing input, `header.claims` | `sig`: the JWS signature. `ES256` is the 64-byte `R ‖ S` (convert a DER signature from a KMS); `RS256` is RSASSA-PKCS1-v1_5 with SHA-256 |
 | `wrap` | `key`, `plaintext` (a 32-byte data key), `aad` | `wrapped`: opaque bytes agentd stores and hands back unchanged |
 | `unwrap` | `key`, `wrapped`, `aad` | `plaintext`: the data key, only when `wrapped` was made under `key` and the same `aad` |
 | `derive` | `key`, `data` (1 to 256 bytes) | `mac`: HMAC-SHA256 of `data` under the derivation key `key`, 32 bytes |
+| `sign_typed_data` | `key`, `typed_data`: EIP-712 typed data as JSON, `{types, primaryType, domain, message}` as `eth_signTypedData_v4` takes it | `sig`: the 65-byte `r ‖ s ‖ v` over the typed data's EIP-712 digest, which the signer computes itself — RFC 6979, `s` in the lower half of the order, `v` 27 or 28 |
 
 The associated data binds a wrapped key to what it seals, each part with a
 four-byte big-endian length: for a grant the parts `delegation-grant-key`,
@@ -165,6 +168,54 @@ server. The reference signer (`agentd --internal-mock-signer`, in debug and
 "audiences": [...], "clients": [...]}`, `{"use": "wrap"}`, `{"use":
 "derive"}` — and holds to every rule above.
 
+## Wallet keys
+
+Under `security.payments.key_custody: external` a wallet names a key id of
+the signer (`wallets.<name>.key`): a secp256k1 key, whose `public_key` is
+`ES256K` and a public JWK agentd derives the wallet's address from. agentd
+sends `sign_typed_data` the whole typed data of an EIP-3009
+`TransferWithAuthorization`, not a digest, so the signer reads what it signs
+and computes the digest itself. agentd recovers the address from every
+signature it is given and refuses one that is not the wallet's.
+
+```yaml
+# fragment: under security:
+payments:
+  key_custody: external          # local (default): key files sealed under seal_key
+  signer:
+    socket: /run/agentd-signer/signer.sock
+    uid: 991
+  wallets:
+    ops: {key: wallet-ops-2026}
+```
+
+A signer:
+
+- MUST sign only typed data of exactly `types`, `primaryType`, `domain` and
+  `message`, whose `types` are exactly `EIP712Domain` and
+  `TransferWithAuthorization`, each of exactly its members in order —
+  `name string, version string, chainId uint256, verifyingContract address`
+  and `from address, to address, value uint256, validAfter uint256,
+  validBefore uint256, nonce bytes32` — whose `primaryType` is
+  `TransferWithAuthorization`, and whose domain and message hold exactly
+  those members;
+- MUST sign only for a chain and token contract (`chainId`,
+  `verifyingContract`) configured for that key, and only a `from` that is
+  the key's own address;
+- MUST refuse a `validBefore` that is not after its clock or is further
+  from it than its own window, a `validAfter` not before `validBefore`, and
+  a nonce that is not 32 bytes;
+- SHOULD hold `to` to the payees configured for the key, and `value` to a
+  maximum;
+- MUST sign nothing with a wallet key that has no token configured.
+
+What it refuses it answers `denied`; agentd fails the payment unsent
+(`payment not sent: …`), and the ledger lets the step pay again later.
+The reference signer's wallet keys are `{"alg": "ES256K", "assets":
+[<CAIP-19 id>, …], "payees": [<address>, …], "max_value": "<atomic>",
+"max_validity": <seconds>}` (`"hex"` gives the key's 32 bytes), each held to
+every rule above.
+
 ## Errors
 
 | Code | Meaning |
@@ -195,7 +246,11 @@ sent again.
   logged as `delegation.signer.unavailable`, and agentd starts. The
   companies' signer is asked for a derivation and a wrap and unwrap of a
   probe the same way: a refusal fails the start, and silence is
-  `company.signer.unavailable`.
+  `company.signer.unavailable`. The payments signer is asked for each
+  wallet key's public key: a refusal, or a key that is not `ES256K` or not
+  the address `wallets.<name>.address` names, fails the start, and silence
+  is `payment.signer.unavailable` — no payment is made from those wallets
+  until the signer names their addresses.
 - **At use**, a delegated call whose grant cannot be opened, or whose
   assertion cannot be signed, fails `signer_unavailable` before any request
   reaches the IdP or the authorization server, and is recorded as
@@ -240,4 +295,5 @@ that, and both are meant to be used:
 
 - [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization): enrolling a person and their grant.
 - [Security model](security.md#acting-for-an-enrolled-person): what holds around the grant.
-- [Configuration reference](configuration.md): every `identity.delegation`, `security.companies` and `spawn` key.
+- [Pay for things with x402](pay-with-x402.md#keep-the-key-with-a-signer): a wallet whose key the signer holds.
+- [Configuration reference](configuration.md): every `identity.delegation`, `security.companies`, `security.payments` and `spawn` key.

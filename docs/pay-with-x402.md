@@ -1,0 +1,310 @@
+# Pay for things with x402
+
+This guide lets a workflow pay for an HTTP resource that asks to be paid
+with x402 — an API call, a document, a data feed priced at a few cents — from
+a wallet agentd holds, and only within a spend policy you declare. It is for
+operators who run agentd against such resources. After it you can make a
+wallet, say what agentd may spend, in which tokens and to whom, have a
+workflow step pay, and have a person approve each payment above an amount
+you choose.
+
+> **Preview.** agentd pays as a client of x402 v2, pinned at the
+> specification's commit `e7a3b4ff47`: over HTTP, with the `exact` scheme on
+> EVM chains and an EIP-3009 authorization. It is behind the `x402` build
+> feature, which no release binary or image carries. Paying over MCP and
+> A2A, and on Solana, is designed and not built.
+
+## What it is
+
+A server that speaks x402 answers a request with `402 Payment Required` and
+a `PAYMENT-REQUIRED` header listing the ways it takes payment. The client
+signs a payment for one of them and sends the same request again with a
+`PAYMENT-SIGNATURE` header. The server checks it, serves the resource,
+settles the payment on chain and says how in a `PAYMENT-RESPONSE` header.
+No account and no person is needed — which is why agentd pays only under a
+spend policy.
+
+| Term | Meaning |
+|---|---|
+| Wallet | An EVM account agentd pays from, by a name you give it. Its key is sealed in a file only the supervisor opens, or held by an [external signer](external-signer.md). |
+| Asset | A token agentd may pay in, named by its CAIP-19 id (`eip155:8453/erc20:0x8335…2913`), which also names its chain. Each has its own caps. |
+| Payee | An address agentd may pay, by a name you give it. |
+| Spend policy | `security.payments`: the wallets, assets and payees, the caps, and who approves. A payment outside it is refused before anything is signed. |
+| Approver | The one person asked about a payment above `approve_above`. Nobody else answers, and no model or judge does. |
+| Ledger | agentd's record of every payment, on the disk before the payment leaves. A payment whose outcome agentd cannot know is never made again. |
+
+## When to use it
+
+Use it when a resource answers `402` with an x402 v2 `PAYMENT-REQUIRED`
+offering `exact` on an EVM chain — USDC on Base, say — and you want a
+workflow you wrote to pay for it.
+
+Use something else when:
+
+- **A model should decide to pay.** agentd has no tool a model calls to
+  pay. Write the paying workflow yourself and [expose it as a
+  tool](author-workflows.md#expose-a-workflow-as-a-tool): you choose the
+  request, the bounds and the wallet, and the model only starts it — and the
+  approver is asked about every payment of such a run.
+- **The server takes Permit2, `upto`, a facilitator's API or Solana.**
+  agentd pays only `exact` with EIP-3009 on EVM chains, and passes every
+  other entry over.
+- **Nobody can approve.** A payment above `approve_above`, or one of work
+  that read outside text, waits for the approver over A2A. Without an A2A
+  listener it is refused.
+
+## Build agentd with the feature
+
+The release binaries and the image do not carry `x402`. Build a binary from
+source with the release feature set plus `x402`:
+
+```bash
+cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,x402"
+```
+
+`x402` brings `oauth` with it, and two crates no other feature uses: `k256`
+for secp256k1 signatures and `sha3` for Keccak-256. Keep `a2a`: the approver
+answers over it. [Build features and crates](features.md) lists every
+feature.
+
+A binary without the feature refuses the configuration at load, with exit
+code `2`:
+
+```text
+{"event":"config.invalid","msg":"security.payments needs the `x402` feature (build with --features x402)"}
+```
+
+## Make a wallet
+
+A wallet's key is a file holding the key sealed under AES-256-GCM, with a
+seal key you keep elsewhere — a mounted secret, 32 random bytes in hex:
+
+```bash
+install -d -m 700 /run/secrets /var/lib/agentd/wallets
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /run/secrets/agentd-payments-seal
+chmod 600 /run/secrets/agentd-payments-seal
+```
+
+With the configuration below written, ask agentd for the wallet's address.
+It makes the key file, `0600`, when there is none, and prints the address to
+fund:
+
+```bash
+agentd -c agentd.yaml --print-wallet-address ops
+```
+
+```text
+0x4E8010b8F36D2Ea3a38D1c2A6A9336D237E33B0d
+```
+
+Send the wallet only what you mean it to spend. agentd refuses to start when
+the key file is a symlink, belongs to another user, can be read by another
+user, or does not open under the seal key to the address it names. It opens
+the file for each signature and wipes the key after, so the plaintext key is
+in memory for one signature. The seal key comes only from a file — never the
+environment — and agentd's workers can open neither file.
+
+## Declare the spend policy
+
+A complete configuration: one wallet, USDC on Base, one payee, and a
+workflow whose `http` step may pay for its request.
+
+```yaml
+# needs: ./payments-seal.key
+agent: {name: buyer, preflight: never}
+intelligence: {endpoints: "mock:final", model: mock}
+store: {kind: file, file: {path: /var/lib/agentd/state}}
+a2a:
+  listen: http://127.0.0.1:8080
+  bearer: "{{secret:A2A_BEARER}}"
+observability:
+  audit: {chain: {path: /var/lib/agentd/audit/audit.log}}
+security:
+  payments:
+    approver: operator
+    approval_timeout: 1h
+    max_validity: 5m
+    seal_key: "{{secret-file:./payments-seal.key}}"
+    wallets:
+      ops: {key_file: /var/lib/agentd/wallets/ops.key}
+    assets:
+      usdc-base:
+        asset: "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        decimals: 6
+        limits: {per_payment: "0.10", per_run: "1.00", per_day: "20.00", per_payee: "5.00"}
+        approve_above: "0.25"
+    payees:
+      weather: {address: "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"}
+workflows:
+  - name: forecast
+    steps:
+      start: {kind: manual}
+      get:
+        kind: http
+        depends_on: [start]
+        url: https://api.weather.example/forecast?city=Lisbon
+        payment: {wallet: ops, max: "0.05 usdc-base"}
+      done: {kind: finish, depends_on: [get], output: "{{ steps.get.output.json }}"}
+```
+
+- **Amounts** are decimals in the token's whole units (`"0.25"` is 250 000
+  of a 6-decimal token), read exactly — no floating point, and a digit past
+  `decimals` is refused rather than rounded.
+- **Caps.** `per_payment` bounds one payment, `per_run` one run's payments,
+  `per_day` every payment in any 24 hours, `per_payee` every payment to one
+  payee in any 24 hours. `per_run`, `per_day` and `per_payee` are required.
+  Two assets' amounts are never added.
+- **What counts** against a cap is every payment that left agentd or may
+  have — settled, out, or of unknown outcome — and one the server refused,
+  until its authorization expires: the server still holds it signed.
+- **The step's `max`** names the assets it pays in and at most how much, as
+  `"<amount> <asset>"` or a list of them. It is literal: a template there is
+  refused at load, so nothing a run reads raises what it may spend. A step
+  cannot widen the policy.
+- **The policy** is the operator's alone and changes only on a restart:
+  a served instruction document cannot set it, and an instruction
+  document's workflow with a paying step is refused at load.
+
+Every payment is a record in the [audit chain](security.md#the-audit-chain),
+so `observability.audit.chain` is required, and so is a store that outlives
+the process (`file`, `mcp` or `http`): the ledger is kept there.
+
+## What a payment looks like
+
+The step sends its request as written. When the answer is `402` with a
+`PAYMENT-REQUIRED`, agentd:
+
+1. checks that the resource it names is the URL the step asked — scheme,
+   host, port, path and, when it names one, the query. A payment for another
+   resource is refused (`resource_mismatch`);
+2. takes the first entry, in the server's order, that the step and the
+   policy allow: `exact`, the `eip3009` transfer method, the
+   `authorization` payment flow, an allowed asset on its network, an allowed
+   payee, within `max` and every cap;
+3. asks the approver when it must ([Approve payments](#approve-payments));
+4. writes the payment to the ledger and the audit chain, signs an EIP-3009
+   `TransferWithAuthorization` — valid from 30 s before now until the
+   server's `maxTimeoutSeconds` or `max_validity`, whichever is sooner, with
+   a random 32-byte nonce — and sends the request once more, with the same
+   method, headers and body and the `PAYMENT-SIGNATURE` header;
+5. reads `PAYMENT-RESPONSE` into the step's output and the audit chain.
+
+The step's output is the second answer with a `payment` member:
+
+```json
+{"status": 200, "json": {"forecast": "sun"},
+ "payment": {"state": "settled", "wallet": "ops", "network": "eip155:8453",
+             "asset": "usdc-base", "amount": "40000", "payee": "weather",
+             "pay_to": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+             "nonce": "0x51d7…e0b3", "transaction": "0x4882…333a",
+             "payer": "0x4E8010b8F36D2Ea3a38D1c2A6A9336D237E33B0d",
+             "error_reason": null}}
+```
+
+When no entry passes, nothing is signed and the step fails naming each entry
+and every reason:
+
+```text
+payment refused unsent: no entry the server offers is one this step and security.payments allow — entry 0: per_day: 0.03 usdc-base with 19.98 usdc-base in the last 24 hours is more than 20 usdc-base
+```
+
+A step without `payment` that is answered `402` fails, with the server's
+`PAYMENT-REQUIRED` decoded into its output as `payment_required`.
+
+## Never twice
+
+A paid request is the step itself, and a payment agentd cannot know the
+outcome of is never made again:
+
+| The paid request | Its record | A retry, a replay or a restart of the step |
+|---|---|---|
+| is out | `sending`, on the disk before it left | — a restart reads it as `unknown` |
+| settled | `settled` | fails `payment_made`, sending nothing |
+| got no answer, a timeout, a 5xx, `settlement_pending`, a success with no `PAYMENT-RESPONSE` | `unknown` | fails `payment_unknown`, sending nothing |
+| was refused: `success: false` with no transaction, or a 400 or 402 with none | `refused` | may pay again, with a new nonce |
+| never left: the signer refused, the dial failed | `unsent` | may pay again |
+
+`settlement_pending` means the transaction was broadcast and may still
+confirm, so agentd treats it as unknown. Find the payment by its nonce and
+transaction in the audit chain, and settle the question on chain yourself.
+
+## Approve payments
+
+The approver is asked, over A2A, about a payment:
+
+- above the asset's `approve_above`;
+- of a step that says `approve: true`;
+- of work that has read outside text — an `http` response, a webhook's
+  payload, an A2A peer's answer, the result of an MCP server tagged
+  `untrusted_input` — or that a model asked for, with `ask_when_tainted:
+  true` (the default). Such work may have been steered to the request. An
+  MCP server's results count only when its `tags` say `untrusted_input`, so
+  tag every server whose results someone else writes.
+
+The question is a task of its own, owned by the approver, in
+`input-required`, marked as agentd's own security gate. Its text is
+agentd's: the amount in whole and atomic units, the token's CAIP-19 id, the
+network, the payee's name and address, the request, the wallet, the
+workflow, run and step, and why it asks. What the step or the server chose
+— the request's method and URL, the server's description — is quoted and
+escaped on one line, so it cannot pass for agentd's words. It takes
+`approve` or `decline`.
+
+- **Only the approver answers.** `approver: operator` (the default) is any
+  operator principal; `approver: "user:alice"` is that principal alone. Any
+  other caller — an operator included — is refused, and the gate stays open.
+  No judge and no `agent.approval` setting answers it.
+- **Unanswered** within `approval_timeout` (default 1h), it declines.
+- **An approval covers the entry it showed, once.** The policy is checked
+  again when it lands — a cap another payment reached meanwhile still
+  refuses — and the payment is signed then.
+- **A restart** while a gate is open ends its step, nothing paid. The step's
+  `retry:` asks again.
+
+The approver answers it as any gate, from the terminal UI, the web UI or
+an A2A message on the task: see [Answer from a
+client](human-in-the-loop.md#answer-from-a-client).
+
+## Keep the key with a signer
+
+With `key_custody: external`, agentd holds no wallet key. A wallet names a
+key of the [external signer](external-signer.md), which answers its address
+and signs EIP-712 typed data — the whole authorization, not a digest, so it
+can read what it signs and refuse anything but the shape and the bounds you
+give it:
+
+```yaml
+# fragment: under security:
+payments:
+  key_custody: external
+  signer: {socket: /run/agentd-signer/signer.sock, uid: 991}
+  wallets:
+    ops: {key: wallet-ops-2026}
+```
+
+agentd checks that every signature recovers to the wallet's address before
+it sends it.
+
+## What it does not do
+
+- **It pays no one else's way.** Only `exact` with EIP-3009 on EVM chains:
+  Permit2, ERC-7710, `upto`, `batch-settlement`, `auth-capture`, Solana and
+  the facilitator and discovery APIs are not built. Entries of another
+  scheme, method or flow are passed over.
+- **It does not settle.** agentd talks to no chain and no facilitator: the
+  server settles. A server that takes the payment and serves nothing is
+  beyond reach — the `authorization` flow settles after the resource is
+  served, and the audit chain keeps what a dispute needs.
+- **It follows no redirect,** and pays only for the URL the step asked.
+- **A paying step in a loop pays once per element:** a request is the step
+  in its run, so each element of a `foreach` is its own request.
+
+## Next steps
+
+- [Security model: payments](security.md#payments): what holds around a
+  payment, and what does not.
+- [Configuration reference](configuration.md#payments): every
+  `security.payments` key.
+- [The `http` node](node-registry.md#http): the step's other fields.
+- [Telemetry reference](telemetry-reference.md#payment): the `payment.*`
+  events and audit records.

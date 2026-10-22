@@ -94,11 +94,38 @@ fn dispatch() -> i32 {
         return agentd::delegation::mock::run_with(addr_file, &knobs);
     }
 
+    // Hidden mock x402 resource server (tests/conformance, RFC 0049): a
+    // loopback HTTP server that asks to be paid, checks the payment it is
+    // sent, and answers with a settlement, announced through <addr-file>.
+    #[cfg(all(feature = "x402", any(feature = "internal-mocks", debug_assertions)))]
+    if argv.get(1).map(String::as_str) == Some("--internal-mock-x402") {
+        let addr_file = argv
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or("/tmp/agentd-mock-x402.addr");
+        let knobs = match argv.get(3).map(String::as_str) {
+            Some("--knobs") => match argv.get(4).map(|k| serde_json::from_str(k)) {
+                Some(Ok(v)) => v,
+                _ => {
+                    eprintln!("--internal-mock-x402: --knobs takes a JSON object");
+                    return exit::USAGE;
+                }
+            },
+            Some(other) => {
+                eprintln!("--internal-mock-x402: unknown argument {other:?}");
+                return exit::USAGE;
+            }
+            None => serde_json::json!({}),
+        };
+        return agentd::payments::mock::run_with(addr_file, &knobs);
+    }
+
     // Hidden reference external signer (tests, and operators writing their
-    // own; RFC 0044 P2a, and the companies preview's seal key since P2b):
-    // the signer protocol on the unix socket named, with keys made at start.
+    // own; RFC 0044 P2a, the companies preview's seal key since P2b, and the
+    // wallet keys of RFC 0049): the signer protocol on the unix socket
+    // named, with keys made at start.
     #[cfg(all(
-        any(feature = "xaa", feature = "companies"),
+        any(feature = "xaa", feature = "companies", feature = "x402"),
         any(feature = "internal-mocks", debug_assertions)
     ))]
     if argv.get(1).map(String::as_str) == Some("--internal-mock-signer") {
@@ -472,6 +499,32 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
                 let _ = &dir;
                 eprintln!(
                     "agentd: --print-client-metadata needs the oauth feature (build with --features oauth)"
+                );
+                exit::USAGE
+            }
+        }
+        // `--print-wallet-address <wallet>`: the address to fund. Under
+        // local custody the sealed key file is made when absent; under
+        // external custody the signer is asked. Nothing else is dialled.
+        Ask::PrintWalletAddress(wallet) => {
+            #[cfg(feature = "x402")]
+            {
+                match agentd::payments::print_wallet_address(&loaded.settings, &wallet) {
+                    Ok(address) => {
+                        println!("{address}");
+                        exit::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("agentd: --print-wallet-address: {e}");
+                        exit::USAGE
+                    }
+                }
+            }
+            #[cfg(not(feature = "x402"))]
+            {
+                let _ = &wallet;
+                eprintln!(
+                    "agentd: --print-wallet-address needs the x402 feature (build with --features x402)"
                 );
                 exit::USAGE
             }

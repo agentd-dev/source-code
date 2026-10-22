@@ -158,6 +158,14 @@ companies = ["oauth", "tls"]
 # AES-256-GCM are the `ring` `oauth` already carries: no new crate. NOT in
 # the release feature set — ID-JAG is a draft and the extension moves.
 xaa = ["oauth"]
+# Paying for an HTTP resource with x402 v2 (RFC 0049), only within the spend
+# policy ADR 0003 asks for: the `http` step's `payment`, `security.payments`,
+# EIP-3009 authorizations signed on EVM chains by the supervisor alone.
+# Sealing the wallet keys and the external signer are `oauth`'s; secp256k1
+# and Keccak-256, which `ring` lacks, are `k256` and `sha3`, the two crates
+# the user approved for EVM signatures (RFC 0048 Q3). NOT in the release
+# feature set: no payment without an operator who chose to build one in.
+x402 = ["oauth", "dep:k256", "dep:sha3"]
 # MCP Events (RFC 0045, SEP-3415 — a draft extension): `mcp.servers[].events`
 # bindings and `event_grants`, polled into declared streams. Hand-rolled on the
 # MCP socket; adds no dependency.
@@ -209,6 +217,13 @@ cel-interpreter = { version = "0.10.0", optional = true, features = ["json"] }
 # to the SAME ring rustls already resolves (no new crate in the graph). The
 # `less-safe-getrandom-custom-or-rdrand` avoidance is default; std rng is used.
 ring = { version = "0.17", optional = true }
+# EVM signatures for x402 (feature `x402`, RFC 0049): secp256k1 ECDSA with
+# RFC 6979 nonces, low-S and public-key recovery (`k256`, `ecdsa` alone — no
+# `std`, no `getrandom`: key bytes come from agentd's own CSPRNG), and
+# Keccak-256 (`sha3`). Optional, enabled by `x402` and nothing else, so no
+# other build carries them.
+k256 = { version = "0.14.0", optional = true, default-features = false, features = ["ecdsa"] }
+sha3 = { version = "0.12.0", optional = true, default-features = false }
 # The reusable MCP base library (workspace crate): the client, wire types and the
 # JSON-RPC codec. In-tree.
 mcp = { package = "agentd-mcp", path = "../mcp", version = "4.0.0" }

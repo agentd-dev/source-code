@@ -26,7 +26,10 @@
 //!   derivation key made at start (`"hex"` gives its 32 bytes instead); a
 //!   signing key's `clients`, when given, are the only `iss` it signs for.
 //!   Default `idp` and `ras` (ES256, no audience: they sign nothing until
-//!   one is given), `seal` (wrap) and `derive` (derive).
+//!   one is given), `seal` (wrap) and `derive` (derive). With `x402`,
+//!   `{"alg": "ES256K", "assets": [...], "payees": [...], "max_value": …,
+//!   "max_validity": …}` is a secp256k1 wallet key (`"hex"` its 32 bytes),
+//!   which signs only the EIP-3009 typed data its policy allows ([`transfer`]).
 //! - `record`: a file each request is appended to as `{"op", "key"}`, and
 //!   each refusal of the policy as `{"op", "key", "denied"}` — never its
 //!   data.
@@ -70,6 +73,9 @@ enum Kind {
     Rs256(Box<RsaKeyPair>),
     Wrap(Box<SealKey>),
     Derive(Box<[u8; 32]>),
+    /// A secp256k1 wallet key (RFC 0049 D8): it signs EIP-3009 typed data.
+    #[cfg(feature = "x402")]
+    Es256k(Box<k256::ecdsa::SigningKey>),
 }
 
 /// One key and what it may be used for.
@@ -79,6 +85,10 @@ pub struct Key {
     audiences: Vec<String>,
     /// The `iss` values it signs for; empty, any.
     clients: Vec<String>,
+    /// A wallet key's policy, as its knob gives it: `assets`, `payees`,
+    /// `max_value`, `max_validity`.
+    #[cfg_attr(not(feature = "x402"), allow(dead_code))]
+    wallet: Value,
 }
 
 struct State {
@@ -131,6 +141,17 @@ fn keys_of(knobs: &Value) -> Result<BTreeMap<String, Key>, String> {
             Kind::Wrap(Box::new(SealKey::new(&raw_key(id, k)?)?))
         } else if k["use"] == "derive" {
             Kind::Derive(Box::new(raw_key(id, k)?))
+        } else if k["alg"] == "ES256K" {
+            #[cfg(feature = "x402")]
+            {
+                Kind::Es256k(Box::new(crate::payments::evm::key_from_bytes(&raw_key(
+                    id, k,
+                )?)?))
+            }
+            #[cfg(not(feature = "x402"))]
+            {
+                return Err(format!("key {id}: ES256K needs the x402 feature"));
+            }
         } else if k["alg"] == "RS256" {
             let pem = std::fs::read_to_string(k["pem_file"].as_str().unwrap_or_default())
                 .map_err(|e| format!("key {id}: {e}"))?;
@@ -156,6 +177,7 @@ fn keys_of(knobs: &Value) -> Result<BTreeMap<String, Key>, String> {
                 kind,
                 audiences: strings(&k["audiences"]),
                 clients: strings(&k["clients"]),
+                wallet: k.clone(),
             },
         );
     }
@@ -367,6 +389,30 @@ fn answer_of(req: &Value, s: &State) -> Value {
         v["ok"] = json!(true);
         v
     };
+    #[cfg(feature = "x402")]
+    if let Kind::Es256k(sk) = &key.kind {
+        let now = crate::auth::cache::now_ms() / 1000;
+        return match op {
+            "public_key" => ok(json!({"alg": "ES256K",
+                "jwk": crate::payments::evm::jwk_of(sk.verifying_key())})),
+            "sign_typed_data" => match transfer(&req["typed_data"], id, key, sk, now) {
+                Ok(digest) => ok(json!({"sig": b64::url_nopad(
+                    &crate::payments::evm::sign_digest(sk, &digest))})),
+                Err(why) => refuse(
+                    "denied",
+                    &format!("not an EIP-3009 authorization this signer signs: {why}"),
+                ),
+            },
+            "sign" | "wrap" | "unwrap" | "derive" => {
+                refuse("wrong_use", &format!("{id} is not a key for {op}"))
+            }
+            _ => refuse("bad_request", &format!("no op {op:?}")),
+        };
+    }
+    #[cfg(feature = "x402")]
+    if op == "sign_typed_data" {
+        return refuse("wrong_use", &format!("{id} is not an EVM key"));
+    }
     if op == "sign" && matches!(key.kind, Kind::Es256(_) | Kind::Rs256(_)) {
         if req["alg"] != alg_of(key) {
             return refuse("wrong_alg", &format!("{id} is {}", alg_of(key)));
@@ -448,7 +494,67 @@ fn alg_of(k: &Key) -> &'static str {
         Kind::Rs256(_) => "RS256",
         Kind::Wrap(_) => "A256GCM",
         Kind::Derive(_) => "HS256",
+        #[cfg(feature = "x402")]
+        Kind::Es256k(_) => "ES256K",
     }
+}
+
+/// The digest of `td` when it is an EIP-3009 authorization the wallet key
+/// `key` (id `id`) signs at `now_s`, held to the policy
+/// `docs/external-signer.md` asks of a signer: exactly EIP-3009's typed
+/// data, for a (chain, token) among the key's `assets`, `from` the key's own
+/// address, `to` among its `payees` when it has them, `value` at most its
+/// `max_value`, a `validBefore` after now and at most `max_validity`
+/// seconds (default 3600) away, and a 32-byte nonce. A key with no
+/// `assets` signs nothing. `Err` says why not — never with what it held.
+#[cfg(feature = "x402")]
+fn transfer(
+    td: &Value,
+    id: &str,
+    key: &Key,
+    sk: &k256::ecdsa::SigningKey,
+    now_s: u64,
+) -> Result<[u8; 32], String> {
+    use crate::payments::{caip::AssetId, evm, x402::Transfer};
+    let assets: Vec<(u64, evm::Address)> = strings(&key.wallet["assets"])
+        .iter()
+        .filter_map(|a| AssetId::parse(a).ok()?.erc20())
+        .collect();
+    if assets.is_empty() {
+        return Err(format!(
+            "key {id} has no asset configured, so it signs nothing"
+        ));
+    }
+    let t = Transfer::read(td)?;
+    if !assets.contains(&(t.chain_id, t.contract)) {
+        return Err(format!("the token is not an asset key {id} signs for"));
+    }
+    let a = &t.authorization;
+    if a.from != evm::address_of_key(sk) {
+        return Err(format!("from is not key {id}'s address"));
+    }
+    let payees: Vec<evm::Address> = strings(&key.wallet["payees"])
+        .iter()
+        .filter_map(|p| evm::Address::parse(p).ok())
+        .collect();
+    if !payees.is_empty() && !payees.contains(&a.to) {
+        return Err(format!("to is not a payee key {id} signs for"));
+    }
+    if let Some(max) = key.wallet["max_value"]
+        .as_str()
+        .and_then(|m| m.parse::<u128>().ok())
+        && a.value > max
+    {
+        return Err(format!("value is more than key {id} signs for"));
+    }
+    let window = key.wallet["max_validity"].as_u64().unwrap_or(3600);
+    if a.valid_before <= now_s || a.valid_before - now_s > window || a.valid_after >= a.valid_before
+    {
+        return Err(format!(
+            "validBefore is not after now and within {window}s of it, or validAfter is not before it"
+        ));
+    }
+    crate::payments::eip712::digest(td)
 }
 
 #[cfg(test)]
@@ -460,6 +566,7 @@ mod tests {
             kind: Kind::Derive(Box::new([0; 32])),
             audiences: audiences.iter().map(|s| s.to_string()).collect(),
             clients: clients.iter().map(|s| s.to_string()).collect(),
+            wallet: Value::Null,
         }
     }
 
@@ -470,6 +577,93 @@ mod tests {
             b64::url_nopad(claims.to_string().as_bytes())
         )
         .into_bytes()
+    }
+
+    /// A wallet key signs only an EIP-3009 authorization its policy allows
+    /// (RFC 0049 D8): the typed data agentd builds, for a configured token,
+    /// from its own address, to a configured payee, within its value and its
+    /// window — and nothing else, whatever the typed data says it is.
+    #[cfg(feature = "x402")]
+    #[test]
+    fn a_wallet_key_signs_only_the_eip3009_shape_its_policy_allows() {
+        use crate::payments::evm::{Address, address_of_key, key_from_bytes};
+        use crate::payments::x402::Authorization;
+        let sk = key_from_bytes(&[0x33; 32]).unwrap();
+        let usdc = Address::parse("0x036CbD53842c5426634e7929541eC2318f3dCF7e").unwrap();
+        let payee = Address::parse("0x209693Bc6afc0C5328bA36FaF03C514EF312287C").unwrap();
+        let k = Key {
+            kind: Kind::Derive(Box::new([0; 32])),
+            audiences: Vec::new(),
+            clients: Vec::new(),
+            wallet: json!({"alg": "ES256K", "assets": [format!("eip155:84532/erc20:{usdc:?}")],
+                           "payees": [payee.checksummed()], "max_value": "50000", "max_validity": 600}),
+        };
+        let now = 1_800_000_000;
+        let auth = Authorization {
+            from: address_of_key(&sk),
+            to: payee,
+            value: 10_000,
+            valid_after: now - 30,
+            valid_before: now + 60,
+            nonce: [9; 32],
+        };
+        let td = auth.typed_data("USDC", "2", 84532, &usdc);
+        assert_eq!(
+            transfer(&td, "w", &k, &sk, now),
+            crate::payments::eip712::digest(&td)
+        );
+        let with = |f: &dyn Fn(&mut Authorization)| {
+            let mut a = auth.clone();
+            f(&mut a);
+            transfer(&a.typed_data("USDC", "2", 84532, &usdc), "w", &k, &sk, now)
+        };
+        let mut permit = td.clone();
+        permit["primaryType"] = json!("Permit");
+        let mut extra = td.clone();
+        extra["message"]["memo"] = json!("x");
+        let mut salted = td.clone();
+        salted["domain"]["salt"] = json!(format!("0x{}", "00".repeat(32)));
+        for (case, r) in [
+            ("another primary type", transfer(&permit, "w", &k, &sk, now)),
+            ("a member more", transfer(&extra, "w", &k, &sk, now)),
+            ("a domain salt", transfer(&salted, "w", &k, &sk, now)),
+            (
+                "another chain",
+                transfer(
+                    &auth.typed_data("USDC", "2", 8453, &usdc),
+                    "w",
+                    &k,
+                    &sk,
+                    now,
+                ),
+            ),
+            (
+                "another token",
+                transfer(
+                    &auth.typed_data("USDC", "2", 84532, &payee),
+                    "w",
+                    &k,
+                    &sk,
+                    now,
+                ),
+            ),
+            ("someone else's from", with(&|a| a.from = payee)),
+            ("another payee", with(&|a| a.to = usdc)),
+            ("past max_value", with(&|a| a.value = 50_001)),
+            ("expired", with(&|a| a.valid_before = now)),
+            ("past its window", with(&|a| a.valid_before = now + 601)),
+        ] {
+            assert!(r.is_err(), "{case} must be refused");
+        }
+        let none = Key {
+            wallet: json!({"alg": "ES256K"}),
+            ..k
+        };
+        assert!(
+            transfer(&td, "w", &none, &sk, now)
+                .unwrap_err()
+                .contains("signs nothing")
+        );
     }
 
     /// Only the shape of a client assertion, for a configured audience, is

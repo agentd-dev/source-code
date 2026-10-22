@@ -74,7 +74,9 @@ pub enum Category {
     /// Paying with x402 (RFC 0049) within ADR 0003's spend policy: the
     /// HTTP transport's headers, the entries a client must skip, refusals
     /// unsent, the approver's gate, never twice, the audit chain and the
-    /// key's custody — against the mock x402 resource server.
+    /// key's custody — against the mock x402 resource server; Solana's
+    /// `exact` transfer; a tool that charges over MCP; and an A2A peer that
+    /// charges, paid on its task or told `payment-rejected`.
     Payments,
 }
 

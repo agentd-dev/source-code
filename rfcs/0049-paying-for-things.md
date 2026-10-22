@@ -421,6 +421,7 @@ steps' `payment` field, of the `http` step's shape and under its rules.
 | The client answers on the task: `taskId`, metadata `payment-submitted` and the `PaymentPayload` in `x402.payment.payload` | One `SendMessage` on the peer's task and in its context, marked with the extension, `returnImmediately` and `historyLength: 0`, on the connection that asked — the card's tenant, the credentials, the trace. |
 | The peer's status messages carry `x402.payment.receipts`, every settlement of the task so far; the final one MUST | The receipts after those the asking message carried are this payment's; the last of them is read. A send follows the task (`GetTask` with `historyLength: 0`, retried until the step's `timeout`) until one comes; a delegation until the task ends. |
 | `payment-failed`, an error code, the task asking again | The receipt as on MCP. No receipt: `payment-failed` is `refused`; a new status message asking to be paid again is `refused`; an HTTP 4xx, or a JSON-RPC error other than `-32603`, to the payment message is `refused`; no answer, one agentd cannot read, an HTTP 5xx or `-32603` is `unknown`; no receipt by the step's `timeout` is `unknown`. |
+| A client that rejects the requirements answers with a message whose metadata says `x402.payment.status: payment-rejected` (v0.2 §5.1, §5.4) | When agentd will not pay — refused unsent, or the approver's gate declined or timed out, or the step went another way — one `SendMessage` on the peer's task, in its context, on the connection that asked, marked with the extension, its metadata `payment-rejected` and nothing else: no reason, so the peer learns nothing of the policy or the approver. Never while a payment of the step's request is out, `settled` or `unknown`. Off the loop, within the step's `timeout` and 10 s; an idle exit waits for it. |
 
 The payment request's `resource` is recorded, not held to anything: an
 A2A peer names a URL of its own (the transport's example names an HTTP
@@ -438,10 +439,13 @@ A step with no `payment` field fails at once on a task that asks to be paid,
 saying so — a delegation no longer follows it until its `timeout` — in every
 build with `a2a`.
 
-*Not done:* agentd does not answer a refused or declined payment with
-`payment-rejected`; the peer's task is left in `input-required`, the step
-failed. The extension describes that message, and a peer gains nothing from
-it that the task's expiry does not give it.
+`payment-rejected` is said only of what agentd decided not to pay. A
+payment that could not be recorded — the ledger or the audit chain did not
+keep its record — signed or sent (`unsent`, which the step's `retry:` may
+make again) rejects nothing, nor does a gate no random source could open,
+and nor does a gate a restart ended: the connection that asked is gone with the process. The transport
+asks this through `PaidCall::rejects` and `PaidCall::reject`; HTTP and MCP
+have no such message, and their calls end with their answers.
 
 **The extension and A2A 1.0.1 disagree, and so do its two documents.** What
 agentd does, and why:
@@ -556,7 +560,14 @@ for `specs/transports-v2/a2a.md` in x402-foundation/x402:
   `approve_above`, paying on the approver's approval and not on a decline;
   never twice after an unknown outcome, over either transport; a step with
   no `payment` field fails on a tool or a peer that charges, at once; the
-  signature in no log line, no output and no audit record.
+  signature in no log line, no output and no audit record; a peer told
+  `payment-rejected` when the policy refuses its payment or the approver
+  declines it or does not answer, and never after an unknown outcome.
+- The `payments` conformance family's checks of Solana (a payment within
+  the policy, refusals unsent), MCP (a paying `mcp.tool` within the policy,
+  refusals unsent, the approver's gate, never twice) and A2A (a peer's
+  task paid, `payment-rejected` on a refusal), each quoting the x402,
+  a2a-x402 or ADR 0003 sentence it proves.
 
 ## 10. Solana: the `exact` scheme on SVM
 

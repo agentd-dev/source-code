@@ -801,6 +801,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         payment_closed: std::collections::VecDeque::new(),
         #[cfg(feature = "x402")]
         payments_swept_ms: 0,
+        #[cfg(feature = "x402")]
+        payment_rejections: Default::default(),
         #[cfg(all(feature = "a2a", feature = "oauth"))]
         inbound,
         #[cfg(feature = "xaa")]

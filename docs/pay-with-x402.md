@@ -266,7 +266,8 @@ escaped on one line, so it cannot pass for agentd's words. It takes
   operator principal; `approver: "user:alice"` is that principal alone. Any
   other caller — an operator included — is refused, and the gate stays open.
   No judge and no `agent.approval` setting answers it.
-- **Unanswered** within `approval_timeout` (default 1h), it declines.
+- **Unanswered** within `approval_timeout` (default 1h), it declines. A
+  peer that asked over A2A is told `payment-rejected`.
 - **An approval covers the entry it showed, once.** The policy is checked
   again when it lands — a cap another payment reached meanwhile still
   refuses — and the payment is signed then.
@@ -274,7 +275,9 @@ escaped on one line, so it cannot pass for agentd's words. It takes
   `retry:` asks again.
 
 The approver answers it as any gate, from the terminal UI, the web UI or
-an A2A message on the task: see [Answer from a
+an A2A message on the task: see [Payment
+approvals](human-in-the-loop.md#payment-approvals) for the gate from the
+approver's side, and [Answer from a
 client](human-in-the-loop.md#answer-from-a-client).
 
 ## Keep the key with a signer
@@ -472,9 +475,19 @@ task it keeps has every `x402.payment.payload` taken out: a peer that hands
 the payment message back puts no signed payment in the step's output or
 the log.
 
+When agentd will not pay — the policy refuses the payment, or the
+approver declines it or does not answer in time — it answers on the peer's
+task with a message whose metadata says `x402.payment.status:
+payment-rejected` and nothing else, so the peer ends the task. The peer
+learns no reason: nothing of the policy or the approver. A payment that
+may have left — its outcome unknown — is never rejected, and nor is a
+request already paid. An idle job waits for the peer to take the message
+before it exits.
+
 A delegation that may not pay ends as soon as the peer asks to be paid, and
-says so. A peer whose card requires a2a-x402 is refused before anything is
-sent to it.
+says so, telling the peer nothing: a step with no `payment` field does not
+speak a2a-x402. A peer whose card requires a2a-x402 is refused before
+anything is sent to it.
 
 agentd speaks A2A 1.0.1 and x402 v2: it activates the extension with the
 `A2A-Extensions` header, under both of the extension's URIs, and does not
@@ -502,9 +515,11 @@ where the extension's documents differ from A2A 1.0.1.
   served, and the audit chain keeps what a dispute needs.
 - **It follows no redirect,** and pays only for the URL the step asked, the
   tool it called, or the peer task that asked.
-- **No `payment-rejected` to a peer.** A payment agentd refuses or the
-  approver declines leaves the peer's task in `input-required`; the step
-  fails.
+- **It rejects only what it decided not to pay.** A peer is told nothing
+  when a payment could not be recorded, signed or sent, or no gate could be
+  opened to ask about it — the step's `retry:` may still make it — nor for
+  a gate a restart ended: the connection that asked is gone with the
+  process. Its task stays in `input-required` until the peer ends it.
 - **A paying step in a loop pays once per element:** a request is the step
   in its run, so each element of a `foreach` is its own request.
 

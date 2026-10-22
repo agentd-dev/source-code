@@ -11,7 +11,7 @@
 //! is in hand, or, for a delegation, until the task ends — and what came of
 //! it said as plainly as the ledger needs: whether the message never left,
 //! was refused, or left with no readable answer, and the receipt, if one
-//! came.
+//! came. [`PaidPeer::reject`] answers it with `payment-rejected` instead.
 
 use super::{
     DelegateOutcome, Follow, Followed, HttpConn, HttpEp, POLL_INTERVAL, PeerAuth, delegate_with,
@@ -234,6 +234,28 @@ impl PaidPeer {
             if let Ok(t) = self.conn.call("GetTask", get.clone(), deadline) {
                 seen = t;
             }
+        }
+    }
+
+    /// Tell the peer agentd will not pay what its task asked: one
+    /// `SendMessage` on the task and in its context, its metadata
+    /// `payment-rejected` (a2a-x402 v0.2 §5.4) and nothing else, marked with
+    /// the extension, on the connection that asked. Only that the peer took
+    /// it is read back; `Err` says why it did not.
+    pub fn reject(&mut self, deadline: Instant) -> Result<(), String> {
+        let tenant = self.conn.tenant.clone();
+        let params = a2a::send_message_params_on_task(
+            &self.task,
+            self.context.as_deref(),
+            "Payment requirements rejected (x402).",
+            x402::rejected(),
+            x402::EXTENSIONS,
+            &mint_message_id(),
+            tenant.as_deref(),
+        );
+        match self.send(params, deadline) {
+            Ok(_) | Err(Reached::Accepted) => Ok(()),
+            Err(Reached::Unsent(e) | Reached::Refused(e) | Reached::Unanswered(e)) => Err(e),
         }
     }
 

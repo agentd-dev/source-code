@@ -35,6 +35,12 @@
 //! covers the entry it showed, once: the policy is asked again when it
 //! lands. A gate a previous life left open ends its step at the next start,
 //! nothing paid.
+//!
+//! **Rejected.** A payment request agentd refuses, or whose approval is
+//! declined or times out, is answered `payment-rejected` where the
+//! transport has that word — an A2A peer's task (a2a-x402) — so the peer
+//! ends the task ([`PaidCall::reject`]). Never while a payment of the
+//! step's request is out, settled or of unknown outcome.
 
 #[cfg(feature = "a2a")]
 pub(crate) mod a2a;
@@ -82,6 +88,17 @@ pub(crate) trait PaidCall: Send {
     /// which the transport puts where it carries one — and read what came
     /// back. On a thread of its own: it may take the call's timeout.
     fn send_paid(&mut self, payload: &Value, run: &str, step: &str) -> Answer;
+    /// Whether the server that asked is told that agentd will not pay: an
+    /// A2A peer is, with a2a-x402's `payment-rejected`, so it ends the task
+    /// that waits for the payment. HTTP and MCP have no such message: the
+    /// call ends with its answer.
+    fn rejects(&self) -> bool {
+        false
+    }
+    /// Tell it, on a thread of its own; `Err` says why it was not told.
+    fn reject(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// What came back from a paid call.
@@ -303,8 +320,12 @@ impl Runtime {
         json!({"run": run, "step": step, "workflow": wf, "url": call.shown()})
     }
 
-    /// A payment refused unsent: the step fails saying why, and the chain
-    /// records it.
+    /// A payment refused unsent: the step fails saying why, the chain
+    /// records it, and the server that asked for `call`'s payment, when it
+    /// is passed, is told ([`Runtime::reject_payment`]). A refusal agentd
+    /// decided passes it; a failure of agentd's own — no random source, a
+    /// ledger or an audit chain that did not keep the record — decided
+    /// nothing, and does not: the step's `retry:` may pay.
     fn payment_refused(
         &mut self,
         run_id: &str,
@@ -312,6 +333,7 @@ impl Runtime {
         first: Option<Value>,
         why: String,
         target: Value,
+        call: Option<Box<dyn PaidCall>>,
     ) {
         let trace = self.step_trace(run_id, step_id);
         self.step_log(run_id, step_id).warn(
@@ -321,6 +343,56 @@ impl Runtime {
         self.payment_audit("refused", target, None, trace.as_ref());
         self.executing.remove(&format!("{run_id}/{step_id}"));
         self.finish_step_pub(run_id, step_id, StepStatus::Failed, first, Some(why), 0);
+        if let Some(call) = call {
+            self.reject_payment(run_id, step_id, call);
+        }
+    }
+
+    /// Tell the server that asked for `call`'s payment that agentd will not
+    /// pay it, where its transport has a word for that ([`PaidCall::reject`]),
+    /// off the loop. Never while a payment of the step's request is out,
+    /// settled or of unknown outcome: the server may hold a payment agentd
+    /// made, and is told nothing that says otherwise.
+    fn reject_payment(&self, run: &str, step: &str, mut call: Box<dyn PaidCall>) {
+        use std::sync::atomic::Ordering;
+        if !call.rejects() {
+            return;
+        }
+        let key = crate::engine::run::idempotency_key(run, step);
+        if self
+            .payments
+            .as_ref()
+            .is_some_and(|p| p.ledger().blocking(&key).is_some())
+        {
+            return;
+        }
+        let line = self.step_log(run, step);
+        let detail = json!({"run": run, "step": step, "call": call.describe()});
+        let (count, wake) = (
+            std::sync::Arc::clone(&self.payment_rejections),
+            self.events_tx.clone(),
+        );
+        count.fetch_add(1, Ordering::SeqCst);
+        let spawned = std::thread::Builder::new()
+            .name("step:pay.reject".into())
+            .spawn({
+                let count = std::sync::Arc::clone(&count);
+                move || {
+                    match call.reject() {
+                        Ok(()) => line.info("payment.rejected", detail),
+                        Err(e) => {
+                            let mut d = detail;
+                            d["error"] = json!(e);
+                            line.warn("payment.rejected", d);
+                        }
+                    }
+                    count.fetch_sub(1, Ordering::SeqCst);
+                    let _ = wake.send(super::events::Event::Tick);
+                }
+            });
+        if spawned.is_err() {
+            count.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     /// A paying step refused before its call is made — its definition is
@@ -334,7 +406,7 @@ impl Runtime {
             .map(|r| r.workflow.clone())
             .unwrap_or_default();
         let target = json!({"run": run, "step": step, "workflow": wf});
-        self.payment_refused(run, step, None, why, target);
+        self.payment_refused(run, step, None, why, target, None);
     }
 
     /// A payment request a paying step's transport handed the loop:
@@ -365,6 +437,7 @@ impl Runtime {
     ) {
         if !self.step_waiting(run, step) {
             self.executing.remove(&format!("{run}/{step}"));
+            self.reject_payment(run, step, call);
             return;
         }
         let target = self.payment_target(run, step, &*call);
@@ -374,7 +447,7 @@ impl Runtime {
                 let why = format!(
                     "payment refused unsent: no x402 v2 payment request ({e}), and nothing was paid"
                 );
-                self.payment_refused(run, step, Some(first), why, target);
+                self.payment_refused(run, step, Some(first), why, target, Some(call));
                 return;
             }
         };
@@ -393,11 +466,11 @@ impl Runtime {
             );
             let mut t = target;
             t["reasons"] = json!(["resource_mismatch"]);
-            self.payment_refused(run, step, Some(first), why, t);
+            self.payment_refused(run, step, Some(first), why, t, Some(call));
             return;
         }
         if let Err(why) = self.payment_precheck(run, step) {
-            self.payment_refused(run, step, Some(first), why, target);
+            self.payment_refused(run, step, Some(first), why, target, Some(call));
             return;
         }
         let Some(p) = self.payments.clone() else {
@@ -418,7 +491,7 @@ impl Runtime {
         ) {
             Ok(s) => s,
             Err(e) => {
-                self.payment_refused(run, step, Some(first), e, target);
+                self.payment_refused(run, step, Some(first), e, target, Some(call));
                 return;
             }
         };
@@ -447,7 +520,7 @@ impl Runtime {
                 );
                 let mut t = target;
                 t["reasons"] = json!(reasons);
-                self.payment_refused(run, step, Some(first), why, t);
+                self.payment_refused(run, step, Some(first), why, t, Some(call));
                 return;
             }
         };
@@ -532,13 +605,14 @@ impl Runtime {
                 );
                 let mut t = target;
                 t["reasons"] = json!(passed.iter().map(|x| x.to_json()).collect::<Vec<_>>());
-                self.payment_refused(&run, &step, None, why, t);
+                self.payment_refused(&run, &step, None, why, t, Some(call));
                 return;
             }
         }
-        if let Some(r) = p.ledger().blocking(&key) {
-            let why = never_twice(r);
-            self.payment_refused(&run, &step, None, why, target);
+        // The server is told nothing: it may hold the payment made already.
+        let blocking = p.ledger().blocking(&key).map(never_twice);
+        if let Some(why) = blocking {
+            self.payment_refused(&run, &step, None, why, target, None);
             return;
         }
         // The nonce and the window are fixed here, on the loop, so the
@@ -552,6 +626,7 @@ impl Runtime {
                     None,
                     format!("payment refused unsent: {e}"),
                     target,
+                    None,
                 );
                 return;
             }
@@ -587,9 +662,18 @@ impl Runtime {
             ended_ms: None,
         };
         let mut t = record_target(&record);
-        if let Err(e) = p.ledger().put(record.clone()) {
+        // Kept apart: a refusal reads the ledger again.
+        let kept = p.ledger().put(record.clone());
+        if let Err(e) = kept {
             t["error"] = json!(e);
-            self.payment_refused(&run, &step, None, format!("payment refused unsent: {e}"), t);
+            self.payment_refused(
+                &run,
+                &step,
+                None,
+                format!("payment refused unsent: {e}"),
+                t,
+                None,
+            );
             return;
         }
         let trace = self.step_trace(&run, &step);
@@ -610,6 +694,7 @@ impl Runtime {
                 None,
                 format!("payment refused unsent: the audit chain did not take its record ({e})"),
                 t,
+                None,
             );
             return;
         }
@@ -743,18 +828,22 @@ impl Runtime {
             self.open_payment_gate(pending, why);
             return;
         }
-        let mut t = self.payment_target(&pending.run, &pending.step, &*pending.call);
+        let Pending {
+            run, step, call, ..
+        } = pending;
+        let mut t = self.payment_target(&run, &step, &*call);
         t["asked_because"] = json!(why);
         t["reasons"] = json!(["no_approver"]);
         self.payment_refused(
-            &pending.run,
-            &pending.step,
+            &run,
+            &step,
             None,
             format!(
                 "payment refused unsent (no_approver): it needs the approver's approval ({}), and no A2A listener serves to ask them",
                 why.join("; ")
             ),
             t,
+            Some(call),
         );
     }
 
@@ -771,18 +860,22 @@ impl Runtime {
         let id = match crate::sec::random::b64url_token(9) {
             Ok(id) => id,
             Err(e) => {
-                let mut t = self.payment_target(&pending.run, &pending.step, &*pending.call);
+                let Pending {
+                    run, step, call, ..
+                } = pending;
+                let mut t = self.payment_target(&run, &step, &*call);
                 t["asked_because"] = json!(why);
                 t["reasons"] = json!(["no_approver"]);
                 self.payment_refused(
-                    &pending.run,
-                    &pending.step,
+                    &run,
+                    &step,
                     None,
                     format!(
                         "payment refused unsent (no_approver): it needs the approver's approval ({}), and no gate could be opened to ask them (the system's random source: {e})",
                         why.join("; ")
                     ),
                     t,
+                    None,
                 );
                 return;
             }
@@ -948,6 +1041,7 @@ impl Runtime {
         self.payment_audit(outcome, t, Some(&principal.id), trace.as_ref());
         let (run, step) = (g.pending.run.clone(), g.pending.step.clone());
         if !self.step_waiting(&run, &step) {
+            self.reject_payment(&run, &step, g.pending.call);
             return self.task_reply(task);
         }
         if let Some(r) = self.runs.get_mut(&run)
@@ -971,6 +1065,7 @@ impl Runtime {
                 )),
                 0,
             );
+            self.reject_payment(&run, &step, g.pending.call);
         }
         self.task_reply(task)
     }
@@ -1061,6 +1156,7 @@ impl Runtime {
                 );
                 self.payment_audit("withdrawn", t, None, g.trace.as_ref());
             }
+            self.reject_payment(&run, &step, g.pending.call);
         }
         // A gate this process does not hold was a previous life's.
         let mut interrupted = Vec::new();

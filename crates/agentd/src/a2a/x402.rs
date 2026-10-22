@@ -7,7 +7,9 @@
 //! that task with a message whose metadata says `payment-submitted` and
 //! carries the `PaymentPayload` under `x402.payment.payload`; the peer's
 //! status messages then carry `x402.payment.receipts`, every settlement
-//! response so far, the last one this payment's.
+//! response so far, the last one this payment's. A client that will not
+//! pay answers on the task with a message whose metadata says
+//! `payment-rejected` (v0.2 §5.4), and the peer ends the task.
 //!
 //! The extension's embedded flow — the payment request inside a higher
 //! protocol's object in the task's artifacts (an AP2 mandate) — is not read:
@@ -40,6 +42,7 @@ pub const ERROR: &str = "x402.payment.error";
 /// The `x402.payment.status` values agentd reads or writes.
 pub const PAYMENT_REQUIRED: &str = "payment-required";
 pub const PAYMENT_SUBMITTED: &str = "payment-submitted";
+pub const PAYMENT_REJECTED: &str = "payment-rejected";
 pub const PAYMENT_COMPLETED: &str = "payment-completed";
 pub const PAYMENT_FAILED: &str = "payment-failed";
 
@@ -88,6 +91,13 @@ pub fn error_code(v: &Value) -> Option<&str> {
 /// `PaymentPayload`.
 pub fn submitted(payload: &Value) -> Value {
     json!({STATUS: PAYMENT_SUBMITTED, PAYLOAD: payload})
+}
+
+/// The metadata of the message that says agentd will not pay:
+/// `payment-rejected`, and nothing else — no reason, so a peer learns
+/// nothing of the spend policy or the approver.
+pub fn rejected() -> Value {
+    json!({STATUS: PAYMENT_REJECTED})
 }
 
 /// `v` with every `x402.payment.payload` member taken out, at any depth. A
@@ -155,6 +165,7 @@ mod tests {
         let m = submitted(&json!({"x402Version": 2}));
         assert_eq!(m[STATUS], PAYMENT_SUBMITTED);
         assert_eq!(m[PAYLOAD]["x402Version"], 2);
+        assert_eq!(rejected(), json!({STATUS: "payment-rejected"}));
     }
 
     /// The payment message a peer hands back, in its history or its status,

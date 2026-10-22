@@ -1138,8 +1138,9 @@ Sends a message to a peer and continues: a notification.
 - `payment: {wallet, max, approve?}` lets the step pay a peer that asks to
   be paid (a2a-x402, the `x402` feature), within `security.payments`: the
   peer's task is answered with the payment and followed until its receipt,
-  up to `timeout`. Without `payment`, a peer that asks to be paid fails the
-  step. See [Pay with x402](pay-with-x402.md#pay-another-agent-over-a2a).
+  up to `timeout`; a payment refused or declined is answered
+  `payment-rejected`. Without `payment`, a peer that asks to be paid fails
+  the step. See [Pay with x402](pay-with-x402.md#pay-another-agent-over-a2a).
 - The request carries the send's span as `traceparent` and `tracestate`; an
   agentd peer continues it.
 - Needs the `a2a` build feature.
@@ -1162,8 +1163,9 @@ response.
 - `payment: {wallet, max, approve?}` lets the step pay a peer whose task
   asks to be paid (a2a-x402, the `x402` feature), within
   `security.payments`: the task is answered with the payment and followed
-  to its end, up to `timeout`. Without `payment`, a task that asks to be
-  paid ends the step at once, and a peer whose card requires a2a-x402 is
+  to its end, up to `timeout`; a payment refused or declined is answered
+  `payment-rejected`. Without `payment`, a task that asks to be paid ends
+  the step at once, and a peer whose card requires a2a-x402 is
   refused before anything is sent. See
   [Pay with x402](pay-with-x402.md#pay-another-agent-over-a2a).
 - With `command` and `args`, the payload is typed and checked against the

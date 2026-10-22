@@ -1863,6 +1863,21 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   to be paid, saying so: an `a2a.delegate` step no longer follows such a
   task until its `timeout`, and a peer whose card requires a2a-x402 is
   refused before anything is sent to it.
+- An `a2a.send` or `a2a.delegate` step that will not pay a peer that asked
+  through a2a-x402 — the policy refuses the payment, the approver declines
+  it or does not answer in time, or the step went another way — answers on
+  the peer's task with a message whose metadata is
+  `x402.payment.status: payment-rejected` and nothing else (a2a-x402 v0.2
+  §5.4), on the connection that asked, so the peer ends the task. It is
+  never sent while a payment of the step's request is out, settled or of
+  unknown outcome, nor for a payment that could not be recorded (the ledger
+  or the audit chain did not keep its record), signed or sent, nor when no
+  gate could be opened to ask the approver.
+  It goes off the loop, within the step's `timeout` and 10 s, and an idle
+  exit waits for it; a `payment.rejected` line says whether the peer took
+  it. `PaidCall` gains `rejects` and `reject`, and `agentd-core` gains
+  `mcp::a2a_client::PaidPeer::reject` and `a2a::x402::{PAYMENT_REJECTED,
+  rejected}`.
 - The mock MCP server's `mock.paid` tool (debug and `internal-mocks` builds
   with `x402`) asks to be paid, verifies a payment as a resource server
   does, and settles, refuses, fails, stalls or answers `settlement_pending`
@@ -1900,6 +1915,18 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   to end, the CI rows `--features x402` and `--features x402,a2a`, and the
   guide [Pay for things with x402](docs/pay-with-x402.md); agentd.dev's
   strip lists x402 v2 as a preview.
+- Eight more `payments` conformance checks, each quoting the x402,
+  a2a-x402 or ADR 0003 sentence it proves: on Solana, an `exact` transfer
+  within the policy that the sponsor verifies, and refusals unsent; over
+  MCP, the payment in `_meta["x402/payment"]` and the settlement read
+  back, refusals unsent, the approver alone answering above the threshold,
+  and an unknown outcome never paid again; over A2A, a peer's task paid on
+  that task, and `payment-rejected` when agentd will not pay — against a
+  charging A2A peer written in the suite, which settles through the mock
+  x402 server.
+- [Human in the loop](docs/human-in-the-loop.md) has a section on payment
+  approvals: who is asked, the gate's text, how to answer, the timeout, and
+  that a payment a model asked for goes to the approver.
 - `agentd-core`: `payments::{caip, eip712, evm, ledger, policy, scheme,
   wallet, x402, svm, ed25519, base58, mock, svm_mock}` and `Payments`; `payments::scheme::Family`, the one
   place that tells chain families apart;

@@ -1,8 +1,8 @@
 # Human in the loop
 
 agentd can stop and ask a person: a workflow's `human` gate, the agent's
-own `ask_human` tool, or a `security.policies` rule that holds a tool call
-until someone approves it. This guide is for builders and operators who put
+own `ask_human` tool, a `security.policies` rule that holds a tool call
+until someone approves it, or a payment that waits for its approver. This guide is for builders and operators who put
 a person in charge of a decision. It shows how to add a gate, decide who may
 answer it, answer it from a client, and choose what happens when nobody can,
 including when a model judge may answer on the operator's behalf.
@@ -587,6 +587,77 @@ one the agent is having there:
   the first message again under the id it was sent with, and the Company
   answers with the conversation it started.
 
+## Payment approvals
+
+An instance built with the `x402` feature pays for things from a workflow
+step with a `payment` field, within `security.payments` ([Pay for things
+with x402](pay-with-x402.md)). Before such a payment is signed, agentd asks
+a person when:
+
+- the amount is above the asset's `approve_above`;
+- the step says `approve: true`;
+- the work has read outside text — the result of an MCP server tagged
+  `untrusted_input` or not tagged at all among it — or a model asked for
+  it, and `security.payments.ask_when_tainted` is on (the default).
+
+A payment a model asked for goes to the approver whatever its amount. A
+model's own tool call never pays: it reads the payment request as the
+tool's error. A model reaches a payment only by starting a paying workflow
+the operator exposed as a tool, and that run's payment is asked of the
+approver. Only an operator who sets `ask_when_tainted: false` lets such a
+payment through within the caps unasked.
+
+- **Who is asked.** `security.payments.approver` alone: `operator` (the
+  default) is any operator principal, and `"user:alice"` is that principal
+  and nobody else. Only the operator's configuration names the approver; no
+  step, document or tool argument can.
+- **Nobody else answers.** An answer from anyone else, an operator
+  included, is refused with the approver's name, and the gate stays open:
+  there is no operator override. No judge answers it, whatever
+  `agent.approval` or `agent.ask_human_fallback` say.
+- **What they see.** The question is a task of its own, owned by the
+  approver, in `input-required`, marked as agentd's own security gate. Its
+  text is fixed in agentd's code; only the values change:
+
+  > Pay *amount asset* (*atomic* atomic units of *CAIP-19 id*) on
+  > *network* to the payee *name* (*address*) for *what is paid for*, from
+  > the wallet *wallet* (*address*)? The workflow "*name*" asks, in run
+  > *run*, step "*step*". It asks you because *why*. The server describes
+  > it as "*description*". Answer approve or decline.
+
+  The amount is in the asset's whole units and in atomic units, the asset
+  by its configured name and its CAIP-19 id, the network by its CAIP-2 id,
+  the payee by its configured name and address. Each is a value the policy
+  checked against its own lists before anyone is asked. What the step or
+  the server chose — an HTTP request's method and URL, a tool's name, an A2A
+  peer's task id, the server's description — is quoted and escaped on one
+  line, so it cannot pass for agentd's words. *why* names each reason:
+  `0.03 usdc is above approve_above 0.02 usdc`, `the step asks for
+  approval of every payment (approve: true)`, the outside text the run
+  read, `a model asked for this run`.
+- **How to answer.** `approve` or `decline`, as a message on the task, from
+  the [terminal or web UI](#answer-from-a-client) or over A2A. Anything else
+  is refused, and the gate stays open. An approval covers the payment the
+  gate showed, once: the policy is checked again when it lands, so a cap
+  another payment reached meanwhile still refuses it.
+- **Timeouts.** Unanswered within `security.payments.approval_timeout`
+  (default `1h`, from `1s` to `7d`), the gate declines. A decline, given or
+  timed out, pays nothing and fails the step. An A2A peer that asked to be
+  paid is told `payment-rejected` on its task, so it ends the task.
+- **No listener, no payment.** Without an A2A listener nobody can be asked,
+  and such a payment is refused unsent (`no_approver`); the configuration
+  load warns of it.
+- **A restart ends the gate.** Unlike a workflow's `human` gate, a payment's
+  gate does not survive a restart: its step fails at the next start, nothing
+  paid (`interrupted`), and the step's `retry:` asks again. A gate whose run
+  was cancelled closes (`withdrawn`).
+
+Each question and answer is a `payment` record in the audit chain —
+`asked`, `approved`, `declined` (`by: on_timeout` when nobody answered),
+`not_addressed` for an answer from someone else, `withdrawn` and
+`interrupted` — and a `payment.*` log line ([Telemetry
+reference](telemetry-reference.md#payment)).
+
 ## Answer from a client
 
 In the [terminal or web UI](interface.md), an open question shows in the
@@ -661,6 +732,8 @@ fires when a gate is answered, with `{task, via}`.
   replay opens its own.
 - The policy, timeout and addressee of a policy gate on a workflow step are
   durable too.
+- A payment's gate is not: a restart ends its step, nothing paid
+  ([Payment approvals](#payment-approvals)).
 - A firing's wait on its person's CIBA approval keeps its gate but not its
   request, which is never written down: after a restart the gate is asked
   again with a new request, once — the run's record says so — and a second
@@ -680,6 +753,9 @@ fires when a gate is answered, with `{task, via}`.
 | `agent.gate_channels` | workflow → step path → channel, for configured workflows | none |
 | `identity.delegation.consent_timeout` | a duration | `24h` |
 | `identity.delegation.consent_per_minute` | gates a minute per person | `10` |
+| `security.payments.approver` | `operator`, or one principal id | `operator` |
+| `security.payments.approval_timeout` | a duration, `1s` to `7d` | `1h` |
+| `security.payments.ask_when_tainted` | `true`, `false` | `true` |
 
 ## Next steps
 
@@ -688,3 +764,5 @@ fires when a gate is answered, with `{task, via}`.
 - [Security model](security.md): why judges never see outside input.
 - [Connect agents over A2A](connect-agents.md): principals, sign-in and
   ownership.
+- [Pay for things with x402](pay-with-x402.md): the spend policy a
+  payment's approval sits inside.

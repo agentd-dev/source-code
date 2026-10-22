@@ -539,6 +539,12 @@ pub struct Runtime {
     /// When the ledger was last swept.
     #[cfg(feature = "x402")]
     pub(crate) payments_swept_ms: u64,
+    /// `payment-rejected` messages still on their way to the A2A peers that
+    /// asked to be paid: an idle exit waits for them, as it waits for a
+    /// `forward:` push, so a job whose payment was refused does not exit
+    /// before the peer is told.
+    #[cfg(feature = "x402")]
+    pub(crate) payment_rejections: Arc<std::sync::atomic::AtomicUsize>,
     /// The inbound-token verifier the A2A listener and the webhook surface
     /// share (RFC 0044 §5.9), when `a2a.inbound_tokens` names an issuer.
     #[cfg(all(feature = "a2a", feature = "oauth"))]
@@ -2270,6 +2276,12 @@ impl Runtime {
             || self
                 .mcp_tasks
                 .cancels
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0;
+        #[cfg(feature = "x402")]
+        let busy = busy
+            || self
+                .payment_rejections
                 .load(std::sync::atomic::Ordering::SeqCst)
                 > 0;
         if busy {

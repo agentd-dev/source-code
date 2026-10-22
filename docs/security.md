@@ -1897,7 +1897,10 @@ before anything is signed:
   agentd's security gate, its text agentd's and what the step or the
   server chose in it — the request, the server's words — quoted.
   No judge answers it and no operator but the approver; unanswered, it
-  declines. The policy is checked again when the approval lands.
+  declines. The policy is checked again when the approval lands. An A2A
+  peer whose payment is refused or declined is told `payment-rejected`
+  and no reason, so it learns nothing of the policy or the approver
+  ([Payment approvals](human-in-the-loop.md#payment-approvals)).
 - **The key stays with the supervisor.** A wallet's key file holds the key
   — secp256k1, or a Solana wallet's Ed25519 seed — sealed under AES-256-GCM
   with a seal key read from a mounted file, bound to the wallet's name and

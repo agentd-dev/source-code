@@ -14,6 +14,9 @@
 //! - Above `approve_above` the approver is asked: an approval pays, a
 //!   decline pays nothing. The question names a peer's task by its id,
 //!   quoted and escaped.
+//! - A peer whose payment agentd refuses, or whose approval is declined or
+//!   times out, is told `payment-rejected` on its task (a2a-x402 v0.2
+//!   §5.4); one whose payment's outcome is unknown never is.
 //! - A payment whose outcome is unknown is never made again: the step's
 //!   retry fails before it sends anything.
 //! - A step with no `payment` field fails on a tool or a peer that charges.
@@ -86,25 +89,32 @@ fn wallet(tag: &str) -> (String, String) {
 }
 
 /// What a test configures beyond the policy.
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Setup<'a> {
     mcp: Option<&'a str>,
     peer: Option<&'a str>,
     listen: Option<u16>,
     approve_above: Option<&'a str>,
+    approval_timeout: Option<&'a str>,
     /// No `security.payments` at all.
     no_policy: bool,
     /// The `tags` of the server `shop`, written under it when set.
     shop_tags: Option<&'a str>,
+    /// `store.on_error: degrade`: a store that fails a write is carried on
+    /// degraded, not halted.
+    degrade: bool,
 }
 
 /// A configuration: the durable store, the audit chain and the spend policy
 /// under `dir`, what `setup` adds, and `workflows`.
 fn config(dir: &str, setup: &Setup, workflows: &str) -> String {
-    let mut c = format!(
-        "agent:\n  name: payer\n\
-         store:\n  kind: file\n  file:\n    path: {dir}/state\n\
-         observability:\n  log_level: info\n  log_content: true\n  audit:\n    chain:\n      path: {dir}/audit/audit.log\n\
+    let mut c =
+        format!("agent:\n  name: payer\nstore:\n  kind: file\n  file:\n    path: {dir}/state\n");
+    if setup.degrade {
+        c += "  on_error: degrade\n";
+    }
+    c += &format!(
+        "observability:\n  log_level: info\n  log_content: true\n  audit:\n    chain:\n      path: {dir}/audit/audit.log\n\
          lifecycle:\n  run_until: idle\n  idle_grace: 300ms\n"
     );
     if let Some(m) = setup.mcp {
@@ -133,6 +143,9 @@ fn config(dir: &str, setup: &Setup, workflows: &str) -> String {
             c += &format!("        approve_above: \"{a}\"\n");
         }
         c += &format!("    payees:\n      shop: {{address: \"{PAY_TO}\"}}\n");
+        if let Some(t) = setup.approval_timeout {
+            c += &format!("    approval_timeout: {t}\n");
+        }
     }
     c + "workflows:\n" + workflows
 }
@@ -456,22 +469,17 @@ impl Drop for Daemon {
     }
 }
 
-#[test]
-fn a_tool_payment_above_the_threshold_waits_for_the_approver() {
-    let mock = common::spawn_mock_mcp("mock://res", false);
-    let (dir, _) = wallet("x402-mcp-ask");
-    let pay = "{kind: mcp.tool, depends_on: [s], server: shop, tool: mock.paid, args: {amount: \"10000\"}, payment: {wallet: ops, max: \"0.05 usdc\"}}";
-    let workflows = [once("approved", pay), once("declined", pay)].concat();
+/// A daemon of `workflows`, configured in `dir` as `setup` says, with the
+/// listener the approver answers on: the daemon, and the listener's address.
+fn listening(tag: &str, dir: &str, setup: Setup, workflows: &str) -> (Daemon, String) {
     let cfg = format!("{dir}/c.yaml");
-    let (d, addr) = common::spawn_bound(|port| {
+    common::spawn_bound(|port| {
         let setup = Setup {
-            mcp: Some(&mock.uri()),
             listen: Some(port),
-            approve_above: Some("0.005"),
-            ..Setup::default()
+            ..setup
         };
-        std::fs::write(&cfg, config(&dir, &setup, &workflows)).unwrap();
-        let stderr_path = common::unique_path("x402-mcp-ask", "log");
+        std::fs::write(&cfg, config(dir, &setup, workflows)).unwrap();
+        let stderr_path = common::unique_path(tag, "log");
         let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
             .args(["--config", &cfg])
             .stdin(Stdio::null())
@@ -484,7 +492,22 @@ fn a_tool_payment_above_the_threshold_waits_for_the_approver() {
             stderr_path: stderr_path.clone(),
         };
         (d, stderr_path)
-    });
+    })
+}
+
+#[test]
+fn a_tool_payment_above_the_threshold_waits_for_the_approver() {
+    let mock = common::spawn_mock_mcp("mock://res", false);
+    let (dir, _) = wallet("x402-mcp-ask");
+    let pay = "{kind: mcp.tool, depends_on: [s], server: shop, tool: mock.paid, args: {amount: \"10000\"}, payment: {wallet: ops, max: \"0.05 usdc\"}}";
+    let workflows = [once("approved", pay), once("declined", pay)].concat();
+    let uri = mock.uri();
+    let setup = Setup {
+        mcp: Some(&uri),
+        approve_above: Some("0.005"),
+        ..Setup::default()
+    };
+    let (d, addr) = listening("x402-mcp-ask", &dir, setup, &workflows);
     let log = d.wait_for("both payments asked", |l| {
         events(l, "payment.asked").len() == 2
     });
@@ -715,8 +738,8 @@ impl Peer {
         self.seen.lock().unwrap().clone()
     }
 
-    /// The payment messages: `SendMessage`s on the peer's task.
-    fn payments(&self) -> Vec<Seen> {
+    /// The `SendMessage`s on the peer's task.
+    fn on_task(&self) -> Vec<Seen> {
         self.seen()
             .into_iter()
             .filter(|s| {
@@ -724,6 +747,24 @@ impl Peer {
                     && s.body["params"]["message"]["taskId"] == self.id.as_str()
             })
             .collect()
+    }
+
+    /// The `SendMessage`s on the peer's task whose metadata says `status`.
+    fn saying(&self, status: &str) -> Vec<Seen> {
+        self.on_task()
+            .into_iter()
+            .filter(|s| s.body["params"]["message"]["metadata"]["x402.payment.status"] == status)
+            .collect()
+    }
+
+    /// The payment messages: `payment-submitted` on the peer's task.
+    fn payments(&self) -> Vec<Seen> {
+        self.saying("payment-submitted")
+    }
+
+    /// The messages saying agentd will not pay: `payment-rejected`.
+    fn rejections(&self) -> Vec<Seen> {
+        self.saying("payment-rejected")
     }
 }
 
@@ -768,6 +809,22 @@ fn serve(mut s: std::net::TcpStream, c: &Charging) {
         c.card.to_string()
     } else {
         match body["method"].as_str() {
+            // The client will not pay: the task ends. Answered a moment
+            // late, longer than the client's idle grace, so a client that
+            // exits before the peer took it never hears it did.
+            Some("SendMessage")
+                if message["taskId"] == c.id.as_str()
+                    && message["metadata"]["x402.payment.status"] == "payment-rejected" =>
+            {
+                std::thread::sleep(Duration::from_millis(800));
+                let ended = json!({"id": c.id, "contextId": "m-ctx", "status": {
+                    "state": "TASK_STATE_FAILED",
+                    "message": {"messageId": "m-rejected", "role": "ROLE_AGENT",
+                        "parts": [{"text": "The payment was rejected."}],
+                        "metadata": {"x402.payment.status": "payment-rejected"}}}});
+                *c.task.lock().unwrap() = ended.clone();
+                result(json!({"task": echoed(ended)}))
+            }
             Some("SendMessage") if message["taskId"] == c.id.as_str() => {
                 if c.merchant == Merchant::Stalls {
                     std::thread::sleep(Duration::from_secs(4));
@@ -977,30 +1034,12 @@ fn the_approver_reads_a_peers_task_id_quoted() {
     let peer = Peer::start_as(id, false, "10000", Merchant::Settles, false);
     let (dir, _) = wallet("x402-a2a-ask");
     let pay = "{kind: a2a.delegate, depends_on: [s], peer: merchant, objective: \"the report, please\", timeout: 20s, payment: {wallet: ops, max: \"0.05 usdc\"}}";
-    let workflows = once("buy", pay);
-    let cfg = format!("{dir}/c.yaml");
-    let (d, addr) = common::spawn_bound(|port| {
-        let setup = Setup {
-            peer: Some(&peer.url),
-            listen: Some(port),
-            approve_above: Some("0.005"),
-            ..Setup::default()
-        };
-        std::fs::write(&cfg, config(&dir, &setup, &workflows)).unwrap();
-        let stderr_path = common::unique_path("x402-a2a-ask", "log");
-        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
-            .args(["--config", &cfg])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
-            .spawn()
-            .expect("spawn agentd");
-        let d = Daemon {
-            child,
-            stderr_path: stderr_path.clone(),
-        };
-        (d, stderr_path)
-    });
+    let setup = Setup {
+        peer: Some(&peer.url),
+        approve_above: Some("0.005"),
+        ..Setup::default()
+    };
+    let (d, addr) = listening("x402-a2a-ask", &dir, setup, &once("buy", pay));
     let log = d.wait_for("the payment asked", |l| {
         !events(l, "payment.asked").is_empty()
     });
@@ -1028,6 +1067,10 @@ fn the_approver_reads_a_peers_task_id_quoted() {
     assert_eq!(done["status"], "completed", "{log}");
     assert_eq!(done["output"]["payment"]["state"], "settled", "{log}");
     assert_eq!(peer.payments().len(), 1);
+    assert!(
+        peer.rejections().is_empty(),
+        "a payment made is never rejected"
+    );
     let (audit, records) = payment_records(&dir);
     let outcomes: Vec<&str> = records
         .iter()
@@ -1060,6 +1103,129 @@ fn a_peer_payment_outside_the_policy_is_refused_unsent() {
         "{e}"
     );
     assert!(peer.payments().is_empty(), "nothing was sent to pay");
+    // The peer is told, on its task and in its context, that agentd will not
+    // pay — and nothing else: no payload, no reason — before agentd exits.
+    let rejected = peer.rejections();
+    assert_eq!(rejected.len(), 1, "one payment-rejected");
+    assert_eq!(peer.on_task().len(), 1, "and nothing else on the task");
+    let m = &rejected[0].body["params"]["message"];
+    assert_eq!(
+        m["metadata"],
+        json!({"x402.payment.status": "payment-rejected"}),
+        "{m}"
+    );
+    assert_eq!(m["contextId"], "m-ctx");
+    assert!(
+        m["extensions"]
+            .as_array()
+            .is_some_and(|x| x.contains(&json!(A2A_X402))),
+        "{m}"
+    );
+    assert!(extensions(&rejected[0]).contains(A2A_X402));
+    let told = events(&log, "payment.rejected");
+    assert_eq!(told.len(), 1, "{log}");
+    assert!(told[0]["error"].is_null(), "the peer took it: {}", told[0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A peer whose payment the approver declines, or nobody answers within
+/// `approval_timeout`, is told `payment-rejected` on its task: nothing was
+/// paid, and the peer ends the task.
+#[test]
+fn a_peer_is_told_payment_rejected_when_the_approval_is_declined_or_unanswered() {
+    let pay = "{kind: a2a.send, depends_on: [s], to: merchant, parts: \"the report, please\", timeout: 20s, payment: {wallet: ops, max: \"0.05 usdc\"}}";
+    // Declined.
+    let peer = Peer::start("10000", Merchant::Settles, false);
+    let (dir, _) = wallet("x402-a2a-declined");
+    let setup = Setup {
+        peer: Some(&peer.url),
+        approve_above: Some("0.005"),
+        ..Setup::default()
+    };
+    let (d, addr) = listening("x402-a2a-declined", &dir, setup, &once("buy", pay));
+    let log = d.wait_for("the payment asked", |l| {
+        !events(l, "payment.asked").is_empty()
+    });
+    let task = events(&log, "payment.asked")[0]["task"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(peer.on_task().is_empty(), "nothing on the task while asked");
+    SendMessage::text("decline")
+        .task(&task)
+        .return_immediately()
+        .result(&addr);
+    let log = d.wait_for("the run ended and the peer told", |l| {
+        !events(l, "run.done").is_empty() && !events(l, "payment.rejected").is_empty()
+    });
+    assert_ne!(events(&log, "run.done")[0]["status"], "completed", "{log}");
+    assert!(peer.payments().is_empty(), "nothing paid");
+    assert_eq!(peer.rejections().len(), 1, "{log}");
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+    // Unanswered.
+    let peer = Peer::start("10000", Merchant::Settles, false);
+    let (dir, _) = wallet("x402-a2a-unanswered");
+    let setup = Setup {
+        peer: Some(&peer.url),
+        approve_above: Some("0.005"),
+        approval_timeout: Some("1s"),
+        ..Setup::default()
+    };
+    let (d, _) = listening("x402-a2a-unanswered", &dir, setup, &once("buy", pay));
+    let log = d.wait_for("the peer told", |l| {
+        !events(l, "payment.rejected").is_empty()
+    });
+    let declined = events(&log, "payment.declined");
+    assert_eq!(declined[0]["by"], "on_timeout", "{log}");
+    assert!(peer.payments().is_empty(), "nothing paid");
+    assert_eq!(peer.rejections().len(), 1, "{log}");
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A payment agentd could not record is no decision not to pay: a ledger
+/// that did not keep the record — the store's directory a file now —
+/// refuses the payment unsent, and the peer is told nothing, so the step's
+/// `retry:` may still pay its task.
+#[test]
+fn a_peer_is_told_nothing_when_a_payment_could_not_be_recorded() {
+    let pay = "{kind: a2a.send, depends_on: [s], to: merchant, parts: \"the report, please\", timeout: 20s, payment: {wallet: ops, max: \"0.05 usdc\"}}";
+    let peer = Peer::start("10000", Merchant::Settles, false);
+    let (dir, _) = wallet("x402-a2a-unrecorded");
+    let setup = Setup {
+        peer: Some(&peer.url),
+        approve_above: Some("0.005"),
+        degrade: true,
+        ..Setup::default()
+    };
+    let (d, addr) = listening("x402-a2a-unrecorded", &dir, setup, &once("buy", pay));
+    let log = d.wait_for("the payment asked", |l| {
+        !events(l, "payment.asked").is_empty()
+    });
+    let task = events(&log, "payment.asked")[0]["task"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::rename(format!("{dir}/state"), format!("{dir}/state.gone")).unwrap();
+    std::fs::write(format!("{dir}/state"), "").unwrap();
+    SendMessage::text("approve")
+        .task(&task)
+        .return_immediately()
+        .result(&addr);
+    let log = d.wait_for("the daemon exited", |l| !events(l, "proc.exit").is_empty());
+    let e = step_done(&log, "pay");
+    assert!(
+        e["err"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("the payment ledger could not keep the record"),
+        "{e}"
+    );
+    assert!(peer.payments().is_empty(), "nothing paid");
+    assert!(peer.on_task().is_empty(), "nothing on the task: {log}");
+    assert!(events(&log, "payment.rejected").is_empty(), "{log}");
+    drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1087,6 +1253,10 @@ fn a_peer_payment_whose_outcome_is_unknown_is_never_made_again() {
         peer.payments().len(),
         1,
         "one payment message, never a second"
+    );
+    assert!(
+        peer.rejections().is_empty(),
+        "a payment whose outcome is unknown is never rejected"
     );
     let objectives = peer
         .seen()
@@ -1124,7 +1294,10 @@ fn a_delegation_that_may_not_pay_fails_on_a_peer_that_charges() {
         started.elapsed() < Duration::from_secs(20),
         "it fails at once, not at the step's timeout"
     );
-    assert!(peer.payments().is_empty());
+    assert!(
+        peer.on_task().is_empty(),
+        "a step that may not pay speaks no a2a-x402 on the task"
+    );
     let _ = std::fs::remove_dir_all(&dir);
     // A peer whose card requires the extension is refused before anything
     // is sent.

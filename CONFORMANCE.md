@@ -21,8 +21,9 @@ contract itself, the authentication the card declares, agentd as an OAuth
 client, agentd as a client of the MCP Tasks and Skills extensions, the
 fake Company agentd is tested against under the Personal Agent Protocol
 draft, agentd acting for an enrolled person through their IdP
-(Enterprise-Managed Authorization, ID-JAG), and agentd paying with x402
-within ADR 0003's spend policy. Every check is
+(Enterprise-Managed Authorization, ID-JAG), and agentd paying with x402 —
+over HTTP, MCP and A2A, on EVM and Solana — within ADR 0003's spend policy.
+Every check is
 registered in [`src/checks/`](crates/agentd-conformance/src/checks) as a
 `Check { id, category, desc, run }`, which both the test harness and the report
 runner pick up; the tables below are those registrations, and a unit test of
@@ -334,6 +335,14 @@ skip.
 | `payments/the-approver-alone-answers-above-the-threshold` | ADR 0003: "the User's approval above a threshold, through an addressed human gate no model or judge answers": an operator who is not the approver is refused, and the approver's approve pays once |
 | `payments/every-payment-is-an-audit-record` | ADR 0003: "every payment an audit record, tied to the request that asked for it": authorized before it is sent, then settled, in the hash-chained audit log, naming the run, the step and the nonce |
 | `payments/no-signature-in-a-log-or-a-childs-payload` | ADR 0003: "the signing key held by the supervisor alone, sealed at rest, never in a model's context, a child's payload or a log": the key file is sealed and 0600, and the signature and the signed header are in no log line and no frame to a child |
+| `payments/svm-pays-the-exact-transfer-within-the-policy` | [EXACT-SVM] "a client MUST effect an on-chain payment of an exact amount of a specified asset to a specified recipient": a Solana entry within the policy is paid from the wallet's base58 key with the transfer the sponsor verifies — the mint, the amount, the payee — and its settlement is the step's |
+| `payments/svm-refused-unsent-outside-the-policy` | ADR 0003: "caps per run, per day and per payee, and an allow-list of payees and assets — a payment outside them is refused unsent": a Solana entry past per_payment and one to a key no allow-list names are refused, and the sponsor sees no transaction |
+| `payments/mcp-pays-in-meta-and-reads-the-payment-response` | [X-MCP] "Clients send payment data using the MCP `_meta` field with key `x402/payment`" and "Servers communicate payment settlement results using the `_meta["x402/payment-response"]` field": a paying mcp.tool step calls the tool once more with the payment in its `_meta`, the tool verifies it, and the settlement is the step's |
+| `payments/mcp-refused-unsent-outside-the-policy` | ADR 0003: "caps per run, per day and per payee, and an allow-list of payees and assets — a payment outside them is refused unsent": a tool asking past per_payment, and one asking to be paid to an unlisted payee, are refused, and neither tool sees a payment |
+| `payments/mcp-the-approver-alone-answers-above-the-threshold` | ADR 0003: "the User's approval above a threshold, through an addressed human gate no model or judge answers": a tool's payment above approve_above waits for the approver, an operator who is not the approver is refused, and the approver's approve pays the tool once |
+| `payments/mcp-unknown-outcome-is-never-paid-again` | ADR 0003: "a payment whose outcome is unknown is never made a second time": a paid tool call that gets no answer within the step's timeout is unknown, and the step's retries call nothing |
+| `payments/a2a-pays-on-the-peers-task` | [X-A2A] "Clients send payment data using the A2A message metadata with task correlation": a peer's task that asks to be paid is answered on that task, a2a-x402 activated, with `payment-submitted` and the payload the peer's facilitator verifies, and the peer's receipt is the step's settlement |
+| `payments/a2a-payment-rejected-when-it-will-not-pay` | [A2A-X402 v0.2 §5.4] "The client rejects all PaymentRequirements options and responds to the server agent with a message setting the message metadata field x402.payment.status to payment-rejected": a peer asking past per_payment is answered on its task with `payment-rejected` and nothing else, and nothing is paid |
 
 ## Running it
 

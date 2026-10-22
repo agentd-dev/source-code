@@ -16,6 +16,10 @@
 //! the payment, `null` when the peer asked for none. The peer is asked for
 //! none of the task's history once it is paid, and the task as the output
 //! carries no `x402.payment.payload`, wherever the peer put one.
+//!
+//! A payment agentd will not make — refused, or its approval declined or
+//! timed out — is answered on the peer's task with `payment-rejected`, on
+//! the same connection, so the peer ends the task.
 
 use std::time::{Duration, Instant};
 
@@ -25,6 +29,10 @@ use super::{Answer, Asked, PaidCall};
 use crate::a2a::x402 as wire;
 use crate::mcp::a2a_client::{DelegateOutcome, PaidPeer, Reached};
 use crate::payments::x402::Settlement;
+
+/// The longest a `payment-rejected` waits for the peer to take it, within
+/// the step's `timeout`.
+const REJECT_WITHIN: Duration = Duration::from_secs(10);
 
 /// The peer's task that asked to be paid, and how its paid answer goes.
 pub(crate) struct PeerTask {
@@ -156,6 +164,18 @@ impl PaidCall for PeerTask {
         .attr("agentd.step", step)
         .end(ok);
         answer
+    }
+
+    /// A peer is told, so it ends its task.
+    fn rejects(&self) -> bool {
+        true
+    }
+
+    /// `payment-rejected` on the peer's task, over the connection that
+    /// asked.
+    fn reject(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + self.timeout.min(REJECT_WITHIN);
+        self.paid.reject(deadline)
     }
 }
 

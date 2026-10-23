@@ -231,11 +231,13 @@ pub(super) fn a_ciba_firing_acts_on_its_persons_approval(h: &Harness) -> Outcome
 /// for nothing; and past `ciba.per_day` requests she is asked no more that
 /// day.
 pub(super) fn a_ciba_firing_denied_or_expired_fails_closed(h: &Harness) -> Outcome {
-    // Every request runs out 3 s after it is made; a poll answers as `ciba`
-    // says once one has answered pending.
+    // A poll answers as `ciba` says once one has answered pending. The
+    // denied request lives a minute, so her answer at the second poll is
+    // never beaten by its expiry however slow the host; only the one meant
+    // to run out unanswered lives 3 s.
     let s = Setup::new(
         h,
-        json!({"ciba": "deny", "ciba_expires_in": 3}),
+        json!({"ciba": "deny", "ciba_expires_in": 60}),
         &ciba_opts(3),
     );
     let _d = s.daemon(h);

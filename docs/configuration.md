@@ -662,7 +662,7 @@ its own. The hardening guide is [Harden a deployment](harden.md).
 A `kind: company` entry declares a Company agentd acts at for its one User,
 under the Personal Agent Protocol draft agentd is pinned to
 ([RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md); the
-`companies` feature, which no release binary carries). `endpoint` is
+`companies` feature, which release binaries carry). `endpoint` is
 `https://<host>`, the domain whose `/.well-known/poppy.json` is read; a path is
 refused. The supervisor discovers and verifies the Company after load (never
 under `--validate-config`, which dials nothing), holds a signed-out Session
@@ -1609,7 +1609,7 @@ The model these keys enforce is [Security model](security.md); the checklist is
 ### Payments
 
 `security.payments` is the spend policy every x402 payment is held to
-(the `x402` feature, which no release binary carries): the wallets agentd
+(the `x402` feature, which release binaries carry): the wallets agentd
 pays from and who holds their keys, the assets it may pay in with their
 caps, the payees it may pay, and the one person who approves a payment
 above an asset's `approve_above`. A payment outside it is refused before

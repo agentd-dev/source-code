@@ -490,13 +490,17 @@ features it was built with.
 
 In the release binaries: `a2a`, `metrics`, `cron`, `otel`, `hot-reload`,
 `config-watch`, `aauth`, `oauth`, `cel`, `sign`, `oci`, `decrypt`,
-`mcp-events`, `mock-models`, and `tls` (on by default).
+`mcp-events`, `mock-models`, `companies`, `xaa`, `x402`, and `tls` (on by
+default). Three of them are previews that do nothing until configured:
+`companies`, acting at companies for one person under the Personal Agent
+Protocol draft 0.1 (https://agentd.dev/docs/act-at-companies/); `xaa`, acting
+for an enrolled person through their enterprise IdP, whose delegated servers
+also need `security.experimental.id_jag: true`; and `x402`, paying only within the
+spend policy in `security.payments` (https://agentd.dev/docs/pay-with-x402/).
 
-**Not** in the release binaries — build from source to get them: `exec`, the
+**Not** in the release binaries — build from source to get it: `exec`, the
 guarded local command runner, which is off at the cargo feature *and* at
-`security.exec.enabled`; and `companies`, a preview of acting at companies
-for one person under the Personal Agent Protocol draft 0.1
-(https://agentd.dev/docs/act-at-companies/).
+`security.exec.enabled`.
 
 ---
 

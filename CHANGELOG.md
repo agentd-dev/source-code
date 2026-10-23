@@ -7,6 +7,13 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+**Security.**
+
+- ctutils 0.4.5, for RUSTSEC-2026-0385: its constant-time mask generation
+  and `u128` comparisons could compile to a branch on a secret. It reaches
+  agentd only under `k256`, the `x402` feature's secp256k1, and `cargo
+  deny` reports it once `x402` is in the graph it judges.
+
 **Added.**
 
 - `private_key_jwt` client authentication for an `oauth2` block (RFC 7523):
@@ -70,7 +77,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   fake breaks that rule or a variant built to break it goes uncaught). The
   suite's binary is built with `oauth`.
 - Acting at Companies for a person (RFC 0047, P1a), behind the new cargo
-  feature `companies`, which no release binary carries. A `services` entry of
+  feature `companies`, in the release binaries (see Changed). A `services` entry of
   `kind: company` declares a Company by its domain (`endpoint:
   https://<host>`), and `security.companies` names the one User the instance
   acts for (`user`, default `operator`), the client identity every Company
@@ -1002,8 +1009,8 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `OAuth2Params::{resource, pkce_s256, dial}`; `login::{resolve_params,
   spec_of}`; `CachedCred::{scope, step_up}`; `sec::harden`.
 - Acting for one enrolled person at MCP servers through their enterprise
-  IdP (RFC 0044 P1), behind the new cargo feature `xaa`, which no release
-  binary carries, and `security.experimental.id_jag: true`. An MCP server's
+  IdP (RFC 0044 P1), behind the new cargo feature `xaa`, in the release
+  binaries (see Changed), and `security.experimental.id_jag: true`. An MCP server's
   `auth` of `grant: id_jag` names its IdP (`identity.providers.<name>`:
   `issuer`, `client_id`, `client_auth` or `client_secret`, `profile:
   generic | okta`, `sign_in`, `subject`, `subjects`, `jwks_uri`), its
@@ -1753,8 +1760,8 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   **Breaking:** `engine::run::Unattended::asked` is a map of grant to
   `Asked`, and `Delegation::firing_started` takes one.
 - Paying for an HTTP resource with x402 v2 (RFC 0049 unit 1, under ADR
-  0003), behind the new cargo feature `x402`, which no release binary
-  carries. An `http` step with `payment: {wallet, max, approve?}`, in a
+  0003), behind the new cargo feature `x402`, in the release binaries (see
+  Changed). An `http` step with `payment: {wallet, max, approve?}`, in a
   workflow of the operator's own configuration, reads a `402`'s
   `PAYMENT-REQUIRED`, takes the first `exact` entry on an EVM chain with the
   `eip3009` transfer method and the `authorization` flow that the step's
@@ -1914,7 +1921,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   ADR 0003 sentence it proves), `x402_e2e` and `x402_transports_e2e` end
   to end, the CI rows `--features x402` and `--features x402,a2a`, and the
   guide [Pay for things with x402](docs/pay-with-x402.md); agentd.dev's
-  strip lists x402 v2 as a preview.
+  strip lists x402 v2.
 - Eight more `payments` conformance checks, each quoting the x402,
   a2a-x402 or ADR 0003 sentence it proves: on Solana, an `exact` transfer
   within the policy that the sponsor verifies, and refusals unsent; over
@@ -1940,6 +1947,25 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Changed.**
 
+- The release binaries and the image carry `companies`, `xaa` and `x402`
+  (the user's decision): `release.yml`'s `FEATURES`, the `Dockerfile`'s
+  default, `deny.toml`'s graph and the CI row of the release set name all
+  three. Each does nothing until configured — `companies` without a
+  `services` entry of `kind: company` or `security.companies`, `xaa`
+  without `identity.*` (and a delegated server without
+  `security.experimental.id_jag: true`), `x402` without
+  `security.payments` — and given a configuration that uses none of them, a
+  release binary serves the same agent card, logs the same lines and writes
+  the same files as one without them. `x402` brings `k256`, `sha3` and 28
+  RustCrypto crates under them: the release graph is 193 crates, 163
+  before, and the three make the x86_64 binary 1.8 MiB larger (a local
+  build of the release profile). A configuration that declares a Company is
+  told at load, in one `config.warning`, that the support tracks the
+  Personal Agent Protocol draft pinned at `95fcbf2`. agentd.dev's standards
+  strip marks none of them a preview any more: the Personal Agent Protocol
+  and ID-JAG are drafts, and DPoP, token exchange, CIBA, Enterprise-Managed
+  Authorization, x402 and a company's OpenAPI operations are listed without
+  a mark.
 - **Breaking:** `agentd-mcp`'s `wire::CallToolResult` has a field `meta`,
   the result's `_meta` as the server sent it: x402 over MCP reads a
   payment's settlement there (RFC 0049 §7.1). The struct is not
@@ -2454,6 +2480,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Fixed.**
 
+- A binary built with `xaa` and given no delegation asks its store nothing
+  about one. It listed the store's credential records at the first pass and
+  every hour, and read one back at the end of every run and subagent —
+  store calls a binary without the feature never made, and a round trip
+  each on an `mcp` or `http` store. Both now wait for a configured
+  delegation, the only thing that writes those records.
 - A run's A2A task that its run had completed or cancelled moved again
   when a gate it had held closed afterwards: a `human` step that timed out
   into the run's end turned the completed task `failed`. A gate that closes

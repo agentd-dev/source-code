@@ -16,8 +16,8 @@
   {
     "name": "Personal Agent Protocol",
     "version": "0.1",
-    "mark": "preview",
-    "full": "Personal Agent Protocol, draft 0.1: a build-from-source preview",
+    "mark": "draft",
+    "full": "Personal Agent Protocol, draft 0.1, pinned to one revision of the draft",
     "href": "/docs/act-at-companies/",
     "tier": 1
   },
@@ -93,8 +93,7 @@
   {
     "name": "DPoP",
     "version": "RFC 9449",
-    "mark": "preview",
-    "full": "DPoP-bound tokens at companies, and at delegated MCP servers whose metadata advertise them: a build-from-source preview",
+    "full": "DPoP-bound tokens at companies, and at delegated MCP servers whose metadata advertise them",
     "href": "/docs/interoperability/#personal-agent-protocol",
     "tier": 2
   },
@@ -171,40 +170,36 @@
   },
   {
     "name": "Enterprise-Managed Authorization",
-    "mark": "preview",
-    "full": "MCP Enterprise-Managed Authorization: agentd acts for an enrolled person at an MCP server through their enterprise IdP, a build-from-source preview",
+    "full": "MCP Enterprise-Managed Authorization: agentd acts for an enrolled person at an MCP server through their enterprise IdP",
     "href": "/docs/authentication/#enterprise-managed-authorization",
     "tier": 2
   },
   {
     "name": "Token Exchange",
     "version": "RFC 8693",
-    "mark": "preview",
-    "full": "OAuth token exchange: an enrolled person's grant exchanged at their IdP for an ID-JAG, or a grant's or a caller's token for a same-domain MCP server's, a build-from-source preview",
+    "full": "OAuth token exchange: an enrolled person's grant exchanged at their IdP for an ID-JAG, or a grant's or a caller's token for a same-domain MCP server's",
     "href": "/docs/authentication/#enterprise-managed-authorization",
     "tier": 2
   },
   {
     "name": "ID-JAG",
     "version": "draft -04",
-    "mark": "preview",
-    "full": "Identity Assertion JWT Authorization Grant, checked claim by claim and redeemed with the JWT bearer grant, a build-from-source preview",
+    "mark": "draft",
+    "full": "Identity Assertion JWT Authorization Grant, an IETF draft, checked claim by claim and redeemed with the JWT bearer grant",
     "href": "/docs/authentication/#enterprise-managed-authorization",
     "tier": 2
   },
   {
     "name": "CIBA",
     "version": "Core 1.0",
-    "mark": "preview",
-    "full": "OpenID Client-Initiated Backchannel Authentication in poll mode: a scheduled workflow's firing asks its person to approve it on their own device, a build-from-source preview",
+    "full": "OpenID Client-Initiated Backchannel Authentication in poll mode: a scheduled workflow's firing asks its person to approve it on their own device",
     "href": "/docs/authentication/#work-nobody-is-there-for",
     "tier": 2
   },
   {
     "name": "x402",
     "version": "v2",
-    "mark": "preview",
-    "full": "x402 v2, paying for an HTTP resource, an MCP tool call or an A2A peer's task with an EIP-3009 authorization on an EVM chain or an SPL transfer on Solana, only within a spend policy the operator declares: a build-from-source preview",
+    "full": "x402 v2, paying for an HTTP resource, an MCP tool call or an A2A peer's task with an EIP-3009 authorization on an EVM chain or an SPL transfer on Solana, only within a spend policy the operator declares",
     "href": "/docs/pay-with-x402/",
     "tier": 2
   },
@@ -218,8 +213,7 @@
   {
     "name": "OpenAPI",
     "version": "3.0 · 3.1",
-    "mark": "preview",
-    "full": "A company's OpenAPI operations as tools: a build-from-source preview",
+    "full": "A company's OpenAPI operations as tools",
     "href": "/docs/act-at-companies/#its-operations-as-tools",
     "tier": 2
   },

@@ -3,17 +3,23 @@
 # agentd cloud-native appliance image — a fully static musl binary on `scratch`.
 #
 # The image ships the **cloud-native feature set**
-# (`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models`): the A2A HTTPS listener
+# (`a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402`): the A2A HTTPS listener
 # (RFC 0029, the external channel + delegation peers), the `/healthz`+`/readyz`+
 # `/metrics` HTTP probe surface (so k8s liveness/readiness probes work), UTC-cron
 # scheduling, OTLP trace+log export, SIGHUP + inotify config hot-reload (a
 # ConfigMap volume swap reloads in place), OAuth/SigV4/SPIFFE endpoint auth,
 # AAuth agent identity, CEL expressions, §7 instruction signature verification,
-# `oci://` instruction pulls with cosign, encrypted instruction envelopes, and
-# MCP Events bindings (a draft extension, SEP-3415).
-# `cel` is the one dependency-BEARING member; all but it and `a2a` (which pulls
-# the TLS stack) are hand-rolled and add NO dependency, `sign`/`oci`/`decrypt`
-# reusing the `ring` rustls already links, `mcp-events` reusing the MCP socket.
+# `oci://` instruction pulls with cosign, encrypted instruction envelopes,
+# MCP Events bindings (a draft extension, SEP-3415), and three previews that do
+# nothing until configured: acting at Companies for a person (the Personal
+# Agent Protocol draft), acting for enrolled people through their IdP (ID-JAG,
+# behind `security.experimental.id_jag`), and paying with x402 within a spend
+# policy (`security.payments`).
+# `cel` and `x402` (`k256`/`sha3`, secp256k1 and Keccak-256) are the
+# dependency-BEARING members; all but them and `a2a` (which pulls the TLS
+# stack) are hand-rolled and add NO dependency, `sign`/`oci`/`decrypt`/
+# `companies`/`xaa` reusing the `ring` rustls already links, `mcp-events`
+# reusing the MCP socket.
 #
 # This list is the same one `.github/workflows/release.yml` builds, and
 # `release_matrix.rs` fails if the two drift: the image and the standalone
@@ -37,7 +43,7 @@
 
 # ---- builder -------------------------------------------------------------
 FROM rust:1.96-alpine AS builder
-ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
+ARG FEATURES="a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402"
 # Alpine's host target IS <arch>-unknown-linux-musl, so the release binary is
 # static (crt-static is on for musl). Building WITHOUT an explicit --target uses
 # that host target, which is exactly what each buildx platform wants — so one

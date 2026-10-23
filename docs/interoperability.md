@@ -25,7 +25,7 @@ agentd over MCP.
 | MCP Events | the draft extension SEP-3415, on 2026-07-28 connections: bindings into durable streams, runtime subscriptions inside an operator's grant, poll and webhook delivery. In the release binaries; agentd says at load that it tracks a draft. |
 | [MCP Tasks](connect-mcp.md#long-running-tool-calls) | the extension SEP-2663 (`io.modelcontextprotocol/tasks`), on 2026-07-28 connections, as a client: a tool call a server answers with a task is followed to its end — a workflow step's as a durable wait that survives a restart, a model's within the call and then with `mcp.task.get` — polled at the server's interval or pushed on `subscriptions/listen`, cancelled with `tasks/cancel`. `mcp.servers[].tasks: off` refuses a server's tasks. In the release binaries. |
 | [MCP Skills](connect-mcp.md#load-skills-from-a-server) | the extension SEP-2640 (`io.modelcontextprotocol/skills`), on 2026-07-28 connections that declare it, as a client: `skills/list` (every page), `skills/get` for a skill no listing names, `resources/directory/read` where the server declares `directoryRead`. Every file is checked against its entry's `sha256:` digest and size, and `SKILL.md`'s frontmatter against the entry's; a skill is named by its server and URI. In the release binaries. |
-| [Enterprise-Managed Authorization](authentication.md#enterprise-managed-authorization) | the extension `io.modelcontextprotocol/enterprise-managed-authorization`, as a client, on servers of `grant: id_jag`: declared in `initialize`'s capabilities at 2025-11-25 and in every request's `_meta` at 2026-07-28; the server is reached with an access token its authorization server issued for an ID-JAG from the person's IdP, once its RFC 9728 metadata has confirmed the pinned resource and authorization server. A preview: the `xaa` feature, not in the release binaries. |
+| [Enterprise-Managed Authorization](authentication.md#enterprise-managed-authorization) | the extension `io.modelcontextprotocol/enterprise-managed-authorization`, as a client, on servers of `grant: id_jag`: declared in `initialize`'s capabilities at 2025-11-25 and in every request's `_meta` at 2026-07-28; the server is reached with an access token its authorization server issued for an ID-JAG from the person's IdP, once its RFC 9728 metadata has confirmed the pinned resource and authorization server. A preview: in the release binaries, and a server of `grant: id_jag` needs `security.experimental.id_jag: true`. |
 | Authorization | OAuth 2.1 with RFC 9728 protected-resource discovery, and the other outbound schemes [below](#credentials-agentd-can-present). Client registration in the order 2026-07-28 gives: a configured `client_id`, else agentd's [Client ID Metadata Document](authentication.md#client-id-metadata-document) where the authorization server advertises one; dynamic client registration, which that revision deprecates, is not implemented. |
 
 **Not supported:** `sampling` and `roots` (agentd declares no client
@@ -87,7 +87,7 @@ delegates to other agents.
 | Wire format | proto3 JSON, written by the official SDK's types generated from the A2A protobuf. |
 | Implementation | [`a2aproject/a2a-rs`](https://github.com/a2aproject/a2a-rs), the A2A project's official Rust SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`). |
 | Inbound identity | bearer tokens, mTLS client certificates (subject and SAN matching, SPIFFE URIs included), sessions from an OAuth 2.0 device authorization grant (RFC 8628) the listener serves itself, and enterprise JWT access tokens (RFC 9068, or an Okta custom authorization server's), declared on the card as `oauth2` schemes with the listener's RFC 9728 metadata. |
-| In-task authorization | `TASK_STATE_AUTH_REQUIRED` (§7.6) where a person must sign in at their IdP before work acts with their grant — at admission, or at a step-up; both are the `xaa` preview, not in the release binaries — and, delegating, a peer's task in it followed until the person authorizes the peer. |
+| In-task authorization | `TASK_STATE_AUTH_REQUIRED` (§7.6) where a person must sign in at their IdP before work acts with their grant — at admission, or at a step-up; both are the `xaa` preview — and, delegating, a peer's task in it followed until the person authorizes the peer. |
 | Co-located agents | a JSON-RPC binding over a unix domain socket, where the kernel authenticates the peer: [binding-jsonrpc-unix](https://agentd.dev/a2a/binding/jsonrpc-unix). |
 
 agentd declares three extensions on its card, none of them required, so a
@@ -113,12 +113,14 @@ agentd's outbound client run against that SDK's official sample server.
 The Personal Agent Protocol is how a company publishes what an agent acting
 for one of its customers may use: MCP servers, its own agent and OpenAPI
 APIs. agentd is a **personal agent** under it, for one person, the User. The
-support is a preview: it is not in the release binaries.
+support is a preview of a draft: it is in the release binaries, and agentd
+says at load, on every configuration that declares a company, that it tracks
+a draft.
 
 | | Support |
 |---|---|
 | Version | draft **0.1**, pinned at the draft repository's commit `95fcbf2`. The draft can change without changing its `protocol_version`, so agentd follows the pinned revision, its JSON Schemas vendored and checked in CI. A discovery document whose major version is not `0` is refused. |
-| Build | the `companies` build feature, which no release binary or image carries; [Build features and crates](features.md) has the build. |
+| Build | the `companies` build feature, in the release binaries and the image; it does nothing until a configuration declares a company. [Build features and crates](features.md) has the build. |
 | Role | the Personal Agent, for one User per instance. Not the Company and not the Company Agent. |
 | Discovery | `/.well-known/poppy.json`, following HTTPS redirects only; the issuer's RFC 8414 metadata, its `issuer` exact and its `poppy_domains` listing the domain; every URL the documents name held to the entry's `hosts`. |
 | Identity | a `client_id` that is the HTTPS URL of a client metadata document, a key set of ES256 keys, and `private_key_jwt` client assertions (RFC 7523) addressed to the issuer. agentd prints the documents for static hosting or serves them on its A2A listener. |
@@ -142,12 +144,13 @@ revision of the draft but the pinned one.
 x402 is how a server asks to be paid for a request: it answers `402` with
 the ways it takes payment, and the client pays and asks again. agentd is a
 paying client, and only within a spend policy the operator declares. The
-support is a preview: it is not in the release binaries.
+support is a preview: it is in the release binaries, and pays nothing until
+a configuration declares a spend policy.
 
 | | Support |
 |---|---|
 | Version | x402 **v2** (`x402Version: 2`), pinned at the specification's commit `e7a3b4ff47`. A payment request of another version is refused. |
-| Build | the `x402` build feature, which no release binary or image carries; [Build features and crates](features.md) has the build. |
+| Build | the `x402` build feature, in the release binaries and the image; it pays nothing without `security.payments`. [Build features and crates](features.md) has the build. |
 | Role | the client that pays. Not a resource server and not a facilitator: agentd talks to no chain. |
 | Transport | HTTP: `PAYMENT-REQUIRED` read from a `402`, the request sent once more with `PAYMENT-SIGNATURE`, `PAYMENT-RESPONSE` read back; base64 JSON, standard or URL-safe. MCP: a tool result's `PaymentRequired` (`structuredContent`, else `content[0].text`), the call made once more with `_meta["x402/payment"]`, `_meta["x402/payment-response"]` read back; a paying call is never an MCP task. A2A: the a2a-x402 extension's standalone flow, activated in `A2A-Extensions` under both its URIs; the peer's task answered with `payment-submitted` and the payload, its `x402.payment.receipts` read, or with `payment-rejected` when agentd refuses the payment or its approval is declined. |
 | Scheme | `exact` on EVM chains (CAIP-2 `eip155`), ERC-20 tokens (CAIP-19 `erc20`), the `eip3009` transfer method and the `authorization` payment flow: an EIP-3009 `TransferWithAuthorization` signed as EIP-712 typed data, secp256k1 with RFC 6979 and a low `s`, addresses held to EIP-55. `exact` on Solana (CAIP-2 `solana`), SPL and Token-2022 tokens (CAIP-19 `token`): a version-0 transaction of the binding's `TransferChecked`, compute-budget and Memo instructions, the server's sponsor as fee payer, signed with Ed25519 and left for the sponsor to complete; a blockhash from the entry or the operator's RPC endpoint. Other entries are passed over. |
@@ -259,12 +262,12 @@ details.
 ## Internet standards
 
 The IETF RFCs agentd implements, and where. The release binaries implement
-all of them except the last two, which only the `companies` and `xaa`
-previews use. OAuth discovery also reads OpenID Connect Discovery 1.0
+all of them; the last two only the `companies` and `xaa` previews use. OAuth
+discovery also reads OpenID Connect Discovery 1.0
 metadata, after RFC 8414. Two OAuth Working Group drafts are implemented
-too: in the release binaries, the [Client ID Metadata Document](authentication.md#client-id-metadata-document),
+too, both in the release binaries: the [Client ID Metadata Document](authentication.md#client-id-metadata-document),
 draft-ietf-oauth-client-id-metadata-document-02, agentd's client where it
-has no registration; in the `xaa` preview, the Identity Assertion JWT
+has no registration; and, in the `xaa` preview, the Identity Assertion JWT
 Authorization Grant ([ID-JAG](authentication.md#enterprise-managed-authorization)),
 draft-ietf-oauth-identity-assertion-authz-grant-04. The `xaa` preview also
 speaks OpenID Client-Initiated Backchannel Authentication Core 1.0 in poll
@@ -304,8 +307,11 @@ There are no prebuilt macOS or Windows binaries. A source build needs Rust
 1.96 or newer and a C compiler. The release binaries and the image carry the
 same feature set. It includes the mock model endpoint (`mock:final`,
 `mock:file:<playbook.json>`), for trying an agent or a workflow without a
-model provider; the guarded local command runner (`exec`) and the
-[`companies` preview](#personal-agent-protocol) are in neither.
+model provider, and the previews of the
+[Personal Agent Protocol](#personal-agent-protocol),
+[Enterprise-Managed Authorization](authentication.md#enterprise-managed-authorization)
+and [x402](#x402), each inert until configured; the guarded local command
+runner (`exec`) is in neither.
 [Build features and crates](features.md) lists every feature.
 
 ## Observability standards

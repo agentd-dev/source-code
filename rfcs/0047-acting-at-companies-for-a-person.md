@@ -1,6 +1,7 @@
 # RFC 0047: Acting at companies for a person — agentd as a Personal Agent under the Personal Agent Protocol draft 0.1
 
 **Status:** Accepted to build 2026-10-17 (the user: "Build now"); decisions 2–12 are recommended defaults accepted with it and open to revision (§13). P0–P4 implemented 2026-10-18, behind the non-release `companies` feature (§9; the guide is docs/act-at-companies.md). P5 is optional: on 2026-10-18 the user took two of its tracks ("Yeah I am good with your recomendations!", on P5a and P5b recommended and the rest not, each with its reason — §9 P5): P5a — one tool per OpenAPI operation — is implemented 2026-10-18, P5b — several accounts per User at one Company — is implemented 2026-10-19, and the others are not built.
+**Status note (2026-10-23):** the feature `companies` is in the release binaries and the image, the user's decision, which answers Q7 (§13). It does nothing until a configuration declares a Company, and a configuration that does is told at load, in one warning, that it tracks the draft pinned at `95fcbf2`. Where this record keeps the feature out of the release set (decision 1, §9, §11), that held until this date.
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-17
 **Extends:** RFC 0031 (endpoint authentication): a `private_key_jwt` client, DPoP-bound tokens, RFC 7009 revocation and RFC 8707 resource indicators. RFC 0037 (service catalog and egress): a new entry kind, `company`, whose endpoints come from a remote document and are bounded by an operator host list.

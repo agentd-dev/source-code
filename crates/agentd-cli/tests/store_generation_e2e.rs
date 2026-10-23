@@ -177,3 +177,30 @@ fn fresh_is_documented_in_help() {
         "--help must say what it does:\n{help}"
     );
 }
+
+/// An instance that acts for nobody asks its store nothing about acting for
+/// someone. The release binaries carry `xaa`, and its first-use approvals
+/// (RFC 0044) were listed from the store at the first pass and read back at
+/// every run's end whether a delegation was configured or not — store calls
+/// a binary built without the feature never made, and on a remote store a
+/// round trip each. Whatever the build, a configuration that uses none of
+/// `xaa`, `companies` and `x402` touches no credential record.
+#[test]
+fn an_instance_that_acts_for_nobody_reads_no_credential_record() {
+    let mock = common::spawn_mock_mcp("mock://noop", false);
+    let cfg = config(&mock.uri(), "", "a");
+    expect(&life(&cfg, &[]), "run.done");
+    let asked: Vec<String> = mock
+        .log()
+        .lines()
+        .filter_map(|l| l.strip_prefix("MOCK_CALL "))
+        .filter(|c| c.contains("/cred/"))
+        .map(str::to_string)
+        .collect();
+    assert!(
+        asked.is_empty(),
+        "the store was asked about credential records:\n{}",
+        asked.join("\n")
+    );
+    std::fs::remove_file(&cfg).ok();
+}

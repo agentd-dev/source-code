@@ -9,7 +9,7 @@
 # over the default graph alone would let it in unseen. release_matrix.rs holds
 # this list to release.yml's, so the two cannot drift.
 [graph]
-features = ["a2a", "metrics", "cron", "otel", "hot-reload", "config-watch", "aauth", "oauth", "cel", "sign", "oci", "decrypt", "mcp-events", "mock-models"]
+features = ["a2a", "metrics", "cron", "otel", "hot-reload", "config-watch", "aauth", "oauth", "cel", "sign", "oci", "decrypt", "mcp-events", "mock-models", "companies", "xaa", "x402"]
 
 [advisories]
 version = 2

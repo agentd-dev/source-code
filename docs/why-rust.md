@@ -186,17 +186,20 @@ closing header injection in one place.
 
 Every figure here names what it was measured on, because a number without
 provenance documents software nobody is running. Every figure is from
-v1.18.0, measured in October 2026.
+v1.18.0, measured in October 2026, except the crate count and the size the
+release set's three newest features add, measured on 2026-10-23 when
+`companies`, `xaa` and `x402` joined it.
 
 | Measure | Value | Measured on |
 |---|---|---|
 | Release binary, x86_64 | 12,099,328 bytes (11.5 MiB), static-PIE, stripped | `agentd-v1.18.0-x86_64-unknown-linux-musl` |
 | Release binary, aarch64 | 8,821,880 bytes (8.4 MiB), static, stripped | `agentd-v1.18.0-aarch64-unknown-linux-musl` |
+| What `companies`, `xaa` and `x402` add | 1,888,288 bytes (1.8 MiB) on x86_64: 13,767,176 bytes without them, 15,655,464 with them | the release profile built locally for `x86_64-unknown-linux-musl` from the same tree with each feature list, cargo 1.98.0 |
 | Download, x86_64 / aarch64 | 5,116,114 / 4,685,265 bytes (`.tar.gz`) | the v1.18.0 release assets |
 | Container image | `FROM scratch` plus the binary | the repository's `Dockerfile` |
 | Idle daemon | 1 thread, 9.3 MiB resident, 1 CPU tick (10 ms) in 6 s | v1.18.0 x86_64 release binary, one `schedule` workflow, `file` store, no MCP server or listener |
 | Start-up | about 7 ms for `agentd --version`, against 0.5 ms for `/bin/true` | v1.18.0 x86_64 release binary, 16-core x86_64 host, averaged over 200 runs |
-| Crates resolved | 82 with no default features, 89 by default, 163 for the release feature set | v1.18.0, `cargo tree -p agentd-cli -e normal --prefix none` over the committed `Cargo.lock` |
+| Crates resolved | 82 with no default features, 89 by default, 193 for the release feature set | after v1.20.0, `cargo tree -p agentd-cli -e normal --prefix none` over the committed `Cargo.lock` |
 | Source | about 170,000 lines in `crates/*/src`, 141,000 of them in the engine | v1.18.0, `wc -l`, inline test modules included |
 
 How to read them:
@@ -208,10 +211,12 @@ How to read them:
 - **The crate counts** are unique package names, each counted once however
   many versions or paths reach it; `-e normal` drops build and dev
   dependencies because neither is linked into the binary. Subtract the five
-  workspace crates for the external count (77, 84, 158). The jump from 89 to
-  163 is the A2A stack and the CEL interpreter: the release set's other
-  features add no crate at all, and the three that need cryptography
-  (`aauth`, `sign`, `oci`) reuse the `ring` that `rustls` already brings.
+  workspace crates for the external count (77, 84, 188). The jump from 89 to
+  193 is the A2A stack, the CEL interpreter and the secp256k1 and Keccak-256
+  that `x402` needs (`k256`, `sha3` and the RustCrypto crates under them):
+  the release set's other features add no crate at all, and the five others
+  that need cryptography (`aauth`, `sign`, `oci`, `companies`, `xaa`) reuse
+  the `ring` that `rustls` already brings.
 - **Start-up is paid per turn.** Seven milliseconds of process start-up is
   negligible next to a model call, and it is why agentd is the wrong tool
   for units of work a few milliseconds long.

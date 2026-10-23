@@ -23,7 +23,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 |---|---|
 | **breaker** | A per-endpoint circuit breaker. After repeated failures it opens, calls skip that endpoint, and it half-opens after a cooldown. See [Models, providers and roles](intelligence.md). |
 | **budget** | A ceiling on tokens or model calls: per run (`limits.run`), per window or lifetime (`intelligence.budget`), per conversation, or per principal. The supervisor enforces it; the model never sees it as a suggestion. See [Control spend with budgets](budgets.md). |
-| **build feature** | A cargo feature that compiles a capability in or out, such as `a2a` or `cel`. Release binaries carry all but `exec`, `companies` and `internal-mocks`. See [Build features and crates](features.md). |
+| **build feature** | A cargo feature that compiles a capability in or out, such as `a2a` or `cel`. Release binaries carry all but `exec` and `internal-mocks`. See [Build features and crates](features.md). |
 
 ## C
 

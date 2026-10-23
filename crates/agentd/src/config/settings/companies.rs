@@ -31,6 +31,9 @@ pub const DEFAULT_JWKS_PATH: &str = "/companies/jwks.json";
 /// The path Direct Sign-In returns the User to under the `client_id`'s
 /// origin, when `client.redirect_uri` names none.
 pub const DEFAULT_REDIRECT_PATH: &str = "/companies/callback";
+/// Said at load wherever a Company is configured: the draft moves without a
+/// version signal, so agentd follows one commit of it (rfcs/0047 §11).
+pub const DRAFT_WARNING: &str = "Acting at Companies tracks the Personal Agent Protocol 0.1 at 95fcbf2, a draft: its documents, messages and flows may change between releases";
 /// Concurrent Company calls per Company when `limits.in_flight` says none.
 pub const DEFAULT_IN_FLIGHT: u32 = 4;
 /// Open conversations, each with its reader, per instance when
@@ -1062,6 +1065,7 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     if entries.is_empty() && !declared {
         return;
     }
+    d.warnings.push(DRAFT_WARNING.into());
     // The User.
     let user = c.user();
     if user != OPERATOR && !is_principal_id(user) {
@@ -1831,6 +1835,47 @@ mod tests {
         .unwrap();
         let names: Vec<&str> = company_servers(&s);
         assert_eq!(names, ["search", "orders"], "in the order of their URLs");
+    }
+
+    /// A configuration that acts at a Company is told at load, once, that
+    /// it follows a draft, naming the commit the vendored draft is pinned
+    /// to; one that does not is told nothing, so a release binary that
+    /// carries the feature and is not asked to use it says what a binary
+    /// without it says.
+    #[cfg(feature = "companies")]
+    #[test]
+    fn a_company_loads_and_says_it_tracks_a_draft() {
+        let warnings = |yaml: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("c.yaml");
+            std::fs::write(
+                &path,
+                yaml.replace("__DIR__", &dir.path().display().to_string()),
+            )
+            .unwrap();
+            let (l, _) =
+                super::super::load(&["--config".to_string(), path.display().to_string()], &[])
+                    .unwrap_or_else(|e| panic!("{e}"));
+            l.warnings
+                .iter()
+                .filter(|w| w.contains("Personal Agent Protocol"))
+                .count()
+        };
+        assert_eq!(warnings(&company("")), 1, "a company entry");
+        assert_eq!(warnings(CLIENT), 1, "security.companies alone");
+        assert_eq!(warnings(STORE), 0, "neither");
+        let pin = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/companies/vendor/PIN"),
+        )
+        .unwrap();
+        let commit = pin
+            .lines()
+            .find_map(|l| l.strip_prefix("commit "))
+            .expect("the PIN names its commit");
+        assert!(
+            DRAFT_WARNING.contains(&commit[..7]),
+            "the warning names {DRAFT_WARNING:?}, the vendored draft is {commit}"
+        );
     }
 
     /// Each refusal RFC 0047 §5.3 lists, named.

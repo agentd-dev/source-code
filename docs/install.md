@@ -173,19 +173,24 @@ Install the published crate with the features you want:
 cargo install agentd-cli --locked --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
 ```
 
+That is the release set without `companies`, `xaa` and `x402`, which reach
+the published crate, the release binaries and the image from the next
+release. Until then cargo refuses them on the published crate (`does not
+have these features`), and a checkout builds them.
+
 Or build a checkout. The binary lands in `target/release/agentd`:
 
 ```bash
 git clone https://github.com/agentd-dev/source-code.git
 cd source-code
-cargo build -p agentd-cli --release --locked --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
+cargo build -p agentd-cli --release --locked --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402"
 ./target/release/agentd --version
 ```
 
-The feature list above is the release set. It includes `mock-models`, the
-mock model endpoint (`mock:final`, `mock:file:<playbook.json>`) that answers
-with no key and no network, so you can try an agent or a workflow without a
-model provider.
+The checkout's feature list is the release set. It includes `mock-models`,
+the mock model endpoint (`mock:final`, `mock:file:<playbook.json>`) that
+answers with no key and no network, so you can try an agent or a workflow
+without a model provider.
 
 A host build like this one is a dynamically linked Linux executable. The
 static musl binaries the releases ship are built with `cross` for the
@@ -193,14 +198,13 @@ static musl binaries the releases ship are built with `cross` for the
 repository's `Dockerfile` builds the same static binary into a `scratch`
 image (`docker build --build-arg FEATURES=… .`).
 
-Two features a guide needs are never in a release binary:
+One feature a guide needs is never in a release binary:
 
 | Feature | What it adds | Needed by |
 |---|---|---|
 | `exec` | The guarded local command runner, also switched on by `security.exec.enabled` | [Build a coding agent](coding-agent.md) |
-| `companies` | Acting at companies for one person under the Personal Agent Protocol draft, a preview | [Act at companies for a person](act-at-companies.md) |
 
-Add one to the list, for example `--features "a2a,…,mock-models,exec"`.
+Add it to the list, for example `--features "a2a,…,exec"`.
 
 Every feature and the configuration that needs it is in [Build features and
 crates](features.md).

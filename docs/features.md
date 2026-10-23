@@ -19,36 +19,51 @@ All of them are built with the default feature `tls` plus this list, taken
 from `.github/workflows/release.yml`:
 
 ```text
-a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models
+a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402
 ```
+
+`companies`, `xaa` and `x402` reach the release binaries and the image from
+the next release; the latest release is built with the list without them.
 
 `mock-models` is the built-in mock model endpoint: `mock:final` and
 `mock:file:<playbook.json>` answer from a script instead of a provider, so you
 can try an agent or a workflow in the released agentd with no provider
 account.
 
-Five features are never in a release binary:
+Three features in the list do nothing until a configuration asks for them.
+Each tracks a draft or a young protocol, so its guide calls it a preview:
+
+- `companies`, agentd acting at Companies for one person under the Personal
+  Agent Protocol draft
+  ([Act at companies for a person](act-at-companies.md),
+  [RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md)). It acts only
+  for a `services` entry of `kind: company` or a `security.companies`
+  section. The draft changes without a version signal, so agentd is pinned to
+  one revision of it and says so at load on every configuration that declares
+  a Company.
+- `xaa`, agentd acting for one enrolled person at MCP servers through their
+  enterprise IdP — ID-JAG and Enterprise-Managed Authorization
+  ([Enterprise-managed authorization](authentication.md#enterprise-managed-authorization),
+  [RFC 0044](../rfcs/0044-enterprise-managed-authorization.md)). It does
+  nothing without `identity.providers` or a server of `grant: id_jag` or
+  `grant: token_exchange`, and such a server needs
+  `security.experimental.id_jag: true` too, because ID-JAG is an IETF draft
+  and the MCP extension is young.
+- `x402`, agentd paying with x402 — for HTTP resources, MCP tool calls and
+  A2A peers' tasks — within a spend policy
+  ([Pay for things with x402](pay-with-x402.md),
+  [RFC 0049](../rfcs/0049-paying-for-things.md)). It pays only within the
+  spend policy an operator declares in `security.payments`
+  ([ADR 0003](../rfcs/adr/0003-no-payment-without-a-spend-policy.md)).
+
+Given a configuration that uses none of them, a release binary serves the same
+agent card, logs the same lines, asks its store the same and writes the same
+files as a binary built without them.
+
+Two features are never in a release binary:
 
 - `exec`, the local command runner. agentd's default posture is that it runs
   no local code; you opt in at build time and again at run time.
-- `companies`, agentd acting at Companies for one person under the Personal
-  Agent Protocol draft, a preview
-  ([Act at companies for a person](act-at-companies.md),
-  [RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md)).
-  The draft changes without a version signal, so agentd is pinned to one
-  revision of it and the feature stays out of the release set.
-- `xaa`, agentd acting for one enrolled person at MCP servers through their
-  enterprise IdP — ID-JAG and Enterprise-Managed Authorization, a preview
-  ([Enterprise-managed authorization](authentication.md#enterprise-managed-authorization),
-  [RFC 0044](../rfcs/0044-enterprise-managed-authorization.md)). ID-JAG is
-  an IETF draft and the MCP extension is young, so the feature stays out of
-  the release set.
-- `x402`, agentd paying with x402 — for HTTP resources, MCP tool calls and
-  A2A peers' tasks — within a spend policy, a preview ([Pay for things with x402](pay-with-x402.md),
-  [RFC 0049](../rfcs/0049-paying-for-things.md)). No payment without an
-  operator who chose to build one in
-  ([ADR 0003](../rfcs/adr/0003-no-payment-without-a-spend-policy.md)), so
-  the feature stays out of the release set.
 - `internal-mocks`, the test scaffolding: the mock MCP servers and crash
   points the test suites drive, and, with `oauth` (and the default `tls`),
   the fake Company that `agentd-conformance` holds to the Personal Agent
@@ -77,24 +92,23 @@ Five features are never in a release binary:
 | `decrypt` | no | yes | none | Encrypted instruction envelopes: age v1 and JWE compact. Implies `sign`. |
 | `mcp-events` | no | yes | none | MCP Events: bindings, grants, `wait` subscriptions, the `events.*` tools and instruction updates by event. The extension is a draft (SEP-3415). |
 | `exec` | no | **no** | none | The guarded local `exec` tool, also gated by `security.exec.enabled`. |
-| `companies` | no | **no** | none new (reuses `ring`) | `services` entries of `kind: company` and `security.companies`: a Session at each declared Company, its MCP tools held by the supervisor under the strict privacy profile, the User's cross-Company gate, Device and Direct Sign-In at the User's own gate with each Account Token kept sealed — up to eight accounts at a Company, each by a label and in a Session of its own — conversations with a Company's agent (followed by readers into the stream `company.<name>`) and calls of its OpenAPI APIs, each allowed operation a tool of its own, operations confirmed only with the User's approval or a standing permission (`client.extensions: [operations]`), Direct Conversations the User joins at their own gate, `company.status`, `company.sign_in`, `company.sign_out`, `company.converse`, `company.read`, `company.handoff`, `company.close`, `company.api`, `company.api.describe`, `company.operation.get`, `company.operation.confirm`, `company.operation.cancel`, `company.direct`, the `http` step's `auth: {kind: company}`, `agentd --print-company-client`, `agentd --login`/`--logout company:<name>[/<label>]` (with `a2a`). Implies `oauth` and `tls`. |
-| `xaa` | no | **no** | none new (reuses `ring`) | `identity.providers`, `identity.delegation`, `security.experimental.id_jag`, `grant: id_jag` on an MCP server, and `a2a.principals[]` `match.uid` and `idp_subject`: the ID-JAG exchange at the person's IdP and its redemption at the server's authorization server, every check an ID-JAG is held to, the sealed grant vault, renewal, step-up and revocation, the person's consent gates, `agentd --login idp:<name>`, `--delegation-list`, `--delegation-approve`, `--delegation-deny`, `--delegation-revoke`, `--delegation-forget`, `--delegation-audit` (with `a2a`) and `--delegation-lint`. Implies `oauth`. |
-| `x402` | no | **no** | `k256`, `sha3` and 28 crates of theirs (RustCrypto) | `security.payments` and the `payment` of the `http`, `mcp.tool`, `a2a.send` and `a2a.delegate` steps: x402 v2 as a paying client over HTTP, MCP and A2A (the a2a-x402 extension), the `exact` scheme on EVM chains with an EIP-3009 authorization (secp256k1 with RFC 6979, Keccak-256) and on Solana with an SPL transfer (Ed25519 with `ring`), signed by the supervisor alone, the spend policy's caps and allow-lists, the approver's gate (with `a2a`), the ledger, wallet keys sealed in files or held by the external signer, and `agentd --print-wallet-address`. Implies `oauth`. |
+| `companies` | no | yes | none new (reuses `ring`) | `services` entries of `kind: company` and `security.companies`: a Session at each declared Company, its MCP tools held by the supervisor under the strict privacy profile, the User's cross-Company gate, Device and Direct Sign-In at the User's own gate with each Account Token kept sealed — up to eight accounts at a Company, each by a label and in a Session of its own — conversations with a Company's agent (followed by readers into the stream `company.<name>`) and calls of its OpenAPI APIs, each allowed operation a tool of its own, operations confirmed only with the User's approval or a standing permission (`client.extensions: [operations]`), Direct Conversations the User joins at their own gate, `company.status`, `company.sign_in`, `company.sign_out`, `company.converse`, `company.read`, `company.handoff`, `company.close`, `company.api`, `company.api.describe`, `company.operation.get`, `company.operation.confirm`, `company.operation.cancel`, `company.direct`, the `http` step's `auth: {kind: company}`, `agentd --print-company-client`, `agentd --login`/`--logout company:<name>[/<label>]` (with `a2a`). Implies `oauth` and `tls`. |
+| `xaa` | no | yes | none new (reuses `ring`) | `identity.providers`, `identity.delegation`, `security.experimental.id_jag`, `grant: id_jag` on an MCP server, and `a2a.principals[]` `match.uid` and `idp_subject`: the ID-JAG exchange at the person's IdP and its redemption at the server's authorization server, every check an ID-JAG is held to, the sealed grant vault, renewal, step-up and revocation, the person's consent gates, `agentd --login idp:<name>`, `--delegation-list`, `--delegation-approve`, `--delegation-deny`, `--delegation-revoke`, `--delegation-forget`, `--delegation-audit` (with `a2a`) and `--delegation-lint`. Implies `oauth`. |
+| `x402` | no | yes | `k256`, `sha3` and 28 crates of theirs (RustCrypto) | `security.payments` and the `payment` of the `http`, `mcp.tool`, `a2a.send` and `a2a.delegate` steps: x402 v2 as a paying client over HTTP, MCP and A2A (the a2a-x402 extension), the `exact` scheme on EVM chains with an EIP-3009 authorization (secp256k1 with RFC 6979, Keccak-256) and on Solana with an SPL transfer (Ed25519 with `ring`), signed by the supervisor alone, the spend policy's caps and allow-lists, the approver's gate (with `a2a`), the ledger, wallet keys sealed in files or held by the external signer, and `agentd --print-wallet-address`. Implies `oauth`. |
 | `mock-models` | no | yes | none | The mock model endpoint: `mock:final` and `mock:file:<playbook.json>`, scripted chat and decision answers. |
 | `internal-mocks` | no | **no** | none | Test scaffolding: the mock MCP servers, crash points and, with `oauth` (and the default `tls`), the fake Company. Implies `mock-models`. |
 
 Of the twenty features, sixteen add no crate of their own: they gate code
 written in this repository, or reuse `ring`, which every build already links.
 Beyond the default `tls`, the dependency cost of the release set comes from
-`a2a` and `cel`; see [Crate counts](#crate-counts). `x402` adds the 30
-crates of `k256` and `sha3`, none of them in the release set.
+`a2a`, `cel` and `x402`, whose 30 crates are `k256`, `sha3` and the
+RustCrypto crates under them; see [Crate counts](#crate-counts).
 
 ## Configuration that needs a feature
 
-A release binary carries everything in this table except `exec`,
-`companies`, `xaa` and `x402`. In a build
-from source, the right-hand column is what you
-see when the feature is missing.
+A release binary carries everything in this table except `exec`. In a
+build from source, the right-hand column is what you see when the feature is
+missing.
 
 | Configuration | Feature | Without the feature |
 |---|---|---|
@@ -126,14 +140,15 @@ The release build is `agentd-cli` with the release feature list. With a Rust
 toolchain of at least 1.96 (edition 2024):
 
 ```bash
-cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
+cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402"
 ```
 
-Add `exec` for the local command runner, `companies` to
-[act at Companies for a person](act-at-companies.md), `x402` to
-[pay for things with x402](pay-with-x402.md), or `internal-mocks` to
-keep the test scaffolding in a release-profile build. `--no-default-features` drops `tls`;
-such a binary reaches `https://` only through a TLS-terminating sidecar.
+Add `exec` for the local command runner, or `internal-mocks` to keep the
+test scaffolding in a release-profile build. Leave out `companies`, `xaa` or
+`x402` for a binary that cannot act at Companies, act for enrolled people or
+pay, whatever its configuration says; leaving out `x402` also drops its 30
+crates. `--no-default-features` drops `tls`; such a binary reaches `https://`
+only through a TLS-terminating sidecar.
 
 The release profile is `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
 `strip = true` and `panic = "abort"`. The build needs a C compiler, because
@@ -176,6 +191,7 @@ flowchart LR
   MCP -->|"protocol"| RMCP["rmcp<br/>official MCP SDK"]
   CORE -.->|"feature a2a"| A2A["a2a-lf · a2a-pb · a2a-server-lf<br/>official A2A SDK"]
   CORE -.->|"feature cel"| CEL["cel-interpreter"]
+  CORE -.->|"feature x402"| X402["k256 · sha3<br/>RustCrypto"]
   CONF["agentd-conformance"] -.->|"runs the binary"| CLI
 ```
 
@@ -194,12 +210,14 @@ unique package names from `cargo tree -p agentd-cli -e normal --prefix none`
 | default (`tls`) | 89 | 84 |
 | default + `cel` | 111 | 106 |
 | default + `a2a` | 146 | 141 |
-| the release feature set | 163 | 158 |
+| default + `x402` | 119 | 114 |
+| the release feature set | 193 | 188 |
 
 The right-hand column leaves out the five workspace crates the command lists.
-`a2a` and `cel` overlap in five crates; the other twelve release features add
-none. Measured with cargo 1.98.0 against the committed `Cargo.lock` of the
-v1.20.0 release. The same count holds for the
+`a2a` and `cel` overlap in five crates and `x402` overlaps neither; the other
+fourteen release features add none. Measured with cargo 1.98.0 against the
+committed `Cargo.lock` after v1.20.0, when `companies`, `xaa` and `x402`
+joined the release set (163 crates before). The same count holds for the
 `x86_64-unknown-linux-musl` target that ships.
 
 ## Footprint

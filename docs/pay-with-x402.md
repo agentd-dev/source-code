@@ -12,8 +12,9 @@ you choose.
 > **Preview.** agentd pays as a client of x402 v2, pinned at the
 > specification's commit `e7a3b4ff47`: over HTTP, MCP and A2A (the a2a-x402
 > extension), with the `exact` scheme on EVM chains (an EIP-3009
-> authorization) and on Solana (an SPL transfer). It is behind the `x402`
-> build feature, which no release binary or image carries.
+> authorization) and on Solana (an SPL transfer). The release binaries and
+> the image carry it from the next release, in the `x402` build feature, and
+> it pays nothing until you declare a spend policy.
 
 ## What it is
 
@@ -55,22 +56,21 @@ Use something else when:
   that read outside text, waits for the approver over A2A. Without an A2A
   listener it is refused.
 
-## Build agentd with the feature
+## Get a binary with the feature
 
-The release binaries and the image do not carry `x402`. Build a binary from
-source with the release feature set plus `x402`:
+The release binaries and the image carry `x402` from the next release, with
+`a2a`, over which the approver answers. Until then, the latest release is
+built without it: [build a checkout](install.md#build-from-source) with the
+release set.
 
-```bash
-cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,x402"
-```
+A build from source needs `x402` in its feature list, as the release set has
+it. `x402` brings `oauth` with it, and two crates no other feature uses:
+`k256` for secp256k1 signatures and `sha3` for Keccak-256. Solana adds none:
+its Ed25519 signatures are `ring`'s. [Build features and crates](features.md)
+lists every feature.
 
-`x402` brings `oauth` with it, and two crates no other feature uses: `k256`
-for secp256k1 signatures and `sha3` for Keccak-256. Solana adds none: its
-Ed25519 signatures are `ring`'s. Keep `a2a`: the approver answers over it. [Build features and crates](features.md) lists every
-feature.
-
-A binary without the feature refuses the configuration at load, with exit
-code `2`:
+A binary built without the feature refuses the configuration at load, with
+exit code `2`:
 
 ```text
 {"event":"config.invalid","msg":"security.payments needs the `x402` feature (build with --features x402)"}

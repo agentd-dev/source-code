@@ -11,9 +11,10 @@ action that matters approved by the person.
 > **Preview.** agentd implements draft 0.1 of the Personal Agent Protocol,
 > pinned at the draft's commit `95fcbf2`. The draft can change in ways that
 > are not backward compatible without changing its version, so this support
-> is a preview: it is behind the `companies` build feature, which no release
-> binary or image carries, and it follows the pinned draft, not the newest
-> one.
+> is a preview: it follows the pinned draft, not the newest one, and agentd
+> says so at load on every configuration that declares a company. The
+> release binaries and the image carry it from the next release, in the
+> `companies` build feature, and it does nothing until you declare a company.
 
 ## What it is
 
@@ -55,23 +56,19 @@ Use something else when:
 - **You need a stable interface.** The draft is still moving, and so is this
   preview.
 
-## Build agentd with the feature
+## Get a binary with the feature
 
-The release binaries and the image do not carry `companies`. Build a binary
-from source with the release feature set plus `companies`:
+The release binaries and the image carry `companies` from the next release,
+with `a2a` for the gates and for `agentd --login company:<name>`, and `cel`
+for standing permissions. Until then, the latest release is built without it:
+[build a checkout](install.md#build-from-source) with the release set.
 
-```bash
-cargo build --release --locked -p agentd-cli --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies"
-```
+A build from source needs `companies` in its feature list, as the release
+set has it. `companies` brings `oauth` and `tls` with it and adds no crate of
+its own. [Build features and crates](features.md) lists every feature.
 
-`companies` brings `oauth` and `tls` with it and adds no crate of its own.
-Keep `a2a` for the gates and for `agentd --login company:<name>`, and `cel`
-for standing permissions. The repository's `Dockerfile` builds the same
-binary into an image with `--build-arg FEATURES=…`.
-[Build features and crates](features.md) lists every feature.
-
-A binary without the feature refuses the configuration at load, with exit
-code `2`:
+A binary built without the feature refuses the configuration at load, with
+exit code `2`:
 
 ```text
 {"event":"config.invalid","msg":"security.companies needs the `companies` feature (build with --features companies)"}
@@ -195,8 +192,14 @@ Then follow these steps.
    agentd --config agentd.yaml
    ```
 
-`--validate-config` dials no company. Once the configuration loads, the
-supervisor does the rest:
+`--validate-config` dials no company. Both commands say first that the
+support tracks a draft:
+
+```text
+{"event":"config.warning","msg":"Acting at Companies tracks the Personal Agent Protocol 0.1 at 95fcbf2, a draft: its documents, messages and flows may change between releases"}
+```
+
+Once the configuration loads, the supervisor does the rest:
 
 - It fetches the discovery document, following HTTPS redirects only, and
   the issuer's metadata. It checks that the document's domain is the host
@@ -804,7 +807,7 @@ gap.
 
 | You see | It means | Do this |
 |---|---|---|
-| `` `kind: company` needs the `companies` feature `` at load | a release binary | [build one with the feature](#build-agentd-with-the-feature) |
+| `` `kind: company` needs the `companies` feature `` at load | a binary built without it, as every release binary is until the next release | [build with the feature](#get-a-binary-with-the-feature) |
 | `security.companies.client is required with a kind: company entry` | no identity | set `client.id` and `client.name` |
 | `store.kind none forgets every User ID …` | a store that keeps nothing | use the file store, or `mcp` or `http` with a `seal_key` |
 | `services.shop.sign_in needs security.companies.seal_key` | a sign-in with nowhere sealed to keep its token | add a `seal_key` |

@@ -3,9 +3,11 @@
 # (Enterprise-Managed Authorization, RFC 0044). The config behind
 # docs/authentication.md#enterprise-managed-authorization.
 #
-#   cargo build --release --features a2a,xaa     # xaa is NOT in release binaries
 #   export OPENAI_API_KEY=sk-…
 #   agentd --config examples/okta-xaa-mcp.yaml
+#
+# The release binaries carry the `xaa` feature this needs; a build from
+# source needs `--features a2a,xaa`.
 #
 # People sign in from a display client — `agentd-tui --endpoint
 # http://127.0.0.1:8420 --login idp`, or the web UI's "sign in with your

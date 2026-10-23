@@ -27,8 +27,19 @@ permissions:
 # `iterate.until` then fails its step at run time, and a start-node `filter`
 # silently drops the event), which would make every non-trivial config a
 # build-from-source job.
+# Acting at Companies for a person (`--features companies`, RFC 0047), acting
+# for one enrolled person through their IdP (`--features xaa`, RFC 0044) and
+# paying with x402 (`--features x402`, RFC 0049) ship because each is inert
+# until configured (the user's decision, 2026-10-23): `companies` does nothing
+# without a `services` entry of `kind: company` or `security.companies`, `xaa`
+# nothing without `identity.*` and `security.experimental.id_jag`, and `x402`
+# nothing without `security.payments`. A release binary not told to use them
+# serves the same card, logs the same lines and writes the same files as one
+# built without them. `companies` and `xaa` reuse the `ring` rustls already
+# links; `x402` buys `k256` and `sha3` (secp256k1 and Keccak-256, which `ring`
+# lacks) and the 28 RustCrypto crates under them.
 env:
-  FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models"
+  FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402"
 
 jobs:
   # Static Linux binaries for the two cloud architectures, cross-compiled in

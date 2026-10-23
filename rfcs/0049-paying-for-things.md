@@ -1,6 +1,7 @@
 # RFC 0049: Paying for things — x402 as a paying client, only within a spend policy
 
 **Status:** Accepted 2026-10-22, as track P of RFC 0048 (§5.6); implemented: unit 1 (HTTP, EVM), Solana (§10) and unit 2 (MCP and A2A, §7.1, §7.2)
+**Status note (2026-10-23):** the feature `x402` is in the release binaries and the image, with `k256`, `sha3` and the 28 RustCrypto crates under them, the user's decision. It stays off in the default cargo build, and a release binary pays nothing without `security.payments`, so ADR 0003 holds. Where this record keeps the feature outside the release set (§2, D1, §8), that held until this date.
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-22
 **Builds on:** ADR 0003 (no payment without a spend policy — binding here), RFC 0044 P2a (the external signer, the audit chain, Landlock over supervisor-only paths), RFC 0047 (gates addressed to one person that no judge or operator answers, sealed records), RFC 0042 (what a served document may set), RFC 0054 (capabilities reach workflows first)

@@ -176,6 +176,103 @@ fn every_documented_copy_of_the_feature_set_is_current() {
     );
 }
 
+/// A document that says the release binaries carry something "from the next
+/// release" is true until that release and false from then on. Docs reach
+/// agentd.dev from `main`, a release behind the binaries a reader downloads,
+/// and the release turns the CHANGELOG's `## Unreleased` into its version:
+/// every such note goes with it, the sentence then saying what the release
+/// carries. The install guide's `cargo install` names the release set, or,
+/// while its note says the published crate waits for the next release, the
+/// release set without the features that note names — cargo refuses the whole
+/// command for one feature the published crate does not have.
+#[test]
+fn a_note_of_the_next_release_goes_with_the_release() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read =
+        |f: &Path| std::fs::read_to_string(f).unwrap_or_else(|e| panic!("{}: {e}", f.display()));
+    // A paragraph's words, wrapped lines and blockquote markers aside.
+    let words = |p: &str| {
+        p.lines()
+            .map(|l| l.trim_start().trim_start_matches('>'))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let unreleased = read(&root.join("CHANGELOG.md"))
+        .lines()
+        .find(|l| l.starts_with("## "))
+        .is_some_and(|l| l == "## Unreleased");
+
+    let mut docs = vec![root.join("README.md")];
+    for dir in ["docs", "docs/ext"] {
+        for p in std::fs::read_dir(root.join(dir))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+        {
+            if p.extension().is_some_and(|x| x == "md") {
+                docs.push(p);
+            }
+        }
+    }
+    let mut notes = Vec::new();
+    for f in &docs {
+        let text = read(f);
+        let mut line = 1;
+        for p in text.split("\n\n") {
+            let p_words = words(p);
+            // The sentence, or the table cell, that says it.
+            if let Some(said) = p_words
+                .split(['.', '|'])
+                .find(|s| s.contains("the next release"))
+            {
+                let name = f.strip_prefix(&root).unwrap_or(f).display();
+                notes.push(format!("{name}:{line}: {}", said.trim()));
+            }
+            line += p.lines().count() + 1;
+        }
+    }
+    assert!(
+        unreleased || notes.is_empty(),
+        "the CHANGELOG has no Unreleased section, so the next release has shipped, \
+         and these still wait for it:\n{}",
+        notes.join("\n")
+    );
+
+    let install = read(&root.join("docs/install.md"));
+    let line = install
+        .lines()
+        .find(|l| l.starts_with("cargo install agentd-cli"))
+        .expect("docs/install.md installs the published crate");
+    let named: Vec<String> = features_named(line).into_iter().map(|(_, f)| f).collect();
+    let want = release_features();
+    assert!(
+        named.iter().all(|f| want.contains(f)),
+        "docs/install.md installs the published crate with a feature the release set \
+         does not name: {named:?}"
+    );
+    let waiting: Vec<&String> = want.iter().filter(|f| !named.contains(f)).collect();
+    if !waiting.is_empty() {
+        let note = install
+            .split("\n\n")
+            .map(words)
+            .find(|p| p.contains("the next release"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "docs/install.md installs the published crate without {waiting:?}, \
+                     and no note says they wait for the next release"
+                )
+            });
+        for f in waiting {
+            assert!(
+                note.contains(&format!("`{f}`")),
+                "docs/install.md leaves `{f}` out of `cargo install`, and its note does \
+                 not say it waits for the next release: {note}"
+            );
+        }
+    }
+}
+
 /// The local pre-push gate runs the same rows as CI. A gate that is a subset of
 /// CI is a gate that says "clean" and then goes red on push.
 #[test]

@@ -148,15 +148,20 @@ oci = ["tls", "dep:ring"]
 # (`--print-company-client`), discovery, DPoP-bound Sessions and the Company's
 # MCP tools, all held by the supervisor. ES256, DPoP and sealing are the
 # `ring` `oauth` already carries, and every Company URL is HTTPS: no new
-# crate. NOT in the release feature set — the draft moves (rfcs/0047 §11).
+# crate. In the release feature set since 2026-10-23: inert until a
+# `services` entry of `kind: company` or `security.companies` uses it, and a
+# configuration that does is told at load that it tracks a draft (rfcs/0047
+# §11).
 companies = ["oauth", "tls"]
 # Acting for one enrolled person at MCP servers through their enterprise IdP
 # (RFC 0044 P1): ID-JAG token exchange (draft-ietf-oauth-identity-assertion-
 # authz-grant-04), RFC 7523 redemption at the server's authorization server,
 # MCP Enterprise-Managed Authorization, the sealed grant vault and the
 # person's own approvals — all held by the supervisor. ES256/RS256 and
-# AES-256-GCM are the `ring` `oauth` already carries: no new crate. NOT in
-# the release feature set — ID-JAG is a draft and the extension moves.
+# AES-256-GCM are the `ring` `oauth` already carries: no new crate. In the
+# release feature set since 2026-10-23, and inert there: ID-JAG is a draft,
+# so nothing of it runs without `identity.*` and the explicit
+# `security.experimental.id_jag`.
 xaa = ["oauth"]
 # Paying for an HTTP resource, an MCP tool's call or an A2A peer's task with
 # x402 v2 (RFC 0049), only within the spend policy ADR 0003 asks for: the
@@ -165,8 +170,9 @@ xaa = ["oauth"]
 # supervisor alone.
 # Sealing the wallet keys and the external signer are `oauth`'s; secp256k1
 # and Keccak-256, which `ring` lacks, are `k256` and `sha3`, the two crates
-# the user approved for EVM signatures (RFC 0048 Q3). NOT in the release
-# feature set: no payment without an operator who chose to build one in.
+# the user approved for EVM signatures (RFC 0048 Q3). In the release feature
+# set since 2026-10-23, and inert there: no payment without an operator who
+# declared a spend policy in `security.payments` (ADR 0003).
 x402 = ["oauth", "dep:k256", "dep:sha3"]
 # MCP Events (RFC 0045, SEP-3415 — a draft extension): `mcp.servers[].events`
 # bindings and `event_grants`, polled into declared streams. Hand-rolled on the

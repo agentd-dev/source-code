@@ -14,10 +14,9 @@
 //! each.
 //!
 //! The pages describe the release binary, so the samples are checked against
-//! a build with the release feature set. A sample for a feature that set
-//! leaves out — `exec`, `companies`, `xaa`, `x402` — is skipped there and
-//! checked by a build that adds it (`--features <release set>,companies`, or
-//! CI's `--all-features`).
+//! a build with the release feature set. A sample for the one feature that
+//! set leaves out, `exec`, is skipped there and checked by a build that adds
+//! it (CI's `--all-features`).
 #![cfg(all(
     unix,
     feature = "a2a",
@@ -33,7 +32,10 @@
     feature = "oci",
     feature = "decrypt",
     feature = "mcp-events",
-    feature = "mock-models"
+    feature = "mock-models",
+    feature = "companies",
+    feature = "xaa",
+    feature = "x402"
 ))]
 
 use std::collections::BTreeSet;
@@ -133,21 +135,12 @@ fn every_complete_configuration_sample_in_the_docs_loads() {
         if top.is_empty() || !top.keys().all(|k| keys.contains(k)) {
             continue; // not an agentd configuration
         }
-        // A sample for a build with `exec` or `companies`, which the
-        // release set leaves out, is checked by a build that has it
-        // (CI's `--all-features`): this one refuses it.
+        // A sample for a build with `exec`, which the release set leaves
+        // out, is checked by a build that has it (CI's `--all-features`):
+        // this one refuses it.
         if !cfg!(feature = "exec")
             && doc.pointer("/security/exec/enabled") == Some(&serde_json::Value::Bool(true))
         {
-            continue;
-        }
-        if !cfg!(feature = "companies") && declares_a_company(&doc) {
-            continue;
-        }
-        if !cfg!(feature = "xaa") && delegates(&doc) {
-            continue;
-        }
-        if !cfg!(feature = "x402") && doc.pointer("/security/payments").is_some() {
             continue;
         }
         let dir = scratch.join(format!("sample-{checked}"));
@@ -186,27 +179,6 @@ fn every_complete_configuration_sample_in_the_docs_loads() {
         failures.len(),
         failures.join("\n")
     );
-}
-
-/// Whether a sample acts at Companies: a `kind: company` service, or any
-/// `security.companies` key — both refused by a build without `companies`.
-fn declares_a_company(doc: &serde_json::Value) -> bool {
-    doc.pointer("/security/companies").is_some()
-        || doc["services"]
-            .as_object()
-            .is_some_and(|s| s.values().any(|v| v["kind"] == "company"))
-}
-
-/// Whether a sample acts for an enrolled person (RFC 0044): an IdP, the
-/// delegation section, the experimental switch or a `grant: id_jag` server —
-/// each refused by a build without `xaa`.
-fn delegates(doc: &serde_json::Value) -> bool {
-    doc.pointer("/identity/providers").is_some()
-        || doc.pointer("/identity/delegation").is_some()
-        || doc.pointer("/security/experimental").is_some()
-        || doc["mcp"]["servers"]
-            .as_array()
-            .is_some_and(|s| s.iter().any(|m| m["auth"]["grant"] == "id_jag"))
 }
 
 /// The files a sample's `# needs:` comment names.

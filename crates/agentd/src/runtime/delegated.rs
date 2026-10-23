@@ -710,8 +710,13 @@ impl Runtime {
 
     /// At most once every [`ONCE_SWEEP_EVERY_MS`] — the first pass of a
     /// life included — drop the stored first-use records no unit can still
-    /// use.
+    /// use. Only a configured delegation makes them, so an instance with
+    /// none never lists the store for them: a binary built with `xaa` and
+    /// not told to use it asks its store what one without it asks.
     pub(crate) fn sweep_once(&mut self) {
+        if self.delegation.is_none() {
+            return;
+        }
         let now = now_ms();
         if self.once_swept_ms != 0 && now.saturating_sub(self.once_swept_ms) < ONCE_SWEEP_EVERY_MS {
             return;
@@ -722,8 +727,12 @@ impl Runtime {
         }
     }
 
-    /// Forget every first use `unit` approved: its work ended.
+    /// Forget every first use `unit` approved: its work ended. Without a
+    /// delegation there are none, and the store is not asked.
     pub(crate) fn forget_once(&mut self, unit: &str) {
+        if self.delegation.is_none() {
+            return;
+        }
         let prefix = format!("{unit}|");
         let before = self.consented_once.len();
         self.consented_once.retain(|k, _| !k.starts_with(&prefix));

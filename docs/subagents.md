@@ -360,7 +360,7 @@ flowchart LR
     C -- "_instance.result<br/>(mode: sync)" --> P
     C -- "_instance.emit<br/>(mirror_streams)" --> P
     C -- "writes token totals" --> M[("child store<br/>manifest")]
-    P -- "reads every 5 s,<br/>charges the delta" --> M
+    P -- "reads every 5 s and at exit,<br/>charges the delta" --> M
     P -- "SIGTERM on ttl,<br/>until or retire" --> C
 ```
 
@@ -377,8 +377,11 @@ Four mechanisms ride that wiring:
   knowing which child wrote them.
 - **Budget metering.** A durable child's token use is charged against the
   parent's budget: the parent reads the child's lifetime total from its
-  manifest every five seconds and charges the difference. A non-durable
-  child has no manifest, so its use is not metered.
+  manifest every five seconds, once more when the child exits and when a
+  restarted parent finds it again, and charges the difference. What has
+  been charged is kept on the child's record, so a restart does not charge
+  it a second time. A non-durable child has no manifest, so its use is not
+  metered.
 - **Retirement.** `ttl` elapsing, the `until` signal arriving in the child,
   `subagent.retire`, or the parent's own shutdown all take one path: the
   child receives SIGTERM (a parent's death reaches it the same way), stops

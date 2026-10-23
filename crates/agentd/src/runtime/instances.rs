@@ -424,7 +424,7 @@ impl Runtime {
             .expect("object")
             .entry("agent")
             .or_insert_with(|| json!({}));
-        agent["name"] = json!(format!("{}/{}", self.instance, t.name));
+        agent["name"] = json!(instance_child_name(&self.instance, &t.name));
         agent["instruction"] = json!(prose);
         // The channels the template's `::!human`s put on its gates: the prose
         // the child reads no longer declares them, so they travel as the
@@ -505,7 +505,7 @@ impl Runtime {
         }
         // Parent-owned composition: store, listener, lifecycle, security.
         doc["store"] = if durable {
-            json!({"kind": "file", "file": {"path": dir.join("state").display().to_string()}})
+            durable_child_store(dir)
         } else {
             json!({"kind": "memory"})
         };
@@ -848,6 +848,9 @@ impl Runtime {
         else {
             return false;
         };
+        // What it spent since the last poll, before its record closes and
+        // the poll passes it by.
+        self.meter_instance(&handle);
         // One the drain asked to drain itself is left for the next life.
         if self.park_drained_instance(&handle, r) {
             self.release_reaped_instance(&handle, false);
@@ -919,6 +922,9 @@ impl Runtime {
             .filter_map(|s| s.config_path.clone().map(|c| (s.handle.clone(), c, None)))
             .collect();
         for (handle, config, limits) in candidates {
+            // What it spent after the last poll of the previous life, whether
+            // or not it comes back.
+            self.meter_instance(&handle);
             let path = PathBuf::from(&config);
             let Some(dir) = path.parent().map(|p| p.to_path_buf()) else {
                 continue;
@@ -1253,55 +1259,77 @@ impl Runtime {
     /// double-billing, and it makes a spawned desk draw down its sponsor's
     /// budget instead of spending off the books. A non-durable child has no
     /// manifest, so its usage is invisible by construction.
+    ///
+    /// The polls are this runtime's own: another runtime in the process (an
+    /// embedder's, a test's) keeps its own clock.
     fn meter_instances(&mut self) {
         let now = now_ms();
-        {
-            static LAST: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
-            let mut g = LAST.lock().unwrap_or_else(|e| e.into_inner());
-            if now.saturating_sub(*g) < 5_000 {
-                return;
-            }
-            *g = now;
+        if now.saturating_sub(self.instances_metered_at) < METER_EVERY_MS {
+            return;
         }
-        let candidates: Vec<(String, Option<String>, u64)> = self
+        self.instances_metered_at = now;
+        let live: Vec<String> = self
             .subagents
             .values()
-            .filter(|s| {
-                s.tier.as_deref() == Some("instance") && s.durable && !is_terminal_status(&s.status)
-            })
-            .map(|s| (s.handle.clone(), s.config_path.clone(), s.tokens))
+            .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
+            .map(|s| s.handle.clone())
             .collect();
-        for (handle, config, charged) in candidates {
-            let Some(dir) = config
-                .as_deref()
-                .and_then(|c| std::path::Path::new(c).parent().map(|p| p.to_path_buf()))
-            else {
-                continue;
-            };
-            let Some(total) = read_child_lifetime_tokens(&dir.join("state")) else {
-                continue;
-            };
-            let delta = total.saturating_sub(charged);
-            if delta == 0 {
-                continue;
-            }
-            self.governor.charge(
-                crate::wire::intel::Usage {
-                    input_tokens: delta,
-                    output_tokens: 0,
-                },
-                &[],
-            );
-            if let Some(s) = self.subagents.get_mut(&handle) {
-                s.tokens = total;
-                s.dirty = true;
-            }
-            self.subagent_log(&handle).info(
-                "instance.metered",
-                json!({"handle": handle, "delta_tokens": delta, "total_tokens": total}),
-            );
-            self.persist_subagent(&handle);
+        for handle in live {
+            self.meter_instance(&handle);
         }
+    }
+
+    /// Charge the parent for what the durable instance child `handle` spent
+    /// since it was last charged: its manifest's lifetime total less the
+    /// `tokens` on its record, which is what has been charged so far and is
+    /// kept with the record, so a restarted parent charges on from it. Called
+    /// by the poll, and once more as the child is reaped or found again at a
+    /// restart, so a child that ends between two polls is not let off what
+    /// it spent since the last.
+    fn meter_instance(&mut self, handle: &str) {
+        let Some(s) = self
+            .subagents
+            .get(handle)
+            .filter(|s| s.tier.as_deref() == Some("instance") && s.durable)
+        else {
+            return;
+        };
+        let charged = s.tokens;
+        let Some(manifest) = s
+            .config_path
+            .as_deref()
+            .and_then(|c| std::path::Path::new(c).parent())
+            .zip(s.template.as_deref())
+            .and_then(|(dir, t)| child_manifest_path(dir, &instance_child_name(&self.instance, t)))
+        else {
+            return;
+        };
+        let Some(total) = read_child_lifetime_tokens(&manifest) else {
+            return;
+        };
+        let delta = total.saturating_sub(charged);
+        if delta == 0 {
+            return;
+        }
+        // A budget counts tokens in and out alike (`Usage::total`), so the
+        // delta is charged as one figure.
+        self.governor.charge(
+            crate::wire::intel::Usage {
+                input_tokens: delta,
+                output_tokens: 0,
+            },
+            &[],
+            now_ms(),
+        );
+        if let Some(s) = self.subagents.get_mut(handle) {
+            s.tokens = total;
+            s.dirty = true;
+        }
+        self.subagent_log(handle).info(
+            "instance.metered",
+            json!({"handle": handle, "delta_tokens": delta, "total_tokens": total}),
+        );
+        self.persist_subagent(handle);
     }
 
     fn instance_bucket_take(&mut self) -> bool {
@@ -1602,25 +1630,47 @@ fn parse_instance_rlimits(limits: &Option<Value>) -> Result<(Option<u64>, Option
     Ok((memory, cpu))
 }
 
-/// Read a child's lifetime token total from its file-store manifest
-/// (`<state>/agentd/<instance>/manifest/agent.json` — the instance segment is
-/// found by walking, since the child's name is composed). The manifest's
-/// `budget` is the child governor's `to_value()`: the `instance` scope's
-/// `lifetime_used`.
-fn read_child_lifetime_tokens(state_root: &std::path::Path) -> Option<u64> {
-    let prefix_dir = state_root.join("agentd");
-    for inst in std::fs::read_dir(prefix_dir).ok()? {
-        let manifest = inst.ok()?.path().join("manifest").join("agent.json");
-        if let Ok(text) = std::fs::read_to_string(&manifest)
-            && let Ok(env) = serde_json::from_str::<Value>(&text)
-            && let Some(used) = env
-                .pointer("/state/budget/instance/lifetime_used")
-                .and_then(Value::as_u64)
-        {
-            return Some(used);
-        }
-    }
-    None
+/// How often the parent reads its durable instance children's spend.
+const METER_EVERY_MS: u64 = 5_000;
+
+/// The name a child composed from the template `template` runs under: its
+/// `agent.name`, and so the instance segment of every key its store writes.
+fn instance_child_name(parent: &str, template: &str) -> String {
+    format!("{parent}/{template}")
+}
+
+/// The store a durable child is composed with: a file store in `state/` in
+/// its directory `dir`, under the default prefix.
+fn durable_child_store(dir: &std::path::Path) -> Value {
+    json!({"kind": "file", "file": {"path": dir.join("state").display().to_string()}})
+}
+
+/// The file a durable child's manifest is in: its key, under the store the
+/// child is composed with ([`durable_child_store`]) and the name it runs
+/// under (`name`, [`instance_child_name`]), where the file store puts that
+/// key ([`crate::store::file::key_path`]). The name is composed, so it is
+/// two segments of the key, and two directories.
+fn child_manifest_path(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let store: crate::config::settings::Store =
+        serde_json::from_value(durable_child_store(dir)).ok()?;
+    let key = crate::store::key(
+        store.prefix(),
+        name,
+        crate::state::Kind::Manifest.as_str(),
+        crate::state::MANIFEST_ID,
+    );
+    crate::store::file::key_path(&crate::config::settings::file_store_root(&store), &key).ok()
+}
+
+/// Read a child's lifetime token total from its manifest at `manifest`
+/// ([`child_manifest_path`]). The manifest's `budget` is the child
+/// governor's `to_value()`: the `instance` scope's `lifetime_used`.
+fn read_child_lifetime_tokens(manifest: &std::path::Path) -> Option<u64> {
+    let text = std::fs::read_to_string(manifest).ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()?
+        .pointer("/state/budget/instance/lifetime_used")
+        .and_then(Value::as_u64)
 }
 
 /// How much of a failed child's log [`exit_cause`] reads, from its end.
@@ -2277,23 +2327,42 @@ mod tests {
         }
     }
 
+    /// The parent finds the manifest a durable child's own store writes: the
+    /// child runs on the store it is composed with, under its composed name,
+    /// and flushes its manifest as every instance does.
     #[test]
     fn a_child_manifest_yields_its_lifetime_tokens() {
         let dir = std::env::temp_dir().join(format!("agentd-meter-{}", std::process::id()));
-        let m = dir.join("agentd").join("parent%2Froom").join("manifest");
-        std::fs::create_dir_all(&m).unwrap();
-        std::fs::write(
-            m.join("agent.json"),
-            serde_json::to_string(&json!({
-                "kind": "manifest", "id": "agent", "seq": 9,
-                "state": {"generation": 1, "budget": {
-                    "instance": {"windows": [], "lifetime_used": 4242},
-                    "scopes": {}}}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(read_child_lifetime_tokens(&dir), Some(4242));
+        let name = instance_child_name("parent", "room");
+        {
+            let store: crate::config::settings::Store =
+                serde_json::from_value(durable_child_store(&dir)).unwrap();
+            let opened = crate::store::open(&store, &|_: &str| None)
+                .unwrap()
+                .unwrap();
+            let child = crate::state::Durable::new(
+                opened,
+                store.prefix(),
+                &name,
+                crate::state::Policy::default(),
+                None,
+            );
+            child.manifest_update(|m| {
+                m.budget =
+                    json!({"instance": {"windows": [], "lifetime_used": 4242}, "scopes": {}});
+            });
+            child.flush(true).unwrap();
+        }
+        let manifest = child_manifest_path(&dir, &name).unwrap();
+        assert!(
+            manifest.ends_with("state/agentd/parent/room/manifest/agent.json"),
+            "{manifest:?}"
+        );
+        assert_eq!(read_child_lifetime_tokens(&manifest), Some(4242));
+        assert_eq!(
+            read_child_lifetime_tokens(&child_manifest_path(&dir, "parent/other").unwrap()),
+            None
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

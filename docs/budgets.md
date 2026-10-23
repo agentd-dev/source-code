@@ -226,6 +226,7 @@ sub-budgets of the work it ran for:
 | preflight, compaction | no | instance, conversation |
 | the goal check, the approve judge | no | instance |
 | a subagent | no, each model call is charged as it returns | instance |
+| a durable instance child | no, its calls are admitted under its own `budget` | instance, every five seconds and when it exits |
 
 Admission works on an estimate, and the charge on what the provider
 reports. The estimate for a turn or step is its context, its system prompt
@@ -234,6 +235,12 @@ tool schemas, the answer's schema and, for a reasoning model, the thinking
 room (2,048, 8,192 or 24,576 tokens by effort, or the model's `budget`). A
 decision that is escalated, and an emulated decision that is asked twice,
 are charged for both calls.
+
+A charge that no admission came before counts in the windows open when it
+is made, so an agent that only spawns instance children and makes no model
+call of its own still has its windows filled by what they spend. Those
+charges count tokens, not `requests`. A non-durable instance child's use is
+not charged; see [Delegate to subagents](delegate-subagents.md).
 
 ## Cap subagents
 

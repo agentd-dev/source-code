@@ -881,6 +881,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         drain_instances: Default::default(),
         private_instances: None,
         instance_doors: Default::default(),
+        instances_metered_at: 0,
         drain_left: Default::default(),
         idle_since: None,
         intel,

@@ -200,7 +200,7 @@ impl crate::runtime::reactor::Runtime {
             output_tokens: u["output_tokens"].as_u64().unwrap_or(0),
         };
         if usage.total() > 0 {
-            self.governor.charge(usage, &[]);
+            self.governor.charge(usage, &[], now_ms());
             self.counters.tokens_in += usage.input_tokens;
             self.counters.tokens_out += usage.output_tokens;
             crate::obs::metrics::record_tokens(usage.input_tokens, usage.output_tokens);

@@ -62,30 +62,9 @@ impl FileStore {
         &self.root
     }
 
-    /// `<root>/<encoded segment>/…/<encoded id>.json`.
-    ///
-    /// Ids reach this adapter from run ids, task ids and context ids, so a
-    /// traversal is closed HERE rather than assumed to have been closed
-    /// upstream: every segment is percent-encoded, which makes `.`, `..` and a
-    /// separator unrepresentable in the encoded form.
+    /// [`key_path`] under this store's root.
     fn path_of(&self, key: &str) -> Result<PathBuf, StoreError> {
-        let mut p = self.root.clone();
-        let segs: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
-        if segs.is_empty() {
-            return Err(StoreError::Mapping("empty store key".into()));
-        }
-        for (i, seg) in segs.iter().enumerate() {
-            if seg.contains('\0') {
-                return Err(StoreError::Mapping("store key contains NUL".into()));
-            }
-            let enc = encode(seg);
-            if i + 1 == segs.len() {
-                p.push(format!("{enc}.{EXT}"));
-            } else {
-                p.push(enc);
-            }
-        }
-        Ok(p)
+        key_path(&self.root, key)
     }
 
     /// Read the envelope at `path`, if the file exists and parses.
@@ -169,6 +148,36 @@ impl Store for FileStore {
     fn kind(&self) -> &'static str {
         "file"
     }
+}
+
+/// The file the latest envelope of `key` lives in under a file store's
+/// `root`: `<root>/<encoded segment>/…/<encoded id>.json`, one directory per
+/// segment of the key before its last. A store reads and writes a key here,
+/// and so does anything that reads a store it does not hold — a parent
+/// reading its instance child's manifest.
+///
+/// Ids reach this adapter from run ids, task ids and context ids, so a
+/// traversal is closed HERE rather than assumed to have been closed
+/// upstream: every segment is percent-encoded, which makes `.`, `..` and a
+/// separator unrepresentable in the encoded form.
+pub(crate) fn key_path(root: &Path, key: &str) -> Result<PathBuf, StoreError> {
+    let mut p = root.to_path_buf();
+    let segs: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return Err(StoreError::Mapping("empty store key".into()));
+    }
+    for (i, seg) in segs.iter().enumerate() {
+        if seg.contains('\0') {
+            return Err(StoreError::Mapping("store key contains NUL".into()));
+        }
+        let enc = encode(seg);
+        if i + 1 == segs.len() {
+            p.push(format!("{enc}.{EXT}"));
+        } else {
+            p.push(enc);
+        }
+    }
+    Ok(p)
 }
 
 /// Recursively collect every `*.json` under `dir`, keyed by its path relative

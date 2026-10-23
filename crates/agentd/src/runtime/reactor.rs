@@ -686,6 +686,9 @@ pub struct Runtime {
     /// build without a listener hands its children no channel.
     #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
     pub(crate) instance_doors: std::sync::Arc<super::instances::DoorSlot>,
+    /// When this runtime last read its durable instance children's spend
+    /// (epoch ms; `runtime::instances`).
+    pub(crate) instances_metered_at: u64,
     /// What the drain stopped and left for the next life.
     pub(crate) drain_left: super::drain::Left,
     pub(crate) idle_since: Option<Instant>,
@@ -1862,7 +1865,7 @@ impl Runtime {
                 // A subagent's usage is charged as it reports; turn usage is
                 // settled on TurnDone against its reservation.
                 if let Some(ChildKind::Subagent { .. }) = self.children.get(node).map(|c| &c.kind) {
-                    self.governor.charge(u, &[]);
+                    self.governor.charge(u, &[], now_ms());
                 }
             }
             AgentMsg::IntelHealth { all_down, .. } => {

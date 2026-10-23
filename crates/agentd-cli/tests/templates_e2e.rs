@@ -3,8 +3,9 @@
 //! params, the freeform switch, and the instance tier (a template whose
 //! instruction defines machinery spawning a FULL child daemon: typed A2A
 //! commands answered by the child's own workflow over its unix socket, ttl
-//! retirement, singleton refusal) — plus the boot-time refusal of template
-//! machinery that tries to define listeners.
+//! retirement, singleton refusal, a durable child's spend charged to its
+//! parent) — plus the boot-time refusal of template machinery that tries to
+//! define listeners.
 #![cfg(unix)]
 
 mod common;
@@ -701,4 +702,240 @@ fn an_instance_param_that_names_a_secret_is_refused() {
         "no child was started:\n{log}"
     );
     assert!(!log.contains("s3cr3t-value"), "{log}");
+}
+
+/// A `desk` whose `desk.work` command runs one model step, so each command
+/// spends what the mock model reports for one call.
+#[cfg(feature = "a2a")]
+const DESK: &str = "subagents:\n\
+    \x20 templates:\n\
+    \x20   desk:\n\
+    \x20     instruction: |\n\
+    \x20       You keep the books for {{params.id}}.\n\
+    \x20       :::!workflow{name=on-work}\n\
+    \x20       steps:\n\
+    \x20         cmd: { kind: a2a, command: desk.work, roles: [agent, operator] }\n\
+    \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
+    \x20         f:   { kind: finish, depends_on: [a], status: completed, output: \"{{steps.a.output}}\" }\n\
+    \x20       :::\n\
+    \x20     params: { id: { type: string, required: true } }\n\
+    \x20     durable: true\n";
+
+/// The lifetime spend the manifest at `path` records, `0` when there is none.
+#[cfg(feature = "a2a")]
+fn lifetime_used(path: &str) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|m| m.pointer("/state/budget/instance/lifetime_used")?.as_u64())
+        .unwrap_or(0)
+}
+
+/// `agentd --config <dir>/<name>.yaml` with `cfg`, to its exit: the exit and
+/// the log.
+#[cfg(feature = "a2a")]
+fn run_named(dir: &str, name: &str, cfg: &str) -> (Option<i32>, String) {
+    let path = format!("{dir}/{name}.yaml");
+    std::fs::write(&path, cfg).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &path])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// A durable instance child's spend is its parent's: what the child's model
+/// calls cost reaches the parent's budget while the child runs, and a
+/// restarted parent charges only what the child spent since. What it charged
+/// before is on the child's record, so the child's whole lifetime is not
+/// charged a second time. The child's name is composed (`parent/desk`), so
+/// its store keeps its manifest a level deeper than a name of one segment
+/// would.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_durable_instance_childs_spend_is_charged_to_its_parent_once() {
+    let dir = common::unique_path("tpl-meter", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let head = format!(
+        "agent: {{ name: parent }}\nstore: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
+         intelligence: {{ endpoints: \"mock:final\", model: mock, budget: {{ lifetime_tokens: 1000000 }} }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 1s }}\n\
+         observability: {{ log_level: info, log_content: true }}\n{DESK}"
+    );
+    let parent = format!("{dir}/state/agentd/parent/manifest/agent.json");
+    let child = format!(
+        "{dir}/state/subagents/file/agentd/parent/inst-1/state/agentd/parent/desk/manifest/agent.json"
+    );
+    // The first life spawns the desk, has it work once and outwaits a poll.
+    let (code, log) = run_named(
+        &dir,
+        "first",
+        &format!(
+            "{head}workflows:\n  - name: caller\n    steps:\n\
+            \x20     s:     {{ kind: once }}\n\
+            \x20     spawn: {{ kind: subagent, template: desk, params: {{ id: north }}, depends_on: [s] }}\n\
+            \x20     work:  {{ kind: a2a.delegate, depends_on: [spawn], peer: \"{{{{steps.spawn.output.peer}}}}\", command: desk.work, args: {{}}, timeout: 30s, retry: {{ max: 6, backoff: 1s }} }}\n\
+            \x20     nap:   {{ kind: sleep, depends_on: [work], duration: 7s }}\n\
+            \x20     f:     {{ kind: finish, depends_on: [nap], status: completed }}\n"
+        ),
+    );
+    assert_eq!(code, Some(0), "{log}");
+    let spent = lifetime_used(&child);
+    assert!(spent > 0, "the desk recorded no spend at {child}:\n{log}");
+    assert!(
+        events(&log, "instance.metered")
+            .iter()
+            .any(|e| e["handle"] == "inst-1" && e["total_tokens"] == spent),
+        "the parent never metered the desk's {spent} tokens:\n{log}"
+    );
+    assert_eq!(
+        lifetime_used(&parent),
+        spent,
+        "the parent's budget is not what its desk spent:\n{log}"
+    );
+    // The second life respawns the desk and has it work again.
+    let (code, log) = run_named(
+        &dir,
+        "second",
+        &format!(
+            "{head}workflows:\n  - name: again\n    steps:\n\
+            \x20     s:    {{ kind: once }}\n\
+            \x20     work: {{ kind: a2a.delegate, depends_on: [s], peer: inst-1, command: desk.work, args: {{}}, timeout: 30s, retry: {{ max: 6, backoff: 1s }} }}\n\
+            \x20     nap:  {{ kind: sleep, depends_on: [work], duration: 7s }}\n\
+            \x20     f:    {{ kind: finish, depends_on: [nap], status: completed }}\n"
+        ),
+    );
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        !events(&log, "instance.respawn").is_empty(),
+        "the desk was not respawned:\n{log}"
+    );
+    let total = lifetime_used(&child);
+    let charged = lifetime_used(&parent);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(total > spent, "the respawned desk spent nothing:\n{log}");
+    assert_eq!(
+        charged, total,
+        "the parent charged {charged} for a desk that spent {total} over two lives:\n{log}"
+    );
+}
+
+/// A child that ends between two polls is charged for what it spent since
+/// the last one: the parent reads its total once more as it reaps it. Here
+/// the desk works and its ttl retires it inside the five seconds before the
+/// parent's next poll, after which it is closed and polled no more.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_durable_instance_childs_last_spend_is_charged_when_it_exits() {
+    let dir = common::unique_path("tpl-meter-exit", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (code, log) = run_named(
+        &dir,
+        "parent",
+        &format!(
+            "agent: {{ name: parent }}\nstore: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
+             intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+             lifecycle: {{ run_until: idle, idle_grace: 1s }}\n\
+             observability: {{ log_level: info, log_content: true }}\n\
+             {DESK}\x20     ttl: 3s\n\
+             workflows:\n  - name: caller\n    steps:\n\
+            \x20     s:     {{ kind: once }}\n\
+            \x20     spawn: {{ kind: subagent, template: desk, params: {{ id: south }}, depends_on: [s] }}\n\
+            \x20     work:  {{ kind: a2a.delegate, depends_on: [spawn], peer: \"{{{{steps.spawn.output.peer}}}}\", command: desk.work, args: {{}}, timeout: 30s, retry: {{ max: 6, backoff: 1s }} }}\n\
+            \x20     nap:   {{ kind: sleep, depends_on: [work], duration: 6s }}\n\
+            \x20     f:     {{ kind: finish, depends_on: [nap], status: completed }}\n"
+        ),
+    );
+    let spent = lifetime_used(&format!(
+        "{dir}/state/subagents/file/agentd/parent/inst-1/state/agentd/parent/desk/manifest/agent.json"
+    ));
+    let charged = lifetime_used(&format!("{dir}/state/agentd/parent/manifest/agent.json"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        events(&log, "instance.exited")
+            .iter()
+            .any(|e| e["status"] == "retired"),
+        "the desk was not retired:\n{log}"
+    );
+    assert!(spent > 0, "the desk recorded no spend:\n{log}");
+    assert_eq!(
+        charged, spent,
+        "the parent charged {charged} for a desk that spent {spent}:\n{log}"
+    );
+}
+
+/// A child its restarted parent cannot bring back is still charged for what
+/// it spent after the previous life's last poll: the parent reads its total
+/// as it finds its record again, before the respawn fails and closes it.
+/// Here the first life ends inside the five seconds after the desk's work,
+/// and the desk's composed config is gone by the second.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_durable_instance_child_that_does_not_come_back_is_charged_for_its_last_spend() {
+    let dir = common::unique_path("tpl-meter-lost", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let head = format!(
+        "agent: {{ name: parent }}\nstore: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
+         intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 1s }}\n\
+         observability: {{ log_level: info, log_content: true }}\n{DESK}"
+    );
+    let (code, log) = run_named(
+        &dir,
+        "first",
+        &format!(
+            "{head}workflows:\n  - name: caller\n    steps:\n\
+            \x20     s:     {{ kind: once }}\n\
+            \x20     spawn: {{ kind: subagent, template: desk, params: {{ id: east }}, depends_on: [s] }}\n\
+            \x20     work:  {{ kind: a2a.delegate, depends_on: [spawn], peer: \"{{{{steps.spawn.output.peer}}}}\", command: desk.work, args: {{}}, timeout: 30s, retry: {{ max: 6, backoff: 1s }} }}\n\
+            \x20     f:     {{ kind: finish, depends_on: [work], status: completed }}\n"
+        ),
+    );
+    assert_eq!(code, Some(0), "{log}");
+    // The desk drains as its parent dies, and has written its last before
+    // the next life reads it.
+    let pid = events(&log, "instance.spawn")
+        .first()
+        .and_then(|e| e["pid"].as_i64())
+        .expect("a spawn") as i32;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the desk outlived its parent"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let desk = format!("{dir}/state/subagents/file/agentd/parent/inst-1");
+    std::fs::remove_file(format!("{desk}/config.json")).unwrap();
+    let (code, log) = run_named(
+        &dir,
+        "second",
+        &format!(
+            "{head}workflows:\n  - name: idle\n    steps:\n\
+            \x20     s: {{ kind: once }}\n\
+            \x20     f: {{ kind: finish, depends_on: [s], status: completed }}\n"
+        ),
+    );
+    let spent = lifetime_used(&format!(
+        "{desk}/state/agentd/parent/desk/manifest/agent.json"
+    ));
+    let charged = lifetime_used(&format!("{dir}/state/agentd/parent/manifest/agent.json"));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, Some(0), "{log}");
+    assert!(
+        events(&log, "instance.respawn").is_empty(),
+        "the desk came back:\n{log}"
+    );
+    assert!(spent > 0, "the desk recorded no spend:\n{log}");
+    assert_eq!(
+        charged, spent,
+        "the parent charged {charged} for a desk that spent {spent}:\n{log}"
+    );
 }

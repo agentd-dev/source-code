@@ -425,7 +425,7 @@ impl Runtime {
         match (reservation, usage) {
             (Some(r), Some(u)) => self.governor.settle(r, u),
             (Some(r), None) => self.governor.release(r),
-            (None, Some(u)) => self.governor.charge(u, scopes),
+            (None, Some(u)) => self.governor.charge(u, scopes, now_ms()),
             (None, None) => {}
         }
     }

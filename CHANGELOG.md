@@ -2510,6 +2510,25 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `agent_tokens_total` and from the child's record. A child that died
   without a result also recorded `0` tokens in `subagent.result` and its
   record, whatever it had reported.
+- A parent is charged for what its durable instance children spend. It
+  looked for a child's manifest one directory under the child's store, but
+  a child's name is composed, `<parent>/<template>`, and its store keeps the
+  manifest two directories down, so no child was ever metered: a spawned
+  desk spent off its sponsor's books, and `instance.metered` was never
+  logged. The parent now reads the manifest where the file store maps the
+  child's key. A child is also metered once more as it exits and when a
+  restarted parent finds it again, so what it spent after the last
+  five-second poll is charged too; before, a child that ended between polls
+  was never polled again. Each runtime keeps its own poll clock, where every
+  runtime in a process shared one.
+- A charge no admission came before — a subagent's model call, the goal
+  check, a child's spend — counted in whichever windows the last admission
+  had rolled to, and the next admission in a later window cleared it: an
+  agent that spawns instance children and makes no model call of its own
+  never had its windows filled. A charge now counts in the windows open
+  when it is made. **Breaking:** `agentd-core`'s `governor::Governor::charge`
+  takes the moment of the charge (`now_ms`) and rolls the windows to it, as
+  `Governor::admit` does.
 - A reload refuses a change to a restart-only setting that the
   instruction's own `:::!config` makes — `lifecycle.run_until`,
   `store.kind`, `store.prefix`, `store.max_value_bytes` or `agent.name` — as

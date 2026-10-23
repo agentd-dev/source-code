@@ -454,12 +454,18 @@ impl Governor {
     }
 
     /// Charge usage that had no reservation (a child reported more calls than
-    /// admissions, or admission is off).
-    pub fn charge(&mut self, usage: Usage, scopes: &[String]) {
+    /// admissions, or admission is off) to the windows open at `now_ms`. No
+    /// admission rolled them first, so the charge does: a window last rolled
+    /// in an earlier hour would otherwise take the spend and lose it at the
+    /// next admission, and an instance that admits nothing itself, spending
+    /// only through its children, would never move its windows on.
+    pub fn charge(&mut self, usage: Usage, scopes: &[String], now_ms: u64) {
         let used = usage.total();
+        self.instance.roll(now_ms);
         self.instance.settle(0, used);
         for k in scopes {
             if let Some(s) = self.scopes.get_mut(k) {
+                s.roll(now_ms);
                 s.settle(0, used);
             }
         }
@@ -719,11 +725,36 @@ mod tests {
         );
         assert_eq!(v["instance"]["windows"][0]["tokens"], json!(50));
         // Unscoped usage still counts against the instance.
-        g.charge(usage(940), &[]);
+        g.charge(usage(940), &[], now);
         assert!(matches!(g.admit(20, &[], now), Admission::Wait { .. }));
         assert_eq!(parse_reset("06:30Z"), Some((6 * 3600 + 30 * 60) * 1000));
         assert_eq!(parse_reset("25:00Z"), None);
         g.drop_scope("conversation:c1");
         assert!(g.to_value()["scopes"].as_object().unwrap().is_empty());
+    }
+
+    /// A charge no admission came before — what an instance child spent,
+    /// metered by its parent — counts in the window open when it is made,
+    /// and an instance that admits nothing itself still moves its windows on.
+    #[test]
+    fn a_charge_counts_in_the_window_it_is_made_in() {
+        let mut g = Governor::new(&budget(
+            json!({"windows": [{"per": "minute", "tokens": 1000}], "on_exhausted": "refuse"}),
+        ));
+        let t0 = 1_700_000_000_000u64;
+        let t0 = t0 - t0 % 60_000;
+        g.charge(usage(900), &[], t0 + 1_000);
+        assert!(
+            matches!(g.admit(200, &[], t0 + 2_000), Admission::Refuse { .. }),
+            "the charge was lost to the first admission's roll"
+        );
+        g.charge(usage(900), &[], t0 + 61_000);
+        let v = g.to_value();
+        assert_eq!(v["instance"]["windows"][0]["tokens"], json!(900), "{v}");
+        assert_eq!(v["instance"]["lifetime_used"], json!(1800), "{v}");
+        assert!(matches!(
+            g.admit(100, &[], t0 + 62_000),
+            Admission::Ok { .. }
+        ));
     }
 }

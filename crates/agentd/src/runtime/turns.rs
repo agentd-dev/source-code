@@ -1547,7 +1547,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
                             .as_deref()
                             .map(|c| self.conversation_scopes(c))
                             .unwrap_or_default();
-                        self.governor.charge(turn.usage, &scopes);
+                        self.governor.charge(turn.usage, &scopes, now_ms());
                     }
                 }
                 self.on_think_done(&purpose, ctx.as_deref(), reply_to, extra, turn, trace);

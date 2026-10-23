@@ -135,6 +135,10 @@ pub struct StreamMeta {
     pub first: u64,
 }
 
+/// The id the instance manifest is kept under, beside its kind: an instance
+/// has one, at `<prefix>/<instance>/manifest/agent`.
+pub(crate) const MANIFEST_ID: &str = "agent";
+
 /// The instance manifest: the index of everything a restore must find, stored
 /// as one record under the `manifest` kind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -924,7 +928,7 @@ impl Durable {
         let snapshot = self.manifest();
         self.put(
             Kind::Manifest,
-            "agent",
+            MANIFEST_ID,
             serde_json::to_value(&snapshot).unwrap_or(Value::Null),
             None,
         )?;
@@ -944,7 +948,7 @@ impl Durable {
     /// [`restore_fresh`](Durable::restore_fresh).
     pub fn restore(&self) -> Result<Restored, StoreError> {
         let mut out = Restored::default();
-        let (manifest, fresh) = match self.get(Kind::Manifest, "agent")? {
+        let (manifest, fresh) = match self.get(Kind::Manifest, MANIFEST_ID)? {
             None => (
                 Manifest {
                     generation: 0,

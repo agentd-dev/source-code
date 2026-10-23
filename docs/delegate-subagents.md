@@ -734,10 +734,11 @@ template's machinery may not write operator-only configuration, define
 `a2a`, `intelligence`, `store` or `lifecycle`, declare MCP Events bindings,
 or open webhook routes; the parent composes those, and external events reach
 the child through the parent. A durable child's token use is charged against
-the parent's budget every five seconds. A `human` step in the template's
-workflows addressed `@human/<name>` to one of the template's `::!human`
-declarations keeps its channel: the parent writes it into the child's
-`agent.gate_channels` ([Human in the loop](human-in-the-loop.md)).
+the parent's budget every five seconds and once more when it exits, whether
+a workflow step or a model's `subagent.run` spawned it. A `human` step in
+the template's workflows addressed `@human/<name>` to one of the template's
+`::!human` declarations keeps its channel: the parent writes it into the
+child's `agent.gate_channels` ([Human in the loop](human-in-the-loop.md)).
 
 Each child has a directory of its own, mode 0700: its composed
 `config.json` (mode 0600), its `log`, its `a2a.sock` and, for a durable

@@ -13,6 +13,13 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   and `u128` comparisons could compile to a branch on a secret. It reaches
   agentd only under `k256`, the `x402` feature's secp256k1, and `cargo
   deny` reports it once `x402` is in the graph it judges.
+- tokio 1.53.3, for RUSTSEC-2026-0386: `AsyncFd::new` and the constructors
+  beside it accepted any `AsRawFd`, so safe code could register a
+  descriptor it did not own, and a closed and reused descriptor number could
+  leave a freed registration behind. agentd's own code constructs no
+  `AsyncFd`; tokio reaches it through `a2a` and the official MCP and A2A
+  SDKs, and `cargo deny` reports it against an advisory database that has
+  the advisory.
 
 **Added.**
 

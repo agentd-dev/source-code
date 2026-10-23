@@ -934,6 +934,7 @@ fn is_informational(args: &[String]) -> bool {
             "-h" | "--help"
                 | "-V"
                 | "--version"
+                | "--build-info"
                 | "--config-schema"
                 | "--workflow-schema"
                 | "--extensions"

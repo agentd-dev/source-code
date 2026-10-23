@@ -1951,6 +1951,16 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   28 dependencies; none is in the release graph.
 - `agentd-core`: `config::settings::McpServer::{untagged, counted_tags}`,
   the one rule for what an MCP server counts as, and `sec::scope::TRUSTED`.
+- `agentd --build-info`: how the binary was built, as one JSON object —
+  `name`, `version`, `revision`, `source_modified`, `features` (every cargo
+  feature compiled in, the ones another implies included, sorted),
+  `target`, `profile`, `rustc` and `builder`. The revision, whether the
+  source was modified and the builder are what the build was given in
+  `AGENTD_REVISION`, `AGENTD_SOURCE_MODIFIED` (`true` or `false`; any other
+  value fails the build) and `AGENTD_BUILDER`, and `null` without them. It
+  reads no configuration, like `--version`. `agentd-core`:
+  `Ask::BuildInfo`, which the binary answers, since only it knows its
+  features.
 
 **Changed.**
 

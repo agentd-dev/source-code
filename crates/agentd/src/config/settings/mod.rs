@@ -6335,6 +6335,11 @@ pub enum Ask {
     Run,
     Help,
     Version,
+    /// `--build-info`: how this binary was built — its version, source
+    /// revision, cargo features, target, profile and compiler — as JSON. The
+    /// binary answers it, since only the binary's own crate knows its
+    /// features.
+    BuildInfo,
     Schema,
     WorkflowSchema,
     /// `--context-template`: print the built-in system-prompt template, so an
@@ -6399,6 +6404,7 @@ fn ask_flag(flag: &str) -> Option<Ask> {
     Some(match flag {
         "-h" | "--help" => Ask::Help,
         "-V" | "--version" => Ask::Version,
+        "--build-info" => Ask::BuildInfo,
         "--config-schema" => Ask::Schema,
         "--workflow-schema" => Ask::WorkflowSchema,
         "--context-template" => Ask::ContextTemplate,
@@ -6868,6 +6874,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
         && ask != Ask::EffectiveConfig
         && ask != Ask::Help
         && ask != Ask::Version
+        && ask != Ask::BuildInfo
         && ask != Ask::Schema
         && ask != Ask::WorkflowSchema
         && ask != Ask::ContextTemplate
@@ -11308,6 +11315,8 @@ pub fn help_text() -> String {
          \x20 --delegation-lint          the Resource connections each IdP must have; dials nothing (needs xaa)\n\
          \x20 --prompt-missing           ask interactively (echo off, on /dev/tty) for each {{secret:NAME}} the startup preflight finds missing; refused without a controlling terminal\n\
          \x20 --env <FILE>               load a dotenv file into this process's environment (repeatable; real env wins, later files win)\n\
+         \x20 --build-info               print how this binary was built (version, revision, features,\n\
+         \x20                            target, profile, compiler) as JSON and exit\n\
          \x20 -h, --help / -V, --version\n\
          \n",
     );
@@ -16313,6 +16322,9 @@ mod tests {
         );
         let (_, ask) = load(&args(&[&["--extensions"][..], &invalid].concat()), &[]).unwrap();
         assert_eq!(ask, Ask::Extensions);
+        // How the binary was built does not depend on a config either.
+        let (_, ask) = load(&args(&[&["--build-info"][..], &invalid].concat()), &[]).unwrap();
+        assert_eq!(ask, Ask::BuildInfo);
         let asked = [&["--extension-schema", "events"][..], &invalid].concat();
         let (_, ask) = load(&args(&asked), &[]).unwrap();
         assert_eq!(ask, Ask::ExtensionSchema("events".into()));

@@ -306,13 +306,14 @@ fn main() {
 Your binary then takes the same configuration files, flags and `AGENTD_*`
 variables as `agentd`. Two differences from the stock command:
 
-- **The asks.** `load` recognizes `--help`, `--version`,
+- **The asks.** `load` recognizes `--help`, `--version`, `--build-info`,
   `--validate-config`, `--effective-config`, `--config-schema`,
   `--workflow-schema`, `--context-template`, `--extensions`,
   `--extension-schema`, `--capabilities`, `--login` and `--logout`, and
   returns them as an `Ask` other than `Ask::Run`. The stock CLI's
   `crates/agentd-cli/src/main.rs` answers each one; copy what you need from
-  it, or refuse them as above.
+  it, or refuse them as above. Answer `Ask::BuildInfo` from your own crate:
+  the stock CLI's answer lists agentd-cli's cargo features, not yours.
 - **The launcher.** `agentd tui` and `agentd ui` live in `agentd-cli`, not in
   the library. Attach the display clients to your binary's listener with
   `agentd-tui --endpoint …` ([Use the terminal and web UI](interface.md)).

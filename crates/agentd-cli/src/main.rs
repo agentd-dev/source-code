@@ -4,13 +4,15 @@
 //! Dispatches between three roles of the one binary: the **supervisor** (parse
 //! and validate the configuration, then run the durable event loop), the
 //! **subagent** re-exec, and the early-exit asks (`--help` / `--version` /
-//! `--config-schema` / `--validate-config` / `--capabilities`). Which role runs
-//! is decided entirely from argv and the environment, before any config is read.
+//! `--build-info` / `--config-schema` / `--validate-config` /
+//! `--capabilities`). Which role runs is decided entirely from argv and the
+//! environment, before any config is read.
 
 use agentd::config::ConfigError;
 use agentd::exit;
 use serde_json::json;
 
+mod build_info;
 #[cfg(all(unix, feature = "a2a"))]
 mod launcher;
 
@@ -338,6 +340,14 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
         }
         Ask::Version => {
             println!("agentd {}", agentd::VERSION);
+            exit::SUCCESS
+        }
+        Ask::BuildInfo => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&build_info::build_info())
+                    .unwrap_or_else(|_| "{}".to_string())
+            );
             exit::SUCCESS
         }
         Ask::Schema => {

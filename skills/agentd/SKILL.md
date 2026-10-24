@@ -27,11 +27,13 @@ error (it names the path), fix, re-validate. When unsure what a key is called:
 
 ```sh
 agentd --config-schema | less    # every key, type and default
-agentd --capabilities              # what THIS binary was built with
+agentd --build-info                # the features THIS binary was built with
 ```
 
-`--capabilities` matters because features are compile-time: a config using
-`a2a:` on a binary built without it is a startup error, not a silent no-op.
+`--build-info` (from the next release) matters because features are
+compile-time: a config using `a2a:` on a binary built without it is a startup
+error, not a silent no-op. `--capabilities` shows what the configuration
+sets up, not the build.
 
 ## Install
 
@@ -47,6 +49,7 @@ cargo build -p agentd-cli --release --features a2a,exec
 ```
 
 Docker: `ghcr.io/agentd-dev/agentd:<version>` (multi-arch, cosign-signed).
+A build with only the features a config needs: https://agentd.dev/docs/build-your-own/
 
 ## A minimal working config
 

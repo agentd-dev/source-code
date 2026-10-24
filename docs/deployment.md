@@ -299,6 +299,10 @@ outside its allow-list and judges the build's dependency graph with
 features you choose without the repository; `agentd-build --list` shows
 what it offers.
 
+[Build your own agentd](build-your-own.md) is the guide: the features a
+configuration needs, a `Dockerfile` `FROM` the builder, the other ways to
+build, and how to check what an image carries before you deploy it.
+
 [examples/docker](../examples/docker/) has a variant on
 `gcr.io/distroless/static-debian12:nonroot` that builds without TLS by
 default, for the loopback-sidecar setup described under [TLS](#tls).

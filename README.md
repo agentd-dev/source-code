@@ -52,7 +52,9 @@ curl -fsSL https://agentd.dev/install.sh | sh
 Linux on x86-64 and arm64. The container image is
 `ghcr.io/agentd-dev/agentd`, and the terminal and web clients are
 `npm install -g @agentd-dev/cli`. [Install](https://agentd.dev/docs/install/)
-covers every option, including building from source.
+covers every option, including building from source, and
+[Build your own agentd](https://agentd.dev/docs/build-your-own/) builds one
+with only the features your configuration and workflows use.
 
 ## Quickstart
 

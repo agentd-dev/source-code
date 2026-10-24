@@ -210,6 +210,10 @@ Add it to the list, for example `--features "a2a,…,exec"`.
 Every feature and the configuration that needs it is in [Build features and
 crates](features.md).
 
+[Build your own agentd](build-your-own.md) is the guide to a build with the
+features you choose: which ones a configuration needs, the builder image,
+and how to check what a build carries.
+
 ## Verify the install
 
 Check the version:
@@ -272,4 +276,6 @@ crates](features.md).
   and resume.
 - [Build features and crates](features.md): every feature, and what the
   release binaries carry.
+- [Build your own agentd](build-your-own.md): a binary or an image with the
+  features you choose.
 - [Deploy](deployment.md): systemd, containers and Kubernetes.

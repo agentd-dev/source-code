@@ -155,6 +155,11 @@ The release profile is `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
 `ring`, the TLS crypto provider, compiles C. It needs no CMake: CI fails the
 build if the `aws-lc` provider enters the dependency tree.
 
+[Build your own agentd](build-your-own.md) covers choosing the features a
+configuration and its workflows need, building them in the builder image
+with an allow-list and `cargo deny`, the other ways to build, and checking
+what a build carries.
+
 ## Crates
 
 The workspace publishes five crates to crates.io. A sixth, the conformance
@@ -232,6 +237,8 @@ connection and the A2A listener add threads of their own; the
 
 - [Install](install.md) — download a release binary or the image, and verify
   it.
+- [Build your own agentd](build-your-own.md) — a binary or an image with the
+  features you choose.
 - [Configuration reference](configuration.md) — every path, with the feature
   it needs.
 - [Embed agentd in Rust](embedding.md) — use `agentd-core` as a library.

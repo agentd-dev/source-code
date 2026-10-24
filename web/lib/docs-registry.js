@@ -310,6 +310,14 @@ export const DOCS = [
     "hint": "Jobs, systemd, Kubernetes"
   },
   {
+    "slug": "build-your-own",
+    "file": "docs/build-your-own.md",
+    "title": "Build your own agentd",
+    "group": "guides",
+    "section": "operate",
+    "blurb": "Build agentd with only the features your configuration and workflows use, and check what the binary and the image carry."
+  },
+  {
     "slug": "operations",
     "file": "docs/operations.md",
     "title": "Operate a running daemon",

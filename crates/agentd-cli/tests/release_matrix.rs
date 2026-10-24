@@ -203,7 +203,13 @@ fn a_note_of_the_next_release_goes_with_the_release() {
         .find(|l| l.starts_with("## "))
         .is_some_and(|l| l == "## Unreleased");
 
-    let mut docs = vec![root.join("README.md")];
+    // The site's condensed reference and the Agent Skill reach agentd.dev
+    // from `main` too.
+    let mut docs = vec![
+        root.join("README.md"),
+        root.join("web/public/llms.txt"),
+        root.join("skills/agentd/SKILL.md"),
+    ];
     for dir in ["docs", "docs/ext"] {
         for p in std::fs::read_dir(root.join(dir))
             .unwrap()

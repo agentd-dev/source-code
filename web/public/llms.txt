@@ -43,7 +43,7 @@ credentialed transport.
 ```sh
 curl -fsSL https://agentd.dev/install.sh | sh     # checksum-verified, no sudo
 docker run --rm ghcr.io/agentd-dev/agentd:latest --capabilities
-cargo build -p agentd-cli --release               # from source; Rust 1.96+, no C toolchain
+cargo build -p agentd-cli --release               # from source; Rust 1.96+ and a C compiler
 ```
 
 Release binaries are Linux musl, amd64 + arm64. `exec` is **not** compiled
@@ -484,9 +484,9 @@ Required fields in **bold**.
 
 ## 11. Build features
 
-Compile-time, and nothing at runtime enumerates them — `--capabilities`
-reports the *configured* surface, what this binary is set up to do, not the
-features it was built with.
+Compile-time. `agentd --build-info` (from the next release) prints the
+features this binary was built with, as JSON; `--capabilities` reports the
+*configured* surface, what this binary is set up to do, not its features.
 
 In the release binaries: `a2a`, `metrics`, `cron`, `otel`, `hot-reload`,
 `config-watch`, `aauth`, `oauth`, `cel`, `sign`, `oci`, `decrypt`,
@@ -501,6 +501,11 @@ spend policy in `security.payments` (https://agentd.dev/docs/pay-with-x402/).
 **Not** in the release binaries — build from source to get it: `exec`, the
 guarded local command runner, which is off at the cargo feature *and* at
 `security.exec.enabled`.
+
+To build only the features a configuration and its workflows need — in the
+builder image (`ghcr.io/agentd-dev/agentd-builder` from the next release,
+`agentd-build --features … --check-config agentd.yaml`), by URL, with cargo
+or embedded: https://agentd.dev/docs/build-your-own/.
 
 ---
 
@@ -561,6 +566,7 @@ Useful to know so you do not assume otherwise:
 | https://agentd.dev/docs/observability/ | events, metrics, OTLP |
 | https://agentd.dev/docs/operations/ | running it in production |
 | https://agentd.dev/docs/deployment/ | containers, Kubernetes, volumes |
+| https://agentd.dev/docs/build-your-own/ | a binary or image with only the features you choose: the builder image, the other ways, checking a build |
 | https://agentd.dev/docs/scaling/ | how a fleet partitions |
 | https://agentd.dev/docs/coding-agent/ | assembling a coding agent |
 | https://agentd.dev/docs/use-cases/ | worked shapes |

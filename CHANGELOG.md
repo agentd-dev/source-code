@@ -2002,6 +2002,14 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   running it. The `Dockerfile` takes it as `BUILD_INFO_FEATURES`, and the
   build refuses, before it compiles, a value that is not what the binary
   will report for `FEATURES`.
+- The guide [Build your own agentd](docs/build-your-own.md): when the
+  release binaries are enough, the features a configuration and its
+  workflows need, a `Dockerfile` `FROM` the builder image that checks the
+  configuration it will run, `agentd-build` and its tiers, checking a build
+  (`--build-info`, the label, a turn as PID 1, cosign), and the other ways —
+  the repository's `Dockerfile` by URL, `cargo install`, a checkout,
+  embedding — compared. The note scan of `release_matrix.rs` reads
+  `web/public/llms.txt` and the Agent Skill as well.
 
 **Changed.**
 

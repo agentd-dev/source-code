@@ -1,0 +1,555 @@
+#!/bin/sh
+# agentd-build: build agentd with an allow-listed set of cargo features.
+#
+# It runs in the agentd-builder image, over the source of one agentd release
+# with every dependency vendored, so a build fetches nothing. Before it
+# compiles anything it refuses a feature the image's features file does not
+# offer, and it says when the combination asked for is not one CI tests.
+# After the build it judges the build's own dependency graph with cargo deny,
+# checks that the binary has the features asked for, and validates the
+# configurations it is given against that binary. `agentd-build --help` says
+# how to use it.
+#
+# POSIX sh: the image has no bash. The paths below can be moved with
+# AGENTD_BUILD_ETC and AGENTD_BUILD_SOURCE, for a builder derived from this
+# one and for the tests that drive this script outside the image.
+set -eu
+# No word this script splits is a pattern.
+set -f
+
+prog=agentd-build
+etc=${AGENTD_BUILD_ETC:-/etc/agentd-build}
+src=${AGENTD_BUILD_SOURCE:-/usr/src/agentd}
+target_dir=${CARGO_TARGET_DIR:-/var/cache/agentd-build/target}
+tab=$(printf '\t')
+nl='
+'
+
+say() { printf '%s: %s\n' "$prog" "$*" >&2; }
+# A step failed after the build began.
+fail() {
+	say "$*"
+	exit 1
+}
+# The build was refused, or asked for wrongly, before anything was compiled.
+refuse() {
+	say "$*"
+	exit 2
+}
+
+usage() {
+	cat <<'EOF'
+agentd-build: build agentd with an allow-listed set of cargo features
+
+USAGE:
+  agentd-build --features LIST [--no-default-features] [--allow FEATURE]...
+               [--check-config FILE]... [--expect-features LIST] [--out DIR]
+  agentd-build --list
+  agentd-build --source-digest
+  agentd-build --help
+
+  --features LIST          the cargo features to build, comma-separated; an
+                           empty LIST builds the default set alone
+  --no-default-features    leave out the default set (tls)
+  --allow FEATURE          build FEATURE, which this builder offers only when
+                           asked twice (its tier is confirm); repeatable
+  --check-config FILE      validate FILE against the binary just built (its
+                           --validate-config); repeatable
+  --expect-features LIST   refuse the build unless its features, with what each
+                           implies and the defaults, are exactly LIST
+  --out DIR                where agentd and build-info.json are written
+                           (default /out)
+  --list                   print the features this builder offers, their tiers,
+                           and the feature sets CI tests
+  --source-digest          print the digest of the source tree
+
+A build runs, in order, stopping at the first step that fails:
+
+  1. refuse a feature the features file does not offer, a refused one, and a
+     confirm one without --allow (exit 2, nothing compiled)
+  2. warn when the features, with what each implies, are not a set CI tests
+  3. cargo build --release --locked --offline -p agentd-cli
+  4. cargo deny check, offline, over the graph of exactly these features
+  5. check that the binary's --build-info lists the features asked for
+  6. validate each --check-config FILE with the binary's --validate-config
+  7. write DIR/agentd and DIR/build-info.json, and print the LABEL line for
+     the image that carries the binary
+
+The features file is /etc/agentd-build/features: one feature per line,
+name<TAB>tier<TAB>reason, with a tier of default, release, tested, confirm
+or refused.
+EOF
+}
+
+# The features file as checked `name<TAB>tier<TAB>reason` lines.
+table() {
+	[ -r "$etc/features" ] || fail "no features file at $etc/features"
+	awk -F '\t' -v file="$etc/features" '
+		/^[ \t]*#/ || /^[ \t]*$/ { next }
+		NF < 3 || $1 !~ /^[a-z0-9][a-z0-9-]*$/ || $2 !~ /^(default|release|tested|confirm|refused)$/ || $3 == "" {
+			printf "agentd-build: %s:%d: want name<TAB>tier<TAB>reason, the tier one of default, release, tested, confirm or refused\n", file, NR > "/dev/stderr"
+			bad = 1
+			next
+		}
+		seen[$1]++ {
+			printf "agentd-build: %s:%d: %s is listed twice\n", file, NR, $1 > "/dev/stderr"
+			bad = 1
+			next
+		}
+		{
+			reason = $3
+			for (i = 4; i <= NF; i++) reason = reason " " $i
+			print $1 "\t" $2 "\t" reason
+		}
+		END { exit bad }
+	' "$etc/features"
+}
+
+# agentd-cli's [features] as `name feature…` lines: each feature with the
+# features of agentd-cli it turns on (not the `agentd/…` it forwards).
+graph() {
+	manifest=$src/crates/agentd-cli/Cargo.toml
+	[ -r "$manifest" ] || fail "no agentd-cli manifest at $manifest"
+	awk '
+		/^\[/ { inside = ($0 ~ /^\[features\][ \t]*$/); next }
+		!inside || /^[ \t]*#/ || /^[ \t]*$/ { next }
+		{
+			eq = index($0, "=")
+			if (!eq) next
+			name = substr($0, 1, eq - 1)
+			gsub(/[ \t]/, "", name)
+			rest = substr($0, eq + 1)
+			sub(/#.*/, "", rest)
+			if (rest !~ /\]/) {
+				print "agentd-build: [features] " name " does not fit on one line" > "/dev/stderr"
+				exit 1
+			}
+			gsub(/\[/, "", rest); gsub(/\]/, "", rest); gsub(/"/, "", rest); gsub(/[ \t]/, "", rest)
+			n = split(rest, deps, ",")
+			out = name
+			for (i = 1; i <= n; i++)
+				if (deps[i] != "" && deps[i] !~ /[\/:]/) out = out " " deps[i]
+			print out
+		}
+	' "$manifest"
+}
+
+# closure LIST: LIST with every feature it turns on, `default` expanded,
+# sorted and comma-separated.
+closure() {
+	printf '%s\n' "$graph_lines" | awk -v want="$1" '
+		{ line[$1] = $0 }
+		END {
+			n = split(want, w, /[, ]+/)
+			for (i = 1; i <= n; i++) if (w[i] != "") on[w[i]] = 1
+			grew = 1
+			while (grew) {
+				grew = 0
+				split("", add)
+				for (f in on) if (f in line) {
+					m = split(line[f], d, " ")
+					for (j = 2; j <= m; j++) if (!(d[j] in on)) add[d[j]] = 1
+				}
+				for (a in add) { on[a] = 1; grew = 1 }
+			}
+			for (f in on) if (f != "default") print f
+		}
+	' | LC_ALL=C sort -u | paste -s -d, -
+}
+
+# The features a tier holds, comma-separated.
+tier_of() {
+	printf '%s\n' "$table_lines" | awk -F '\t' -v name="$1" '$1 == name { print $2 }'
+}
+reason_of() {
+	printf '%s\n' "$table_lines" | awk -F '\t' -v name="$1" '$1 == name { print $3 }'
+}
+
+# release.yml's FEATURES: the set the release binaries and image are built with.
+release_set() {
+	wf=$src/.github/workflows/release.yml
+	[ -r "$wf" ] || return 0
+	sed -n 's/^ *FEATURES: *"\([^"]*\)".*$/\1/p' "$wf" | head -n 1
+}
+
+# The rows of ci.yml's `features` matrix, as written.
+ci_rows() {
+	wf=$src/.github/workflows/ci.yml
+	[ -r "$wf" ] || return 0
+	awk '
+		/^ *features:[ \t]*$/ { inside = 1; next }
+		inside && /^ *- "/ {
+			row = $0
+			sub(/^ *- "/, "", row)
+			sub(/".*$/, "", row)
+			print row
+			next
+		}
+		{ inside = 0 }
+	' "$wf"
+}
+
+# The feature sets CI tests, one per line: `<closure><TAB><what it is>`.
+tested_sets() {
+	rel=$(release_set)
+	if [ -n "$rel" ]; then
+		printf '%s\t%s\n' "$(closure "$rel,default")" "the release set"
+	fi
+	printf '%s\t%s\n' "$(closure default)" "the default set"
+	all=$(printf '%s\n' "$graph_lines" | awk '$1 != "default" { print $1 }' | paste -s -d, -)
+	ci_rows | while IFS= read -r row; do
+		case " $row " in
+		*" --all-features "*) set=$all ;;
+		*" --features "*)
+			set=${row#*--features }
+			set=${set%% *}
+			;;
+		*) set= ;;
+		esac
+		printf '%s\t%s\n' "$(closure "$set,default")" "ci.yml's row \"$row\""
+	done
+}
+
+# The digest of the source tree: every file's path and content, the build's
+# own record (.agentd-build/) and any target directory aside.
+source_digest() {
+	(
+		cd "$src"
+		find . \( -path ./target -o -path ./.agentd-build \) -prune -o -type f -print0 |
+			LC_ALL=C sort -z |
+			xargs -0 sha256sum |
+			sha256sum
+	) | awk '{ print "sha256:" $1 }'
+}
+
+list() {
+	printf 'Features this builder offers (%s):\n\n' "$etc/features"
+	printf '%s\n' "$table_lines" | awk -F '\t' '{ printf "  %-16s %-8s %s\n", $1, $2, $3 }'
+	printf '\nThe default set: %s\n' "$(closure default)"
+	printf '\nFeature sets CI tests (a build whose features, with what each implies\n'
+	printf 'and the defaults, are one of these is a tested build):\n\n'
+	tested_sets | awk -F '\t' '{ printf "  %s\n      %s\n", $2, $1 }'
+}
+
+# ---- arguments -----------------------------------------------------------
+
+features=
+features_given=
+no_default=
+allows=
+configs=
+expect=
+expect_given=
+out=/out
+mode=build
+
+# An option that takes a value is given one, and not the next option.
+need() {
+	if [ "$2" -lt 2 ] || [ "${3#--}" != "$3" ]; then
+		refuse "$1 needs a value (agentd-build --help)"
+	fi
+}
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--features)
+		need "$1" $# "${2-}"
+		features=$2 features_given=1
+		shift 2
+		;;
+	--features=*)
+		features=${1#*=} features_given=1
+		shift
+		;;
+	--no-default-features)
+		no_default=1
+		shift
+		;;
+	--allow)
+		need "$1" $# "${2-}"
+		allows="$allows $2"
+		shift 2
+		;;
+	--allow=*)
+		allows="$allows ${1#*=}"
+		shift
+		;;
+	--check-config | --check-config=*)
+		case $1 in
+		*=*) f=${1#*=} && shift ;;
+		*) need "$1" $# "${2-}" && f=$2 && shift 2 ;;
+		esac
+		case $f in *"$nl"*) refuse "--check-config: a path with a newline in it" ;; esac
+		case $f in /*) ;; *) f=$PWD/$f ;; esac
+		configs="$configs$f$nl"
+		;;
+	--expect-features)
+		need "$1" $# "${2-}"
+		expect=$2 expect_given=1
+		shift 2
+		;;
+	--expect-features=*)
+		expect=${1#*=} expect_given=1
+		shift
+		;;
+	--out)
+		need "$1" $# "${2-}"
+		out=$2
+		shift 2
+		;;
+	--out=*)
+		out=${1#*=}
+		shift
+		;;
+	--list)
+		mode=list
+		shift
+		;;
+	--source-digest)
+		mode=digest
+		shift
+		;;
+	-h | --help)
+		usage
+		exit 0
+		;;
+	*) refuse "unknown argument: $1 (agentd-build --help)" ;;
+	esac
+done
+
+if [ "$mode" = digest ]; then
+	source_digest
+	exit 0
+fi
+
+table_lines=$(table) || exit 2
+graph_lines=$(graph) || exit 2
+
+if [ "$mode" = list ]; then
+	list
+	exit 0
+fi
+
+[ -n "$features_given" ] || refuse "say which features to build: --features LIST (agentd-build --list shows them)"
+
+# ---- 1. what this builder offers ------------------------------------------
+
+# The features asked for, one per line.
+asked=$(printf '%s\n' "$features" |
+	awk '{ n = split($0, w, /[, \t]+/); for (i = 1; i <= n; i++) if (w[i] != "") print w[i] }' |
+	LC_ALL=C sort -u)
+problems=
+for f in $asked; do
+	if [ "$f" = default ]; then
+		problems="$problems${nl}default is not a feature: the default set ($(closure default)) is on unless --no-default-features"
+	elif ! printf '%s\n' "$graph_lines" | awk -v f="$f" '$1 == f { found = 1 } END { exit !found }'; then
+		problems="$problems${nl}agentd has no feature called $f (agentd-build --list)"
+	fi
+done
+if [ -n "$problems" ]; then
+	printf '%s\n' "$problems" | awk 'NF { print "agentd-build: refused: " $0 }' >&2
+	exit 2
+fi
+
+asked_csv=$(printf '%s\n' "$asked" | paste -s -d, -)
+if [ -n "$no_default" ]; then
+	build=$(closure "$asked_csv")
+else
+	build=$(closure "$asked_csv,default")
+fi
+
+for a in $allows; do
+	[ "$(tier_of "$a")" = confirm ] ||
+		refuse "--allow $a: $a is not a feature this builder asks to confirm (agentd-build --list)"
+	case ",$build," in
+	*",$a,"*) ;;
+	*) say "note: --allow $a, but the build does not include $a" ;;
+	esac
+done
+
+# Every feature the build would compile, implied and default ones included:
+# a feature this builder does not offer cannot come in through another.
+for f in $(printf '%s\n' "$build" | tr ',' ' '); do
+	tier=$(tier_of "$f")
+	how=
+	case ",$asked_csv," in
+	*",$f,"*) ;;
+	*)
+		how=$(printf '%s\n' "$asked" | while IFS= read -r g; do
+			case ",$(closure "$g")," in *",$f,"*) printf '%s\n' "$g" ;; esac
+		done | awk '{ w[NR] = $0 } END {
+			if (NR == 0) { print " (on by default; --no-default-features leaves it out)"; exit }
+			s = w[1]; for (i = 2; i <= NR; i++) s = s ", " w[i]
+			print " (" s (NR == 1 ? " turns" : " turn") " it on)"
+		}')
+		;;
+	esac
+	case $tier in
+	'') problems="$problems${nl}$f$how is not offered by this builder (agentd-build --list)" ;;
+	refused) problems="$problems${nl}$f$how: $(reason_of "$f")" ;;
+	confirm)
+		case " $allows " in
+		*" $f "*) ;;
+		*) problems="$problems${nl}$f$how needs --allow $f: $(reason_of "$f")" ;;
+		esac
+		;;
+	esac
+done
+if [ -n "$problems" ]; then
+	printf '%s\n' "$problems" | awk 'NF { print "agentd-build: refused: " $0 }' >&2
+	exit 2
+fi
+
+# Exactly, in any order: a label written from LIST must not leave out what
+# the binary has.
+if [ -n "$expect_given" ]; then
+	want=$(printf '%s\n' "$expect" |
+		awk '{ n = split($0, w, /[, \t]+/); for (i = 1; i <= n; i++) if (w[i] != "") print w[i] }' |
+		LC_ALL=C sort -u | paste -s -d, -)
+	[ "$want" = "$build" ] ||
+		refuse "refused: this build's features are $build, not $want (--expect-features)"
+fi
+
+# ---- 2. is it a set CI tests? ---------------------------------------------
+
+tested=$(tested_sets | awk -F '\t' -v build="$build" '
+	# The members of `a` that `b` lacks, in the (sorted) order of `a`; their count in n.
+	function minus(a, b,    pa, pb, inb, i, out) {
+		split("", inb)
+		for (i = split(b, pb, ","); i > 0; i--) inb[pb[i]] = 1
+		out = ""; n = 0
+		for (i = 1; i <= split(a, pa, ","); i++)
+			if (pa[i] != "" && !(pa[i] in inb)) { out = out (out == "" ? "" : ",") pa[i]; n++ }
+		return out
+	}
+	{
+		if ($1 == build) { print "exact\t" $2; found = 1; exit }
+		added = minus(build, $1); d = n
+		lacking = minus($1, build); d += n
+		if (best == "" || d < bestd) { best = $2; bestd = d; badd = added; black = lacking }
+	}
+	END {
+		if (!found && best != "") print "near\t" best "\t" badd "\t" black
+	}
+')
+case $tested in
+exact*) tested_as=${tested#*"$tab"} ;;
+*)
+	tested_as=
+	rest=${tested#*"$tab"}
+	nearest=${rest%%"$tab"*}
+	rest=${rest#*"$tab"}
+	adds=${rest%%"$tab"*}
+	lacks=${rest#*"$tab"}
+	diff=
+	[ -z "$adds" ] || diff="it adds $adds"
+	[ -z "$lacks" ] || diff="${diff:+$diff and }it lacks $lacks"
+	say "warning: CI does not test this combination (${build:-no features}); the nearest tested set is $nearest: $diff"
+	;;
+esac
+
+# ---- 3. the build ---------------------------------------------------------
+
+revision=
+[ ! -r "$src/.agentd-build/REVISION" ] || revision=$(cat "$src/.agentd-build/REVISION")
+modified=
+if [ -r "$src/.agentd-build/SOURCE_DIGEST" ]; then
+	if [ "$(source_digest)" = "$(cat "$src/.agentd-build/SOURCE_DIGEST")" ]; then
+		modified=false
+	else
+		modified=true
+		say "note: the source differs from the source this builder was made with, and the build says so (source_modified: true)"
+	fi
+fi
+builder=
+[ ! -r "$etc/builder" ] || builder=$(cat "$etc/builder")
+
+# Only what this builder knows reaches the binary: a value left in the
+# environment would be reported as if the builder had said it.
+unset AGENTD_REVISION AGENTD_SOURCE_MODIFIED AGENTD_BUILDER
+[ -z "$revision" ] || export AGENTD_REVISION="$revision"
+[ -z "$modified" ] || export AGENTD_SOURCE_MODIFIED="$modified"
+[ -z "$builder" ] || export AGENTD_BUILDER="$builder"
+
+set -- build --release --locked --offline -p agentd-cli
+[ -z "$no_default" ] || set -- "$@" --no-default-features
+[ -z "$asked_csv" ] || set -- "$@" --features "$asked_csv"
+say "cargo $*"
+(cd "$src" && CARGO_TARGET_DIR=$target_dir cargo "$@") || fail "the build failed"
+bin=$target_dir/release/agentd
+[ -x "$bin" ] || fail "the build wrote no binary at $bin"
+
+# ---- 4. the build's own dependency graph ----------------------------------
+
+# deny.toml judges the graph the release ships ([graph] features is the
+# release set); this build is judged on its own. cargo deny's own feature
+# flags cannot say that: a feature list on its command line replaces the
+# file's only when it is not empty, and its no-default-features is ORed with
+# the file's. So the [graph] section is replaced in a copy, which names this
+# build's graph exactly.
+[ -r "$src/deny.toml" ] || fail "no deny.toml at $src/deny.toml"
+deny_config=$(mktemp)
+trap 'rm -f "$deny_config"' EXIT
+awk -v features="$asked_csv" -v nodefault="${no_default:+true}" '
+	/^\[graph\][ \t]*$/ { skip = 1; next }
+	skip && /^\[/ { skip = 0 }
+	!skip { print }
+	END {
+		n = split(features, f, ",")
+		list = ""
+		for (i = 1; i <= n; i++) list = list (i > 1 ? ", " : "") "\"" f[i] "\""
+		print ""
+		print "# agentd-build: the graph of this build alone."
+		print "[graph]"
+		print "features = [" list "]"
+		print "no-default-features = " (nodefault == "" ? "false" : nodefault)
+	}
+' "$src/deny.toml" >"$deny_config"
+# The release's deny.toml lists licences, exceptions and waived advisories
+# for the release graph; one this narrower graph never meets is not a fault
+# of the build.
+(cd "$src" && cargo deny --offline --locked --manifest-path crates/agentd-cli/Cargo.toml \
+	check --config "$deny_config" --exclude-dev \
+	-A license-not-encountered -A license-exception-not-encountered -A advisory-not-detected) ||
+	fail "cargo deny refused this build's dependency graph (above); nothing was written to $out"
+
+# ---- 5. the binary has what was asked for --------------------------------
+
+info=$("$bin" --build-info) || fail "the binary does not answer --build-info"
+have=$(printf '%s\n' "$info" | jq -r '.features | join(",")')
+[ "$have" = "$build" ] ||
+	fail "the binary reports the features $have, and the build asked for $build"
+
+# ---- 6. the configurations it must run ------------------------------------
+
+while IFS= read -r f; do
+	[ -n "$f" ] || continue
+	"$bin" --validate-config --config "$f" ||
+		fail "$f does not validate against this build (above); nothing was written to $out"
+done <<EOF
+$configs
+EOF
+
+# ---- 7. the outputs -------------------------------------------------------
+
+mkdir -p "$out"
+cp "$bin" "$out/agentd"
+chmod 0755 "$out/agentd"
+printf '%s\n' "$info" >"$out/build-info.json"
+
+size=$(wc -c <"$out/agentd" | tr -d ' ')
+sum=$(sha256sum "$out/agentd" | awk '{ print $1 }')
+printf '%s\n' "$info" | jq -r --arg out "$out" --arg size "$size" --arg sum "$sum" \
+	--arg tested "${tested_as:-no}" '
+	"agentd-build: built agentd \(.version) (\(.profile), \(.target))",
+	"  features         \(.features | join(","))",
+	"  revision         \(.revision // "unknown") (source modified: \(if .source_modified == null then "unknown" else .source_modified end))",
+	"  builder          \(.builder // "unknown")",
+	"  tested by CI     \($tested)",
+	"  binary           \($out)/agentd (\($size) bytes, sha256 \($sum))",
+	"  build info       \($out)/build-info.json",
+	"",
+	"The image that carries it is labelled with what it was built with:",
+	"",
+	"  LABEL dev.agentd.features=\"\(.features | join(","))\""
+'

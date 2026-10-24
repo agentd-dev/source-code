@@ -1961,6 +1961,47 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   reads no configuration, like `--version`. `agentd-core`:
   `Ask::BuildInfo`, which the binary answers, since only it knows its
   features.
+- The builder image, `ghcr.io/agentd-dev/agentd-builder`, tagged as the
+  image is, signed with cosign and SBOM-attested: the source of the release
+  with every dependency vendored, on `rust:1.96-alpine` pinned by digest,
+  CI's cargo-deny with a snapshot of the RustSec advisory database, and
+  `agentd-build`, which builds agentd offline with an allow-listed set of
+  cargo features: `agentd-build --features LIST [--no-default-features]
+  [--allow FEATURE]… [--check-config FILE]… [--expect-features LIST]
+  [--out DIR]`. Before it compiles, it refuses a feature its features file
+  (`/etc/agentd-build/features`, `name<TAB>tier<TAB>reason`) does not offer,
+  `internal-mocks`, and `exec` without `--allow exec`, and it warns when the
+  features, with what each implies, are not a set CI tests, naming the
+  nearest one. It then builds with `--release --locked --offline`, judges
+  the build's own dependency graph with `cargo deny`, checks that the
+  binary's `--build-info` lists the features asked for, validates each
+  `--check-config` against the binary, and writes `DIR/agentd`,
+  `DIR/build-info.json` and the `LABEL` line for the image that carries it.
+  Given the configuration whose workflows the binary will run,
+  `--check-config` refuses a build that lacks what a node needs: a CEL
+  `when` guard without `cel`, a cron schedule without `cron`, a webhook
+  start without `a2a`. `agentd-build --list` shows what it offers and the
+  sets CI tests. A
+  builder made `FROM agentd-builder` with a narrower features file offers
+  less: a feature it leaves out cannot come in through one that implies it.
+  The official image is built by the same `agentd-build`, in the
+  `Dockerfile`'s `build` stage, `FROM` the `builder` stage, and the release
+  builds it `FROM` the builder it publishes, by digest. A build in a builder
+  reports the release and commit the builder was told (`VERSION` and
+  `REVISION`, which the release passes); a builder built from a checkout is
+  told neither, and a build in it reports `revision`, `source_modified` and
+  `builder` as `null`.
+- A release publishes nothing before `ci.yml`'s `cargo deny` job passes
+  again, at tag time, and publishes to crates.io only after the binaries,
+  the builder and the image are out. The builder's `cargo deny` reads the
+  advisory database as it is when the builder is built, so an advisory
+  published since CI last ran refuses the tag before anything is published,
+  rather than leaving crates on crates.io for a release with no image.
+- The image's `dev.agentd.features` label: the features `agentd
+  --build-info` reports, so a registry says what an image can do without
+  running it. The `Dockerfile` takes it as `BUILD_INFO_FEATURES`, and the
+  build refuses, before it compiles, a value that is not what the binary
+  will report for `FEATURES`.
 
 **Changed.**
 

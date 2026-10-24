@@ -196,7 +196,8 @@ A host build like this one is a dynamically linked Linux executable. The
 static musl binaries the releases ship are built with `cross` for the
 `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` targets, and the
 repository's `Dockerfile` builds the same static binary into a `scratch`
-image (`docker build --build-arg FEATURES=… .`).
+image, with the features a build argument
+([Build your own image](deployment.md#build-your-own-image)).
 
 One feature a guide needs is never in a release binary:
 

@@ -258,6 +258,14 @@ feature set, including the A2A listener, `/metrics` and the probes, cron,
 OTLP export, hot reload and the `mock:` model endpoint. Pin a version or a
 digest in production.
 
+From the next release, the image's `dev.agentd.features` label lists the
+features its binary was built with, as `agentd --build-info` reports them,
+so you can read them without running the image:
+
+```bash
+docker inspect --format '{{ index .Config.Labels "dev.agentd.features" }}' ghcr.io/agentd-dev/agentd:latest
+```
+
 The image is signed with cosign in the release workflow. Verify it before
 you deploy:
 
@@ -271,13 +279,25 @@ orphans, so it runs as PID 1 without `tini`.
 ### Build your own image
 
 The `Dockerfile` at the repository root builds the same image. The feature
-set is a build argument:
+set is a build argument, `FEATURES`, and `BUILD_INFO_FEATURES` says what
+the binary will report for it: `FEATURES`, the features each one implies
+and the default `tls`, sorted. It becomes the image's `dev.agentd.features`
+label, and the build refuses, before it compiles, a value that is not what
+the binary will report:
 
 ```bash
 docker build -t agentd:local .
-docker build --build-arg FEATURES=a2a,metrics,cron,otel,hot-reload,config-watch -t agentd:narrow .
+docker build --build-arg FEATURES=a2a,metrics,cron,otel,hot-reload,config-watch --build-arg BUILD_INFO_FEATURES=a2a,config-watch,cron,hot-reload,metrics,otel,tls -t agentd:narrow .
 docker buildx build --platform linux/amd64,linux/arm64 -t registry.example.com/agentd:1.20.0 --push .
 ```
+
+The image is built `FROM` the Dockerfile's `builder` stage, the source with
+every dependency vendored and `agentd-build`, which refuses a feature
+outside its allow-list and judges the build's dependency graph with
+`cargo deny`. From the next release that stage is published as
+`ghcr.io/agentd-dev/agentd-builder`, so you can build a binary with the
+features you choose without the repository; `agentd-build --list` shows
+what it offers.
 
 [examples/docker](../examples/docker/) has a variant on
 `gcr.io/distroless/static-debian12:nonroot` that builds without TLS by

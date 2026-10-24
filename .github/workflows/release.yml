@@ -2,14 +2,15 @@ name: release
 
 # Cut a release by pushing a tag, e.g. `git tag v0.2.0 && git push origin v0.2.0`.
 # Produces: static Linux binaries (amd64 + arm64), a multi-arch OCI image on GHCR
-# (cosign-signed, SBOM-attested), and a SHA256SUMS. (For a Debian/systemd host,
-# `packaging/` ships a hardened unit + env for a manual install.)
+# and the builder image it is built in (both cosign-signed, SBOM-attested), and
+# a SHA256SUMS. (For a Debian/systemd host, `packaging/` ships a hardened unit +
+# env for a manual install.)
 on:
   push:
     tags: ["v*"]
 
-# Least privilege per job; the container job adds packages + id-token for GHCR
-# push + keyless signing.
+# Least privilege per job; the container and builder jobs add packages +
+# id-token for GHCR push + keyless signing.
 permissions:
   contents: read
 
@@ -42,9 +43,35 @@ env:
   FEATURES: "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402"
 
 jobs:
+  # The supply-chain gate again, at tag time: ci.yml's deny job, line for
+  # line (builder_image.rs holds the two equal), against the advisory
+  # database as it is now. The builder's `agentd-build` judges the release
+  # graph against the same database, so an advisory or a yank published
+  # since CI last ran would refuse the builder and the image; here it
+  # refuses the tag before anything is published. Every job below waits for
+  # it.
+  deny:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_DENY_VERSION: "0.19.5"
+      CARGO_DENY_SHA256: 5ea64ae09959b5fe1072d898f95caaa89b374678ba6728d5e9ed1366745479b0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: |
+          name="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
+          curl -sSfL -o "$RUNNER_TEMP/deny.tgz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${name}.tar.gz"
+          echo "${CARGO_DENY_SHA256}  $RUNNER_TEMP/deny.tgz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/deny.tgz" -C "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/${name}/cargo-deny" "$HOME/.cargo/bin/cargo-deny"
+      - run: cargo deny check
+
   # Static Linux binaries for the two cloud architectures, cross-compiled in
   # docker via `cross` so amd64 and arm64 both produce a fully static musl ELF.
   binaries:
+    needs: [deny]
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -73,15 +100,22 @@ jobs:
           files: dist/*
 
   # Multi-arch OCI image → GHCR, cosign-signed (keyless OIDC) with an SPDX SBOM
-  # attestation.
+  # attestation. It is built FROM the builder the job below publishes, by
+  # digest: that image takes the place of the Dockerfile's `builder` stage,
+  # so the image's binary is the one `agentd-build` finds already compiled
+  # in the published builder, and the release set is compiled once.
   #
   # FEATURES is passed EXPLICITLY rather than left to the Dockerfile's default.
   # It was left to the default, and the default stopped matching: `sign`, `oci`
   # and `decrypt` joined this release's binaries and never reached the image,
   # so the container could not verify a signature the release notes promised it
-  # could. release_matrix.rs now pins the Dockerfile default to this list too,
-  # but the build no longer depends on that agreement.
+  # could. release_matrix.rs now pins the Dockerfile default to this list too.
+  # BUILD_INFO_FEATURES, what the binary reports for this list, is left to the
+  # Dockerfile's default, which builder_image.rs holds to it; were the two to
+  # drift, the build would refuse (`--expect-features`) rather than label the
+  # image with features its binary does not have.
   container:
+    needs: [builder]
     permissions:
       contents: read
       packages: write
@@ -109,6 +143,9 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
+          # The Dockerfile's `builder` stage is the published builder.
+          build-contexts: |
+            builder=docker-image://ghcr.io/${{ github.repository_owner }}/agentd-builder@${{ needs.builder.outputs.digest }}
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
@@ -137,12 +174,85 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: cosign attest --yes --predicate sbom.spdx.json --type spdxjson "ghcr.io/${{ github.repository_owner }}/agentd@${DIGEST}"
 
+  # The builder image → GHCR: the Dockerfile's `builder` stage — the source of
+  # this release with every dependency vendored, CI's cargo-deny with a
+  # snapshot of the advisory database, and `agentd-build`, which builds agentd
+  # with an allow-listed feature set, offline (packaging/builder/). The image
+  # above is built FROM it, by the digest this job outputs. It is published
+  # under the image's tags, and signed and SBOM-attested exactly as the image
+  # is: builder_image.rs holds the two jobs' tags and signing steps equal.
+  builder:
+    needs: [deny]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/agentd-builder
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+          # metadata-action titles an image after the repository; this one
+          # has a name of its own.
+          labels: |
+            org.opencontainers.image.title=agentd-builder
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # FEATURES is the release set the builder's labels name; VERSION
+          # becomes the `builder` every build made in it reports.
+          build-args: |
+            FEATURES=${{ env.FEATURES }}
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign image (keyless)
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/${{ github.repository_owner }}/agentd-builder@${DIGEST}"
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/agentd-builder@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-release-assets: false
+      - name: Attest SBOM
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign attest --yes --predicate sbom.spdx.json --type spdxjson "ghcr.io/${{ github.repository_owner }}/agentd-builder@${DIGEST}"
+
   # Publish the library crates to crates.io.
   #
-  # `needs: [binaries]` on purpose: a crates.io publish is the ONE irreversible
-  # step in a release — a version can be yanked but never re-used or removed —
-  # so the reversible artifacts prove the build first. Everything else here can
-  # be deleted and re-cut from the same tag.
+  # `needs` every other artifact on purpose: a crates.io publish is the ONE
+  # irreversible step in a release — a version can be yanked but never re-used
+  # or removed — so the reversible artifacts prove the build first. That
+  # includes the builder and the image: their `agentd-build` judges the release
+  # graph against the advisory database as it is when they build, and a tag
+  # it refuses must leave nothing on crates.io. Everything else here can be
+  # deleted and re-cut from the same tag.
   #
   # Two properties this job needs that a naive `cargo publish` does not have:
   #
@@ -155,7 +265,7 @@ jobs:
   #      because the sparse index has not caught up. Order is net → mcp → core
   #      → cli, each waiting for its predecessor to be resolvable.
   crates:
-    needs: [binaries]
+    needs: [binaries, builder, container]
     permissions:
       contents: read
     runs-on: ubuntu-latest

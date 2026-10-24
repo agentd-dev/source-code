@@ -1,0 +1,36 @@
+# The cargo features this builder offers, one per line:
+#
+#   name<TAB>tier<TAB>reason
+#
+# The tiers:
+#
+#   default  on unless the build asks for --no-default-features
+#   release  in the release set: what the published binaries and image carry
+#   tested   built and tested on its own in CI, and not in the release set
+#   confirm  built only when the build asks for it again with --allow <name>
+#   refused  never built by this builder
+#
+# agentd-build refuses a feature with no line here, and says the reason when
+# it refuses one or asks for --allow. A builder made FROM agentd-builder may
+# replace this file with a narrower one: a feature it leaves out is a feature
+# that builder does not offer, even when another feature implies it.
+tls	default	rustls with bundled web roots: https:// to models, MCP servers and peers, with no system CA bundle
+a2a	release	the A2A listener, outbound A2A peers and the webhook listener
+metrics	release	/metrics, /healthz and /readyz on observability.metrics_addr
+cron	release	five-field UTC cron expressions on schedule starts
+otel	release	OTLP over HTTP/JSON: run traces and log export
+hot-reload	release	reload the configuration on SIGHUP
+config-watch	release	an inotify watch that reloads the configuration (lifecycle.watch_config)
+aauth	release	an Ed25519 agent identity that signs outbound MCP requests
+oauth	release	OAuth 2.1 credentials for models, MCP servers and peers; agentd --login
+cel	release	CEL expressions: when, until and filter guards, computed values, policy matches
+sign	release	signature verification of instruction documents (agent.instruction.trust)
+oci	release	oci:// instruction sources, with cosign verification
+decrypt	release	encrypted instruction envelopes: age v1 and JWE compact
+mcp-events	release	MCP Events bindings, grants and event waits (a draft extension)
+mock-models	release	the mock: model endpoint, scripted answers with no provider
+companies	release	acting at Companies for a person (a draft protocol); inert until configured
+xaa	release	acting for an enrolled person through their IdP (ID-JAG, a draft); inert until configured
+x402	release	paying with x402 within a spend policy (security.payments); inert until configured
+exec	confirm	runs local commands on the host the agent runs on (security.exec); never in a release
+internal-mocks	refused	test scaffolding: mock servers and crash points for agentd's own test suites

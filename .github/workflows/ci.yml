@@ -314,21 +314,61 @@ jobs:
           esac
           "$bin" --version
 
-  # Build the OCI image from the Dockerfile (single-arch smoke build, no push) and
-  # prove the static binary runs — so a Dockerfile or static-link regression is
-  # caught on every PR, not at release time.
+  # Build the builder image and, FROM it, the OCI image (single-arch smoke
+  # builds, no push), and prove both work — so a Dockerfile, builder or
+  # static-link regression is caught on every PR, not at release time. The
+  # builder stage pre-warms the release build, and the image's build reuses
+  # it from the same buildx cache and finds it current, so there is one
+  # release build here.
   image:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      - name: Build the builder image (amd64, load locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: builder
+          load: true
+          tags: agentd-builder:ci
+      # What it offers, and that it refuses outside the allow-list before it
+      # compiles anything: exit 2, a reason, and no cargo output.
+      - name: Smoke-test the builder
+        run: |
+          docker run --rm agentd-builder:ci --list
+          refused() {
+            set +e
+            out=$(docker run --rm agentd-builder:ci "$@" 2>&1)
+            code=$?
+            set -e
+            echo "$out"
+            if [ "$code" != 2 ] || ! grep -q 'refused:' <<<"$out" || grep -q 'Compiling' <<<"$out"; then
+              echo "::error::agentd-build $* was not refused before it compiled (exit $code)"
+              exit 1
+            fi
+          }
+          refused --features exec
+          unknown=no-such-feature
+          refused --features "$unknown"
       - name: Build image (amd64, load locally)
         uses: docker/build-push-action@v6
         with:
           context: .
           load: true
           tags: agentd:ci
+      # A turn, not only --version: agentd is PID 1 in the container, and a
+      # subagent's view of its parent is what that changes. The label says
+      # what --build-info says.
       - name: Smoke-test the image
         run: |
           docker run --rm agentd:ci --version
           docker run --rm agentd:ci --help | grep -q -- '--metrics-addr'
+          docker run --rm agentd:ci --instruction 'say hi' --intelligence mock:final --agent.preflight never
+          docker run --rm agentd:ci --build-info
+          have=$(docker run --rm agentd:ci --build-info | jq -r '.features | join(",")')
+          label=$(docker inspect --format '{{ index .Config.Labels "dev.agentd.features" }}' agentd:ci)
+          if [ "$have" != "$label" ]; then
+            echo "::error::the image is labelled dev.agentd.features=$label and its binary reports $have"
+            exit 1
+          fi

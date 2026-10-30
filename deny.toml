@@ -22,6 +22,14 @@ ignore = [
     # arrives only through cel-interpreter, the `cel` feature's one crate.
     # Drop this when cel-interpreter moves off paste.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time proc-macro pulled in by cel-interpreter; no known vulnerability" },
+    # pulldown-cmark 0.13.5 fixes RUSTSEC-2026-0414 but is younger than the 14-day
+    # dependency age rule. Drop this and bump the crate on or after 2026-11-04.
+    { id = "RUSTSEC-2026-0414", reason = "fix (pulldown-cmark 0.13.5) is under the 14-day age rule until 2026-11-04" },
+    # Every crypto-bigint 0.7 release before 0.7.9 is yanked; 0.7.9 (the first
+    # unyanked fix for RUSTSEC-2026-0387) is younger than the 14-day rule. Drop
+    # both entries and bump the crate on or after 2026-11-08.
+    { id = "RUSTSEC-2026-0387", reason = "fix (crypto-bigint 0.7.9) is under the 14-day age rule until 2026-11-08" },
+    { crate = "crypto-bigint@0.7.5", reason = "yanked; the unyanked fix 0.7.9 is under the 14-day age rule until 2026-11-08" },
 ]
 
 [bans]

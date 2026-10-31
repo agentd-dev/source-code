@@ -9,7 +9,9 @@
 //! hands agentd `--intelligence http://<addr>`; loopback plaintext is the
 //! dev/test carve-out, since production intelligence is HTTPS-only.
 //!
-//! Speaks just enough OpenAI-compatible `/chat/completions` over that listener
+//! Speaks just enough OpenAI-compatible `/chat/completions` — and the same
+//! scripts over the Responses API (`POST …/responses`, where a model such as
+//! `gpt-6.1-sol` is asked) — over that listener
 //! to drive a *real* agentic loop without a live model: it reads the request and
 //! returns a scripted assistant turn — a final answer or a tool call — switching
 //! to a final answer once a tool result appears in the transcript, so the ReAct
@@ -122,15 +124,33 @@ fn serve(listener: TcpListener, script: &str, announce: bool) {
 }
 
 fn handle(mut stream: TcpStream, script: &str, announce: bool) {
-    let Some((body, trace)) = read_request_body(&mut stream) else {
+    let Some((path, body, trace)) = read_request(&mut stream) else {
         return;
     };
     if announce {
         eprintln!("MOCK_LLM_TRACE {}", serde_json::Value::Object(trace));
     }
+    let payload = respond(script, &path, &body);
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        payload.len(),
+        payload
+    );
+    let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.flush();
+}
+
+/// The answer to one request on `path`. A decisions request is answered in
+/// its own shape wherever it arrives. A Responses API request (`…/responses`)
+/// is read as the Chat Completions request it stands for ([`chat_view`]),
+/// answered by the one script engine ([`answer`]), and the answer written in
+/// the Responses shape ([`responses_answer`]): a script behaves the same on
+/// both wire shapes, so a rehearsal under a real model's name takes the path
+/// the live run takes. Every other path is Chat Completions.
+fn respond(script: &str, path: &str, body: &str) -> String {
     // A decisions request (RFC 0046 §5.5) — `{model, state, questions}` —
     // is answered as a decision model would answer it.
-    if let Ok(req) = serde_json::from_str::<serde_json::Value>(&body)
+    if let Ok(req) = serde_json::from_str::<serde_json::Value>(body)
         && req
             .get("questions")
             .is_some_and(serde_json::Value::is_object)
@@ -140,39 +160,33 @@ fn handle(mut stream: TcpStream, script: &str, announce: bool) {
                 .ok()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         });
-        let payload = decision_response(playbook.as_ref(), &req, &body);
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            payload.len(),
-            payload
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.flush();
-        return;
+        return decision_response(playbook.as_ref(), &req, body);
     }
+    let route = path.split('?').next().unwrap_or(path);
+    if route.ends_with("/responses") {
+        return responses_answer(&answer(script, &chat_view(body)));
+    }
+    answer(script, body)
+}
+
+/// The scripted answer to a Chat Completions request body, as a chat
+/// completion: the one script engine both wire shapes are answered by.
+fn answer(script: &str, body: &str) -> String {
     if let Some(path) = script.strip_prefix("file:") {
-        let payload = match std::fs::read_to_string(path)
+        return match std::fs::read_to_string(path)
             .map_err(|e| e.to_string())
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).map_err(|e| e.to_string()))
         {
-            Ok(playbook) => playbook_response(&playbook, &body),
+            Ok(playbook) => playbook_response(&playbook, body),
             Err(e) => final_answer(&format!("mock-llm: cannot load playbook {path}: {e}")),
         };
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            payload.len(),
-            payload
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.flush();
-        return;
     }
     // `echo-system`: answer with the SYSTEM message verbatim. The system prompt
     // is whatever an operator's `context.template` produced, so echoing it makes
     // that observable end to end — a test asserts on what a model actually
     // receives rather than on an internal function's return value.
     if script == "echo-system" {
-        let sys = serde_json::from_str::<serde_json::Value>(&body)
+        let sys = serde_json::from_str::<serde_json::Value>(body)
             .ok()
             .and_then(|v| {
                 v["messages"].as_array().and_then(|ms| {
@@ -182,15 +196,7 @@ fn handle(mut stream: TcpStream, script: &str, announce: bool) {
                 })
             })
             .unwrap_or_else(|| "(no system message)".to_string());
-        let payload = final_answer(&sys);
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            payload.len(),
-            payload
-        );
-        let _ = stream.write_all(resp.as_bytes());
-        let _ = stream.flush();
-        return;
+        return final_answer(&sys);
     }
     // A `role:tool` message means the model already called a tool, so the next
     // turn is a final answer. The `gate` script needs the COUNT (define → run →
@@ -218,7 +224,7 @@ fn handle(mut stream: TcpStream, script: &str, announce: bool) {
     };
     // `gate`: the model AUTHORS a workflow containing a `human` gate, runs it —
     // the run blocks while the gate awaits the A2A reply — and then answers.
-    let payload = if script == "gate" {
+    if script == "gate" {
         match tool_results {
             0 => tool_call(
                 "workflow.define",
@@ -234,23 +240,131 @@ fn handle(mut stream: TcpStream, script: &str, announce: bool) {
         }
     } else {
         response_json(script, saw_tool_result)
-    };
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        payload.len(),
-        payload
-    );
-    let _ = stream.write_all(resp.as_bytes());
-    let _ = stream.flush();
+    }
 }
 
-/// Read an HTTP/1.1 request: headers up to the blank line, then `Content-Length`
-/// body bytes. Returns the request body (the chat-completions JSON) and its
-/// W3C trace headers (`traceparent`, `tracestate`), by lowercase name.
-fn read_request_body(
+/// A Responses API request body read as the Chat Completions request it
+/// stands for: `instructions` is the system message and the `input` items
+/// are the messages — an assistant's `function_call` items its `tool_calls`,
+/// a `function_call_output` a `role: tool` message. Every other field is
+/// kept as sent, so a playbook's `when_contains` still sees the request's
+/// own text. What the script engine reads (the system message, the tool
+/// results and their count) is then the same on either wire shape.
+fn chat_view(body: &str) -> String {
+    use serde_json::{Value, json};
+    let Ok(Value::Object(mut req)) = serde_json::from_str::<Value>(body) else {
+        return body.to_string();
+    };
+    // A content: a string as is, a list of parts as the text of its parts.
+    let text = |c: &Value| -> Value {
+        match c {
+            Value::Array(parts) => Value::String(
+                parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<String>(),
+            ),
+            other => other.clone(),
+        }
+    };
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(i) = req.remove("instructions").filter(|i| !i.is_null()) {
+        messages.push(json!({"role": "system", "content": i}));
+    }
+    let items = match req.remove("input") {
+        Some(Value::Array(items)) => items,
+        Some(Value::String(s)) => vec![json!({"role": "user", "content": s})],
+        _ => Vec::new(),
+    };
+    for item in &items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                let call = json!({"id": item["call_id"], "type": "function",
+                    "function": {"name": item["name"], "arguments": item["arguments"]}});
+                // The calls of one answer ride on one assistant message.
+                match messages.last_mut() {
+                    Some(m) if m["role"] == "assistant" => {
+                        if let Some(calls) = m["tool_calls"].as_array_mut() {
+                            calls.push(call);
+                        } else {
+                            m["tool_calls"] = json!([call]);
+                        }
+                    }
+                    _ => messages
+                        .push(json!({"role": "assistant", "content": null, "tool_calls": [call]})),
+                }
+            }
+            Some("function_call_output") => messages.push(json!({"role": "tool",
+                "tool_call_id": item["call_id"], "content": text(&item["output"])})),
+            Some("reasoning") => {}
+            _ => {
+                if let Some(role) = item.get("role").and_then(Value::as_str) {
+                    let role = if role == "developer" { "system" } else { role };
+                    messages.push(json!({"role": role, "content": text(&item["content"])}));
+                }
+            }
+        }
+    }
+    req.insert("messages".into(), Value::Array(messages));
+    Value::Object(req).to_string()
+}
+
+/// A chat completion written as a Responses API answer: the text a
+/// `message` item of `output_text`, each tool call a `function_call` item
+/// under its `call_id`, and the usage `input_tokens`/`output_tokens` (a
+/// playbook's usage may be written in either shape).
+fn responses_answer(chat: &str) -> String {
+    use serde_json::{Value, json};
+    let v: Value = serde_json::from_str(chat).unwrap_or_default();
+    let msg = &v["choices"][0]["message"];
+    let mut output = Vec::new();
+    if let Some(t) = msg["content"].as_str() {
+        output.push(
+            json!({"type": "message", "id": "msg_mock", "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": t, "annotations": []}]}),
+        );
+    }
+    for (i, tc) in msg["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        output.push(
+            json!({"type": "function_call", "id": format!("fc_{}", i + 1),
+            "call_id": tc["id"], "name": tc["function"]["name"],
+            "arguments": tc["function"]["arguments"], "status": "completed"}),
+        );
+    }
+    let u = &v["usage"];
+    let count = |a: &str, b: &str| u[a].as_u64().or_else(|| u[b].as_u64()).unwrap_or(0);
+    let (input, out) = (
+        count("input_tokens", "prompt_tokens"),
+        count("output_tokens", "completion_tokens"),
+    );
+    json!({"id": "resp_mock", "object": "response", "status": "completed", "output": output,
+        "usage": {"input_tokens": input, "output_tokens": out, "total_tokens": input + out}})
+    .to_string()
+}
+
+/// Read an HTTP/1.1 request: the request line, headers up to the blank line,
+/// then `Content-Length` body bytes. Returns the request path, the body (the
+/// model request's JSON) and its W3C trace headers (`traceparent`,
+/// `tracestate`), by lowercase name.
+fn read_request(
     stream: &mut TcpStream,
-) -> Option<(String, serde_json::Map<String, serde_json::Value>)> {
+) -> Option<(String, String, serde_json::Map<String, serde_json::Value>)> {
     let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).ok()? == 0 {
+        return None;
+    }
+    let path = request_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or("/")
+        .to_string();
     let mut content_length = 0usize;
     let mut trace = serde_json::Map::new();
     loop {
@@ -277,7 +391,7 @@ fn read_request_body(
     }
     let mut body = vec![0u8; content_length];
     reader.read_exact(&mut body).ok()?;
-    Some((String::from_utf8_lossy(&body).into_owned(), trace))
+    Some((path, String::from_utf8_lossy(&body).into_owned(), trace))
 }
 
 /// The scripted assistant turn as an OpenAI chat-completion body.
@@ -639,5 +753,111 @@ mod tests {
         assert_eq!(turn1.tool_calls[0].arguments["uri"], "file:///watch.json");
         let turn2 = openai::parse_response(response_json("subscribe", true).as_bytes()).unwrap();
         assert!(!turn2.wants_tools());
+    }
+
+    /// A neutral request for a model the Responses API is for, as agentd
+    /// sends it there.
+    fn responses_body(messages: Vec<crate::wire::intel::Message>) -> String {
+        let req = crate::wire::intel::Request {
+            model: "gpt-6.1-sol".into(),
+            messages,
+            max_tokens: 64,
+            ..Default::default()
+        };
+        String::from_utf8(crate::intel::responses::build_request(&req, None).0).unwrap()
+    }
+
+    #[test]
+    fn the_scripts_answer_in_the_responses_shape_on_its_path() {
+        use crate::intel::responses;
+        use crate::wire::intel::Message;
+        let body = responses_body(vec![Message::system("SYS-MARK"), Message::user("hi")]);
+        let r =
+            responses::parse_response(respond("final", "/v1/responses", &body).as_bytes()).unwrap();
+        assert_eq!(r.text.as_deref(), Some("mock-llm done"));
+        assert!(r.tool_calls.is_empty());
+        assert_eq!((r.usage.input_tokens, r.usage.output_tokens), (11, 5));
+        // echo-system reads the Responses `instructions` as the system message.
+        let r =
+            responses::parse_response(respond("echo-system", "/v1/responses", &body).as_bytes())
+                .unwrap();
+        assert_eq!(r.text.as_deref(), Some("SYS-MARK"));
+        // The chat path still answers in the chat shape.
+        assert!(
+            responses::parse_response(respond("final", "/v1/chat/completions", &body).as_bytes())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_playbook_reads_responses_tool_outputs_as_tool_results() {
+        use crate::intel::responses;
+        use crate::wire::intel::{Message, ToolCall};
+        let play =
+            std::env::temp_dir().join(format!("agentd-mock-responses-{}.json", std::process::id()));
+        std::fs::write(
+            &play,
+            serde_json::json!({"turns": [
+                {"tool_calls": [{"name": "erp.read", "arguments": {"id": 7}}],
+                 "usage": {"prompt_tokens": 300, "completion_tokens": 30}},
+                {"echo_tool_result": true}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let script = format!("file:{}", play.display());
+        let ask = |body: &str| {
+            responses::parse_response(respond(&script, "/v1/responses", body).as_bytes()).unwrap()
+        };
+        let t0 = ask(&responses_body(vec![Message::user("go")]));
+        assert_eq!(t0.tool_calls[0].name, "erp.read");
+        assert_eq!(t0.tool_calls[0].id, "call_1");
+        assert_eq!(t0.tool_calls[0].arguments["id"], 7);
+        assert_eq!((t0.usage.input_tokens, t0.usage.output_tokens), (300, 30));
+        let call = ToolCall {
+            id: t0.tool_calls[0].id.clone(),
+            name: "erp.read".into(),
+            arguments: serde_json::json!({"id": 7}),
+        };
+        let body = responses_body(vec![
+            Message::user("go"),
+            Message::assistant(None, vec![call]),
+            Message::tool_result("call_1", "LEDGER-42", false),
+        ]);
+        let view: serde_json::Value = serde_json::from_str(&chat_view(&body)).unwrap();
+        assert_eq!(
+            view["messages"][1]["tool_calls"][0]["function"]["name"],
+            "erp.read"
+        );
+        assert_eq!(view["messages"][2]["role"], "tool");
+        assert_eq!(view["messages"][2]["tool_call_id"], "call_1");
+        assert_eq!(ask(&body).text.as_deref(), Some("LEDGER-42"));
+        let _ = std::fs::remove_file(&play);
+    }
+
+    /// A model the Responses API is for is routed there on the mock's host
+    /// too, and a tool turn closes over it: the call, its result, the answer.
+    #[test]
+    fn a_tool_turn_round_trips_over_the_responses_api() {
+        use crate::intel::client::IntelClient;
+        use crate::wire::intel::{Message, Request};
+        let client = IntelClient::from_parts("mock:read", None).unwrap();
+        let mut req = Request {
+            model: "gpt-6.1-sol".into(),
+            messages: vec![Message::system("be terse"), Message::user("read it")],
+            max_tokens: 64,
+            ..Default::default()
+        };
+        let t0 = client.complete(&req).unwrap();
+        assert!(t0.wants_tools(), "{t0:?}");
+        assert_eq!(t0.tool_calls[0].name, "resource.read");
+        assert_eq!(t0.tool_calls[0].arguments["uri"], "file:///in.json");
+        let id = t0.tool_calls[0].id.clone();
+        req.messages
+            .push(Message::assistant(None, t0.tool_calls.clone()));
+        req.messages.push(Message::tool_result(id, "{}", false));
+        let t1 = client.complete(&req).unwrap();
+        assert!(!t1.wants_tools());
+        assert_eq!(t1.text.as_deref(), Some("read complete"));
     }
 }

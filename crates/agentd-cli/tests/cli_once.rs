@@ -160,6 +160,50 @@ fn a_mock_model_needs_no_temporary_directory() {
     );
 }
 
+/// A model the Responses API is for (`gpt-6.1-sol`) is asked there on the
+/// mock's host as on OpenAI's, so the mock answers the Responses API: a
+/// rehearsal under the real model's name takes the live run's path. It
+/// failed with "response has no output" while the mock spoke chat alone.
+#[test]
+fn a_mock_turn_completes_under_a_responses_model() {
+    let run = |script: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args([
+                "--instruction",
+                "say hi RESPONSES-MARK",
+                "--intelligence",
+                script,
+                "--model",
+                "gpt-6.1-sol",
+                "--agent.preflight",
+                "never",
+                "--log-level",
+                "error",
+            ])
+            .output()
+            .expect("run agentd")
+    };
+    for (script, want) in [
+        ("mock:final", "mock-llm done"),
+        // echo-system answers with the system prompt it received, which
+        // carries the instruction: it reached the Responses `instructions`.
+        ("mock:echo-system", "RESPONSES-MARK"),
+    ] {
+        let out = run(script);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{script}; stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(want),
+            "{script}; stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+}
+
 /// A `--prompt` one-shot is a turn, not a `once` run, and its turn's outcome
 /// is the job's exit code: an unreachable model is exit 4 here too, where it
 /// used to end the job 0 with nothing on stdout.

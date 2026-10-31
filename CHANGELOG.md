@@ -2582,6 +2582,17 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   pins the binding (`mode: pin`) to the version it applied, as the
   instruction.md consumer SDK does. `instruction.binding.created` logs the
   `target` and `mode`; a binding response's `binding.id` is read too.
+- The built-in mock model (`mock:<script>`) answers the Responses API. A
+  model the default `openai` dialect asks there on any host (gpt-5.6 and
+  later, gpt-6.1-sol, the `-pro` and `codex` models) was asked there on the
+  mock's too, and the mock, which answered Chat Completions alone, failed
+  every turn with "response has no output", so a rehearsal had to rename
+  its model. The mock now serves `POST …/responses` beside its chat route
+  with the same scripts and playbooks: it reads `instructions`, input
+  messages and `function_call_output` items as the chat request they stand
+  for, and answers with `message`/`output_text` and `function_call` items
+  and `input_tokens`/`output_tokens` usage, so a rehearsal under the real
+  model's name takes the path the live run takes.
 - agentd no longer sends `temperature: 0` to every model. gpt-5.5 refused
   every call with a 400 ("Only the default (1) value is supported") even
   with no temperature configured, because each turn, step, judge and goal

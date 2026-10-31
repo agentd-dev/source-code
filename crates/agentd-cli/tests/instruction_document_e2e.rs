@@ -247,19 +247,32 @@ fn a_workflow_without_a_dialect_is_refused_naming_the_attribute() {
     assert!(err.contains("needs dialect"), "{err}");
 }
 
-/// The 1.1 sigil is not instruction/1 syntax: such a document is prose, and
-/// nothing in it configures the agent.
+/// The 1.1 sigil is not instruction/1 syntax: such a document is refused,
+/// naming the line with the SDK's legacy-syntax code, never delivered as
+/// prose its author did not mean.
 #[test]
-fn a_sigiled_block_is_prose() {
-    let (valid, err, caps) = load(
+fn a_sigiled_block_is_refused_as_legacy_syntax() {
+    let (valid, err, _) = load(
         ":::!workflow{name=w}\nsteps: {s: {kind: once}, f: {kind: finish, depends_on: [s]}}\n:::\n",
         &[],
     );
-    assert!(valid, "{err}");
+    assert!(!valid, "a 1.1 document loaded");
     assert!(
-        caps["workflows"].as_array().is_none_or(|w| w.is_empty()),
-        "{caps}"
+        err.contains("line 1: ") && err.contains("(instruction.md/legacy-syntax)"),
+        "{err}"
     );
+}
+
+/// An `instruction/workflow` body the language refuses is the SDK's
+/// `invalid-workflow`, refusing the document before agentd's own check.
+#[test]
+fn a_workflow_the_language_refuses_is_the_sdks_diagnostic() {
+    let (valid, err, _) = load(
+        ":::workflow{id=w dialect=instruction/workflow}\nsteps:\n  s: {kind: manual}\n  pause: {kind: wait, depends_on: [s], timeout: 1m}\n  f: {kind: finish, depends_on: [pause]}\n:::\n",
+        &[],
+    );
+    assert!(!valid, "a wait with no `on` loaded");
+    assert!(err.contains("(invalid-workflow)"), "{err}");
 }
 
 /// A document with no block at all: rules, a reason, a comment and

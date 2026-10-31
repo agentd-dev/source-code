@@ -24,7 +24,14 @@ Blocks are directives: a container `:::kind{attrs}` … `:::`, a leaf
 their families; an unknown kind, an unclosed block, an invalid attribute and
 a duplicate `id` are errors and refuse the whole document.
 
-The older `:::!kind` form is not `instruction/1` syntax: such a line is prose.
+The older `:::!kind` form is not `instruction/1` syntax: a document with such
+a line is refused, naming it (`instruction.md/legacy-syntax`).
+
+An `instruction/workflow` body is checked by the SDK against the language's
+node registry (`invalid-workflow`, `limit-exceeded`,
+`extension-unavailable`). What a valid workflow asks of this host — a start on
+an event agentd raises, a server it declares — is agentd's own check, at
+load.
 
 ## Blocks agentd maps
 

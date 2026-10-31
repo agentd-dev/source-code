@@ -59,36 +59,10 @@ pub struct Claims {
     pub author: Option<String>,
 }
 
-/// An SDK verification's reason with agentd's stable code. The SDK says why
-/// in words only; the codes are what a refusal is matched by.
-fn refusal(reason: &str) -> Refusal {
-    let code = if reason.contains("digest does not") {
-        "digest-mismatch"
-    } else if reason.contains("is not pinned") {
-        "unpinned-publisher"
-    } else if reason.contains("is not this reader") {
-        "audience-mismatch"
-    } else if reason.contains("exceed the author attestation") {
-        "delivery-ceiling-exceeded"
-    } else if reason.contains("expected typ") || reason.contains("header typ") {
-        "signature-typ-mismatch"
-    } else {
-        "attestation"
-    };
-    Refusal::new(code, reason)
-}
-
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-}
-
-/// The claims of a JWS whose signature was ALREADY verified — the embedded
-/// author of a verified delivery, say. Never a verification of its own.
-pub fn claims_of(jws: &str) -> Option<Claims> {
-    let payload = jws.split('.').nth(1)?;
-    serde_json::from_slice(&b64::url_decode(payload).ok()?).ok()
 }
 
 /// Verify an author signature over the authored bytes with a raw Ed25519
@@ -115,12 +89,23 @@ pub fn verify_author(
     typed(r)
 }
 
+/// A verification refused carries the SDK's code (`instruction_md::VERIFY_CODES`)
+/// and its reason.
+fn refused(r: &instruction_md::VerifyResult) -> Refusal {
+    Refusal::new(r.code, r.reason.clone())
+}
+
+/// Verified claims, typed.
+fn claims(c: Option<serde_json::Map<String, Value>>) -> Result<Claims, Refusal> {
+    serde_json::from_value(Value::Object(c.unwrap_or_default()))
+        .map_err(|e| Refusal::new("malformed", format!("the claims do not read: {e}")))
+}
+
 fn typed(r: instruction_md::VerifyResult) -> Result<Claims, Refusal> {
     if !r.ok {
-        return Err(refusal(&r.reason));
+        return Err(refused(&r));
     }
-    serde_json::from_value(Value::Object(r.claims.unwrap_or_default()))
-        .map_err(|e| Refusal::new("attestation", format!("the claims do not read: {e}")))
+    claims(r.claims)
 }
 
 /// A verified delivery.
@@ -162,12 +147,13 @@ pub fn verify_delivery(
             now: Some(now as i64),
         },
     );
-    let delivery = typed(r)?;
-    let author = delivery
-        .author
-        .as_deref()
-        .and_then(claims_of)
-        .ok_or_else(|| Refusal::new("attestation", "the embedded author claims do not read"))?;
+    if !r.ok {
+        return Err(refused(&r));
+    }
+    // The SDK verified the embedded author attestation with the delivery and
+    // hands back its claims.
+    let author = claims(r.author)?;
+    let delivery = claims(r.claims)?;
     let effective = granted
         .iter()
         .filter(|g| max.is_empty() || max.contains(g))
@@ -182,31 +168,21 @@ pub fn verify_delivery(
 }
 
 /// The manifest a delivery of `text` names: its `instruction-resolved/1`
-/// resolution's format, status, document, dependencies and digest (never its
-/// body), as the SDK resolves it with nothing to compose.
+/// resolution (`Resolved::manifest`: format, status, document, dependencies
+/// and digest, never its body), as the SDK resolves it with nothing to
+/// compose.
 pub fn manifest_of(text: &str, uri: &str, version: &str) -> Value {
-    let r = instruction_md::resolve(
+    instruction_md::resolve(
         text,
         &instruction_md::ResolveOptions {
             uri: uri.to_string(),
             version: version.to_string(),
             ..instruction_md::ResolveOptions::default()
         },
-    );
-    let full = r.resolved.to_json();
-    let mut m = serde_json::Map::new();
-    for k in [
-        "format",
-        "status",
-        "document",
-        "dependencies",
-        "resolved_digest",
-    ] {
-        if let Some(v) = full.get(k) {
-            m.insert(k.into(), v.clone());
-        }
-    }
-    Value::Object(m)
+    )
+    .resolved
+    .manifest()
+    .to_json()
 }
 
 /// The author signature that travels beside a document file: the JWS in
@@ -295,7 +271,7 @@ pub fn verify_authored(
         for k in p.author_keys.iter().filter(|k| !is_jwks_uri(k)) {
             let key = load_key_file(k).map_err(|e| {
                 Refusal::new(
-                    "attestation",
+                    "unknown-key",
                     format!(
                         "the author key pinned for publisher {:?} cannot be used — {e}",
                         p.publisher
@@ -310,7 +286,7 @@ pub fn verify_authored(
     }
     let jws = signature.ok_or_else(|| {
         Refusal::new(
-            "attestation",
+            "author-missing",
             format!(
                 "the instruction carries no author signature beside it (a file's `<path>.jws`, \
                  an OCI layer's `md.instruction/signature` annotation), but {} pinned \
@@ -323,7 +299,7 @@ pub fn verify_authored(
     // The refusal of the last pin tried: every pin is a chance to verify, so
     // only when none does is the document refused, and with the last reason.
     let mut last = Refusal::new(
-        "attestation",
+        "bad-signature",
         "no pinned key verifies this document's signature",
     );
     for (pin, key) in &keys {
@@ -506,7 +482,7 @@ mod authored_tests {
         let (key_file, _) = key_and_sig(dir.path(), DOC, &[]);
         let e = verify_authored(DOC.as_bytes(), None, &[pin(&key_file, &[])], 100).unwrap_err();
         assert!(e.message.contains("no author signature beside it"), "{e}");
-        assert_eq!(e.code, "attestation");
+        assert_eq!(e.code, "author-missing");
     }
 
     /// Tampering after signing is caught: the signature covers the bytes.
@@ -641,7 +617,7 @@ mod tests {
         let k = key();
         let jws = sign(&k, &claims("delivery", &digest(DOC), &[])).unwrap();
         let e = verify_author(&jws, k.public_bytes(), DOC, "", "", NOW).unwrap_err();
-        assert_eq!(e.code, "signature-typ-mismatch", "{e}");
+        assert_eq!(e.code, "typ-mismatch", "{e}");
     }
 
     #[test]
@@ -693,7 +669,7 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert_eq!(e.code, "delivery-ceiling-exceeded", "{e}");
+        assert_eq!(e.code, "capabilities-exceeded", "{e}");
     }
 
     #[test]

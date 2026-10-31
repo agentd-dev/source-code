@@ -29,7 +29,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use instruction_md::{Diagnostic, Node, ReadOptions, Reading, Severity};
+use instruction_md::{
+    ConfigurationBlock, ConnectedObject, Diagnostic, ReadOptions, Reading, Severity,
+};
 use serde_json::{Map, Value};
 
 pub use instruction_md::Document;
@@ -120,8 +122,8 @@ fn said(d: &Diagnostic) -> String {
 #[derive(Debug, Clone)]
 pub struct Parsed {
     pub reading: Reading,
-    /// The SDK's diagnostics — the reader's and the inline checks' — none of
-    /// them an error.
+    /// The SDK's diagnostics — the reader's, the inline checks', the
+    /// workflow bodies' and the 1.1 lines' — none of them an error.
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -132,11 +134,17 @@ impl Parsed {
     }
 }
 
-/// Read a document with the SDK. An error among its diagnostics refuses the
-/// whole document; warnings are kept on the result.
+/// Read a document with the SDK: the reader's diagnostics, the inline
+/// checks', each `instruction/workflow` body's (`check_reading`), and the
+/// lines written in the 1.1 syntax (`legacy_diagnostics`, an error: a 1.1
+/// `:::!kind` block is prose to this reader, and delivering it would deliver
+/// what its author did not mean). An error refuses the whole document;
+/// warnings are kept on the result.
 pub fn parse(text: &str) -> Result<Parsed, Vec<Refusal>> {
     let reading = instruction_md::read(text, &ReadOptions::default());
-    let diagnostics = instruction_md::check_reading(&reading);
+    let mut diagnostics = instruction_md::check_reading(&reading);
+    diagnostics.extend(instruction_md::legacy_diagnostics(text));
+    diagnostics.sort_by_key(|d| d.line().unwrap_or(0));
     let errors: Vec<Refusal> = diagnostics
         .iter()
         .filter(|d| d.severity == Severity::Error)
@@ -153,12 +161,13 @@ pub fn parse(text: &str) -> Result<Parsed, Vec<Refusal>> {
 }
 
 /// Whether delivery would change anything of `text` — any block, keyword
-/// line, comment, metadata, reference or parameter. Plain prose is used as it
-/// is, byte for byte; the SDK's text ends in one newline, which alone is not
-/// a change.
+/// line, comment, metadata, reference or parameter — or has anything to say
+/// about it. Plain prose is used as it is, byte for byte.
 pub fn needs_delivery(text: &str) -> bool {
-    let (agent, diagnostics) = instruction_md::deliver(text, None);
-    !diagnostics.is_empty() || agent.trim_end_matches('\n') != text.trim_end_matches('\n')
+    let reading = instruction_md::read(text, &ReadOptions::default());
+    reading.changes_text()
+        || !instruction_md::check_reading(&reading).is_empty()
+        || !instruction_md::legacy_diagnostics(text).is_empty()
 }
 
 /// A document split at its backmatter (§3.2).
@@ -173,36 +182,23 @@ pub struct SplitEndMatter<'a> {
     pub opener_line: Option<usize>,
 }
 
-/// Split a whole document at its backmatter, as the SDK recognises it: for a
-/// reader that needs the text without its record (a folder of documents, a
-/// prompt). Backmatter that is not a YAML mapping is refused.
+/// Split a whole document at its backmatter, as the SDK recognises it
+/// (`split_backmatter`): for a reader that needs the text without its record
+/// (a folder of documents, a prompt). Backmatter that is not a YAML mapping
+/// is refused.
 pub fn split_end_matter(text: &str) -> Result<SplitEndMatter<'_>, Refusal> {
-    let r = instruction_md::read(text, &ReadOptions::default());
-    let Some(range) = r.back_range else {
-        return Ok(SplitEndMatter {
-            before: text,
-            end_matter: None,
-            opener_line: None,
-        });
-    };
-    if let Some(d) = r.diagnostics.iter().find(|d| {
-        d.severity == Severity::Error
-            && d.code == "invalid-metadata"
-            && d.line().is_some_and(|l| l >= range.start)
-    }) {
+    let split = instruction_md::split_backmatter(text);
+    if let Some(d) = split
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+    {
         return Err(Refusal::of(d));
     }
-    // The range starts at the `---` separator.
-    let opener = range.start.max(1) as usize;
-    let cut = text
-        .split_inclusive('\n')
-        .take(opener - 1)
-        .map(str::len)
-        .sum::<usize>();
     Ok(SplitEndMatter {
-        before: &text[..cut],
-        end_matter: Some(r.document.metadata.back.clone()),
-        opener_line: Some(opener),
+        before: split.before,
+        opener_line: split.range.map(|r| r.start as usize),
+        end_matter: split.backmatter.map(|_| split.data.clone()),
     })
 }
 
@@ -293,11 +289,13 @@ pub fn extract_from_wire(
     )
 }
 
-/// Map a read document onto agentd's configuration. A block that cannot be
+/// Map a read document onto agentd's configuration: the SDK's connected
+/// objects and configuration blocks that stand at the top level or inside
+/// layout blocks only (`Location::in_layout`) — never inside an example, a
+/// policy or any other block whose body is guidance. A block that cannot be
 /// mapped refuses the whole document — no partial load; a connected object
 /// agentd will not activate is a warning and stays text.
 pub fn fold(parsed: &Parsed, admission: Admission<'_>) -> Result<Extraction, Vec<Refusal>> {
-    let lines: Vec<&str> = parsed.reading.lines.iter().map(String::as_str).collect();
     let mut f = Folder {
         out: Extraction {
             cleaned: parsed.text(),
@@ -306,10 +304,17 @@ pub fn fold(parsed: &Parsed, admission: Admission<'_>) -> Result<Extraction, Vec
         },
         errs: Vec::new(),
         admission,
-        lines: &lines,
     };
-    for n in &parsed.reading.document.body {
-        f.node(n);
+    let body = &parsed.reading.document.body;
+    for o in instruction_md::connected_objects(body) {
+        if o.location.in_layout() {
+            f.object(&o);
+        }
+    }
+    for b in instruction_md::configuration_blocks(body) {
+        if b.location.in_layout() {
+            f.block(&b);
+        }
     }
     if f.errs.is_empty() {
         Ok(f.out)
@@ -322,100 +327,55 @@ struct Folder<'a> {
     out: Extraction,
     errs: Vec<Refusal>,
     admission: Admission<'a>,
-    lines: &'a [&'a str],
-}
-
-fn line_of(n: &Node) -> usize {
-    n.range.map_or(0, |r| r.start as usize)
-}
-
-/// A string attribute, trimmed, when it is not empty.
-fn attr<'n>(n: &'n Node, key: &str) -> Option<&'n str> {
-    n.attr_str(key).map(str::trim).filter(|s| !s.is_empty())
-}
-
-/// A list attribute (the reader splits `tools="a,b"` into a list).
-fn list(n: &Node, key: &str) -> Vec<Value> {
-    match n.attrs.get(key) {
-        Some(Value::Array(a)) => a.clone(),
-        Some(Value::String(s)) => s
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| Value::String(s.to_string()))
-            .collect(),
-        _ => Vec::new(),
-    }
 }
 
 impl Folder<'_> {
-    fn host_policy(&mut self, n: &Node, message: String) {
-        let id = attr(n, "id").map_or_else(String::new, |i| format!(" {i:?}"));
+    fn host_policy(&mut self, kind: &str, id: Option<&str>, line: usize, message: String) {
+        let id = id.map_or_else(String::new, |i| format!(" {i:?}"));
         self.out.warnings.push(format!(
-            "line {}: {}{id} is not activated: {message} ({HOST_POLICY})",
-            line_of(n),
-            n.kind
+            "line {line}: {kind}{id} is not activated: {message} ({HOST_POLICY})"
         ));
     }
 
-    fn declare(&mut self, n: &Node) {
-        let mut rec = n.attrs.clone();
-        rec.insert("line".into(), Value::from(line_of(n)));
+    fn declare(&mut self, kind: &str, attrs: &Map<String, Value>, line: usize) {
+        let mut rec = attrs.clone();
+        rec.insert("line".into(), Value::from(line));
         self.out
             .declarations
-            .entry(n.kind.clone())
+            .entry(kind.to_string())
             .or_default()
             .push(Value::Object(rec));
     }
 
-    /// A container's body as written, between its fences.
-    fn body(&self, n: &Node) -> String {
-        let Some(r) = n.range else {
-            return String::new();
-        };
-        let (from, to) = (r.start as usize, r.end as usize);
-        if to <= from + 1 {
-            return String::new();
-        }
-        self.lines
-            .get(from..to - 1)
-            .map(|ls| ls.join("\n"))
-            .unwrap_or_default()
-            .trim()
-            .to_string()
+    /// Record an object agentd does not activate, and say why.
+    fn hold(&mut self, o: &ConnectedObject<'_>, why: String) {
+        let line = o.location.line().unwrap_or(0) as usize;
+        self.declare(o.kind, o.attrs, line);
+        self.host_policy(o.kind, o.id, line, why);
     }
 
-    fn node(&mut self, n: &Node) {
-        if !n.is_directive() {
-            return;
-        }
-        match n.kind.as_str() {
-            "mcp" => self.mcp(n),
-            "agent" => self.agent(n),
-            "workflow" => self.workflow(n),
-            "config" => self.config(n),
-            "skill" => self.skill(n),
+    fn object(&mut self, o: &ConnectedObject<'_>) {
+        match o.kind {
+            "mcp" => self.mcp(o),
+            "agent" => self.agent(o),
+            "skill" => self.skill(o),
             "person" | "role" => {
-                if let Some(id) = attr(n, "id") {
+                if let Some(id) = o.id {
                     self.out.people.insert(id.to_string());
                 }
             }
-            "tool" | "service" | "source" => self.declare(n),
-            kind if instruction_md::registry::kind(kind).is_some_and(|k| k.family == "layout") => {
-                for c in n.children() {
-                    self.node(c);
-                }
+            "tool" | "service" | "source" => {
+                self.declare(o.kind, o.attrs, o.location.line().unwrap_or(0) as usize);
             }
             _ => {}
         }
     }
 
-    fn mcp(&mut self, n: &Node) {
-        let Some(id) = attr(n, "id") else { return };
-        let Some(src) = attr(n, "src") else {
-            self.declare(n);
-            return self.host_policy(
-                n,
+    fn mcp(&mut self, o: &ConnectedObject<'_>) {
+        let Some(id) = o.id else { return };
+        let Some(src) = o.src else {
+            return self.hold(
+                o,
                 "agentd dials an MCP server by its URL (`src`); a registry entry or server \
                  reference is not resolved"
                     .into(),
@@ -424,54 +384,49 @@ impl Folder<'_> {
         let mut server = Map::new();
         server.insert("name".into(), id.into());
         server.insert("endpoint".into(), src.into());
-        let mut allow = list(n, "tools");
-        for a in list(n, "allow") {
+        let mut allow = o.list("tools");
+        for a in o.list("allow") {
             if !allow.contains(&a) {
                 allow.push(a);
             }
         }
         if !allow.is_empty() {
-            server.insert("allow".into(), Value::Array(allow));
+            server.insert("allow".into(), allow.into());
         }
-        let deny = list(n, "deny");
+        let deny = o.list("deny");
         if !deny.is_empty() {
-            server.insert("exclude".into(), Value::Array(deny));
+            server.insert("exclude".into(), deny.into());
         }
         push(&mut self.out.config, "mcp", "servers").push(Value::Object(server));
     }
 
-    fn agent(&mut self, n: &Node) {
-        let Some(id) = attr(n, "id") else { return };
-        if attr(n, "protocol") != Some("a2a") {
-            self.declare(n);
-            return self.host_policy(n, "agentd reaches agents over A2A (`protocol=a2a`)".into());
+    fn agent(&mut self, o: &ConnectedObject<'_>) {
+        let Some(id) = o.id else { return };
+        if o.attr("protocol") != Some("a2a") {
+            return self.hold(o, "agentd reaches agents over A2A (`protocol=a2a`)".into());
         }
         if let Err(why) = self.admission.admits(IDENTITY) {
-            self.declare(n);
-            return self.host_policy(n, why);
+            return self.hold(o, why);
         }
-        if let Some(b) = attr(n, "binding").filter(|b| *b != "JSONRPC") {
-            self.declare(n);
-            return self.host_policy(n, format!("agentd speaks A2A's JSONRPC binding, not {b}"));
+        if let Some(b) = o.attr("binding").filter(|b| *b != "JSONRPC") {
+            return self.hold(o, format!("agentd speaks A2A's JSONRPC binding, not {b}"));
         }
-        if attr(n, "tenant").is_some() {
-            self.declare(n);
-            return self.host_policy(
-                n,
+        if o.attr("tenant").is_some() {
+            return self.hold(
+                o,
                 "agentd takes an agent's tenant from its Agent Card, not from the document".into(),
             );
         }
         // agentd dials the configured URL and reads the card on its origin
         // (`/.well-known/agent-card.json`), so an endpoint is used as it is,
         // and a card at the well-known path names its origin.
-        let endpoint = match (attr(n, "endpoint"), attr(n, "src")) {
+        let endpoint = match (o.endpoint, o.src) {
             (Some(e), _) => e.to_string(),
             (None, Some(card)) => match card.strip_suffix("/.well-known/agent-card.json") {
                 Some(origin) if origin.contains("://") => origin.to_string(),
                 _ => {
-                    self.declare(n);
-                    return self.host_policy(
-                        n,
+                    return self.hold(
+                        o,
                         "agentd finds an agent by its endpoint, or by an Agent Card at \
                          /.well-known/agent-card.json on its origin; this `src` is neither"
                             .into(),
@@ -487,49 +442,67 @@ impl Folder<'_> {
         push(&mut self.out.config, "a2a", "peers").push(Value::Object(peer));
     }
 
-    /// A structured body that parsed to a mapping, or a refusal.
-    fn mapping(&mut self, n: &Node) -> Option<Map<String, Value>> {
-        match n.value.as_ref().and_then(|v| v.data.as_ref()) {
-            Some(Value::Object(m)) => Some(m.clone()),
-            _ => {
-                self.errs.push(Refusal::at(
-                    line_of(n),
-                    "invalid-structured-body",
-                    format!("the {} body must be a mapping", n.kind),
-                ));
-                None
-            }
-        }
-    }
-
-    fn workflow(&mut self, n: &Node) {
-        let dialect = attr(n, "dialect").unwrap_or_default();
-        if !WORKFLOW_DIALECTS.contains(&dialect) {
-            self.declare(n);
-            return self.host_policy(
-                n,
-                format!(
-                    "agentd runs the {} dialects, not {dialect:?}",
-                    WORKFLOW_DIALECTS.join(" and ")
-                ),
+    fn skill(&mut self, o: &ConnectedObject<'_>) {
+        let Some(id) = o.id else { return };
+        if o.src.is_some() {
+            return self.hold(
+                o,
+                "agentd loads packaged skills from its configuration (`skills:`), not from a \
+                 document's `src`"
+                    .into(),
             );
         }
-        let Some(mut m) = self.mapping(n) else { return };
-        if !m.contains_key("name")
-            && let Some(id) = attr(n, "id")
-        {
-            m.insert("name".into(), id.into());
+        let body = o.body.map(str::trim).unwrap_or_default();
+        if body.is_empty() {
+            return self.declare(o.kind, o.attrs, o.location.line().unwrap_or(0) as usize);
         }
-        self.out.workflows.push(Value::Object(m));
+        self.out.skills.push(InlineSkill {
+            name: id.to_string(),
+            description: o.description.or(o.title).unwrap_or_default().to_string(),
+            when_to_use: o.attr("trigger").map(str::to_string),
+            body: body.to_string(),
+        });
     }
 
-    fn config(&mut self, n: &Node) {
-        let dialect = attr(n, "dialect").unwrap_or_default();
-        if dialect != CONFIG_DIALECT {
-            self.declare(n);
-            return self.host_policy(n, format!("agentd reads {CONFIG_DIALECT}, not {dialect:?}"));
+    /// A workflow or a configuration block. Its body's shape is the reader's
+    /// to judge (a structured body that does not parse, or is no mapping,
+    /// is its error), and an `instruction/workflow` body's is the SDK's
+    /// (`invalid-workflow`, `limit-exceeded`, `extension-unavailable`);
+    /// what the body asks of this host — a start on an event agentd raises,
+    /// a server it declares — is the engine's, at load.
+    fn block(&mut self, b: &ConfigurationBlock<'_>) {
+        let line = b.location.line().unwrap_or(0) as usize;
+        let dialect = b.dialect.unwrap_or_default();
+        let (wanted, what) = match b.kind {
+            "workflow" => (WORKFLOW_DIALECTS.contains(&dialect), "workflow"),
+            "config" => (dialect == CONFIG_DIALECT, "config"),
+            _ => return,
+        };
+        if !wanted {
+            self.declare(b.kind, b.attrs, line);
+            let runs = if what == "workflow" {
+                format!(
+                    "agentd runs the {} dialects",
+                    WORKFLOW_DIALECTS.join(" and ")
+                )
+            } else {
+                format!("agentd reads {CONFIG_DIALECT}")
+            };
+            return self.host_policy(b.kind, b.id, line, format!("{runs}, not {dialect:?}"));
         }
-        let Some(m) = self.mapping(n) else { return };
+        let Some(Value::Object(m)) = b.data else {
+            return;
+        };
+        let mut m = m.clone();
+        if what == "workflow" {
+            if !m.contains_key("name")
+                && let Some(id) = b.id
+            {
+                m.insert("name".into(), id.into());
+            }
+            self.out.workflows.push(Value::Object(m));
+            return;
+        }
         // The document cannot grant itself trust: its grants and its own
         // source are the operator's.
         for key in [
@@ -539,7 +512,7 @@ impl Folder<'_> {
         ] {
             if m.contains_key(key) {
                 self.errs.push(Refusal::at(
-                    line_of(n),
+                    line,
                     "self-grant",
                     format!(
                         "a config block may not write `{key}` — it is operator configuration, \
@@ -549,32 +522,6 @@ impl Folder<'_> {
             }
         }
         merge_missing(&mut self.out.config, m);
-    }
-
-    fn skill(&mut self, n: &Node) {
-        let Some(id) = attr(n, "id") else { return };
-        if attr(n, "src").is_some() {
-            self.declare(n);
-            return self.host_policy(
-                n,
-                "agentd loads packaged skills from its configuration (`skills:`), not from a \
-                 document's `src`"
-                    .into(),
-            );
-        }
-        let body = self.body(n);
-        if body.is_empty() {
-            return self.declare(n);
-        }
-        self.out.skills.push(InlineSkill {
-            name: id.to_string(),
-            description: attr(n, "description")
-                .or_else(|| attr(n, "title"))
-                .unwrap_or_default()
-                .to_string(),
-            when_to_use: attr(n, "trigger").map(str::to_string),
-            body,
-        });
     }
 }
 
@@ -708,6 +655,21 @@ mod tests {
         let e = extract(":::mcp{id=x}\nunclosed\n", &all_families()).unwrap_err();
         assert!(e.iter().any(|r| r.code == "unclosed-directive"), "{e:?}");
         assert!(e[0].to_string().starts_with("line 1: "), "{e:?}");
+    }
+
+    /// A 1.1 `:::!kind` line refuses the document with the SDK's code.
+    #[test]
+    fn a_legacy_line_refuses_the_document() {
+        let e = extract(
+            ":::!mcp{name=x}\nendpoint: https://x.example/mcp\n:::\n",
+            &all_families(),
+        )
+        .unwrap_err();
+        assert!(
+            e.iter()
+                .any(|r| r.code == instruction_md::LEGACY_SYNTAX && r.line == Some(1)),
+            "{e:?}"
+        );
     }
 
     #[test]

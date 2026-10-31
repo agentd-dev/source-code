@@ -14,7 +14,9 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   official instruction.md Rust SDK, `instruction-md`: its read, its checks,
   its agent text (`instruction-text/1`), its digests and its JWS
   verification. agentd delivers the SDK's agent text byte for byte. A 1.1
-  document does not load as one: a `:::!kind` line is prose. agentd maps
+  document is refused, each `:::!kind` line named with the SDK's
+  `instruction.md/legacy-syntax` code, and an `instruction/workflow` body is
+  checked by the SDK (`invalid-workflow`, …). agentd maps
   `:::mcp{id src tools allow deny}` to `mcp.servers` (`id` → `name`, `src` →
   `endpoint`, `tools`/`allow` → `allow`, `deny` → `exclude`),
   `::agent{protocol=a2a endpoint|src}` to `a2a.peers` under the `identity`

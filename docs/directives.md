@@ -78,8 +78,8 @@ a host-policy diagnostic (§17), never dropped in silence.
 An error the SDK reports — an unknown kind, an unclosed block, an invalid
 attribute, a duplicate id — refuses the whole document, naming the line. A
 document with nothing the agent text would change reaches the model byte for
-byte. The older `:::!kind` form is not part of the format: such a line is
-prose.
+byte. The older `:::!kind` form is not part of the format: a document with such a
+line is refused, naming it, rather than delivered as prose.
 
 ```mermaid
 flowchart LR

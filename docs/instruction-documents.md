@@ -139,6 +139,7 @@ diagnostic's code. A warning is said and the document loads. The common ones:
 | `:::mcp{src=…}` with no id | `:::mcp needs id=…` | Give it an `id`; it becomes the server's name. |
 | `:::worfklow{…}` | `:::worfklow is not a kind of this specification` (`unknown-kind`) | Fix the kind name. |
 | A block with no closing `:::` | `:::skill is not closed` (`unclosed-directive`) | Close it. |
+| A workflow body the language refuses, such as a `wait` with no `on` | the SDK's `invalid-workflow`, naming the step | Fix the step; see [the node registry](node-registry.md). |
 | Two blocks with the same `id` | `the id "digest" is used twice` (`duplicate-id`) | Rename one. |
 | `:::config` setting `intelligence.endpoints` | `the instruction's :::config writes intelligence.endpoints — operator configuration is not a document's to set` | Move the key to the operator's config. |
 | `:::config` setting `document_capabilities` | `a config block may not write document_capabilities` (`self-grant`) | Grants are the operator's. |
@@ -146,7 +147,9 @@ diagnostic's code. A warning is said and the document loads. The common ones:
 | `:::mcp{id=fs …}` when the operator has a server `fs` | `mcp.servers[]: duplicate server name 'fs'` | Rename it. A document adds servers; it never re-points one. |
 
 A block written in the older `:::!kind` form is not `instruction/1` syntax.
-It is read as prose: it configures nothing and reaches the model as written.
+The document is refused, naming each such line with the SDK's
+`instruction.md/legacy-syntax` code, rather than delivered as prose its author
+did not mean.
 
 ## Check what the model receives
 
@@ -666,7 +669,7 @@ on an update the running text stays.
 | Trap | What happens | Do this instead |
 |---|---|---|
 | `instruction: https://docs.example.com/agent.md` | The value names an MCP resource; with no server serving it, startup exits `6`. | `instruction: {url: "https://…"}` or `--instruction.url`. |
-| A block in the older `:::!kind` form | It is prose: it configures nothing, and the model reads it as written. | Write the `instruction/1` block. |
+| A block in the older `:::!kind` form | The document is refused (`instruction.md/legacy-syntax`), naming the line. | Write the `instruction/1` block. |
 | Two `:::config` blocks set `limits` | The earlier block's `limits` wins; the later one's keys fill only what it left unsaid. | Keep each top-level section in one block. |
 | The document and the operator both name the turn model | The operator's wins; the document's is dropped. | Name models in the document and leave `--model` unset, or the reverse. |
 | A document changes `store.kind` or `lifecycle.run_until` | The change needs a restart, as in a config file. | Restart after the edit. |

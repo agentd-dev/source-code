@@ -58,7 +58,7 @@ allow = [
 # agentd's own licence is not a dependency policy: AGPL-3.0-only applies to
 # agentd itself, so it is excepted for these workspace crates BY NAME rather
 # than allowed — an allow-list entry would let an AGPL dependency in unseen.
-# agentd-instruction is MIT OR Apache-2.0 and needs no exception.
+# instruction-md (the instruction.md SDK) is MIT OR Apache-2.0 and needs no exception.
 exceptions = [
     { allow = ["AGPL-3.0-only"], crate = "agentd-core" },
     { allow = ["AGPL-3.0-only"], crate = "agentd-cli" },

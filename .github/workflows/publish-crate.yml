@@ -1,10 +1,10 @@
 name: publish-crate
 
 # Publish one library crate to crates.io by hand, on its own schedule — for a
-# crate other projects consume between agentd releases (agentd-instruction,
-# which the instruction.md platform builds on), without cutting an agentd tag.
+# crate other projects consume between agentd releases, without cutting an
+# agentd tag.
 #
-#   gh workflow run publish-crate.yml -f crate=agentd-instruction
+#   gh workflow run publish-crate.yml -f crate=agentd-mcp
 #
 # The release workflow still publishes every crate a tag moves; agentd-core and
 # agentd-cli are not offered here, because their version IS the tag's. A
@@ -17,7 +17,7 @@ on:
         description: "The crate to publish"
         required: true
         type: choice
-        options: [agentd-instruction, agentd-net, agentd-mcp]
+        options: [agentd-net, agentd-mcp]
 
 permissions:
   contents: read

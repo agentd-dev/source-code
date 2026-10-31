@@ -41,11 +41,6 @@ ROWS=(
   "--all-features"
 )
 
-# agentd-instruction's own rows (ci.yml's gate job): the crate is published on
-# its own and most consumers build it without `sign`, which the union and the
-# rows above never lint.
-INSTRUCTION_ROWS=("" "--features sign")
-
 fail=0
 # A check this machine could not run. It does not fail the gate — CI runs it —
 # but the verdict names it, so "GATE CLEAN" never claims a check that did not
@@ -59,7 +54,7 @@ cargo fmt --all --check || fail=1
 step "clippy (workspace, all features)"
 cargo clippy --workspace --all-targets --all-features -- -D warnings || fail=1
 
-step "clippy matrix (${#ROWS[@]} rows x 2 crates, ${#INSTRUCTION_ROWS[@]} agentd-instruction rows)"
+step "clippy matrix (${#ROWS[@]} rows x 2 crates)"
 for F in "${ROWS[@]}"; do
   for P in agentd-core agentd-cli; do
     if ! cargo clippy -p "$P" --all-targets $F -- -D warnings >/tmp/ci-gate.log 2>&1; then
@@ -69,25 +64,8 @@ for F in "${ROWS[@]}"; do
     fi
   done
 done
-for F in "${INSTRUCTION_ROWS[@]}"; do
-  if ! cargo clippy -p agentd-instruction --all-targets $F -- -D warnings >/tmp/ci-gate.log 2>&1; then
-    echo "  FAIL  agentd-instruction  ${F:-<default>}"
-    grep -m3 -E '^error' /tmp/ci-gate.log | sed 's/^/        /'
-    fail=1
-  fi
-done
 [ $fail -eq 0 ] && echo "  all rows clean"
 
-# ci.yml's gate job: agentd-instruction's docs are its docs.rs page, and
-# rustdoc only warns on a broken intra-doc link — so deny warnings, per row.
-step "rustdoc (agentd-instruction, ${#INSTRUCTION_ROWS[@]} rows)"
-for F in "${INSTRUCTION_ROWS[@]}"; do
-  if ! RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p agentd-instruction $F >/tmp/ci-gate.log 2>&1; then
-    echo "  FAIL  agentd-instruction docs  ${F:-<default>}"
-    grep -m3 -E '^(error|warning)' /tmp/ci-gate.log | sed 's/^/        /'
-    fail=1
-  fi
-done
 
 # ci.yml's `deny` job. It runs in quick mode too: it reads the lockfile and
 # builds nothing. The version is ci.yml's own pin, read rather than copied, so
@@ -159,7 +137,6 @@ if [ "${1:-}" != "quick" ]; then
     export INSTRUCTION_SPEC_REPO="$spec_tree"
     echo "  spec $spec_sha from $spec_clone"
     against=$spec_sha
-    drift agentd-instruction corpus the_vendored_corpus_matches_upstream_when_present
     drift agentd-cli instruction_spec_corpus the_vendored_schema_matches_upstream_when_present
   fi
   if [ -z "$draft_sha" ]; then
@@ -185,11 +162,6 @@ if [ "${1:-}" != "quick" ]; then
   step "test (workspace, all features)"
   cargo test --workspace --all-features --no-fail-fast || fail=1
 
-  # ci.yml's gate job: agentd-instruction in its default build (no `sign`),
-  # where a test that only compiles with a feature would break the consumers
-  # that never enable it.
-  step "test (agentd-instruction, default features)"
-  cargo test -p agentd-instruction --no-fail-fast || fail=1
 
   # A release publishes agentd-net, agentd-mcp, agentd-core and agentd-cli to
   # crates.io. `cargo publish` refuses a crate whose path dependency is not
@@ -208,7 +180,7 @@ if [ "${1:-}" != "quick" ]; then
   # from the index, so every crate the release will upload is packaged and
   # verified here — none has to wait until its dependency is on crates.io.
   pending=()
-  for c in agentd-net agentd-mcp agentd-instruction agentd-core agentd-cli; do
+  for c in agentd-net agentd-mcp agentd-core agentd-cli; do
     v=$(cargo metadata --no-deps --format-version 1 2>/dev/null \
         | python3 -c "import json,sys;print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='$c'))")
     if [ "$(curl -s -o /dev/null -w '%{http_code}' -A 'agentd-ci-gate' \

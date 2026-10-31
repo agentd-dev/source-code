@@ -144,6 +144,15 @@ fn every_shipped_example_config_validates() {
         if !layered && f.file_name().is_some_and(|n| n == "services.yaml") {
             continue; // the catalog on its own declares no agent
         }
+        // A `<name>.local.yaml` beside `<name>.yaml` is a layer too: the demos
+        // rehearse as `-c <name>.yaml -c <name>.local.yaml`, so it is checked
+        // layered exactly so (the base is checked on its own as well).
+        let base = f
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".local.yaml"))
+            .map(|stem| f.with_file_name(format!("{stem}.yaml")))
+            .filter(|b| b.exists());
         checked += 1;
         // An example that references a secret is CORRECT — that is the
         // idiom. Supply each one so validation gets past the environment and
@@ -154,12 +163,19 @@ fn every_shipped_example_config_validates() {
         if layered {
             cmd.arg("-c").arg(&catalog);
         }
+        if let Some(b) = &base {
+            cmd.arg("-c").arg(b);
+        }
         cmd.arg("-c").arg(f);
+        let under: Vec<&PathBuf> = layered
+            .then_some(&catalog)
+            .into_iter()
+            .chain(base.as_ref())
+            .collect();
         for name in secret_names(&text).into_iter().chain(
-            layered
-                .then(|| std::fs::read_to_string(&catalog).unwrap_or_default())
-                .map(|t| secret_names(&t))
-                .unwrap_or_default(),
+            under
+                .iter()
+                .flat_map(|p| secret_names(&std::fs::read_to_string(p).unwrap_or_default())),
         ) {
             cmd.env(name, "test-value");
         }

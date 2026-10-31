@@ -23,6 +23,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Added.**
 
+- `examples/demos/`: two finance demos agentd runs itself — accounts payable (invoices as MCP Events, decided under an instruction followed over MCP, a gate to the controller or CFO above the limit) and month-end close (a bank-feed subscription, a second agentd asked over A2A, journal entries drafted with `journal.post` never granted, a review gate) — with stand-in MCP servers on the official TypeScript SDK and `rehearse.sh`, which runs both on the mock model and asserts every beat from the logs.
 - `private_key_jwt` client authentication for an `oauth2` block (RFC 7523):
   `auth.client_auth: {method: private_key_jwt, key, kid, assertion_aud}`
   sends no secret, and each token and revocation request carries a fresh

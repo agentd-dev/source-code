@@ -1,0 +1,39 @@
+{
+  "_note": "Fictional data for agentd's month-end close demo. Every company, bank, person and number here is invented.",
+  "company": "Northwind Supplies Ltd.",
+  "bankAccount": {
+    "id": "BA-01",
+    "name": "Operating account",
+    "bank": "Albion Commercial Bank (fictional)",
+    "number": "•••• 4417",
+    "currency": "GBP",
+    "glAccount": "1010"
+  },
+  "feedDate": "2026-10-31",
+  "accounts": [
+    { "code": "1010", "name": "Cash at bank — operating account", "type": "asset" },
+    { "code": "1100", "name": "Trade debtors", "type": "asset" },
+    { "code": "1190", "name": "Suspense — unidentified receipts", "type": "asset" },
+    { "code": "2100", "name": "Trade creditors", "type": "liability" },
+    { "code": "4900", "name": "Interest income", "type": "income" },
+    { "code": "6200", "name": "Rent and rates", "type": "expense" },
+    { "code": "6810", "name": "Bank charges", "type": "expense" },
+    { "code": "7000", "name": "Wages and salaries", "type": "expense" }
+  ],
+  "cashBook": [
+    { "id": "LE-5501", "date": "2026-10-31", "amount": "12450.00", "reference": "NWS-INV-8812", "description": "Receipt — Oakridge Garden Centres, invoice NWS-INV-8812", "account": "1100" },
+    { "id": "LE-5502", "date": "2026-10-31", "amount": "-7920.50", "reference": "HL-2026-1180", "description": "Payment — Harbourline Logistics Ltd., HL-2026-1180", "account": "2100" },
+    { "id": "LE-5503", "date": "2026-10-31", "amount": "-84210.00", "reference": "PAYROLL-OCT", "description": "October payroll", "account": "7000" }
+  ],
+  "bankLines": [
+    { "id": "BL-0901", "date": "2026-10-31", "amount": "12450.00", "description": "OAKRIDGE GARDEN CTRS NWS-INV-8812" },
+    { "id": "BL-0902", "date": "2026-10-31", "amount": "-7920.50", "description": "HARBOURLINE LOGISTICS HL-2026-1180" },
+    { "id": "BL-0903", "date": "2026-10-31", "amount": "-84210.00", "description": "BACS PAYROLL OCT" }
+  ],
+  "nextBankLines": [
+    { "id": "BL-0904", "date": "2026-10-31", "amount": "-38.50", "description": "ALBION BANK CHARGES OCT" },
+    { "id": "BL-0905", "date": "2026-10-31", "amount": "1212.40", "description": "INTEREST CREDIT OCT" },
+    { "id": "BL-0906", "date": "2026-10-31", "amount": "-2400.00", "description": "DD WESTMERE ESTATES RENT NOV" },
+    { "id": "BL-0907", "date": "2026-10-31", "amount": "5000.00", "description": "OAKRIDGE GARDEN CTRS" }
+  ]
+}

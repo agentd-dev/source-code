@@ -1,0 +1,267 @@
+# Demo (a): accounts payable, decided under a policy someone else owns.
+#
+# Northwind Supplies Ltd.'s accounts-payable agent. Its approval policy is an
+# instruction document published on instruction.md and served over MCP; the
+# controller edits it there. Invoices arrive from the accounts-payable system
+# as MCP Events (`invoice.created`), one workflow run each:
+#
+#   invoice.created ─► decide: an agent step, read-only AP tools, the policy
+#     ├─ approved ─► invoices.approve
+#     ├─ held     ─► invoices.hold
+#     └─ escalate ─► invoices.hold ─► human gate, to the controller or the CFO
+#                                       ├─ approve ─► invoices.approve
+#                                       └─ reject  ─► stays on hold
+#
+# The model reads and decides; it holds no write tool. The workflow records
+# what it decided, and only a person's answer at the gate releases an invoice
+# above the limit.
+#
+# The live beat: the controller raises the approval limit and releases v2 of
+# the policy. The registry says so on the resource's subscription and by MCP
+# Events (`md.instruction.activity`); agentd re-reads the document and logs
+# `instruction.applied` (old → new version id); the next invoice is decided
+# under v2 — the same amount that needed the controller now does not.
+#
+# Placeholders the recorder fills (environment; defaults in brackets):
+#   AP_INSTRUCTION_URI   the policy's resource on the mirror
+#                        [instruction://northwind/ap-approval-policy@latest]
+#   IMD_MCP_URL          the mirror's MCP endpoint [http://localhost:18080/mcp]
+#   IMD_TOKEN_URL        the agents realm's token endpoint
+#   IMD_CLIENT_ID        the agent credential's client id (orgs_agents_create)
+#   PAYABLES_MCP_URL     the AP stand-in [http://127.0.0.1:8701/mcp]
+#   AGENTD_DEMO_HOME     where state lives [/tmp/agentd-demos]
+# Secrets, by reference only, from the environment (see env.sh):
+#   OPENAI_API_KEY, INSTRUCTION_MD_CLIENT_SECRET, CONTROLLER_TOKEN, CFO_TOKEN
+#
+#   agentd --validate-config -c examples/demos/ap-agent.yaml
+#   agentd -c examples/demos/ap-agent.yaml
+#
+# Rehearse without the mirror: layer ap-agent.local.yaml on top, which serves
+# a local copy of the policy from a registry stand-in (see README.md).
+
+vars:
+  # The policy's resource on the registry. `vars` take `${…}` from the
+  # environment; agent.instruction does not (a `${name}` there is an
+  # instruction parameter), so the address reaches it through this var.
+  ap_policy: "${AP_INSTRUCTION_URI:-instruction://northwind/ap-approval-policy@latest}"
+
+agent:
+  name: ap-agent
+  description: Accounts payable for Northwind Supplies Ltd. (a demo; fictional data).
+  # Every unit of work here is a workflow run, not a chat message.
+  preflight: never
+  instruction:
+    mcp:
+      server: instruction-md
+      resource: "{{config.ap_policy}}"
+      # A release moves the ref; the registry says so on this event type, which
+      # also covers an owner/name address the registry cannot subscribe to.
+      events: [md.instruction.activity]
+    # The floor under the subscription and the events, not the primary path.
+    refresh: 10m
+    # A payments agent must not keep approving on a policy it can no longer
+    # confirm: past the deadline, live runs finish and new invoices wait.
+    unavailable: freeze
+  # Invoices start runs nobody owns (a stream): their gates open as tasks on
+  # the A2A listener, where the controller's and the CFO's clients see them.
+  ask_human_unowned: gate
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  token: "{{secret:OPENAI_API_KEY}}"
+  model: gpt-5.6-sol
+
+store:
+  kind: file
+  file: {path: "${AGENTD_DEMO_HOME:-/tmp/agentd-demos}/ap-agent"}
+
+streams:
+  invoices: {retention: {max_events: 10000, max_age: 30d}}
+
+mcp:
+  servers:
+    - name: payables
+      # A loopback http:// endpoint is agentd's plaintext carve-out: the bytes
+      # never leave the machine. Anything else must be https://.
+      endpoint: "${PAYABLES_MCP_URL:-http://127.0.0.1:8701/mcp}"
+      ns: payables
+      # Invoices and vendor records are financial data (sensitive), and their
+      # text is written by vendors (untrusted_input). No server here is
+      # egress, so the Rule of Two holds for every step that reads them.
+      tags: {"*": [sensitive, untrusted_input]}
+      events:
+        - name: invoice.created
+          delivery: [poll]
+          into: {stream: invoices, subject: invoice.created}
+          # After a restart, ask the server for what was missed.
+          replay: 1h
+          # Required on an untrusted_input server: whoever can write invoices
+          # must not decide how fast runs start.
+          rate: 120/1m
+    - name: instruction-md
+      endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"
+      auth:
+        kind: oauth2
+        grant: client_credentials
+        client_id: "${IMD_CLIENT_ID:-agentd-ap-demo}"
+        client_secret: "{{secret:INSTRUCTION_MD_CLIENT_SECRET}}"
+        token_url: "${IMD_TOKEN_URL:-http://localhost:8080/realms/instruction-md-agents/protocol/openid-connect/token}"
+      # The registry's answers are the operator's policy, not outside text.
+      tags: {"*": [trusted]}
+
+# The display surface: the TUI attaches here, and so do the gates' answerers.
+a2a:
+  listen: http://127.0.0.1:8420
+  events: {enabled: true}
+  principals:
+    # Each person signs in with their own token; a gate is addressed to one of
+    # them by label, and any other operator's answer is recorded as an override.
+    - match: {bearer_ref: "{{secret:CONTROLLER_TOKEN}}"}
+      id: morgan.ellis
+      role: operator
+      labels: {approver: controller}
+    - match: {bearer_ref: "{{secret:CFO_TOKEN}}"}
+      id: sam.okafor
+      role: operator
+      labels: {approver: cfo}
+
+workflows:
+  - name: invoice-intake
+    description: Decide each new vendor invoice under the AP approval policy.
+    # One invoice at a time, in arrival order: the demo reads top to bottom.
+    concurrency: {max_runs: 1, on_overflow: queue}
+    steps:
+      on_invoice:
+        kind: stream
+        stream: invoices
+        subject: invoice.created
+        inputs:
+          invoice_id: "{{ payload.data.payload.invoiceId }}"
+          vendor: "{{ payload.data.payload.vendorName }}"
+          amount: "{{ payload.data.payload.amount }}"
+          currency: "{{ payload.data.payload.currency }}"
+
+      decide:
+        kind: agent
+        depends_on: [on_invoice]
+        servers: [payables]
+        # Read-only: the decision is the model's, the writes are the workflow's.
+        tools: [payables.invoices.get, payables.vendors.get, payables.invoices.list]
+        instruction: |
+          A new vendor invoice arrived: {{ inputs.invoice_id }} from
+          {{ inputs.vendor }}, {{ inputs.currency }} {{ inputs.amount }}.
+          Read it and its vendor, and decide it under your accounts-payable
+          policy.
+        output_schema:
+          type: object
+          required: [decision, approver, reason]
+          properties:
+            decision: {type: string, enum: [approved, held, escalate]}
+            approver: {type: string, enum: [none, controller, cfo]}
+            reason: {type: string}
+
+      outcome:
+        kind: switch
+        depends_on: [decide]
+        on: "{{ steps.decide.output.decision }}"
+        cases: {approved: approve, held: hold, escalate: hold_for_approval}
+        default: hold
+
+      approve:
+        kind: mcp.tool
+        depends_on: [outcome]
+        server: payables
+        tool: invoices.approve
+        args:
+          invoiceId: "{{ inputs.invoice_id }}"
+          note: "agentd, under the AP policy: {{ steps.decide.output.reason }}"
+      hold:
+        kind: mcp.tool
+        depends_on: [outcome]
+        server: payables
+        tool: invoices.hold
+        args:
+          invoiceId: "{{ inputs.invoice_id }}"
+          reason: "{{ steps.decide.output.reason }}"
+
+      hold_for_approval:
+        kind: mcp.tool
+        depends_on: [outcome]
+        server: payables
+        tool: invoices.hold
+        args:
+          invoiceId: "{{ inputs.invoice_id }}"
+          reason: "awaiting {{ steps.decide.output.approver }} approval: {{ steps.decide.output.reason }}"
+      approver:
+        kind: switch
+        depends_on: [hold_for_approval]
+        on: "{{ steps.decide.output.approver }}"
+        cases: {cfo: ask_cfo}
+        default: ask_controller
+
+      ask_controller:
+        kind: human
+        depends_on: [approver]
+        to: {role: operator, labels: {approver: controller}}
+        question: |
+          Approve {{ inputs.invoice_id }} from {{ inputs.vendor }} for {{ inputs.currency }} {{ inputs.amount }}?
+          It is above the approval limit and on hold. Agent: {{ steps.decide.output.reason }}
+        schema: {type: string, enum: [approve, reject]}
+        timeout: 3d
+        on_error: continue
+      controller_says:
+        kind: switch
+        depends_on: [ask_controller]
+        on: "{{ steps.ask_controller.output }}"
+        cases: {approve: approve_controller}
+        default: rejected
+      approve_controller:
+        kind: mcp.tool
+        depends_on: [controller_says]
+        server: payables
+        tool: invoices.approve
+        args:
+          invoiceId: "{{ inputs.invoice_id }}"
+          note: "Approved by the financial controller at the agentd gate."
+
+      ask_cfo:
+        kind: human
+        depends_on: [approver]
+        to: {role: operator, labels: {approver: cfo}}
+        question: |
+          Approve {{ inputs.invoice_id }} from {{ inputs.vendor }} for {{ inputs.currency }} {{ inputs.amount }}?
+          It is above GBP 50,000 and on hold. Agent: {{ steps.decide.output.reason }}
+        schema: {type: string, enum: [approve, reject]}
+        timeout: 3d
+        on_error: continue
+      cfo_says:
+        kind: switch
+        depends_on: [ask_cfo]
+        on: "{{ steps.ask_cfo.output }}"
+        cases: {approve: approve_cfo}
+        default: rejected
+      approve_cfo:
+        kind: mcp.tool
+        depends_on: [cfo_says]
+        server: payables
+        tool: invoices.approve
+        args:
+          invoiceId: "{{ inputs.invoice_id }}"
+          note: "Approved by the CFO at the agentd gate."
+
+      approved:
+        kind: finish
+        depends_on: [approve]
+        output: {invoice: "{{ inputs.invoice_id }}", decision: approved}
+      held:
+        kind: finish
+        depends_on: [hold]
+        output: {invoice: "{{ inputs.invoice_id }}", decision: held}
+      approved_by_person:
+        kind: finish
+        depends_on: [approve_controller, approve_cfo]
+        output: {invoice: "{{ inputs.invoice_id }}", decision: approved_by_person}
+      rejected:
+        kind: finish
+        depends_on: [controller_says, cfo_says]
+        output: {invoice: "{{ inputs.invoice_id }}", decision: rejected_by_person}

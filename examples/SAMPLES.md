@@ -10,6 +10,7 @@
 > | **`startup/`** | **A software company with two employees** — eleven instances run every role except CEO/CTO: ticket + SMS/voice support, engineering with CI-signal gates, QA, SRE incident lifecycle, sales cadences, finance dunning, marketing calendar + outreach, an egress-choke-point outbox, and a chief of staff. Third-party webhooks, signals, durable streams, MCP trust tags, HITL gates, A2A mesh, conversational interface — all of it, validated against the binary. The reasoning is written up as [docs/two-person-company.md](../docs/two-person-company.md). |
 > | **`hiring/`** | **A hiring agent, end to end** — two instances split by the lethal-trifecta gate: the CV-reading intake and the mail-sending actions side. |
 > | **`tail/`** | **Processing lines as they arrive** — react to appended CSV/text lines with a durable byte cursor that survives a restart, partial-line hold-back, and rotation detection. A directory-shaped project (`agentd.yml` + `workflows/`). |
+> | **`demos/`** | **Two finance demos, end to end** — accounts payable (invoices arrive as MCP Events and are decided under an approval policy followed over MCP; above the limit, a gate to the controller or the CFO; a new policy version applies within seconds) and month-end close (a bank-feed subscription, a second agentd asked over A2A, journal entries drafted but never posted, a review gate). Stand-in MCP servers on the official TypeScript SDK, and `rehearse.sh`, which runs both on the mock model and checks every beat. |
 > | **`voice/`** | **A voice agent, end to end** — wake word, speech, and a room full of people who are not authenticated. Two instances split by the lethal-trifecta gate (the ears that hear vs. the hands that unlock), plus a stdlib-only reference MCP server for the microphone and the speaker. Runs with `--fake` and no hardware. |
 >
 > Every sample runs on one durable runtime (`lifecycle.run_until` = job or
@@ -26,6 +27,7 @@
 | File | What it is |
 |---|---|
 | `coding-agent.yaml` | A pair-programming agent for a repository: the `exec` fence, approvals, budgets, and the display surface the TUI/web UI attach to. |
+| `demos/` | Two finance demos: an `events` binding and a `stream` start per invoice, `agent.instruction.mcp` followed by subscription and MCP Events (`instruction.applied` on a release), `switch` routing to addressed `human` gates, a `subscribe` start on a bank feed, `a2a.delegate` to a second agentd's `a2a` start, and a server `allow` list that leaves `journal.post` ungranted. |
 | `voice/` | A voice-controlled household agent: `subscribe` start on an MCP resource, `window` for conversational context, `on_overflow: replace` as barge-in, `event: human.asked` to speak every gate aloud, and an addressed gate a voice cannot answer. |
 | `instructions/triage.md` | An instruction file with an output contract — classify an inbox item, take one action, emit JSON. Used by the reactive and loop samples. |
 | `instructions/research.md` | An instruction file with an output contract — research a topic to a single sourced answer. Used by the once sample. |

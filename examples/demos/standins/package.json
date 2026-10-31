@@ -1,0 +1,20 @@
+{
+  "name": "agentd-demo-standins",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Stand-in MCP servers for agentd's finance demos: an accounts-payable system and an ERP with a bank feed. Fictional data only.",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node start.mjs",
+    "payables": "node payables.mjs",
+    "erp": "node erp.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "4.6.7"
+  }
+}

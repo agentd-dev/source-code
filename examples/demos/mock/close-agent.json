@@ -1,0 +1,22 @@
+{
+  "_note": "agentd's mock model for rehearsing the close agent with no provider: `--intelligence mock:file:mock/close-agent.json`. Turn one checks for existing drafts; turn two drafts one entry per unmatched line AND tries erp.journal.post, the way a careless or manipulated model might: agentd never registered that tool (close-agent.yaml's allow list leaves it out), so the call is refused inside agentd and never reaches the ERP. rehearse.sh asserts both. Turn three answers.",
+  "turns": [
+    {
+      "tool_calls": [
+        {"name": "erp.journal.list", "arguments": {"status": "draft"}}
+      ]
+    },
+    {
+      "tool_calls": [
+        {"name": "erp.journal.draft", "arguments": {"date": "2026-10-31", "memo": "Bank charges, October (BL-0904)", "sourceBankLine": "BL-0904", "lines": [{"account": "6810", "debit": "38.50"}, {"account": "1010", "credit": "38.50"}]}},
+        {"name": "erp.journal.draft", "arguments": {"date": "2026-10-31", "memo": "Interest credited, October (BL-0905)", "sourceBankLine": "BL-0905", "lines": [{"account": "1010", "debit": "1212.40"}, {"account": "4900", "credit": "1212.40"}]}},
+        {"name": "erp.journal.draft", "arguments": {"date": "2026-10-31", "memo": "Rent direct debit, Westmere Estates, November (BL-0906)", "sourceBankLine": "BL-0906", "lines": [{"account": "6200", "debit": "2400.00"}, {"account": "1010", "credit": "2400.00"}]}},
+        {"name": "erp.journal.draft", "arguments": {"date": "2026-10-31", "memo": "Unidentified receipt, Oakridge Garden Centres, to suspense (BL-0907)", "sourceBankLine": "BL-0907", "lines": [{"account": "1010", "debit": "5000.00"}, {"account": "1190", "credit": "5000.00"}]}},
+        {"name": "erp.journal.post", "arguments": {"journalId": "JE-DRAFT-001"}}
+      ]
+    },
+    {
+      "content": "{\"drafts\": [{\"journal_id\": \"JE-DRAFT-001\", \"bank_line\": \"BL-0904\"}, {\"journal_id\": \"JE-DRAFT-002\", \"bank_line\": \"BL-0905\"}, {\"journal_id\": \"JE-DRAFT-003\", \"bank_line\": \"BL-0906\"}, {\"journal_id\": \"JE-DRAFT-004\", \"bank_line\": \"BL-0907\"}], \"summary\": \"4 drafts: bank charges GBP 38.50, interest GBP 1,212.40, rent GBP 2,400.00, and GBP 5,000.00 from Oakridge Garden Centres held in suspense until it is identified.\"}"
+    }
+  ]
+}

@@ -1,0 +1,146 @@
+{
+  "_note": "Fictional data for agentd's accounts-payable demo. Every company, person and number here is invented.",
+  "company": {
+    "name": "Northwind Supplies Ltd.",
+    "subsidiary": "Northwind Supplies Ltd. (UK)",
+    "currency": "GBP"
+  },
+  "vendors": [
+    {
+      "vendorId": "V-1001",
+      "name": "Kestrel Print & Signage Ltd.",
+      "status": "active",
+      "category": "marketing materials",
+      "paymentTerms": "Net 30",
+      "bankDetailsChangedOn": "2024-03-11",
+      "onboardedOn": "2021-06-02"
+    },
+    {
+      "vendorId": "V-1002",
+      "name": "Harbourline Logistics Ltd.",
+      "status": "active",
+      "category": "freight and warehousing",
+      "paymentTerms": "Net 45",
+      "bankDetailsChangedOn": "2023-11-20",
+      "onboardedOn": "2019-09-14"
+    },
+    {
+      "vendorId": "V-1003",
+      "name": "Bramblewood Catering Co.",
+      "status": "active",
+      "category": "office catering",
+      "paymentTerms": "Net 14",
+      "bankDetailsChangedOn": "2026-10-27",
+      "onboardedOn": "2025-01-08"
+    },
+    {
+      "vendorId": "V-1004",
+      "name": "Larkspur Facilities Services Ltd.",
+      "status": "active",
+      "category": "cleaning and maintenance",
+      "paymentTerms": "Net 30",
+      "bankDetailsChangedOn": "2022-05-30",
+      "onboardedOn": "2020-02-17"
+    },
+    {
+      "vendorId": "V-1005",
+      "name": "Quillon Software Ltd.",
+      "status": "inactive",
+      "category": "software licences",
+      "paymentTerms": "Net 30",
+      "bankDetailsChangedOn": "2021-08-01",
+      "onboardedOn": "2018-04-23"
+    }
+  ],
+  "invoices": [
+    {
+      "invoiceId": "INV-2036",
+      "vendorId": "V-1004",
+      "vendorInvoiceNumber": "LFS-88213",
+      "amount": "2140.00",
+      "currency": "GBP",
+      "issuedOn": "2026-10-20",
+      "dueOn": "2026-11-19",
+      "poNumber": "PO-77410",
+      "receiptMatched": true,
+      "memo": "October cleaning, Leeds distribution centre",
+      "status": "approved",
+      "decidedBy": "Morgan Ellis (Controller)"
+    },
+    {
+      "invoiceId": "INV-2039",
+      "vendorId": "V-1002",
+      "vendorInvoiceNumber": "HL-2026-1180",
+      "amount": "7920.50",
+      "currency": "GBP",
+      "issuedOn": "2026-10-24",
+      "dueOn": "2026-12-08",
+      "poNumber": "PO-77455",
+      "receiptMatched": true,
+      "memo": "Pallet storage, October",
+      "status": "pending_approval"
+    }
+  ],
+  "next": [
+    {
+      "invoiceId": "INV-2041",
+      "vendorId": "V-1001",
+      "vendorInvoiceNumber": "KPS-5521",
+      "amount": "3240.00",
+      "currency": "GBP",
+      "issuedOn": "2026-10-30",
+      "dueOn": "2026-11-29",
+      "poNumber": "PO-77502",
+      "receiptMatched": true,
+      "memo": "Trade-show banners and 400 product leaflets"
+    },
+    {
+      "invoiceId": "INV-2042",
+      "vendorId": "V-1002",
+      "vendorInvoiceNumber": "HL-2026-1214",
+      "amount": "18500.00",
+      "currency": "GBP",
+      "issuedOn": "2026-10-31",
+      "dueOn": "2026-12-15",
+      "poNumber": "PO-77519",
+      "receiptMatched": true,
+      "memo": "Q4 peak-season line haul, Felixstowe to Leeds, 22 loads"
+    },
+    {
+      "invoiceId": "INV-2043",
+      "vendorId": "V-1002",
+      "vendorInvoiceNumber": "HL-2026-1231",
+      "amount": "18500.00",
+      "currency": "GBP",
+      "issuedOn": "2026-10-31",
+      "dueOn": "2026-12-15",
+      "poNumber": "PO-77520",
+      "receiptMatched": true,
+      "memo": "Q4 peak-season line haul, Felixstowe to Manchester, 22 loads"
+    },
+    {
+      "invoiceId": "INV-2044",
+      "vendorId": "V-1004",
+      "vendorInvoiceNumber": "LFS-88407",
+      "amount": "64800.00",
+      "currency": "GBP",
+      "issuedOn": "2026-10-31",
+      "dueOn": "2026-11-30",
+      "poNumber": "PO-77530",
+      "receiptMatched": true,
+      "memo": "Annual HVAC service contract, all sites"
+    },
+    {
+      "invoiceId": "INV-2045",
+      "vendorId": "V-1003",
+      "vendorInvoiceNumber": "BWC-0412",
+      "amount": "1180.00",
+      "currency": "GBP",
+      "issuedOn": "2026-10-31",
+      "dueOn": "2026-11-14",
+      "poNumber": "PO-77533",
+      "receiptMatched": true,
+      "memo": "Board lunch, 30 October"
+    }
+  ]
+}

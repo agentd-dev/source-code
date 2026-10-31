@@ -1,0 +1,26 @@
+{
+  "_note": "agentd's mock model for rehearsing demo (a) with no provider: `--intelligence mock:file:mock/ap-agent.json`. The first rule whose text appears in the request answers it. The decision rule that matters is the second: it keys on the approval limit as the delivered policy states it, so the same invoice amount is escalated under v1 and approved under v2 — the rehearsal proves the policy text reached the model, not that the mock is clever. A real model reads the invoice and the vendor with the read-only tools first; this one answers at once.",
+  "match": [
+    {
+      "when_contains": "Bramblewood Catering",
+      "content": "{\"decision\": \"held\", \"approver\": \"none\", \"reason\": \"Vendor bank details changed on 2026-10-27, within 30 days: verify by phone before paying.\"}"
+    },
+    {
+      "when_contains": "GBP 64800.00",
+      "content": "{\"decision\": \"escalate\", \"approver\": \"cfo\", \"reason\": \"GBP 64,800.00 on PO-77530 is above GBP 50,000: the CFO decides.\"}"
+    },
+    {
+      "when_contains": "Approval limit: GBP 25,000.",
+      "content": "{\"decision\": \"approved\", \"approver\": \"none\", \"reason\": \"Within the GBP 25,000 approval limit; PO matched, goods received, vendor active.\"}"
+    },
+    {
+      "when_contains": "GBP 18500.00",
+      "content": "{\"decision\": \"escalate\", \"approver\": \"controller\", \"reason\": \"GBP 18,500.00 is above the GBP 10,000 approval limit: the controller decides.\"}"
+    }
+  ],
+  "turns": [
+    {
+      "content": "{\"decision\": \"approved\", \"approver\": \"none\", \"reason\": \"Within the approval limit; PO matched, goods received, vendor active.\"}"
+    }
+  ]
+}

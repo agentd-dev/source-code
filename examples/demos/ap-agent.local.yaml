@@ -1,0 +1,32 @@
+# Rehearsal layer for demo (a): the policy from a local file, served by the
+# registry stand-in (standins/registry.mjs) instead of the instruction.md
+# mirror. Layer it over ap-agent.yaml:
+#
+#   node standins/registry.mjs --file "$AGENTD_DEMO_HOME/ap-policy.md" &
+#   agentd -c examples/demos/ap-agent.yaml -c examples/demos/ap-agent.local.yaml
+#
+# Files merge as JSON Merge Patch, later over earlier, and a list replaces the
+# list: the server list is restated with `instruction-md` pointing at the
+# stand-in on 127.0.0.1:8703, which needs no sign-in. Everything else — the
+# instruction source and its events, the stream, the workflow, the gates, the
+# listener — is ap-agent.yaml's, unchanged, so the rehearsal follows a release
+# the same way the recording does: the resource's subscription and an MCP
+# Events occurrence, then `instruction.applied`.
+#
+# "Releasing v2" is copying instruction/ap-policy-v2.md over the served file.
+
+mcp:
+  servers:
+    - name: payables
+      endpoint: "${PAYABLES_MCP_URL:-http://127.0.0.1:8701/mcp}"
+      ns: payables
+      tags: {"*": [sensitive, untrusted_input]}
+      events:
+        - name: invoice.created
+          delivery: [poll]
+          into: {stream: invoices, subject: invoice.created}
+          replay: 1h
+          rate: 120/1m
+    - name: instruction-md
+      endpoint: "${REGISTRY_MCP_URL:-http://127.0.0.1:8703/mcp}"
+      tags: {"*": [trusted]}

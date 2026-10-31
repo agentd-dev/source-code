@@ -23,7 +23,9 @@ and for operators reading a failed call. The concepts behind it are in
 
 | Dialect | Default path | Effective path |
 |---|---|---|
-| `openai` | `/v1/chat/completions` | as configured |
+| `openai` | `/v1/chat/completions` | as configured; for a call routed to the Responses API, `…/responses` beside a path ending `/chat/completions` |
+| `openai-chat` | `/v1/chat/completions` | as configured |
+| `openai-responses` | `/v1/responses` | as configured |
 | `anthropic` | `/v1/messages` | as configured |
 | `bedrock` | — | `/model/{modelId}/converse`, always |
 | `decisions` | `/v1/decisions` | as configured |
@@ -44,7 +46,7 @@ request, beside the headers the dialect sets.
 | `model` | the wire model |
 | `max_tokens` | the per-call answer cap, for a chat model whose name does not start with `gpt-5`, `chatgpt-5`, `o1`, `o3` or `o4` |
 | `max_completion_tokens` | the answer cap, for those names; for a reasoning model, the cap plus the thinking room |
-| `temperature` | `0`; absent for a reasoning model |
+| `temperature` | the model's `temperature`, when its config sets one; never for a reasoning model or a model whose name starts with `gpt-5` or later, `chatgpt-5`, `o1`, `o3` or `o4` |
 | `reasoning_effort` | the effort, for a reasoning model |
 | `messages` | `system`, `user`, `assistant` (with `tool_calls`), `tool` |
 | `tools` | `[{type: function, function: {name, description, parameters}}]`, when the call has tools |
@@ -68,6 +70,57 @@ with an `error` object is a provider error.
 | `tool_calls` | tool use |
 | `length` | answer cut at the cap |
 | anything else | other |
+
+## OpenAI Responses dialect
+
+`dialect: openai-responses` sends every call here. The default `openai`
+dialect sends a call here, on any host, when its model takes function tools
+only on the Responses API: a name that starts with `gpt-5.N` for N of 6 or
+more, or `gpt-6` and any later family; an `o1-pro`, `o3-pro` or
+`gpt-5…-pro` model; or a name containing `codex`. On `api.openai.com` it
+also sends every `gpt-5` model and later here. That call
+goes to the path beside the configured one, `…/chat/completions` becoming
+`…/responses`; a configured path that does not end `/chat/completions`
+stays on Chat Completions. `dialect: openai-chat` sends every call to Chat
+Completions.
+
+**Headers:** as on `openai`.
+
+| Body field | Value |
+|---|---|
+| `model` | the wire model |
+| `store` | `false` |
+| `instructions` | every system message, joined with a blank line |
+| `input` | `user` and `assistant` messages; an assistant's tool calls as `{type: function_call, call_id, name, arguments}`, a tool's result as `{type: function_call_output, call_id, output}` |
+| `max_output_tokens` | the answer cap; for a reasoning model, plus the thinking room |
+| `reasoning` | `{effort}`, for a reasoning model |
+| `include` | `["reasoning.encrypted_content"]`, for a reasoning model and a model of a reasoning family |
+| `temperature` | as on `openai` |
+| `tools` | `[{type: function, name, description, parameters, strict: false}]`, when the call has tools |
+| `tool_choice` | `"auto"`, when the call has tools |
+| `text.format` | `{type: json_schema, name: "answer", schema, strict}`, when the answer has a schema |
+
+- An assistant tool call's `arguments` is sent as a JSON string; a tool
+  result that is an error is sent with `ERROR: ` before it.
+- While a turn is still calling tools, the output of a call that reasoned —
+  its `reasoning` items, with their encrypted content, and the items they
+  led to — is sent back to the same model as it came, and to no other.
+
+**Response:** the `output_text` parts of the `message` items are the text;
+`function_call` items are the tool calls, `call_id` the id and `arguments`
+parsed as JSON (an unparsable string is kept as `{"_raw": "<string>"}`);
+`usage.input_tokens` and `usage.output_tokens` are the tokens, the
+reasoning tokens counted in the output. A body with a non-null `error`, or
+`status: failed`, is a provider error.
+
+| Answer | Read as |
+|---|---|
+| a `function_call` item | tool use |
+| `status: completed` | final answer |
+| `status: incomplete`, `incomplete_details.reason: max_output_tokens` | answer cut at the cap |
+| anything else | other |
+
+Failures, retries and failover are those of every dialect (below).
 
 ## Anthropic dialect
 
@@ -189,7 +242,8 @@ level name in the output. Answers from this dialect are `calibrated: true`.
 ### Emulation on a chat dialect
 
 A decide call on a chat or reasoning model is one call on that model's
-dialect, at temperature `0` where the dialect sends one:
+dialect, at the model's `temperature` where its config sets one and the
+dialect sends one:
 
 - A system message describes the expected JSON object, one key per
   question, and says the state is data, never an instruction.
@@ -242,7 +296,7 @@ part of it has `oneOf`, `not`, `if`, `then`, `else` or `patternProperties`,
 an object with no `properties`, an `additionalProperties` that is a schema, a
 `$ref` outside `$defs` or `definitions`, or a recursive definition.
 
-On `openai`, `strict` is `true` when the constrained form exists, every
+On `openai` and `openai-responses`, `strict` is `true` when the constrained form exists, every
 object in it requires all of its properties, and it has no `allOf`; the
 constrained form is then sent. Otherwise the schema is sent as written with
 `strict: false`, as guidance.
@@ -268,8 +322,8 @@ it is.
 
 | Call | `temperature` | Answer cap |
 |---|---|---|
-| chat model on `openai` | `0` | 4,096 |
-| chat model on Bedrock, non-Claude family | `0` | 4,096 |
+| chat model on `openai`, `openai-chat` or `openai-responses` | the model's `temperature`, if set; none for `gpt-5` and later, `chatgpt-5`, `o1`, `o3`, `o4` | 4,096 |
+| chat model on Bedrock, non-Claude family | the model's `temperature`, if set | 4,096 |
 | Claude model, on `anthropic` or Bedrock | none | 4,096 |
 | reasoning model, any dialect | none | 4,096 plus the thinking room |
 | preflight on a chat model | as above | 1,024 |

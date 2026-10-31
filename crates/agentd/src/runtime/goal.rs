@@ -373,7 +373,7 @@ fn goal_judge_call(
         messages: vec![Message::System(system.to_string()), Message::User(user)],
         tools: vec![],
         max_tokens: 300,
-        temperature: Some(0.0),
+        temperature: None,
         output_schema: Some(verdict_schema()),
         ..Default::default()
     };
@@ -436,7 +436,7 @@ pub(crate) fn goal_decision_call(
                 &Request {
                     model: model.clone(),
                     max_tokens: 384,
-                    temperature: Some(0.0),
+                    temperature: None,
                     decision: Some(decision.clone()),
                     ..Default::default()
                 },

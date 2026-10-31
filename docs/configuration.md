@@ -427,7 +427,7 @@ nothing more.
 | Path | Type | Default | Class | What it does |
 |---|---|---|---|---|
 | `intelligence.endpoints` | list, or one comma-separated string | `[]` | live · op | Ordered endpoints for failover. Each is `https://host[:port][/path]`, a loopback `http://`, or `mock:` (the built-in mock model: `mock:final`, `mock:file:<playbook.json>`; needs `mock-models`, which release binaries carry). |
-| `intelligence.dialect` | `openai \| anthropic \| bedrock \| decisions` | `openai` | live · doc | The wire format. `bedrock` pairs with `auth.kind: aws`; `decisions` is for a provider only. |
+| `intelligence.dialect` | `openai \| openai-chat \| openai-responses \| anthropic \| bedrock \| decisions` | `openai` | live · doc | The wire format. `openai` is Chat Completions, and OpenAI's Responses API for the models that take tools only there (`gpt-5.6`, `gpt-6` and later, the `-pro` and `codex` models) on any host and for every `gpt-5` model and later on `api.openai.com`; `openai-chat` is Chat Completions for every model, `openai-responses` the Responses API for every model. `bedrock` pairs with `auth.kind: aws`; `decisions` is for a provider only. |
 | `intelligence.token` | secret | — | live · op | The bearer for every endpoint of the connection. |
 | `intelligence.token_file` | path | — | live · op | A file holding the bearer, read at every dial. `token` wins when both are set. |
 | `intelligence.headers` | map | `{}` | live · op | Extra request headers. A credential-shaped header needs a reference. |
@@ -440,11 +440,14 @@ Where a request goes:
 
 | Endpoint written | Posted to |
 |---|---|
-| host only, `dialect: openai` | `<host>/v1/chat/completions` |
+| host only, `dialect: openai` | `<host>/v1/chat/completions`; `<host>/v1/responses` for a call routed to the Responses API |
+| host only, `dialect: openai-chat` | `<host>/v1/chat/completions` |
+| host only, `dialect: openai-responses` | `<host>/v1/responses` |
+| a path ending `/chat/completions`, `dialect: openai`, a call routed to the Responses API | that path with `/chat/completions` replaced by `/responses` |
 | host only, `dialect: anthropic` | `<host>/v1/messages` |
 | `dialect: bedrock` | the Converse path for the model |
 | host only, `dialect: decisions` | `<host>/v1/decisions` |
-| any URL with a path, `bedrock` aside | that path, exactly as written |
+| any other URL with a path, `bedrock` aside | that path, exactly as written |
 
 So `https://api.openai.com/v1/chat/completions` and
 `https://api.anthropic.com` are the forms to write; `https://api.openai.com/v1`
@@ -466,6 +469,7 @@ posts to `/v1` and fails.
 | `intelligence.models.<name>.fallback` | string | — | live · doc | The model asked when this one is unavailable (every endpoint failed or broken open). A cycle is exit 2. |
 | `intelligence.models.<name>.escalate` | string | — | live · doc | A decision model's: the model an unsure answer is asked again on, once. |
 | `intelligence.models.<name>.reasoning.effort` | `low \| medium \| high` | `medium` | live · doc | A reasoning model's default effort; a node's or `think` call's `effort` overrides it. |
+| `intelligence.models.<name>.temperature` | number, 0 to 2 | unset | live · doc | The sampling temperature sent to the model. Unset sends none, and the model runs at its own default. Never sent to a reasoning model, a Claude model, or a model whose name starts with `gpt-5` or later, `chatgpt-5`, `o1`, `o3` or `o4`, which refuse one. Refused on a decision model. |
 | `intelligence.models.<name>.reasoning.budget` | int | by effort | live · doc | Thinking tokens, for the dialects that take a budget. |
 | `intelligence.roles.turn` | model, or `{model}` | `intelligence.model` | live · doc | The agent's turns; `agent`, `extract` and `summarize` nodes; subagents that name no model. |
 | `intelligence.roles.think` | model, or `{model}` | `roles.turn` | live · doc | The `think` tool and `think` nodes. |

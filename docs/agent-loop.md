@@ -290,9 +290,12 @@ sequenceDiagram
   end
 ```
 
-**Requests go out at temperature 0**, except where current models refuse
-one: nothing is sent on `dialect: anthropic`, to a Claude model on Bedrock,
-or to any reasoning model. A reasoning model is sent its effort instead,
+**A temperature is sent only when the model's config sets one**
+(`intelligence.models.<name>.temperature`); otherwise the model runs at its
+own default. Even a configured one is never sent where current models
+refuse it: on `dialect: anthropic`, to a Claude model on Bedrock, to an
+OpenAI reasoning family (`gpt-5` and later, `o1`, `o3`, `o4`), or to any
+reasoning model. A reasoning model is sent its effort instead,
 and its output cap is raised by the room its thinking needs, which budget
 admission counts. Within a turn that keeps calling tools, a reasoning
 model's own reasoning parts are sent back to it as it wrote them, and only

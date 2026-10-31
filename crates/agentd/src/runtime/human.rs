@@ -1360,7 +1360,7 @@ UNDECIDED.";
         messages: vec![Message::System(system.to_string()), Message::User(user)],
         tools: vec![],
         max_tokens: 400,
-        temperature: Some(0.0),
+        temperature: None,
         output_schema: closed.as_deref().map(judge_answer_schema),
         ..Default::default()
     };
@@ -1476,7 +1476,7 @@ fn human_decision_call(
                 &Request {
                     model: model.clone(),
                     max_tokens: 256,
-                    temperature: Some(0.0),
+                    temperature: None,
                     decision: Some(decision.clone()),
                     ..Default::default()
                 },

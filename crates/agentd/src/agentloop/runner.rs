@@ -381,7 +381,7 @@ impl<'a> Session<'a> {
                 messages: self.messages.clone(),
                 tools: self.tools.clone(),
                 max_tokens: PER_CALL_MAX_TOKENS,
-                temperature: Some(0.0),
+                temperature: None,
                 ..Default::default()
             };
 

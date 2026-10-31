@@ -4364,9 +4364,11 @@
           "type": "object"
         },
         "dialect": {
-          "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)",
+          "description": "wire dialect; openai (default) = Chat Completions, and the Responses API for the OpenAI models that take tools only there (gpt-5.6, gpt-6 and later, the -pro and codex models), and for every gpt-5 model and later on api.openai.com; openai-chat = Chat Completions for every model; openai-responses = the Responses API for every model; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)",
           "enum": [
             "openai",
+            "openai-chat",
+            "openai-responses",
             "anthropic",
             "bedrock",
             "decisions"
@@ -4443,6 +4445,12 @@
                 },
                 "type": "object"
               },
+              "temperature": {
+                "description": "the sampling temperature sent to this model; unset (default) sends none. Never sent to a reasoning model, a Claude model, or OpenAI's gpt-5* and o-series, which refuse one",
+                "maximum": 2,
+                "minimum": 0,
+                "type": "number"
+              },
               "window": {
                 "description": "this model's context window, so compaction stops guessing from the model NAME",
                 "minimum": 1,
@@ -4465,9 +4473,11 @@
                 "$ref": "#/$defs/Auth"
               },
               "dialect": {
-                "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)",
+                "description": "wire dialect; openai (default) = Chat Completions, and the Responses API for the OpenAI models that take tools only there (gpt-5.6, gpt-6 and later, the -pro and codex models), and for every gpt-5 model and later on api.openai.com; openai-chat = Chat Completions for every model; openai-responses = the Responses API for every model; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)",
                 "enum": [
                   "openai",
+                  "openai-chat",
+                  "openai-responses",
                   "anthropic",
                   "bedrock",
                   "decisions"

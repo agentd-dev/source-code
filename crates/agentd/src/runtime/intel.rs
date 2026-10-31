@@ -286,6 +286,9 @@ impl Runtime {
             reference: None,
             fallbacks: Vec::new(),
             reasoning,
+            temperature: reference
+                .and_then(|r| intel.tier(r))
+                .and_then(|t| t.temperature),
             structured_prompt: conn.structured_prompt,
             credential_error,
         }

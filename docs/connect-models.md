@@ -82,6 +82,69 @@ for any API that serves `/chat/completions` with tool calling: write its
 full URL and its model name. A gateway that wants a different header takes
 it under `headers` (see [Credentials](#credentials)).
 
+agentd sends a `temperature` only when the model's config sets one
+(`intelligence.models.<name>.temperature`), and never to a model whose name
+starts with `gpt-5` or later, `chatgpt-5`, `o1`, `o3` or `o4`: those refuse
+any temperature but their default.
+
+### gpt-5.6 and later: the Responses API
+
+OpenAI's newest models — gpt-5.6 and the gpt-6 family — take function tools
+only on the Responses API (`/v1/responses`); on `/v1/chat/completions` a
+request with tools is refused with a 400. The default `openai` dialect asks
+them there by itself, so such a model needs nothing beyond its name:
+
+```yaml
+intelligence:
+  endpoints: https://api.openai.com
+  token: "{{secret:OPENAI_API_KEY}}"
+  models:
+    sol:
+      kind: reasoning
+      model: gpt-6.1-sol
+      reasoning: {effort: medium}
+  roles: {turn: sol}
+```
+
+`kind: reasoning` is what raises the call's output cap by the room the
+model's thinking needs; without it, the thinking and the answer share the
+4,096-token answer cap.
+
+The rule the default dialect routes by has two tiers. A model that Chat
+Completions refuses tools for goes to Responses on any endpoint, because no
+other call can work. On OpenAI's own API (`api.openai.com`) every `gpt-5`
+model and later goes there too: Responses is OpenAI's current API for them,
+and it keeps their reasoning across a turn's tool rounds. Any other host is
+taken for an OpenAI-compatible server — vLLM, Ollama, a gateway, Azure —
+which mostly speaks Chat Completions alone, so a model chat still serves
+stays on chat there.
+
+| Model name | On `api.openai.com` | On any other host |
+|---|---|---|
+| `gpt-5.N…` with N of 6 or more; `gpt-6…` and every later family | Responses | Responses |
+| `o1-pro…`, `o3-pro…`, `gpt-5…-pro…`, any name containing `codex` | Responses | Responses |
+| `gpt-5`, `gpt-5.1` … `gpt-5.5` and their variants | Responses | Chat Completions |
+| every other name (`gpt-4o`, `gpt-4.1`, `o3`, `o4-mini`, open models) | Chat Completions | Chat Completions |
+
+A Responses call goes to the path beside the configured one: a host alone
+or `…/v1/chat/completions` posts to `…/v1/responses`, and a gateway mount
+such as `https://gw.example/openai/v1/chat/completions` to
+`https://gw.example/openai/v1/responses`. A path that does not end
+`/chat/completions` says nothing about where Responses lives, so it stays
+on Chat Completions. Name the dialect to fix it for every model on the
+connection:
+
+| `dialect` | Every call goes to |
+|---|---|
+| `openai` (default) | Chat Completions, or Responses by the rule above |
+| `openai-responses` | the Responses API, at `/v1/responses` or the path written |
+| `openai-chat` | Chat Completions, at `/v1/chat/completions` or the path written |
+
+Every Responses call is sent with `store: false`, so nothing is kept at
+OpenAI between calls. A reasoning model's reasoning comes back encrypted
+and goes back to it while a turn is still calling tools. The full wire is
+in [Intelligence wire reference](intelligence-reference.md#openai-responses-dialect).
+
 ## Anthropic
 
 Set `dialect: anthropic` and give the host alone. agentd posts to

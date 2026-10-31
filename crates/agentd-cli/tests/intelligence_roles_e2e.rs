@@ -472,6 +472,49 @@ fn a_provider_dials_with_its_own_token_not_the_top_level_environment() {
     let _ = std::fs::remove_file(&top);
 }
 
+/// A model is sent the temperature its config sets, and a model whose config
+/// sets none is sent none — not a default of agentd's.
+#[test]
+fn a_temperature_is_sent_only_when_the_model_sets_one() {
+    let play = playbook(r#"{"from": "none"}"#);
+    std::fs::write(
+        &play,
+        serde_json::json!({"turns": [{"content": "{\"from\": \"none\"}"}], "match": [
+            {"when_contains": "\"temperature\":0.7", "content": "{\"from\": \"0.7\"}"},
+            {"when_contains": "\"temperature\"", "content": "{\"from\": \"another\"}"}
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let cfg = format!(
+        "{BASE}intelligence:\n  endpoints: \"mock:file:{play}\"\n\
+        \x20 models:\n\
+        \x20   plain: {{ model: wire-plain }}\n\
+        \x20   warm: {{ model: wire-warm, temperature: 0.7 }}\n\
+        \x20   five: {{ model: gpt-5.5, temperature: 0.7 }}\n\
+        \x20 roles: {{ turn: plain }}\n\
+        workflows:\n\
+        \x20 - name: w\n    steps:\n\
+        \x20     s: {{ kind: once }}\n\
+        \x20     a: {{ kind: think, prompt: \"x\", depends_on: [s] }}\n\
+        \x20     b: {{ kind: think, prompt: \"y\", model: warm, depends_on: [s] }}\n\
+        \x20     c: {{ kind: think, prompt: \"z\", model: five, depends_on: [s] }}\n\
+        \x20     f: {{ kind: finish, depends_on: [a, b, c], status: completed, output: {{ a: \"{{{{steps.a.output.from}}}}\", b: \"{{{{steps.b.output.from}}}}\", c: \"{{{{steps.c.output.from}}}}\" }} }}\n"
+    );
+    let (code, out, log) = run(&cfg);
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(
+        out["a"], "none",
+        "no temperature set, none sent: {out}\n{log}"
+    );
+    assert_eq!(out["b"], "0.7", "the model's own: {out}\n{log}");
+    assert_eq!(
+        out["c"], "none",
+        "a reasoning family is sent none: {out}\n{log}"
+    );
+    let _ = std::fs::remove_file(&play);
+}
+
 /// A reasoning model is asked with its effort — its own, or the one a node
 /// names over it — and a node's model's fallback with none.
 #[test]

@@ -1735,9 +1735,11 @@ pub struct Intelligence {
     #[serde(deserialize_with = "string_or_list")]
     pub endpoints: Vec<String>,
     pub model: Option<String>,
-    /// The wire dialect: `openai` (default), `anthropic`, or
-    /// `bedrock` (native Amazon Bedrock Converse — pair with `auth: {kind: aws,
-    /// service: bedrock}`). Unset ⇒ OpenAI-compatible.
+    /// The wire dialect: `openai` (default — Chat Completions, and the
+    /// Responses API for the OpenAI models that need it), `openai-chat`,
+    /// `openai-responses`, `anthropic`, or `bedrock` (native Amazon Bedrock
+    /// Converse — pair with `auth: {kind: aws, service: bedrock}`). Unset ⇒
+    /// `openai`.
     pub dialect: Option<String>,
     pub token: Option<Secret>,
     pub token_file: Option<String>,
@@ -1874,6 +1876,11 @@ pub struct ModelTier {
     /// a token budget for the dialects that take one. A node's or a `think`
     /// call's `effort` overrides the effort for that call.
     pub reasoning: Option<ReasoningDefaults>,
+    /// The sampling temperature sent to this model, 0 to 2. Unset — the
+    /// default — sends none, and the model runs at its own default. Never
+    /// sent to a reasoning model, nor to a model of a family that refuses
+    /// one (Claude; OpenAI's `gpt-5*` and `o`-series).
+    pub temperature: Option<f32>,
 }
 
 /// `intelligence.models.<n>.reasoning`.
@@ -8312,6 +8319,16 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 );
             }
         }
+        if let Some(temp) = t.temperature {
+            if !(0.0..=2.0).contains(&temp) {
+                err(&mut d, format!("{at}.temperature: a number from 0 to 2"));
+            } else if t.kind == ModelKind::Decision {
+                err(
+                    &mut d,
+                    format!("{at}.temperature: a decision model writes nothing to sample"),
+                );
+            }
+        }
         if let Some(r) = &t.reasoning {
             if t.kind != ModelKind::Reasoning {
                 err(
@@ -10731,7 +10748,7 @@ fn validate_connection(c: &Connection<'_>, client: Option<&client::Client>, d: &
     if let Some(dialect) = c.dialect {
         if crate::intel::client::Provider::from_dialect(Some(dialect)).is_none() {
             d.errors.push(format!(
-                "{at}.dialect: {dialect:?} (want openai|anthropic|bedrock|decisions)"
+                "{at}.dialect: {dialect:?} (want openai|openai-chat|openai-responses|anthropic|bedrock|decisions)"
             ));
         }
         // The top-level connection serves the agent's turns, which write.
@@ -17386,6 +17403,54 @@ mod tests {
             (
                 "  dialect: decisions\n",
                 "the top-level connection serves the agent's turns",
+            ),
+        ] {
+            let e = errors(extra);
+            assert!(e.contains(why), "{extra}\n→ {e}");
+        }
+    }
+
+    /// A model's `temperature` is a number from 0 to 2 on a model that
+    /// writes; the OpenAI dialects are named by their three selectors.
+    #[test]
+    fn a_models_temperature_and_the_openai_dialects() {
+        let errors = |extra: &str| -> String {
+            let doc = format!(
+                "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    jevp: {{endpoints: \"https://jev.example/v1/decisions\", dialect: decisions}}\n    oai: {{endpoints: \"https://api.openai.com\", dialect: openai-responses}}\n    oaic: {{endpoints: \"https://api.openai.com\", dialect: openai-chat}}\n{extra}"
+            );
+            match load_doc(&doc) {
+                Ok(l) => validate(&l).errors.join("; "),
+                Err(e) => e.to_string(),
+            }
+        };
+        let ok = errors(
+            "  models:\n    warm: {model: gpt-4.1, temperature: 0.7}\n    cold: {model: m, temperature: 0}\n    sol: {kind: reasoning, model: gpt-5.6-sol, provider: oai}\n    old: {model: gpt-4o, provider: oaic, temperature: 2}\n  roles: {turn: sol}\n",
+        );
+        assert!(ok.is_empty(), "{ok}");
+        let s = load_doc(
+            "intelligence:\n  endpoints: \"mock:json\"\n  models:\n    warm: {model: gpt-4.1, temperature: 0.5}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            s.settings.intelligence.models["warm"].temperature,
+            Some(0.5)
+        );
+        for (extra, why) in [
+            (
+                "  models:\n    hot: {model: m, temperature: 2.5}\n",
+                "temperature: a number from 0 to 2",
+            ),
+            (
+                "  models:\n    neg: {model: m, temperature: -1}\n",
+                "temperature: a number from 0 to 2",
+            ),
+            (
+                "  models:\n    jev: {kind: decision, provider: jevp, model: j-1, temperature: 0}\n",
+                "a decision model writes nothing to sample",
+            ),
+            (
+                "  dialect: openai-completions\n",
+                "want openai|openai-chat|openai-responses|anthropic|bedrock|decisions",
             ),
         ] {
             let e = errors(extra);

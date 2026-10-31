@@ -131,7 +131,7 @@ fn top_level_properties(
                 }
             }));
     let endpoints = json!({ "oneOf": [ { "type": "array", "items": { "type": "string" } }, { "type": "string" } ], "description": "ordered endpoint list (failover); one comma-separated string is accepted" });
-    let dialect = json!({ "enum": ["openai", "anthropic", "bedrock", "decisions"], "description": "wire dialect; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)" });
+    let dialect = json!({ "enum": ["openai", "openai-chat", "openai-responses", "anthropic", "bedrock", "decisions"], "description": "wire dialect; openai (default) = Chat Completions, and the Responses API for the OpenAI models that take tools only there (gpt-5.6, gpt-6 and later, the -pro and codex models), and for every gpt-5 model and later on api.openai.com; openai-chat = Chat Completions for every model; openai-responses = the Responses API for every model; bedrock = native Amazon Bedrock Converse (pair with auth.kind=aws); decisions = a decision model's endpoint, posted at its full URL (a provider only)" });
     let structured_output = json!({ "enum": ["auto", "prompt"], "description": "how a call whose answer has a JSON Schema is asked on this connection: auto (default) — natively where the dialect and the schema allow (OpenAI response_format, Anthropic output_config.format, a Claude model's on Bedrock), else in the prompt; prompt — in the prompt alone, for a server that refuses a response format. The answer is validated against the schema either way" });
     // A role that writes takes a model; one that decides, a threshold too.
     let writing_role = |what: &str| {
@@ -171,6 +171,7 @@ fn top_level_properties(
                                 "effort": { "enum": ["low", "medium", "high"] },
                                 "budget": { "type": "integer", "minimum": 1024, "description": "thinking tokens, for the dialects that take a budget (anthropic, bedrock's Anthropic models); default by effort" } } },
                             "model": { "type": "string", "description": "the wire model name sent to the provider" },
+                            "temperature": { "type": "number", "minimum": 0, "maximum": 2, "description": "the sampling temperature sent to this model; unset (default) sends none. Never sent to a reasoning model, a Claude model, or OpenAI's gpt-5* and o-series, which refuse one" },
                             "escalate": { "type": "string", "description": "a decision model's: the model an unsure answer is asked again on, once" },
                             "provider": { "type": "string", "description": "the connection: a name under intelligence.providers; default the top-level one. Operator-only" },
                             "window": { "type": "integer", "minimum": 1, "description": "this model's context window, so compaction stops guessing from the model NAME" },

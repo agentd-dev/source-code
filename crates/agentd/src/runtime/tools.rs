@@ -2056,7 +2056,7 @@ impl Runtime {
             budget_admission: self.governor.is_active(),
             idempotency_prefix: String::new(),
             tool_meta: None,
-            temperature: Some(0.0),
+            temperature: None,
             max_tokens_per_call: 0,
             turn_id: self.next_id("think"),
             decision: None,

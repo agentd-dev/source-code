@@ -23,6 +23,28 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Added.**
 
+- The OpenAI Responses API dialect (`POST /v1/responses`), for OpenAI's
+  newest models, which take function tools only there: gpt-5.6-sol on
+  `/v1/chat/completions` answered every call that carried tools with a
+  400. `dialect: openai-responses` asks every model on the connection on
+  the Responses API. The default `openai` dialect now routes by itself, at
+  the path beside a configured `…/chat/completions` one: on any host, the
+  models Chat Completions refuses tools for — `gpt-5.N` with N of 6 or
+  more, `gpt-6` and every later family (gpt-6.1-sol among them), the
+  `o1-pro`/`o3-pro`/`gpt-5…-pro` and `codex` models; on
+  `api.openai.com`, every `gpt-5` model and later as well. Other hosts are
+  OpenAI-compatible servers that mostly speak chat alone, and older models
+  stay on chat; `dialect:
+  openai-chat` keeps every model on Chat Completions. The dialect sends
+  `instructions` and `input` items (prior tool calls as
+  `function_call`/`function_call_output`), flat function tools,
+  `reasoning.effort`, `max_output_tokens`, the answer's schema as
+  `text.format`, and `store: false`; a reasoning model's encrypted
+  reasoning goes back to it while a turn is still calling tools, and to no
+  other model. Errors, retries and failover are the chat dialect's.
+- `intelligence.models.<name>.temperature` (0 to 2): the sampling
+  temperature sent to that model. Unset sends none.
+
 - `examples/demos/`: two finance demos agentd runs itself — accounts payable (invoices as MCP Events, decided under an instruction followed over MCP, a gate to the controller or CFO above the limit) and month-end close (a bank-feed subscription, a second agentd asked over A2A, journal entries drafted with `journal.post` never granted, a review gate) — with stand-in MCP servers on the official TypeScript SDK and `rehearse.sh`, which runs both on the mock model and asserts every beat from the logs.
 - `private_key_jwt` client authentication for an `oauth2` block (RFC 7523):
   `auth.client_auth: {method: private_key_jwt, key, kid, assertion_aud}`
@@ -2551,6 +2573,23 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   instruction taints nothing.
 
 **Fixed.**
+
+- agentd no longer sends `temperature: 0` to every model. gpt-5.5 refused
+  every call with a 400 ("Only the default (1) value is supported") even
+  with no temperature configured, because each turn, step, judge and goal
+  check asked at 0. A temperature is now sent only when the model's config
+  sets one, and never — on either OpenAI dialect — to a model of an OpenAI
+  reasoning family (`gpt-5` and later, `chatgpt-5`, `o1`, `o3`, `o4`),
+  as none was already sent to a Claude model or a reasoning model.
+- `instructions_bindings_create` is no longer refused by the instruction
+  registry. agentd sent its consumer as `{label, kind, workload}`, and the
+  registry, whose consumer is `{name, kind, host, version}` with no other
+  property, refused the call (`Additional properties are not allowed
+  ('label', 'workload' were unexpected)`), so no binding was created and no
+  applied version was ever reported. The consumer is now `{name: <instance
+  name>, kind: "agentd", host: <agent name>, version: <agentd version>}`,
+  and the in-tree mock registry refuses any other property, as the registry
+  does.
 
 - A restarted parent no longer loses a durable instance child whose
   previous process is still draining. A parent that idle-exits or dies

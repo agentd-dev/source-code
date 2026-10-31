@@ -113,7 +113,7 @@ pub fn build_request(req: &Request, _token: Option<&str>) -> (Vec<u8>, Vec<(Stri
             if let Some(t) = req.temperature
                 && model_family(&req.model) != Some(Family::Anthropic)
             {
-                inference.insert("temperature".into(), json!(t));
+                inference.insert("temperature".into(), json!(super::openai::decimal(t)));
             }
         }
     }

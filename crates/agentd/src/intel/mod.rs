@@ -17,6 +17,10 @@ pub mod endpoints;
 pub mod failover;
 pub mod health;
 pub mod openai;
+// OpenAI's Responses API (`/v1/responses`): the dialect OpenAI's newest
+// models take function tools on. Chosen by `dialect: openai-responses`, or
+// per request by the default `openai` dialect for those models.
+pub mod responses;
 // The wire copy of an answer's JSON Schema, which each dialect asks for
 // natively (RFC 0046 §5.8). Pure functions over `serde_json::Value`.
 pub mod structured;

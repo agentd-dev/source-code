@@ -281,8 +281,12 @@ counts downstream, where those facts live.
 
 ## Limits
 
-- **Four dialects.** agentd speaks the OpenAI-compatible chat wire,
-  Anthropic Messages, Bedrock Converse, and the decisions wire. Other
+- **Five dialects.** agentd speaks the OpenAI-compatible chat wire,
+  OpenAI's Responses API, Anthropic Messages, Bedrock Converse, and the
+  decisions wire. The default `openai` dialect asks the OpenAI models that
+  take tools only on the Responses API there (gpt-5.6, the gpt-6 family and
+  later) on any host, and every gpt-5 model and later on `api.openai.com`,
+  so such a model needs no extra setting. Other
   providers are reached through their OpenAI-compatible endpoints or a
   gateway.
 - **Native tool calling only.** There is no prompt-embedded action

@@ -14,19 +14,41 @@ use serde_json::{Map, Value, json};
 /// path (`https://host[:port]` with path `/`).
 pub const DEFAULT_PATH: &str = "/v1/chat/completions";
 
-/// The output-token-limit parameter name for `model`. OpenAI's reasoning models
-/// (`gpt-5*`, the `o1/o3/o4` series) require `max_completion_tokens` and REJECT
-/// the older `max_tokens`; everything else (gpt-4o/4.1, and self-hosted
-/// OpenAI-compatible servers that only implement the classic param) takes
-/// `max_tokens`. Choosing per model keeps both working.
-fn max_tokens_key(model: &str) -> &'static str {
+/// Whether `model` is of an OpenAI reasoning family — `gpt-5*` and later
+/// (`gpt-6`…), `chatgpt-5*`, the `o1/o3/o4` series. Such a model thinks
+/// whether or not it is asked to, takes `max_completion_tokens` and REFUSES
+/// the older `max_tokens`, and refuses any `temperature` but its default
+/// (a 400). Everything else — gpt-4o/4.1, and the self-hosted
+/// OpenAI-compatible servers that only implement the classic parameters —
+/// takes both.
+pub fn reasoning_family(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    if m.starts_with("gpt-5")
+    m.starts_with("gpt-5")
         || m.starts_with("chatgpt-5")
         || m.starts_with("o1")
         || m.starts_with("o3")
         || m.starts_with("o4")
-    {
+        || super::responses::gpt_generation(&m).is_some_and(|(major, _)| major >= 5)
+}
+
+/// The temperature a request to `model` carries: the one set, and none to a
+/// model of an OpenAI reasoning family, which refuses it. Shared by both
+/// OpenAI dialects. As the decimal the config wrote — `0.7`, not the
+/// `0.699999988…` a widened `f32` would put on the wire.
+pub fn temperature_for(model: &str, set: Option<f32>) -> Option<f64> {
+    set.filter(|_| !reasoning_family(model)).map(decimal)
+}
+
+/// `t` as the shortest decimal that reads back as it, widened to `f64`.
+pub(super) fn decimal(t: f32) -> f64 {
+    t.to_string().parse().unwrap_or(t as f64)
+}
+
+/// The output-token-limit parameter name for `model`: `max_completion_tokens`
+/// for a reasoning family, else `max_tokens`. Choosing per model keeps both
+/// working.
+fn max_tokens_key(model: &str) -> &'static str {
+    if reasoning_family(model) {
         "max_completion_tokens"
     } else {
         "max_tokens"
@@ -52,7 +74,7 @@ pub fn build_request(req: &Request, token: Option<&str>) -> (Vec<u8>, Vec<(Strin
         }
         None => {
             body.insert(max_tokens_key(&req.model).into(), json!(req.max_tokens));
-            if let Some(t) = req.temperature {
+            if let Some(t) = temperature_for(&req.model, req.temperature) {
                 body.insert("temperature".into(), json!(t));
             }
         }
@@ -268,6 +290,33 @@ mod tests {
             reasoning: None,
             output_schema: None,
         }
+    }
+
+    /// A temperature is sent only when one is set, and never to a model of
+    /// an OpenAI reasoning family: gpt-5.5 refuses any but its default (400).
+    #[test]
+    fn temperature_only_when_set_and_never_to_a_reasoning_family() {
+        let body =
+            |r: &Request| -> Value { serde_json::from_slice(&build_request(r, None).0).unwrap() };
+        let mut r = req();
+        r.temperature = None;
+        assert!(body(&r).get("temperature").is_none());
+        r.temperature = Some(0.0);
+        assert_eq!(body(&r)["temperature"], 0.0);
+        for m in [
+            "gpt-5.5",
+            "gpt-5",
+            "chatgpt-5",
+            "o1",
+            "o3-mini",
+            "o4-mini",
+            "gpt-6",
+        ] {
+            r.model = m.into();
+            assert!(body(&r).get("temperature").is_none(), "{m}");
+        }
+        r.model = "gpt-4o".into();
+        assert_eq!(body(&r)["temperature"], 0.0);
     }
 
     #[test]

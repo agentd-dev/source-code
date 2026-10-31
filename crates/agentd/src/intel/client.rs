@@ -23,15 +23,23 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use super::endpoints::EndpointList;
-use super::{anthropic, bedrock, failover, openai};
+use super::{anthropic, bedrock, failover, openai, responses};
 
 /// Which in-binary adapter speaks to the endpoint. OpenAI-compatible is the
-/// default; Anthropic Messages and Bedrock Converse are the other two dialects
-/// compiled in. The set stops here deliberately: any other provider is reached
+/// default; OpenAI's Responses API, Anthropic Messages and Bedrock Converse
+/// are the other dialects compiled in. The set stops here deliberately: any other provider is reached
 /// through a gateway, which keeps provider quirks out of the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
+    /// `dialect: openai` (the default): Chat Completions, except for a call
+    /// the routing rule sends to the Responses API
+    /// ([`super::responses::routes_to`]) — at the Responses path beside the
+    /// configured Chat Completions one.
     OpenAiCompatible,
+    /// `dialect: openai-chat`: Chat Completions for every model.
+    OpenAiChat,
+    /// `dialect: openai-responses`: the Responses API for every model.
+    OpenAiResponses,
     Anthropic,
     /// Amazon Bedrock Converse — the model id rides the URL path, not the body,
     /// and auth is SigV4 (an `intelligence.auth: {kind: aws}`), not a bearer.
@@ -44,7 +52,8 @@ pub enum Provider {
 impl Provider {
     pub(super) fn default_path(self) -> &'static str {
         match self {
-            Provider::OpenAiCompatible => openai::DEFAULT_PATH,
+            Provider::OpenAiCompatible | Provider::OpenAiChat => openai::DEFAULT_PATH,
+            Provider::OpenAiResponses => responses::DEFAULT_PATH,
             Provider::Anthropic => anthropic::DEFAULT_PATH,
             Provider::Bedrock => bedrock::DEFAULT_PATH,
             Provider::Decisions => super::decisions::DEFAULT_PATH,
@@ -57,6 +66,8 @@ impl Provider {
     pub fn from_dialect(dialect: Option<&str>) -> Option<Provider> {
         match dialect.map(str::trim).filter(|s| !s.is_empty()) {
             None | Some("openai") | Some("openai-compatible") => Some(Provider::OpenAiCompatible),
+            Some("openai-chat") => Some(Provider::OpenAiChat),
+            Some(responses::NAME) => Some(Provider::OpenAiResponses),
             Some("anthropic") => Some(Provider::Anthropic),
             Some("bedrock") => Some(Provider::Bedrock),
             Some("decisions") => Some(Provider::Decisions),
@@ -64,15 +75,32 @@ impl Provider {
         }
     }
 
-    /// The effective request path for THIS request. Fixed for OpenAI and
-    /// Anthropic (the configured or default path); Bedrock puts the URI-encoded
-    /// model id in the path — `/model/{modelId}/converse` — so the path must be
-    /// computed per request and the signer and the wire must be handed the same
-    /// dynamic target, or the signature will not cover what is sent.
-    pub(super) fn request_path(self, configured: &str, req: &Request) -> String {
+    /// The dialect and the request path THIS request is sent with — the one
+    /// resolver of both. Bedrock puts the URI-encoded model id in the path —
+    /// `/model/{modelId}/converse` — so the path is computed per request, and
+    /// the signer and the wire must be handed the same dynamic target, or the
+    /// signature will not cover what is sent. The default `openai` dialect
+    /// asks a model the Responses API is for on `host` there
+    /// ([`responses::routes_to`]), at the path beside a Chat Completions path; a path that is not one (a gateway's own route)
+    /// says nothing about where Responses lives, so it stays on chat — name
+    /// `dialect: openai-responses` for it. Every other dialect is fixed, at
+    /// the configured or default path.
+    pub(super) fn for_request(
+        self,
+        configured: &str,
+        host: &str,
+        req: &Request,
+    ) -> (Provider, String) {
         match self {
-            Provider::Bedrock => bedrock::converse_path(&req.model),
-            _ => configured.to_string(),
+            Provider::Bedrock => (self, bedrock::converse_path(&req.model)),
+            Provider::OpenAiCompatible if responses::routes_to(&req.model, host) => {
+                match responses::path_beside(configured) {
+                    Some(path) => (Provider::OpenAiResponses, path),
+                    None => (Provider::OpenAiChat, configured.to_string()),
+                }
+            }
+            Provider::OpenAiCompatible => (Provider::OpenAiChat, configured.to_string()),
+            _ => (self, configured.to_string()),
         }
     }
 }
@@ -173,6 +201,10 @@ pub struct IntelClient {
     /// This model's reasoning controls, when it is a reasoning model: set on
     /// every request it is asked, and on no other link's.
     reasoning: Option<crate::wire::intel::ReasoningAsk>,
+    /// This model's configured temperature, sent on every request on it that
+    /// names none; `None` sends none. The dialects still leave it out where
+    /// the model refuses one.
+    temperature: Option<f32>,
     /// Why this connection's credential could not be produced when the
     /// client was built: every call on it then fails with
     /// [`IntelError::Credential`], unsent.
@@ -259,6 +291,7 @@ impl IntelClient {
             last_all_down: std::cell::Cell::new(false),
             fallback: None,
             reasoning: None,
+            temperature: None,
             credential_error: None,
         }
     }
@@ -276,6 +309,13 @@ impl IntelClient {
         reasoning: Option<crate::wire::intel::ReasoningAsk>,
     ) -> IntelClient {
         self.reasoning = reasoning;
+        self
+    }
+
+    /// Send every request on this model that names no temperature with
+    /// `temperature` — the model's configured one. `None` sends none.
+    pub fn with_temperature(mut self, temperature: Option<f32>) -> IntelClient {
+        self.temperature = temperature;
         self
     }
 
@@ -507,6 +547,7 @@ impl IntelClient {
                 next.model = f.model.clone();
                 // The fallback is its own model, with its own controls.
                 next.reasoning = None;
+                next.temperature = None;
                 f.client
                     .complete_until(&next, self.deadline.get(), call)
                     .map(|mut resp| {
@@ -540,15 +581,22 @@ impl IntelClient {
         req: &Request,
         call: Option<&crate::obs::trace::TraceContext>,
     ) -> Result<Response, IntelError> {
+        // This model's own controls, under what the call names itself.
         let owned;
-        let req = match (&self.reasoning, &req.reasoning) {
-            (Some(r), None) => {
-                let mut with = req.clone();
-                with.reasoning = Some(*r);
-                owned = with;
-                &owned
+        let add_reasoning = self.reasoning.is_some() && req.reasoning.is_none();
+        let add_temperature = self.temperature.is_some() && req.temperature.is_none();
+        let req = if add_reasoning || add_temperature {
+            let mut with = req.clone();
+            if add_reasoning {
+                with.reasoning = self.reasoning;
             }
-            _ => req,
+            if add_temperature {
+                with.temperature = self.temperature;
+            }
+            owned = with;
+            &owned
+        } else {
+            req
         };
         // One model call. A no-op when metrics are not enabled.
         crate::obs::metrics::record_intel_call();

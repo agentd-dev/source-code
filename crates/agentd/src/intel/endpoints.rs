@@ -439,33 +439,42 @@ impl Endpoint {
             req
         };
 
-        use super::bedrock;
-        let (body, headers) = match self.provider {
-            Provider::OpenAiCompatible => openai::build_request(req, self.token.as_deref()),
-            Provider::Anthropic => anthropic::build_request(req, self.token.as_deref()),
-            Provider::Bedrock => bedrock::build_request(req, self.token.as_deref()),
+        use super::{bedrock, responses};
+        // The dialect and the effective request path, resolved together for
+        // THIS request: fixed for most dialects; Bedrock derives
+        // `/model/{modelId}/converse` from the request, and the default
+        // `openai` dialect sends a model that needs the Responses API there.
+        // The SAME path string is sent on the wire AND fed to the AAuth/SigV4
+        // signers below, so the signature covers the exact request-target.
+        // Recomputing it separately for either use would silently invalidate
+        // every signature.
+        let (wire, path) = self
+            .provider
+            .for_request(&self.http_path, &self.host_header, req);
+        let token = self.token.as_deref();
+        let (body, headers) = match wire {
+            Provider::OpenAiCompatible | Provider::OpenAiChat => openai::build_request(req, token),
+            Provider::OpenAiResponses => responses::build_request(req, token),
+            Provider::Anthropic => anthropic::build_request(req, token),
+            Provider::Bedrock => bedrock::build_request(req, token),
             Provider::Decisions => unreachable!("answered above"),
         };
-        // The effective request path: fixed for OpenAI and Anthropic; Bedrock
-        // derives `/model/{modelId}/converse` from the request. The SAME string
-        // is sent on the wire AND fed to the AAuth/SigV4 signers below, so the
-        // signature covers the exact request-target. Recomputing it separately
-        // for either use would silently invalidate every signature.
-        let path = self.provider.request_path(&self.http_path, req);
         let (resp, latency) = self.post(&path, body, headers, timeout, deadline, trace)?;
 
-        let mut parsed = match self.provider {
-            Provider::OpenAiCompatible => openai::parse_response(&resp.body),
+        let mut parsed = match wire {
+            Provider::OpenAiCompatible | Provider::OpenAiChat => openai::parse_response(&resp.body),
+            Provider::OpenAiResponses => responses::parse_response(&resp.body),
             Provider::Anthropic => anthropic::parse_response(&resp.body),
             Provider::Bedrock => bedrock::parse_response(&resp.body),
             Provider::Decisions => unreachable!("answered above"),
         }
         .map_err(IntelError::Parse)?;
-        // A message that thought is tagged with the model that wrote it: its
-        // parts go back to that model alone (RFC 0046 §5.7).
+        // A message that thought is tagged with the dialect and the model
+        // that wrote it: its parts go back to that model alone (RFC 0046 §5.7).
         if let Some(r) = parsed.reasoning.as_mut() {
-            let dialect = match self.provider {
+            let dialect = match wire {
                 Provider::Bedrock => bedrock::NAME,
+                Provider::OpenAiResponses => responses::NAME,
                 _ => anthropic::NAME,
             };
             r.origin = crate::wire::intel::ReasoningParts::origin(dialect, &req.model);
@@ -518,7 +527,7 @@ impl Endpoint {
             model: req.model.clone(),
             messages: decisions::emulation_messages(d),
             max_tokens: req.max_tokens,
-            temperature: Some(0.0),
+            temperature: req.temperature,
             reasoning: req.reasoning,
             output_schema: Some(decisions::emulation_schema(d)),
             ..Default::default()

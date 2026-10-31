@@ -675,6 +675,10 @@ pub struct IntelConfig {
     /// its defaults, with a node's or a `think` call's `effort` over them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<crate::wire::intel::ReasoningAsk>,
+    /// The model's `temperature`, when its config sets one: sent on every
+    /// call on it that names none itself. `None` sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
     /// This connection's `structured_output: prompt` (RFC 0046 §5.8): a call
     /// that carries an answer schema is asked in the prompt alone, with no
     /// format on the wire. `false` — `auto` — asks natively wherever the
@@ -733,6 +737,7 @@ impl IntelConfig {
             .with_dialect(self.dialect.as_deref())
             .with_timeout(self.timeout_ms.map(std::time::Duration::from_millis))
             .with_reasoning(self.reasoning)
+            .with_temperature(self.temperature)
             .with_structured_prompt(self.structured_prompt)
             .with_credential_error(self.credential_error.clone());
         // `auth: {kind: aws}` SigV4-signs the dial, with credentials fetched

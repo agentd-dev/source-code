@@ -423,7 +423,7 @@ pub fn run_turn(
             messages: messages.clone(),
             tools: tools.clone(),
             max_tokens: max_tokens_per_call,
-            temperature: spec.temperature.or(Some(0.0)),
+            temperature: spec.temperature,
             output_schema: spec.output_schema.clone(),
             ..Default::default()
         };
@@ -831,7 +831,7 @@ fn decide(
         let req = Request {
             model: model.to_string(),
             max_tokens,
-            temperature: Some(0.0),
+            temperature: None,
             decision: Some(job.decision.clone()),
             ..Default::default()
         };

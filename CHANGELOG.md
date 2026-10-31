@@ -2013,6 +2013,11 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Changed.**
 
+- The instruction registry's consumer-binding tools are called by their
+  current names, `instructions_bindings_create` and
+  `instructions_bindings_report` (instruction.md renamed them from
+  `instructions.bindings.*`), so agentd is listed again among an
+  instruction's consumers.
 - The release binaries and the image carry `companies`, `xaa` and `x402`
   (the user's decision): `release.yml`'s `FEATURES`, the `Dockerfile`'s
   default, `deny.toml`'s graph and the CI row of the release set name all

@@ -10,7 +10,7 @@
 #    old_version_id → new_version_id and the delivered digest — every time the
 #    ref moves to a new version (measure publish→applied latency from the ts),
 #  - creates ONE consumer binding and reports each applied version
-#    (`instructions.bindings.create` / `.report`, RFC-0028 §3.3); every MCP
+#    (`instructions_bindings_create` / `_report`, RFC-0028 §3.3); every MCP
 #    session announces clientInfo {name: "agentd", version} plus the workload
 #    label (the instance name) in clientInfo.title,
 #  - exposes the current versionId in agentd's status

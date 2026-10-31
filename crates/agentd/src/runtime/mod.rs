@@ -2316,7 +2316,7 @@ impl Runtime {
                     "workload": self.settings.agent.name.clone().unwrap_or_else(|| "agentd".into()),
                 },
             });
-            match client.call_tool("instructions.bindings.create", Some(args)) {
+            match client.call_tool("instructions_bindings_create", Some(args)) {
                 Ok(r) if !r.is_error() => {
                     binding_id = serde_json::from_str::<Value>(&r.text()).ok().and_then(|v| {
                         v.get("bindingId")
@@ -2355,7 +2355,7 @@ impl Runtime {
             "deliveredDigest": delivered_digest,
             "client": {"name": "agentd", "version": crate::VERSION},
         });
-        match client.call_tool("instructions.bindings.report", Some(args)) {
+        match client.call_tool("instructions_bindings_report", Some(args)) {
             Ok(r) if !r.is_error() => self.log.info(
                 "instruction.binding.reported",
                 json!({"binding_id": binding_id, "version_id": version_id}),

@@ -964,11 +964,11 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
         return tool_ok(req.id, out);
     }
     if let Some(n) = name
-        && n.starts_with("instructions.bindings.")
+        && n.starts_with("instructions_bindings_")
     {
         eprintln!("MOCK_BINDINGS {n} {args}");
         return match n {
-            "instructions.bindings.create" => {
+            "instructions_bindings_create" => {
                 tool_ok(req.id, json!({"bindingId": "sub_mock_1", "mode": "follow"}))
             }
             _ => tool_ok(req.id, json!({"ok": true})),

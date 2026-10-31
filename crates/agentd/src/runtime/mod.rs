@@ -879,6 +879,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         drain_reason: String::new(),
         drain_forced: false,
         drain_instances: Default::default(),
+        respawn_waits: Default::default(),
         private_instances: None,
         instance_doors: Default::default(),
         instances_metered_at: 0,

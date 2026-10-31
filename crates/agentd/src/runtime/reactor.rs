@@ -676,6 +676,10 @@ pub struct Runtime {
     /// its force has killed each since. One that then exits is parked for the
     /// next life rather than closed.
     pub(crate) drain_instances: BTreeMap<String, bool>,
+    /// Durable instance children a restart found whose previous life's
+    /// process still holds their state, each respawned once it lets go
+    /// (`runtime::instances`).
+    pub(crate) respawn_waits: BTreeMap<String, super::instances::RespawnWait>,
     /// The directory of this process's own that its non-durable instance
     /// children live in, made at the first of them and removed with the
     /// runtime (`runtime::instances`).

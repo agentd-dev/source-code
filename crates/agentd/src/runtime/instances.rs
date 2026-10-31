@@ -35,6 +35,16 @@ use std::path::PathBuf;
 /// Extra grace past the child's own drain window before SIGKILL.
 const KILL_GRACE_MS: u64 = 5_000;
 
+/// A restored instance child whose respawn waits for its previous life's
+/// process to let its state go.
+#[derive(Debug, Clone)]
+pub(crate) struct RespawnWait {
+    /// When the wait began, in ms since the epoch.
+    pub(crate) since: u64,
+    /// Who holds the child's state, as its store's lock names it.
+    pub(crate) holder: String,
+}
+
 /// The peer an instance child reports home over: its parent, through the
 /// channel it was handed at spawn.
 pub(crate) const PARENT_PEER: &str = "parent";
@@ -761,6 +771,7 @@ impl Runtime {
     /// escalation for children that ignored the drain.
     pub(crate) fn instances_tick(&mut self) {
         self.meter_instances();
+        self.respawn_waiting();
         let now = now_ms();
         let drain_ms = self.settings.lifecycle.drain_timeout().as_millis() as u64;
         let mut to_persist = Vec::new();
@@ -910,67 +921,173 @@ impl Runtime {
     }
 
     /// Restore-time respawn: live instance records whose composed config still
-    /// exists come back. PDEATHSIG takes a child down with its parent, so no
-    /// process from the previous life is still running; the record's handle is
-    /// the child's identity and its state is durable, so the respawned daemon
-    /// picks up where the dead one stopped.
+    /// exists come back. The record's handle is the child's identity and its
+    /// state is durable, so the respawned daemon picks up where the previous
+    /// one stopped. PDEATHSIG takes a child down with its parent, but as a
+    /// drain: a child of a parent that died or idle-exited may still be
+    /// draining, holding its state, when the next life starts. That one is
+    /// respawned once it lets go ([`Runtime::respawn_waiting`]).
     pub(crate) fn respawn_restored_instances(&mut self) {
-        let candidates: Vec<(String, String, Option<Value>)> = self
+        let candidates: Vec<(String, String)> = self
             .subagents
             .values()
             .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
-            .filter_map(|s| s.config_path.clone().map(|c| (s.handle.clone(), c, None)))
+            .filter_map(|s| s.config_path.clone().map(|c| (s.handle.clone(), c)))
             .collect();
-        for (handle, config, limits) in candidates {
+        for (handle, config) in candidates {
             // What it spent after the last poll of the previous life, whether
             // or not it comes back.
             self.meter_instance(&handle);
-            let path = PathBuf::from(&config);
-            let Some(dir) = path.parent().map(|p| p.to_path_buf()) else {
-                continue;
-            };
-            // The respawned child is told it was delivered exactly as the
-            // first one was, from the composed config it is about to read —
-            // the one copy of that prose the child's digest check compares,
-            // so no other record of it can drift from what the child sees.
-            let Some(delivered) = delivered_prose_of(&path) else {
-                if let Some(s) = self.subagents.get_mut(&handle) {
-                    s.status = "failed".into();
-                    s.error = Some("config lost across restart".into());
+            self.respawn_instance(&handle, &config);
+        }
+    }
+
+    /// Start the restored child `handle` again from its composed `config`,
+    /// or, while its previous life's process still holds its state, wait for
+    /// that one to exit.
+    fn respawn_instance(&mut self, handle: &str, config: &str) {
+        let waited_since = self.respawn_waits.remove(handle).map(|w| w.since);
+        let path = PathBuf::from(config);
+        let Some(dir) = path.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        // The respawned child is told it was delivered exactly as the
+        // first one was, from the composed config it is about to read —
+        // the one copy of that prose the child's digest check compares,
+        // so no other record of it can drift from what the child sees.
+        let Some(delivered) = delivered_prose_of(&path) else {
+            if let Some(s) = self.subagents.get_mut(handle) {
+                s.status = "failed".into();
+                s.error = Some("config lost across restart".into());
+            }
+            self.persist_subagent(handle);
+            return;
+        };
+        // A child started on state its previous life still holds fails at
+        // its store's lock: it waits, and its directory is left as it is
+        // until then.
+        if let Some(holder) = crate::store::file::lock_holder(&child_state_root(&dir)) {
+            self.wait_for_respawn(handle, holder, waited_since);
+            return;
+        }
+        // It signs as this life's agent.
+        if let Err(e) = self.recompose_identity(&path) {
+            forget_instance_key(&dir);
+            if let Some(s) = self.subagents.get_mut(handle) {
+                s.status = "failed".into();
+                s.error = Some(format!("respawn: {e}"));
+            }
+            self.persist_subagent(handle);
+            return;
+        }
+        match self.spawn_instance_process(handle, &path, &dir, &None, &delivered) {
+            Ok(pid) => {
+                if let Some(s) = self.subagents.get_mut(handle) {
+                    s.pid = Some(pid);
+                    s.status = "running".into();
+                    s.attempt += 1;
+                    s.retiring_since = None;
                 }
-                self.persist_subagent(&handle);
-                continue;
-            };
-            // It signs as this life's agent.
-            if let Err(e) = self.recompose_identity(&path) {
+                crate::obs::metrics::record_subagent_restart("restored");
+                let mut ev = json!({"handle": handle, "pid": pid});
+                if let Some(since) = waited_since {
+                    ev["waited_ms"] = json!(now_ms().saturating_sub(since));
+                }
+                self.subagent_log(handle).info("instance.respawn", ev);
+                self.persist_subagent(handle);
+            }
+            Err(e) => {
                 forget_instance_key(&dir);
-                if let Some(s) = self.subagents.get_mut(&handle) {
+                if let Some(s) = self.subagents.get_mut(handle) {
                     s.status = "failed".into();
                     s.error = Some(format!("respawn: {e}"));
                 }
-                self.persist_subagent(&handle);
-                continue;
+                self.persist_subagent(handle);
             }
-            match self.spawn_instance_process(&handle, &path, &dir, &limits, &delivered) {
-                Ok(pid) => {
-                    if let Some(s) = self.subagents.get_mut(&handle) {
-                        s.pid = Some(pid);
-                        s.status = "running".into();
-                        s.attempt += 1;
-                        s.retiring_since = None;
-                    }
-                    crate::obs::metrics::record_subagent_restart("restored");
-                    self.subagent_log(&handle)
-                        .info("instance.respawn", json!({"handle": handle, "pid": pid}));
-                    self.persist_subagent(&handle);
-                }
-                Err(e) => {
-                    forget_instance_key(&dir);
+        }
+    }
+
+    /// Hold the respawn of `handle` until `holder`, its previous life's
+    /// process, lets its state go; waiting `since` an earlier tick, else from
+    /// now. The record's pid was that process's, which this life neither
+    /// reaps nor signals, so it goes.
+    fn wait_for_respawn(&mut self, handle: &str, holder: String, since: Option<u64>) {
+        if let Some(s) = self.subagents.get_mut(handle) {
+            s.pid = None;
+        }
+        if since.is_none() {
+            self.subagent_log(handle).info(
+                "instance.respawn_wait",
+                json!({"handle": handle, "holder": holder,
+                       "within_ms": self.respawn_window_ms(),
+                       "note": "its previous life still holds its state; it is respawned once that one exits"}),
+            );
+        }
+        let since = since.unwrap_or_else(now_ms);
+        self.respawn_waits
+            .insert(handle.to_string(), RespawnWait { since, holder });
+    }
+
+    /// How long a restored child's respawn waits for its previous life: the
+    /// window this parent gives a child to drain before it kills one.
+    fn respawn_window_ms(&self) -> u64 {
+        self.settings.lifecycle.drain_timeout().as_millis() as u64 + KILL_GRACE_MS
+    }
+
+    /// Each tick: the respawns waiting on a previous life's child go ahead
+    /// once it has let its state go. One still held past the drain window is
+    /// given up, its record `failed` with the holder named. A drain starts
+    /// none of them; their records stay for the next life.
+    fn respawn_waiting(&mut self) {
+        if self.draining || self.respawn_waits.is_empty() {
+            return;
+        }
+        let now = now_ms();
+        let window = self.respawn_window_ms();
+        let waiting: Vec<(String, u64)> = self
+            .respawn_waits
+            .iter()
+            .map(|(h, w)| (h.clone(), w.since))
+            .collect();
+        for (handle, since) in waiting {
+            let Some(config) = self
+                .subagents
+                .get(&handle)
+                .filter(|s| !is_terminal_status(&s.status))
+                .and_then(|s| s.config_path.clone())
+            else {
+                self.respawn_waits.remove(&handle);
+                continue;
+            };
+            let state = PathBuf::from(&config)
+                .parent()
+                .map(child_state_root)
+                .unwrap_or_default();
+            match crate::store::file::lock_holder(&state) {
+                None => self.respawn_instance(&handle, &config),
+                Some(holder) if now >= since + window => {
+                    self.respawn_waits.remove(&handle);
+                    let waited = now.saturating_sub(since);
                     if let Some(s) = self.subagents.get_mut(&handle) {
                         s.status = "failed".into();
-                        s.error = Some(format!("respawn: {e}"));
+                        s.error = Some(format!(
+                            "respawn: its state is still locked by {holder} {waited} ms after \
+                             this restart; the previous life's child did not exit"
+                        ));
+                        s.updated = now;
+                        s.dirty = true;
                     }
+                    // The record first: what the event reports is on it.
                     self.persist_subagent(&handle);
+                    self.subagent_log(&handle).warn(
+                        "instance.respawn_failed",
+                        json!({"handle": handle, "holder": holder, "waited_ms": waited}),
+                    );
+                }
+                Some(holder) => {
+                    if let Some(w) = self.respawn_waits.get_mut(&handle) {
+                        w.holder = holder;
+                    }
                 }
             }
         }
@@ -994,6 +1111,12 @@ impl Runtime {
         };
         if is_terminal_status(&s.status) {
             return err(format!("instance {handle:?} is not running ({})", s.status));
+        }
+        if let Some(w) = self.respawn_waits.get(handle) {
+            return err(format!(
+                "instance {handle:?} is not running yet: its respawn waits for {} to exit",
+                w.holder
+            ));
         }
         let Some(sock) = s.socket.clone() else {
             return err(format!("instance {handle:?} has no A2A socket"));
@@ -1063,6 +1186,8 @@ impl Runtime {
         self.subagents
             .values()
             .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
+            // Its socket is still its previous life's until it is respawned.
+            .filter(|s| !self.respawn_waits.contains_key(&s.handle))
             .find(|s| {
                 s.handle == name
                     || (s.template.as_deref() == Some(name)
@@ -1642,7 +1767,12 @@ fn instance_child_name(parent: &str, template: &str) -> String {
 /// The store a durable child is composed with: a file store in `state/` in
 /// its directory `dir`, under the default prefix.
 fn durable_child_store(dir: &std::path::Path) -> Value {
-    json!({"kind": "file", "file": {"path": dir.join("state").display().to_string()}})
+    json!({"kind": "file", "file": {"path": child_state_root(dir).display().to_string()}})
+}
+
+/// The root of the file store a durable child composed in `dir` runs on.
+fn child_state_root(dir: &std::path::Path) -> PathBuf {
+    dir.join("state")
 }
 
 /// The file a durable child's manifest is in: its key, under the store the

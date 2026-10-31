@@ -395,7 +395,15 @@ Four mechanisms ride that wiring:
 Across a parent restart, live instance children are started again from their
 composed configuration. Their state is durable and the handle is their
 identity, so a child picks up where it stopped. A non-durable child runs on a
-memory store and is not restarted.
+memory store and is not restarted. A parent that idle-exits or dies does not
+wait for its children: each drains on the SIGTERM the parent's death sends.
+When the parent starts again before a child's previous process has exited,
+that process still holds the child's state, and the respawn waits for it
+(`instance.respawn_wait`, naming the holder's pid). Until then the child is
+not a peer. A previous process still running after the parent's
+`lifecycle.drain_timeout` plus five seconds is given up: the child's record
+closes `failed` with the holder in its error, logged
+`instance.respawn_failed`.
 
 A child's state belongs to the parent that spawned it. A durable child's
 directory is kept with the parent's durable state: under the file store's

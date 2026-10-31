@@ -825,6 +825,202 @@ fn a_durable_instance_childs_spend_is_charged_to_its_parent_once() {
     );
 }
 
+/// A parent's first life, run with `head`: it spawns a durable desk, has it
+/// work once and idle-exits. The desk drains as its parent dies, and is held
+/// at the end of its drain (`AGENTD_TEST_HOLD_AT`), its state still locked,
+/// until the file at the returned path exists. Returns the desk's pid and
+/// that path.
+#[cfg(feature = "a2a")]
+fn a_desk_left_draining(dir: &str, head: &str) -> (i32, String) {
+    let release = format!("{dir}/state/subagents/file/agentd/parent/inst-1/release");
+    let first = format!(
+        "{head}workflows:\n  - name: caller\n    steps:\n\
+        \x20     s:     {{ kind: once }}\n\
+        \x20     spawn: {{ kind: subagent, template: desk, params: {{ id: west }}, depends_on: [s] }}\n\
+        \x20     work:  {{ kind: a2a.delegate, depends_on: [spawn], peer: \"{{{{steps.spawn.output.peer}}}}\", command: desk.work, args: {{}}, timeout: 30s, retry: {{ max: 6, backoff: 1s }} }}\n\
+        \x20     f:     {{ kind: finish, depends_on: [work], status: completed }}\n"
+    );
+    std::fs::write(format!("{dir}/first.yaml"), first).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &format!("{dir}/first.yaml")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .env("AGENTD_TEST_HOLD_AT", "drain.done")
+        .env("AGENTD_TEST_HOLD_RELEASE", &release)
+        .output()
+        .expect("run");
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(0), "{log}");
+    let pid = events(&log, "instance.spawn")
+        .first()
+        .and_then(|e| e["pid"].as_i64())
+        .expect("a spawn") as i32;
+    assert!(
+        unsafe { libc::kill(pid, 0) } == 0,
+        "the desk did not outlive its parent:\n{log}"
+    );
+    (pid, release)
+}
+
+/// Start `agentd --config <dir>/<name>.yaml` with `cfg`, its log to
+/// `<dir>/<name>.log`, and wait for its first `event`. On none within 20 s,
+/// or an exit first, the desk is released, the run stopped and the test
+/// failed with the log.
+#[cfg(feature = "a2a")]
+fn start_and_await(
+    dir: &str,
+    name: &str,
+    cfg: &str,
+    event: &str,
+    release: &str,
+) -> (std::process::Child, String, Value) {
+    use std::time::{Duration, Instant};
+    std::fs::write(format!("{dir}/{name}.yaml"), cfg).unwrap();
+    let log_path = format!("{dir}/{name}.log");
+    let mut p = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &format!("{dir}/{name}.yaml")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log_path).unwrap())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if let Some(e) = events(&log, event).into_iter().next() {
+            return (p, log_path, e);
+        }
+        if Instant::now() >= deadline || p.try_wait().unwrap().is_some() {
+            std::fs::write(release, "").unwrap();
+            let _ = p.kill();
+            let _ = p.wait();
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let _ = std::fs::remove_dir_all(dir);
+            panic!("no {event}:\n{log}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// A parent that exits leaves its durable child to drain on its own (its
+/// death reaches the child as SIGTERM), so the next life can start while
+/// that child still holds its state. The restored child is respawned once
+/// the previous one lets go, not started on the held state to fail at its
+/// store's lock and stay failed for the parent's whole life.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_restored_child_waits_for_its_previous_life_to_let_its_state_go() {
+    let dir = common::unique_path("tpl-respawn-held", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let head = format!(
+        "agent: {{ name: parent }}\nstore: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
+         intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 1s }}\n\
+         observability: {{ log_level: info, log_content: true }}\n{DESK}"
+    );
+    let (old, release) = a_desk_left_draining(&dir, &head);
+    // The second life finds it still there, and says it waits for it.
+    let second = format!(
+        "{head}workflows:\n  - name: again\n    steps:\n\
+        \x20     s:    {{ kind: once }}\n\
+        \x20     work: {{ kind: a2a.delegate, depends_on: [s], peer: inst-1, command: desk.work, args: {{}}, timeout: 30s, retry: {{ max: 10, backoff: 1s }} }}\n\
+        \x20     f:    {{ kind: finish, depends_on: [work], status: completed }}\n"
+    );
+    let (mut p2, log2, wait) =
+        start_and_await(&dir, "second", &second, "instance.respawn_wait", &release);
+    assert_eq!(wait["handle"], "inst-1", "{wait}");
+    assert_eq!(wait["holder"], format!("pid {old}"), "{wait}");
+    // Still held a moment later: nothing was started on its state.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(unsafe { libc::kill(old, 0) } == 0);
+    let log = std::fs::read_to_string(&log2).unwrap_or_default();
+    assert!(
+        events(&log, "instance.respawn").is_empty(),
+        "respawned onto held state:\n{log}"
+    );
+    std::fs::write(&release, "").unwrap();
+    let code = p2.wait().unwrap().code();
+    let log = std::fs::read_to_string(&log2).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(code, Some(0), "{log}");
+    let respawn = events(&log, "instance.respawn");
+    assert_eq!(respawn.len(), 1, "{log}");
+    assert_ne!(respawn[0]["pid"], old, "{log}");
+    assert!(respawn[0]["waited_ms"].as_u64().is_some(), "{log}");
+    assert!(
+        events(&log, "instance.exited")
+            .iter()
+            .all(|e| e["status"] != "failed"),
+        "{log}"
+    );
+    assert!(
+        events(&log, "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "again" && e["status"] == "completed"),
+        "{log}"
+    );
+}
+
+/// A previous life's child that holds its state past the parent's drain
+/// window is given up on by name: the record closes `failed` with the holder
+/// in its error and an `instance.respawn_failed` event, and nothing was
+/// started on the held state. Here the parent's `drain_timeout` is 1 s, so
+/// it waits 6 s.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_restored_child_still_held_past_the_drain_window_is_given_up_by_name() {
+    let dir = common::unique_path("tpl-respawn-stuck", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    let head = format!(
+        "agent: {{ name: parent }}\nstore: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
+         intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 1s, drain_timeout: 1s }}\n\
+         observability: {{ log_level: info, log_content: true }}\n{DESK}"
+    );
+    let (old, release) = a_desk_left_draining(&dir, &head);
+    let second = format!(
+        "{head}workflows:\n  - name: hold\n    steps:\n\
+        \x20     s:   {{ kind: once }}\n\
+        \x20     nap: {{ kind: sleep, depends_on: [s], duration: 30s }}\n\
+        \x20     f:   {{ kind: finish, depends_on: [nap], status: completed }}\n"
+    );
+    let (mut p2, log2, failed) =
+        start_and_await(&dir, "second", &second, "instance.respawn_failed", &release);
+    std::fs::write(&release, "").unwrap();
+    unsafe { libc::kill(p2.id() as i32, libc::SIGTERM) };
+    let _ = p2.wait();
+    let log = std::fs::read_to_string(&log2).unwrap_or_default();
+    // The parent's record of the desk, wherever its store keeps the kind.
+    let record = std::fs::read_dir(format!("{dir}/state/agentd/parent"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|kind| kind.path().join("inst-1.json"))
+        .find(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(failed["handle"], "inst-1", "{failed}");
+    assert_eq!(failed["holder"], format!("pid {old}"), "{failed}");
+    assert!(
+        failed["waited_ms"].as_u64().is_some_and(|w| w >= 6_000),
+        "{failed}"
+    );
+    assert!(
+        events(&log, "instance.respawn").is_empty(),
+        "respawned onto held state:\n{log}"
+    );
+    let record = record.expect("the desk's record");
+    let state = record.pointer("/state").unwrap_or(&record);
+    assert_eq!(state["status"], "failed", "{record}");
+    assert!(
+        state["error"]
+            .as_str()
+            .is_some_and(|e| e.contains(&format!("pid {old}"))),
+        "{record}"
+    );
+}
+
 /// A child that ends between two polls is charged for what it spent since
 /// the last one: the parent reads its total once more as it reaps it. Here
 /// the desk works and its ttl retires it inside the five seconds before the

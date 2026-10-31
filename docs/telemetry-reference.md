@@ -512,7 +512,9 @@ its `jti`.
 | `instance.op.refused` | warn | `op`, `principal`, `note`, `handle?` | An instance operation from anyone but the child itself — over the channel its parent handed it, about its own handle — or an operator. |
 | `instance.op.unknown` | warn | `op` |  |
 | `instance.channel` | info | `held` | An instance child took the channel its parent handed it at spawn (`held: true`), the one way it reaches its parent; `false` when it was started with none. |
-| `instance.respawn` | info | `handle`, `pid` |  |
+| `instance.respawn` | info | `handle`, `pid`, `waited_ms?` | `waited_ms`: how long the respawn waited for the child's previous process to release its state (`instance.respawn_wait`). |
+| `instance.respawn_failed` | warn | `handle`, `holder`, `waited_ms` | The child's previous process still held its state past the parent's `lifecycle.drain_timeout` plus five seconds; the record closes `failed`. |
+| `instance.respawn_wait` | info | `handle`, `holder`, `note`, `within_ms` | A restart found the child's previous process (`holder`, `pid <n>`) still holding its state; the child is respawned once that process releases it. |
 | `instance.result` | info | `handle`, `link` | `link`: the span of the child's report. |
 | `instance.retire` | info | `handle`, `pid`, `why` |  |
 | `instance.send` | info, warn | `handle`, `err?` |  |

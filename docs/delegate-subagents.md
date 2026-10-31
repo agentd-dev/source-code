@@ -790,6 +790,15 @@ still running then. Its record says `parked`, and a durable child starts
 again from its composed configuration when the parent restarts, as every
 live durable instance child does.
 
+A parent that idle-exits or is killed does not wait: the child drains on the
+SIGTERM the parent's death sends, and may still hold its state when the
+parent starts again. The respawn then waits for the previous process to exit
+and logs `instance.respawn_wait` with its pid. Calls to the child fail until
+it is back, so give them a `retry`. A previous process still running after
+the parent's `lifecycle.drain_timeout` plus five seconds is given up: the
+record closes `failed` with that pid in its error, and the parent logs
+`instance.respawn_failed`.
+
 > **Warning.** The parent's load checks a template's tier rules and its
 > boundary, but not the steps of its workflows. Those are validated when a
 > spawn composes the child's configuration, and an error refuses that spawn
@@ -851,7 +860,7 @@ Each child logs to the daemon's log. The events to watch:
 | `subagent.kill.escalated` | A killed child had not stopped at its grace and was signalled: `handle`, `signal` (`SIGTERM`, then `SIGKILL`) |
 | `child.unhealthy` | Liveness tore a child down: `node`, `health` |
 | `intel.swap.sent` | A reload handed running children their model again |
-| `instance.spawn`, `instance.retire`, `instance.exited`, `instance.respawn` | An instance child's lifecycle |
+| `instance.spawn`, `instance.retire`, `instance.exited`, `instance.respawn`, `instance.respawn_wait`, `instance.respawn_failed` | An instance child's lifecycle |
 | `instance.result`, `instance.mirror`, `instance.metered` | A sync result, a mirrored event, a budget charge |
 
 The `agent_subagents_spawned_total` and `agent_subagents_exited_total`

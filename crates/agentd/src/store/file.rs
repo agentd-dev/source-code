@@ -336,28 +336,19 @@ impl LockFile {
         restrict_file(&file);
         #[cfg(unix)]
         {
-            use std::io::{Read, Seek, Write};
             use std::os::unix::io::AsRawFd;
             // Non-blocking: a held lock must fail fast and say who holds it,
             // not stall a startup that is never going to succeed.
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc != 0 {
-                let mut holder = String::new();
-                let mut f = &file;
-                let _ = f.rewind();
-                let _ = f.read_to_string(&mut holder);
-                let who = holder.trim();
-                let who = if who.is_empty() {
-                    "another process".to_string()
-                } else {
-                    format!("pid {who}")
-                };
+                let who = holder_of(&file);
                 return Err(format!(
                     "{} is locked by {who} — another agentd is using this state \
                      directory; give this instance its own agent.name or store.file.path",
                     path.parent().unwrap_or(path).display()
                 ));
             }
+            use std::io::{Seek, Write};
             let mut f = &file;
             let _ = f.rewind();
             let _ = f.set_len(0);
@@ -365,5 +356,78 @@ impl LockFile {
             let _ = f.flush();
         }
         Ok(LockFile { _file: file })
+    }
+}
+
+/// Who holds the instance lock of the file store at `root`: `pid <n>` as the
+/// holder wrote it, else `another process`; `None` when nobody does, or there
+/// is no lock to hold. Asked by trying the lock and letting it go at once, so
+/// it answers for a holder that is still running, not for whoever wrote the
+/// file last.
+pub(crate) fn lock_holder(root: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let file = fs::File::open(root.join(LOCK)).ok()?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            // Closing the file lets the lock go.
+            return None;
+        }
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return None;
+        }
+        Some(holder_of(&file))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        None
+    }
+}
+
+/// The holder a held lock file names: the pid it wrote, else `another
+/// process`.
+#[cfg(unix)]
+fn holder_of(file: &fs::File) -> String {
+    use std::io::{Read, Seek};
+    let mut holder = String::new();
+    let mut f = file;
+    let _ = f.rewind();
+    let _ = f.read_to_string(&mut holder);
+    match holder.trim() {
+        "" => "another process".to_string(),
+        who => format!("pid {who}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lock is asked about while it is held, and answers with the pid the
+    /// holder wrote; once the store is dropped nobody holds it, though the
+    /// file still names the last holder.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_lock_names_its_holder_and_a_released_one_nobody() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root =
+            std::env::temp_dir().join(format!("agentd-lock-holder-{}-{nanos}", std::process::id()));
+        assert_eq!(lock_holder(&root), None, "no store, no lock");
+        let store = FileStore::open(&root).unwrap();
+        assert_eq!(
+            lock_holder(&root),
+            Some(format!("pid {}", std::process::id()))
+        );
+        // Asking did not take it: the holder still has it.
+        assert!(FileStore::open(&root).is_err());
+        drop(store);
+        assert_eq!(lock_holder(&root), None);
+        assert!(FileStore::open(&root).is_ok());
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -2551,6 +2551,21 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Fixed.**
 
+- A restarted parent no longer loses a durable instance child whose
+  previous process is still draining. A parent that idle-exits or dies
+  leaves the child to drain on the SIGTERM its death sends, so a parent
+  started again at once (a rolling restart, a crash loop) found the child's
+  state still locked: the respawned child failed at its store's lock within
+  milliseconds (`instance.exited` `failed`, `… is locked by pid N`), was
+  never tried again, and every call to it failed for the parent's whole
+  life. The parent now checks the child's store lock before it respawns the
+  child. While the previous process holds the lock, the respawn waits
+  (`instance.respawn_wait`, naming the holder) and goes ahead on the first
+  tick after the lock is released (`instance.respawn` with `waited_ms`). A
+  child still held past the parent's `lifecycle.drain_timeout` plus five
+  seconds is given up: its record closes `failed` with the holder in its
+  error, and the parent logs `instance.respawn_failed`. While it waits, the
+  child is not a peer, and `subagent.send` to it is refused.
 - A binary built with `xaa` and given no delegation asks its store nothing
   about one. It listed the store's credential records at the first pass and
   every hour, and read one back at the end of every run and subagent —

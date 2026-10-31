@@ -37,9 +37,13 @@ agent:
   ask_human_unowned: gate
 
 intelligence:
-  endpoints: https://api.openai.com/v1/chat/completions
+  # The host alone: agentd picks the API for the model (gpt-6.1-sol takes
+  # tools on the Responses API only, so it is asked there).
+  endpoints: https://api.openai.com
   token: "{{secret:OPENAI_API_KEY}}"
-  model: gpt-6.1-sol
+  models:
+    sol: {kind: reasoning, model: gpt-6.1-sol, reasoning: {effort: medium}}
+  roles: {turn: sol}
 
 store:
   kind: file

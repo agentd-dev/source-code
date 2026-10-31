@@ -1,7 +1,7 @@
 ---
 spec: "1"
 title: Payments service — how we work
-description: The payments team's engineering handbook for every coding agent that works in the payments monorepo, in place of a rules file per tool and per repo. (The rehearsal copy of v2.)
+description: The payments team's engineering handbook for the coding agent in the payments repository. (The rehearsal copy of v2.)
 language: en
 tags: [engineering, payments]
 ---

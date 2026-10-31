@@ -30,7 +30,8 @@
 #
 # Placeholders (environment; defaults in brackets):
 #   HOME_INSTRUCTION_URI   [instruction://ins_01M69H2WEK2P005WHYHJJMYM4A@latest]
-#   IMD_MCP_URL, IMD_TOKEN_URL, IMD_CLIENT_ID   the mirror, as in ap-agent.yaml
+#   IMD_MCP_URL, IMD_TOKEN_URL   the mirror, as in ap-agent.yaml
+#   HOME_CLIENT_ID         the agent credential's client id [home-climate]
 #   THERMOSTAT_MCP_URL     [http://127.0.0.1:8741/mcp]
 #   AIRCON_MCP_URL         [http://127.0.0.1:8742/mcp]
 #   HOME_AGENT_URL         the home agent's A2A endpoint [http://127.0.0.1:8744]
@@ -61,9 +62,13 @@ agent:
   ask_human_unowned: gate
 
 intelligence:
-  endpoints: https://api.openai.com/v1/chat/completions
+  # The host alone: agentd picks the API for the model (gpt-6.1-sol takes
+  # tools on the Responses API only, so it is asked there).
+  endpoints: https://api.openai.com
   token: "{{secret:OPENAI_API_KEY}}"
-  model: gpt-6.1-sol
+  models:
+    sol: {kind: reasoning, model: gpt-6.1-sol, reasoning: {effort: medium}}
+  roles: {turn: sol}
 
 store:
   kind: file
@@ -76,7 +81,7 @@ mcp:
       auth:
         kind: oauth2
         grant: client_credentials
-        client_id: "${IMD_CLIENT_ID:-home-climate}"
+        client_id: "${HOME_CLIENT_ID:-home-climate}"
         client_secret: "{{secret:HOME_CLIENT_SECRET}}"
         token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
       tags: {"*": [trusted]}

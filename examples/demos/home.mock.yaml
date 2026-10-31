@@ -14,4 +14,6 @@
 intelligence:
   endpoints: "${MODEL_URL:-http://127.0.0.1:8749/v1/chat/completions}"
   token: null
-  model: scripted
+  # The turn goes to the scripted model; `sol` stays declared and unused.
+  models: {scripted: {model: scripted}}
+  roles: {turn: scripted}

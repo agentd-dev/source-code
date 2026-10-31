@@ -21,7 +21,7 @@ mcp:
       auth:
         kind: oauth2
         grant: client_credentials
-        client_id: voice-agent
+        client_id: "${VOICE_AGENT_CLIENT_ID:-voice-agent}"
         client_secret: "{{secret:VOICE_AGENT_CLIENT_SECRET}}"
         token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
       tags: {"*": [trusted]}

@@ -22,8 +22,9 @@
 #
 # Placeholders the recorder fills (environment; defaults in brackets):
 #   REPO                     the repository (required; no default)
-#   CODER_INSTRUCTION_URI    [instruction://ins_01M69X1HCQX52R87HGFSV7Z941@latest]
-#   IMD_MCP_URL, IMD_TOKEN_URL, IMD_CLIENT_ID   the mirror, as in ap-agent.yaml
+#   CODER_INSTRUCTION_URI    [instruction://ins_01M6A4D6VM7DM190DD1D7V14G0@latest]
+#   IMD_MCP_URL, IMD_TOKEN_URL   the mirror, as in ap-agent.yaml
+#   CODER_CLIENT_ID          the agent credential's client id [coder]
 #   AGENTD_DEMO_HOME         where state lives [/tmp/agentd-demos]
 # Secrets, by reference only: OPENAI_API_KEY, CODER_CLIENT_SECRET,
 # ENGINEER_TOKEN (env.sh).
@@ -32,7 +33,7 @@
 # mock playbook (README.md).
 
 vars:
-  handbook: "${CODER_INSTRUCTION_URI:-instruction://ins_01M69X1HCQX52R87HGFSV7Z941@latest}"
+  handbook: "${CODER_INSTRUCTION_URI:-instruction://ins_01M6A4D6VM7DM190DD1D7V14G0@latest}"
 
 agent:
   name: coder
@@ -50,9 +51,13 @@ agent:
     unavailable: keep
 
 intelligence:
-  endpoints: https://api.openai.com/v1/chat/completions
+  # The host alone: agentd picks the API for the model (gpt-6.1-sol takes
+  # tools on the Responses API only, so it is asked there).
+  endpoints: https://api.openai.com
   token: "{{secret:OPENAI_API_KEY}}"
-  model: gpt-6.1-sol
+  models:
+    sol: {kind: reasoning, model: gpt-6.1-sol, reasoning: {effort: medium}}
+  roles: {turn: sol}
   budget:
     windows: [{per: day, tokens: 2000000}]
     on_exhausted: refuse
@@ -68,7 +73,7 @@ mcp:
       auth:
         kind: oauth2
         grant: client_credentials
-        client_id: "${IMD_CLIENT_ID:-coder}"
+        client_id: "${CODER_CLIENT_ID:-coder}"
         client_secret: "{{secret:CODER_CLIENT_SECRET}}"
         token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
       tags: {"*": [trusted]}
@@ -106,18 +111,8 @@ security:
   egress: closed
 
 services:
-  openai: {kind: intelligence, endpoint: "https://api.openai.com/v1"}
+  openai: {kind: intelligence, endpoint: "https://api.openai.com"}
   mirror: {kind: mcp, endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"}
-  # The handbook declares two servers of its own, GitHub and Sentry (its
-  # :::mcp blocks). This demo uses neither. They are catalogued so that
-  # egress: closed admits the document, with every tool excluded, so nothing
-  # either returns reaches the model; that is what the `trusted` tag says
-  # (a server tagged untrusted_input beside exec is the lethal trifecta, and
-  # agentd refuses to start). agentd still dials both at startup, and
-  # without a credential each refuses the handshake (HTTP 401). To dial
-  # nothing, publish the demo's handbook without the two blocks.
-  github: {kind: mcp, endpoint: "https://api.githubcopilot.com/mcp/", exclude: ["*"], tags: {"*": [trusted]}}
-  sentry: {kind: mcp, endpoint: "https://mcp.sentry.dev/mcp", exclude: ["*"], tags: {"*": [trusted]}}
 
 limits:
   run: {steps: 40, tokens: 400000, deadline: 20m}

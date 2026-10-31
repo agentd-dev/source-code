@@ -40,7 +40,7 @@ switch (demo) {
     if (has('mock')) servers.push(mock('support.model.json', 8729));
     break;
   case 'coder':
-    if (policy) servers.push(registry(8733, 'instruction://ins_01M69X1HCQX52R87HGFSV7Z941@latest', 'Payments service — how we work'));
+    if (policy) servers.push(registry(8733, 'instruction://ins_01M6A4D6VM7DM190DD1D7V14G0@latest', 'Payments service — how we work'));
     break;
   case 'home': {
     const token = `${process.env.AGENTD_DEMO_HOME ?? '/tmp/agentd-demos'}/tokens/home-peer.token`;

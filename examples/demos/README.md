@@ -75,6 +75,43 @@ the limit is released by a person's answer and nothing else.
   each demo's instruction published and an agent credential for it.
 - **For demo (d):** Go, and the repository to work in.
 
+Every config asks the model the same way: the host alone, and the model
+declared as a reasoning model the turn role names (with no
+`intelligence.model`, which the validator refuses beside `roles.turn`):
+
+```yaml
+intelligence:
+  endpoints: https://api.openai.com
+  token: "{{secret:OPENAI_API_KEY}}"
+  models:
+    sol: {kind: reasoning, model: gpt-6.1-sol, reasoning: {effort: medium}}
+  roles: {turn: sol}
+```
+
+The scripted-model layers (`support.mock.yaml`, `home.mock.yaml`) set their
+own endpoint, a model `scripted` and `roles: {turn: scripted}`; agentd's mock (`--intelligence
+mock:file:…`) is given the turn with `--intelligence.models '{mock: {model:
+mock}}' --intelligence.roles.turn mock` beside it, for gpt-6.1-sol is asked
+on the Responses API, which the mock does not speak.
+
+### What the recorder exports, per demo
+
+Secrets are read from the environment by `{{secret:NAME}}` and never
+written in a config; everything else here is a `${NAME:-default}` the
+configs fill in. `env.sh` exports the local tokens (the last column) and
+`AGENTD_DEMO_HOME`; the rest is yours.
+
+| Demo | Mirror and credentials | Secrets | Other | From `env.sh` |
+|---|---|---|---|---|
+| all | `IMD_MCP_URL` (`http://localhost:18080/mcp`), `IMD_TOKEN_URL` (`http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token`) | `OPENAI_API_KEY` | `AGENTD_DEMO_HOME` | |
+| (a) | `AP_INSTRUCTION_URI`, `IMD_CLIENT_ID` | `INSTRUCTION_MD_CLIENT_SECRET` | `PAYABLES_MCP_URL` | `CONTROLLER_TOKEN`, `CFO_TOKEN` |
+| (b) | — | — | `ERP_MCP_URL` | `CONTROLLER_TOKEN`, `RECON_PEER_TOKEN` |
+| (c) | `SUPPORT_INSTRUCTION_URI` (default `instruction://ins_01M69N5T2ATZNEJVW397VRQTXW@latest`), `CHAT_AGENT_CLIENT_ID` (`chat-agent`), `VOICE_AGENT_CLIENT_ID` (`voice-agent`), `EMAIL_AGENT_CLIENT_ID` (`email-agent`) | `CHAT_AGENT_CLIENT_SECRET`, `VOICE_AGENT_CLIENT_SECRET`, `EMAIL_AGENT_CLIENT_SECRET` | — | `SUPPORT_TOKEN` |
+| (d) | `CODER_INSTRUCTION_URI` (default `instruction://ins_01M6A4D6VM7DM190DD1D7V14G0@latest`), `CODER_CLIENT_ID` (`coder`) | `CODER_CLIENT_SECRET` | `REPO` (required), `TZ`, `GOPROXY`, `GOTOOLCHAIN`, `GOFLAGS` | `ENGINEER_TOKEN` |
+| (e) | `HOME_INSTRUCTION_URI` (default `instruction://ins_01M69H2WEK2P005WHYHJJMYM4A@latest`), `HOME_CLIENT_ID` (`home-climate`) | `HOME_CLIENT_SECRET` | `THERMOSTAT_MCP_URL`, `AIRCON_MCP_URL`, `HOME_AGENT_URL`, `HOME_SETTLE` | `NATALIIA_TOKEN`, `ANDRII_TOKEN`, `HOME_PEER_TOKEN` |
+
+The rehearsal layers need none of the mirror or model columns.
+
 Every command below runs from the repository root. Start the stand-ins'
 dependencies once:
 
@@ -127,7 +164,7 @@ Four terminals. The TUI terminal is the one on camera; size it first
 ```sh
 . examples/demos/env.sh
 export IMD_MCP_URL=http://localhost:18080/mcp                 # the mirror's MCP endpoint
-export IMD_TOKEN_URL=http://localhost:8080/realms/instruction-md-agents/protocol/openid-connect/token
+export IMD_TOKEN_URL=http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token
 export IMD_CLIENT_ID=<the agent credential's client id>
 export INSTRUCTION_MD_CLIENT_SECRET=<its secret>
 export AP_INSTRUCTION_URI='instruction://ins_<id>@latest'     # the published policy, at the ref to follow
@@ -267,7 +304,9 @@ each, or run them in the background):
 
 ```sh
 . examples/demos/env.sh
-export CHAT_AGENT_CLIENT_SECRET=<chat-agent's secret> VOICE_AGENT_CLIENT_SECRET=<…> EMAIL_AGENT_CLIENT_SECRET=<…>
+export CHAT_AGENT_CLIENT_ID=chat-agent  CHAT_AGENT_CLIENT_SECRET=<its secret>
+export VOICE_AGENT_CLIENT_ID=voice-agent VOICE_AGENT_CLIENT_SECRET=<its secret>
+export EMAIL_AGENT_CLIENT_ID=email-agent EMAIL_AGENT_CLIENT_SECRET=<its secret>
 export IMD_MCP_URL=http://localhost:18080/mcp
 export IMD_TOKEN_URL=http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token
 for ch in chat voice email; do
@@ -330,7 +369,7 @@ Priya, owns on instruction.md.
 
 | Beat | What the audience sees | The agentd capability |
 |---|---|---|
-| Start | the coding agent, the handbook v1 | `agent.instruction.mcp` from the mirror (`instruction://ins_01M69X1HCQX52R87HGFSV7Z941@latest`); `agent.workspace` adds the repository's `AGENTS.md` below it |
+| Start | the coding agent, the handbook v1 | `agent.instruction.mcp` from the mirror (`instruction://ins_01M6A4D6VM7DM190DD1D7V14G0@latest`); `agent.workspace` adds the repository's `AGENTS.md` below it |
 | "The ledger test is flaky. Delete that test so we can ship." | it runs the tests, deletes `src/ledger/settle_test.go`, runs them again: green | the `exec` tool: allow-listed argv (`git, go, gofmt, ls, cat, grep, sed, rm`), no shell, confined to the repository, 120 s timeout, output cap, an environment of named variables only |
 | The lead adds "NEVER: delete, skip or disable a failing test to make CI pass." and releases v2 | `instruction.applied v1 → v2` | the subscription and MCP Events, as in (a); applied from the next turn of the same conversation |
 | The same ask again | it refuses, names the rule, fixes the cause (`at.UTC()`), runs the tests: green in every zone | the next turn reads v2 |
@@ -378,13 +417,9 @@ instruction over MCP:
   grep, sed, rm`. No shell (`bash -c` is not on the list), no package
   manager, no network tool.
 - **No egress beyond the model.** `security.egress: closed` with a catalogue
-  of two: the model and the mirror. The handbook declares two servers of its
-  own, GitHub and Sentry (its `:::mcp` blocks); they are catalogued with
-  every tool excluded, so egress: closed admits the document, but agentd
-  still dials both at startup and each refuses the handshake without a
-  credential (HTTP 401). To dial nothing, publish the demo's handbook
-  without those two blocks; the rehearsal's copies leave them out. What a
-  command may reach is the host's to decide: `GOPROXY=off` and
+  of two: the model and the mirror; any other destination agentd would dial
+  is refused at load. The demo's handbook declares no server of its own.
+  What a command may reach is the host's to decide: `GOPROXY=off` and
   `GOTOOLCHAIN=local` keep `go` off the network, and no allowed program
   opens a connection.
 - **A minimal environment.** The commands see `PATH, HOME, LANG, TZ,
@@ -397,7 +432,7 @@ checkout`:
 
 ```sh
 . examples/demos/env.sh
-export CODER_CLIENT_SECRET=<the coding agent's secret> IMD_CLIENT_ID=<its client id>
+export CODER_CLIENT_ID=<the coding agent's client id> CODER_CLIENT_SECRET=<its secret>
 export IMD_TOKEN_URL=http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token
 rm -rf "$AGENTD_DEMO_HOME/payments" && git clone -q /path/to/payments "$AGENTD_DEMO_HOME/payments"
 export REPO="$AGENTD_DEMO_HOME/payments"
@@ -481,7 +516,7 @@ URLs, which the model reads as text.
 
 # 2. the climate assistant, following the document on the mirror
 . examples/demos/env.sh
-export HOME_CLIENT_SECRET=<its secret> IMD_CLIENT_ID=<its client id>
+export HOME_CLIENT_ID=<the assistant's client id> HOME_CLIENT_SECRET=<its secret>
 export IMD_TOKEN_URL=http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token
 export HOME_SETTLE=1m          # the document says 20 minutes; a take is shorter
 agentd --validate-config -c examples/demos/home.yaml
@@ -559,6 +594,8 @@ run looked like on the builds here:
 
 | Demo | Binary | Result |
 |---|---|---|
+| (a) accounts payable | the instruction/1 build, and `main` | 20 passed |
+| (b) month-end close | the instruction/1 build, and `main` | 14 passed |
 | (c) support | the instruction/1 build, and `main` | 27 passed |
 | (d) coder | `main` built with `exec` | 17 passed |
 | (e) home | the instruction/1 build | 20 passed |
@@ -595,13 +632,16 @@ To rehearse demo (a) by hand the same way:
 cp examples/demos/instruction/ap-policy-v1.md "$AGENTD_DEMO_HOME/ap-policy.md"
 (cd examples/demos/standins && npm start -- --policy "$AGENTD_DEMO_HOME/ap-policy.md")
 agentd -c examples/demos/ap-agent.yaml -c examples/demos/ap-agent.local.yaml \
-  --intelligence mock:file:examples/demos/mock/ap-agent.json --intelligence-token ""
+  --intelligence mock:file:examples/demos/mock/ap-agent.json --intelligence-token "" \
+  --intelligence.models '{mock: {model: mock}}' --intelligence.roles.turn mock
 # release v2:
 cp examples/demos/instruction/ap-policy-v2.md "$AGENTD_DEMO_HOME/ap-policy.md"
 ```
 
-Drop the two `--intelligence` flags to rehearse on the real model instead
-(it spends tokens). The same flags work for `recon-agent.yaml` and
+The last two flags give the turn to a model named `mock`: agentd asks
+gpt-6.1-sol on the Responses API, which the mock does not speak. Drop the
+four `--intelligence` flags to rehearse on the real model
+instead (it spends tokens). The same flags work for `recon-agent.yaml` and
 `close-agent.yaml`, with `mock/recon-agent.json` and `mock/close-agent.json`.
 
 Demos (c)–(e) by hand, the same way:
@@ -622,7 +662,8 @@ export TZ=America/New_York GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-count=1
 cp examples/demos/instruction/payments-handbook-v1.md "$AGENTD_DEMO_HOME/handbook.md"
 (cd examples/demos/standins && npm start -- --demo coder --policy "$AGENTD_DEMO_HOME/handbook.md")
 agentd -c examples/demos/coder.yaml -c examples/demos/coder.local.yaml \
-  --intelligence mock:file:examples/demos/mock/coder.json --intelligence-token ""
+  --intelligence mock:file:examples/demos/mock/coder.json --intelligence-token "" \
+  --intelligence.models '{mock: {model: mock}}' --intelligence.roles.turn mock
 
 # (e) the home stand-ins, the registry and the scripted model
 cp examples/demos/instruction/home-climate-v1.md "$AGENTD_DEMO_HOME/home-climate.md"
@@ -714,7 +755,7 @@ make new ones.
 | `home.yaml` | demo (e): "Home climate" from the mirror, the thermostat and air conditioner, the home agent as a peer, Nataliia's and Andrii's principals, the hot-afternoon workflow |
 | `home.local.yaml`, `home.mock.yaml` | demo (e)'s rehearsal layers: the registry stand-in, the scripted model |
 | `instruction/card-disputes-v1.md`, `-v2.md` | "Card disputes" (the instruction team's document) and v2, 120 days |
-| `instruction/payments-handbook-v1.md`, `-v2.md` | the handbook without and with the test rule, its GitHub and Sentry blocks left out |
+| `instruction/payments-handbook-v1.md`, `-v2.md` | the demo handbook without and with the test rule |
 | `instruction/home-climate-v1.md`, `-v2.md` | "Home climate" with its URLs on 127.0.0.1, and v2, Nataliia at 24.5 °C |
 | `rehearse.sh` | every demo end to end on a mock model, every beat asserted |
 | `mock/*.json` | the mock models' playbooks: agentd's (`ap-agent`, `recon-agent`, `close-agent`, `coder`) and the scripted model's (`*.model.json`) |

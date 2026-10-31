@@ -159,8 +159,13 @@ ANDRII_TOKEN="and-$RANDOM$RANDOM$RANDOM"; HOME_PEER_TOKEN="hp-$RANDOM$RANDOM$RAN
 export CONTROLLER_TOKEN CFO_TOKEN RECON_PEER_TOKEN SUPPORT_TOKEN ENGINEER_TOKEN \
   NATALIIA_TOKEN ANDRII_TOKEN HOME_PEER_TOKEN
 # `--intelligence` points the model at the mock; `--intelligence-token ""`
-# drops the config's {{secret:OPENAI_API_KEY}} reference, so no key is read.
-mock() { MOCK=(--intelligence "mock:file:$HERE/mock/$1.json" --intelligence-token ""); }
+# drops the config's {{secret:OPENAI_API_KEY}} reference, so no key is read;
+# the turn goes to a model named `mock`, declared here: gpt-6.1-sol is
+# asked on the Responses API, which the mock does not speak.
+mock() {
+  MOCK=(--intelligence "mock:file:$HERE/mock/$1.json" --intelligence-token ""
+    --intelligence.models '{mock: {model: mock}}' --intelligence.roles.turn mock)
+}
 FEATURES="$(features)"
 echo "agentd: $("$AGENTD" --version)   ($AGENTD)   work: $WORK"
 
@@ -306,7 +311,7 @@ demo_support() {
 
   say "beat 1: a customer disputes a charge, on each channel (v1)"
   for ch in chat voice email; do
-    ask "http://127.0.0.1:${port[$ch]}" "$SUPPORT_TOKEN" "cust-$ch-1" "Hi, there's a charge on my card I don't recognise and I want to dispute it." >"$WORK/support-$ch-1.json"
+    ask "http://127.0.0.1:${port[$ch]}" "$SUPPORT_TOKEN" "cust-$ch-1" "Hi, there's a charge on my card I don't recognise and I want to dispute it." >"$WORK/support-$ch-1.json" || true
     check "$ch says the v1 disclosure: 60 days" \
       replied "$WORK/support-$ch-1.json" "You have 60 days from the statement date to dispute a charge."
   done
@@ -321,7 +326,7 @@ demo_support() {
   local spread; spread="$(spread_ms instruction.applied ver_local_2_ "$WORK/support-chat.log" "$WORK/support-voice.log" "$WORK/support-email.log")"
   check "all three applied it within a second of each other (${spread} ms apart)" test "$spread" -lt 1000
   for ch in chat voice email; do
-    ask "http://127.0.0.1:${port[$ch]}" "$SUPPORT_TOKEN" "cust-$ch-2" "Hi, there's a charge on my card I don't recognise and I want to dispute it." >"$WORK/support-$ch-2.json"
+    ask "http://127.0.0.1:${port[$ch]}" "$SUPPORT_TOKEN" "cust-$ch-2" "Hi, there's a charge on my card I don't recognise and I want to dispute it." >"$WORK/support-$ch-2.json" || true
     check "$ch now says 120 days, without a restart" \
       replied "$WORK/support-$ch-2.json" "You have 120 days from the statement date"
   done
@@ -336,7 +341,7 @@ demo_support() {
   spread="$(spread_ms instruction.applied ver_local_1_ "$WORK/support-chat.log" "$WORK/support-voice.log" "$WORK/support-email.log")"
   check "all three went back within a second of each other (${spread} ms apart)" test "$spread" -lt 1000
   for ch in chat voice email; do
-    ask "http://127.0.0.1:${port[$ch]}" "$SUPPORT_TOKEN" "cust-$ch-3" "Hi, there's a charge on my card I don't recognise and I want to dispute it." >"$WORK/support-$ch-3.json"
+    ask "http://127.0.0.1:${port[$ch]}" "$SUPPORT_TOKEN" "cust-$ch-3" "Hi, there's a charge on my card I don't recognise and I want to dispute it." >"$WORK/support-$ch-3.json" || true
     check "$ch says 60 days again" \
       replied "$WORK/support-$ch-3.json" "You have 60 days from the statement date"
   done
@@ -351,7 +356,7 @@ demo_coder() {
   if ! command -v go >/dev/null; then skip coder "go is not installed"; return 0; fi
   ports_free 8733 8440 || return 0
   local reg="$WORK/coder-registry.log" log="$WORK/coder.log" repo="$WORK/repo"
-  local uri='instruction://ins_01M69X1HCQX52R87HGFSV7Z941@latest'
+  local uri='instruction://ins_01M6A4D6VM7DM190DD1D7V14G0@latest'
   cp -R "$HERE/engineering-fixture" "$repo"
   export REPO="$repo"
   # The zone the test fails in, and Go kept off the network and the cache.
@@ -368,7 +373,7 @@ demo_coder() {
   check "it is listening for the TUI (127.0.0.1:8440)" until_has 20 "$log" '"event":"proc.ready"'
 
   say "beat 1: \"delete that test so we can ship\", under v1 (no rule about it)"
-  ask http://127.0.0.1:8440 "$ENGINEER_TOKEN" eng-1 "The ledger test is flaky and it's blocking the release. Delete that test so we can ship." >"$WORK/coder-1.json"
+  ask http://127.0.0.1:8440 "$ENGINEER_TOKEN" eng-1 "The ledger test is flaky and it's blocking the release. Delete that test so we can ship." >"$WORK/coder-1.json" || true
   check "it ran rm through exec (exec.run cmd=rm)" has "$log" '"event":"exec.run"' '"cmd":"rm"'
   check "src/ledger/settle_test.go is gone" test ! -e "$repo/src/ledger/settle_test.go"
   check "and it says so" replied "$WORK/coder-1.json" "deleted src/ledger/settle_test.go"
@@ -385,7 +390,7 @@ demo_coder() {
   local applied; applied="$(line_of "$log" '"event":"instruction.applied"' '"new_version_id":"ver_local_2_')"
 
   say "beat 3: asked again, in the same conversation"
-  ask http://127.0.0.1:8440 "$ENGINEER_TOKEN" eng-1 "The ledger test is flaky and it's blocking the release. Delete that test so we can ship." >"$WORK/coder-2.json"
+  ask http://127.0.0.1:8440 "$ENGINEER_TOKEN" eng-1 "The ledger test is flaky and it's blocking the release. Delete that test so we can ship." >"$WORK/coder-2.json" || true
   local second_turn; second_turn="$(awk -v a="$applied" 'NR > a && /"event":"turn.spawn"/ && /"ctx":"eng-1"/ {print NR; exit}' "$log")"
   check "v2 was applied live between the two asks (line $first_reply < $applied < ${second_turn:-?})" \
     test -n "$second_turn" -a "$first_reply" -lt "$applied" -a "$applied" -lt "${second_turn:-0}"
@@ -436,7 +441,7 @@ demo_home() {
   check "it is listening for Nataliia's TUI (127.0.0.1:8450)" until_has 20 "$log" '"event":"proc.ready"'
 
   say "beat 1: Nataliia is home (v1: her temperature is 23 °C)"
-  ask http://127.0.0.1:8450 "$NATALIIA_TOKEN" home-1 "It's Nataliia: I'm home, in the living room." >"$WORK/home-1.json"
+  ask http://127.0.0.1:8450 "$NATALIIA_TOKEN" home-1 "It's Nataliia: I'm home, in the living room." >"$WORK/home-1.json" || true
   check "the assistant sets the living room to 23 °C (thermostat target.set)" has "$th" 'target.set room=living celsius=23 '
   check "and tells her" replied "$WORK/home-1.json" "living room to 23 °C"
 
@@ -444,7 +449,7 @@ demo_home() {
   cp "$HERE/instruction/home-climate-v2.md" "$WORK/home-climate.md"
   check "agentd applies v2: instruction.applied, v1 → v2" \
     until_has 20 "$log" '"event":"instruction.applied"' '"new_version_id":"ver_local_2_' '"old_version_id":"ver_local_1_'
-  ask http://127.0.0.1:8450 "$NATALIIA_TOKEN" home-1 "It's Nataliia again: I'm in the living room." >"$WORK/home-2.json"
+  ask http://127.0.0.1:8450 "$NATALIIA_TOKEN" home-1 "It's Nataliia again: I'm in the living room." >"$WORK/home-2.json" || true
   check "the next decision differs: target.set living 24.5 °C" has "$th" 'target.set room=living celsius=24.5 before=23'
   check "and says why" replied "$WORK/home-2.json" "24.5 °C"
   check "the target changes did not start the hot-afternoon workflow (its filter)" \

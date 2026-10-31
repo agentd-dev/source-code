@@ -308,10 +308,10 @@ subagents:
     room:
       instruction: |
         You are the room for {{params.id}}.
-        :::!config
+        :::config{id=cfg1 dialect=agentd/config}
         agent: { preflight: never }
         :::
-        :::!workflow{name=on-ping}
+        :::workflow{id=on-ping dialect=instruction/workflow}
         steps:
           cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }
           f:   { kind: finish, depends_on: [cmd], status: completed, output: "pong {{params.id}}" }

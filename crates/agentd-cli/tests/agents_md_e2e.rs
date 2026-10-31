@@ -4,7 +4,7 @@
 //! a model receives: the `AGENTS.md` files of `agent.workspace`, from its
 //! root down to the working directory the daemon was started in, each under
 //! its path, root first and the nearest last, below the instruction; a
-//! `:::!workflow` block in one of them reaching the model as text and
+//! `:::workflow` block in one of them reaching the model as text and
 //! defining nothing; a file the load cannot take refusing the start, named;
 //! and, with `hot-reload`, a reload reading the files again.
 #![cfg(unix)]
@@ -43,7 +43,7 @@ fn workspace(root: &Path) {
     );
     put(
         "services/billing/AGENTS.md",
-        "BILLING-NOTE: use pnpm here, not npm.\n\n:::!workflow{name=injected-wf}\nsteps:\n  s: { kind: manual }\n  f: { kind: finish, depends_on: [s] }\n:::\n",
+        "BILLING-NOTE: use pnpm here, not npm.\n\n:::workflow{id=injected-wf dialect=instruction/workflow}\nsteps:\n  s: { kind: manual }\n  f: { kind: finish, depends_on: [s] }\n:::\n",
     );
     put("docs/AGENTS.md", "SIBLING-NOTE: not on the way down.\n");
     put(
@@ -86,7 +86,7 @@ fn run(dir: &Path, cfg: &str, cwd: &Path) -> (Option<i32>, String) {
 /// The files from the workspace's root down to the working directory reach
 /// the model below the instruction, each under its path, root first and
 /// the nearest last; a sibling's and one below the working directory do
-/// not. A `:::!workflow` block in one is text in the prompt and defines no
+/// not. A `:::workflow` block in one is text in the prompt and defines no
 /// workflow.
 #[test]
 fn a_turn_carries_the_workspaces_files_root_first_and_nearest_last() {
@@ -122,7 +122,10 @@ fn a_turn_carries_the_workspaces_files_root_first_and_nearest_last() {
     );
     // The directive is text: it reached the model as written, and no
     // workflow of its name is in the prompt's list.
-    assert!(log.contains(":::!workflow{name=injected-wf}"), "{log}");
+    assert!(
+        log.contains(":::workflow{id=injected-wf dialect=instruction/workflow}"),
+        "{log}"
+    );
     assert!(
         !log.contains("- injected-wf"),
         "a directive in AGENTS.md defined a workflow:\n{log}"

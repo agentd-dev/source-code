@@ -4,7 +4,7 @@
 //!
 //! A running config is assembled from more places every release: up to three
 //! discovery rungs, the process environment, the flags, the conventional
-//! `workflows/`, `skills/` and `subagents/` folders, and a `:::!config`
+//! `workflows/`, `skills/` and `subagents/` folders, and a `:::config`
 //! fragment inside an instruction that may itself have come from a folder, an
 //! OCI artifact or a URL. `--validate-config` answers "is this valid"; nothing
 //! answered "what is it, and who said so".
@@ -148,7 +148,7 @@ pub fn report(trace: &Trace, files: &[String], document_config: &Map<String, Val
     ];
     if !document_config.is_empty() {
         notes.push(
-            "`document_config` is the `:::!config` fragment the instruction declared. It \
+            "`document_config` is the `:::config` fragment the instruction declared. It \
              merges UNDER `config`, so an explicit setting still wins, and it is applied \
              after this document is typed — it is not folded into `config` above."
                 .to_string(),

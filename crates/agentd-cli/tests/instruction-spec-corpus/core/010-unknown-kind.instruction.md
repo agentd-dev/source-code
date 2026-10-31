@@ -1,3 +1,3 @@
-:::!banana{name=x}
+:::banana{id=x}
 peel
 :::

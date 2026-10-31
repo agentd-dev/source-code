@@ -126,8 +126,8 @@ fn top_level_properties(
                     "ask_human_fallback": { "enum": ["wait", "pause", "idle", "fail", "finish", "stop", "auto"], "description": "what ask_human does when it does not gate — no A2A listener, or an unowned ask under ask_human_unowned: fallback — and, for auto, when a gate that names no addressee times out: wait (park until timeout), fail (default), or auto (an LLM judge answers on the operator's behalf, marked as auto). An addressed gate, which every security.policies gate is, is never judged: it times out" },
                     "ask_human_unowned": { "enum": ["gate", "fallback"], "description": "what an ask no caller owns — an ask_human or a security.policies gate raised by a schedule, webhook, stream or subagent (a subagent is unowned even under a caller's turn) — does: gate (a gate task on the A2A listener, owned by the principal the unit works for or else the operator, who answers it; requires a2a.listen) or fallback (default — ask_human_fallback applies; a policy gate takes its on_timeout)" },
                 "approval": { "enum": ["ask", "auto", "accept"], "description": "whether a gate asks a person (ask), lets an LLM judge decide (auto), or takes the ask's recommendation (accept); runtime-settable via admin.set" },
-                "document_capabilities": { "type": "array", "items": { "enum": ["material", "knowledge", "interface", "identity", "compute", "infra", "compose"] }, "description": "instruction-document families this agent's instruction may use (the trust ladder). Empty grants only the default rung; naming a family admits its blocks. Fail-closed, restart-only." },
-                "gate_channels": { "type": "object", "description": "the channel a configured workflow's gate is announced on: workflow name → step path → channel. How a subagent template's ::!human channels reach its instance child; an instruction document's own ::!human declarations stand where both name a step. Operator-only.", "additionalProperties": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } } }
+                "document_capabilities": { "type": "array", "items": { "enum": ["interface", "identity"] }, "description": "the grants this agent's instruction document may use beyond the default: identity admits its A2A agents (::agent → a2a.peers), interface a workflow that opens an inbound route. Empty admits guidance, :::mcp, :::workflow, :::config, :::skill and ::person. Fail-closed, restart-only." },
+                "gate_channels": { "type": "object", "description": "the channel a configured workflow's gate is announced on: workflow name → step path → channel. How a subagent template's channels reach its instance child; an instruction document never puts a channel on a gate. Operator-only.", "additionalProperties": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1 } } }
                 }
             }));
     let endpoints = json!({ "oneOf": [ { "type": "array", "items": { "type": "string" } }, { "type": "string" } ], "description": "ordered endpoint list (failover); one comma-separated string is accepted" });
@@ -217,7 +217,7 @@ fn top_level_properties(
                     "narrow": { "type": "object", "additionalProperties": { "type": "object", "additionalProperties": false, "properties": {
                         "tags": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] }, "description": "trifecta tags to ADD (never remove)" },
                         "describe": { "type": "string", "description": "operator annotation appended beneath the tool's own description" }
-                    } }, "description": "append-only narrowing of an existing tool (a :::!override block): add tags, append a note; never widen" }
+                    } }, "description": "append-only narrowing of an existing tool (the tools.overrides surface): add tags, append a note; never widen" }
                 }
             }));
     m.insert("store".to_string(), json!({
@@ -920,7 +920,7 @@ fn defs_properties(
                     "rate": { "type": "string", "description": "`<burst>/<per>s` arrival quota; operators are exempt" }, "budget": budget } },
                 "labels": { "type": "object", "additionalProperties": { "type": "string" }, "description": "operator-declared attributes carried into the run, the MCP `_meta` and the audit line" } } }));
     m.insert("SubagentTemplate".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["instruction"],
-                "description": "an operator-declared subagent definition: `instruction` is a full instruction document — no config-defining directives = the flat worker; machinery (:::workflow/:::mcp/:::stream/:::config/:::tools) = an instance-tier child",
+                "description": "an operator-declared subagent definition: `instruction` is a full instruction document — no config-defining directives = the flat worker; configuration (:::workflow, :::mcp, :::config) = an instance-tier child",
                 "properties": {
                 "instruction": { "oneOf": [
                     { "type": "string", "description": "the definition; {{params.X}} holes fold in at spawn as data, never re-parsed for directives. A path-shaped value or a URI names the document instead of being it — the same classification agent.instruction uses." },

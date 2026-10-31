@@ -1,8 +1,0 @@
-[
-  {
-    "line": 1,
-    "code": "skill-when-alias",
-    "severity": "info",
-    "message": "line 1: write trigger= on a skill; when= is read as its alias"
-  }
-]

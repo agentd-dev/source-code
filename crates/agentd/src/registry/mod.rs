@@ -503,7 +503,7 @@ impl Registry {
                 }
             }
         }
-        // 6. Narrow (`:::!override`) — append-only: add trifecta tags, and
+        // 6. Narrow (`:::override`) — append-only: add trifecta tags, and
         // append an operator annotation beneath the server's own description,
         // never replacing it. Narrowing may only make a tool MORE careful.
         for (name, narrow) in &settings.tools.narrow {

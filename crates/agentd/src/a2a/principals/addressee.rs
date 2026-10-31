@@ -163,21 +163,20 @@ impl Addressee {
         // No principal id starts with `@` or `#` (they are `operator`,
         // `anonymous`, `user:…` and `agent:…`), so such a `to` is a channel
         // (`#ops`, `@channel/ops`) or a reference — a place to notify, not a
-        // principal. An instruction document's `@human/<name>` never arrives
-        // here resolved to its channel: the loader addresses it to the
-        // human's principal, or to the operators, and carries the channel
-        // alongside (`config::humans`). What does arrive is a channel written
-        // straight into a `to`, or a reference to a human the document never
-        // declared — and saying which is what lets the author fix it.
+        // principal. An instruction document's person never arrives here:
+        // the loader addresses a gate to one it declares to the operators
+        // (`config::humans`). What does arrive is a channel written straight
+        // into a `to`, or a bare name the document never declared — and
+        // saying which is what lets the author fix it.
         let reference = match &self.id {
-            Some(id) if id.starts_with("@human/") => {
-                " (`@human/<name>` is an instruction document's reference, and it resolves only \
-                 inside the document that declares that human with `::!human`)"
-            }
             Some(id) if id.starts_with('@') || id.starts_with('#') => {
-                " (a channel is not a principal: to announce a gate on a channel, address it \
-                 from an instruction document to a `::!human` that declares the channel — \
-                 operators answer it and the channel is carried on the gate)"
+                " (a channel is not a principal: to announce a gate on a channel, name it in \
+                 the operator's `agent.gate_channels` — operators answer it and the channel is \
+                 carried on the gate)"
+            }
+            Some(id) if !id.contains(':') && id != "anonymous" => {
+                " (a bare name is an instruction document's person, and it resolves only \
+                 inside the document that declares it with `::person`)"
             }
             _ => "",
         };
@@ -351,7 +350,7 @@ mod tests {
     }
 
     /// A channel or a reference that reaches a gate's `to` names no
-    /// principal. A document's `@human/<name>` never arrives as its channel
+    /// principal. A document's `<name>` never arrives as its channel
     /// (the loader resolves it), so what does arrive is a channel written
     /// into a `to` or a reference to an undeclared human: the refusal says
     /// which — and a principal id never looks like either.
@@ -360,10 +359,7 @@ mod tests {
         for (reference, why) in [
             ("#ops", "a channel is not a principal"),
             ("@channel/ops", "a channel is not a principal"),
-            (
-                "@human/oncall",
-                "resolves only inside the document that declares",
-            ),
+            ("oncall", "resolves only inside the document that declares"),
         ] {
             let e = Addressee::parse(&json!(reference))
                 .unwrap()
@@ -379,7 +375,7 @@ mod tests {
     }
 
     /// A `to` names who may answer and nothing else: where a gate is
-    /// announced is declared only by an instruction document's `::!human`
+    /// announced is declared only by the operator's `agent.gate_channels`
     /// (`config::humans`), so a `to` that tries to carry a channel is a typo
     /// like any other unknown field.
     #[test]

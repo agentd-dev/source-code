@@ -55,7 +55,7 @@ pub(crate) fn say(log: &crate::obs::log::Logger, notes: Vec<Note>) {
 /// The catalogue `settings` describe, over the connections `conns`: each
 /// source's Skills extension listed, the user folder (`skills.dir`), then
 /// the project folder (`.agents/skills/`) over it, then the instruction's
-/// `:::!skill` definitions over both.
+/// `:::skill` definitions over both.
 pub(crate) fn build(
     settings: &Settings,
     conns: &BTreeMap<String, Arc<McpClient>>,

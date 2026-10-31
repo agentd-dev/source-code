@@ -1,0 +1,12 @@
+{
+ "valid": true,
+ "grants": [
+  "identity"
+ ],
+ "errors": [],
+ "registers": {
+  "workflows": [
+   "ask"
+  ]
+ }
+}

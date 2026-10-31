@@ -1,3 +1,0 @@
-## !workflow nightly
-
-prose only

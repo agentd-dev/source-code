@@ -1697,19 +1697,14 @@ fn write_json(stream: &mut TcpStream, status: u16, payload: &Value, session: Opt
 
 /// The document this mock's registry serves. `REGISTRY_VERSION` moves when the
 /// caller asks for `@next`, so a test can watch an apply boundary.
-const REGISTRY_DOC: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock.\n\n:::!workflow{name=mock-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
-const REGISTRY_DOC_V2: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, version two.\n\n:::!workflow{name=mock-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+const REGISTRY_DOC: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock.\n\n:::workflow{id=mock-drain dialect=\"instruction/workflow\"}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+const REGISTRY_DOC_V2: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, version two.\n\n:::workflow{id=mock-drain dialect=\"instruction/workflow\"}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
 /// The document `@endmatter` serves: no fence at all — front matter and
 /// prose — followed by end matter that changes on every read, under a new
 /// versionId each time: a publisher editing only the record. Fence-free on
 /// purpose, so only a consumer whose delivery gate sees front and end matter
 /// strips the record; one that reads it raw delivers a new text per read.
 const REGISTRY_DOC_PROSE: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, in prose.\n";
-/// The document `@variants` serves: one variant per model family (§5.2's
-/// `agent` key) and one for any host but agentd, so what a consumer delivers
-/// shows which facts it chose them by — its operator's model, read where the
-/// read happens, or none at all.
-pub const REGISTRY_DOC_VARIANTS: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\n:::when{agent=\"claude\"}\nAnswer as the claude variant.\n:::\n\n:::when{agent=\"gpt\"}\nAnswer as the gpt variant, at somewhat greater length.\n:::\n\n:::unless{host=\"agentd\"}\nAnswer as a host other than agentd.\n:::\n";
 /// How many times `@endmatter` has been read: the counter its end matter and
 /// versionId carry. Per mock process, which is per test.
 static END_MATTER_READS: AtomicU64 = AtomicU64::new(0);
@@ -1777,12 +1772,9 @@ fn registry_contents(uri: &str) -> serde_json::Value {
     if base.ends_with("@foreign") {
         text = text.replace("id: instruction://ins_mock", "id: instruction://ins_other");
     }
-    let version_id = if base.ends_with("@variants") {
-        text = REGISTRY_DOC_VARIANTS.to_string();
-        "ver_mock_variants".to_string()
-    } else if end_matter {
+    let version_id = if end_matter {
         let n = END_MATTER_READS.fetch_add(1, Ordering::SeqCst) + 1;
-        text = format!("{REGISTRY_DOC_PROSE}\n---\nreviewed: {n}\n---\n");
+        text = format!("{REGISTRY_DOC_PROSE}\n---\nnotes: \"reviewed {n}\"\n");
         format!("ver_mock_em_{n}")
     } else if v2 {
         "ver_mock_2".to_string()
@@ -1790,15 +1782,6 @@ fn registry_contents(uri: &str) -> serde_json::Value {
         "ver_mock_1".to_string()
     };
     let version_id = version_id.as_str();
-    // `@selfsigned` serves version one carrying its own author JWS in its
-    // front matter — the transport-independent form a file or OCI source
-    // carries. The author signs the §7.2 author digest, which excludes that
-    // line, so the JWS signed over the bare document is the one it carries.
-    if base.ends_with("@selfsigned")
-        && let Some((author, _)) = mock_signatures(&text, version_id, MOCK_CAPABILITIES, 1)
-    {
-        text = text.replacen("---\n# ", &format!("signature: {author}\n---\n# "), 1);
-    }
     let text = text.as_str();
     let mut meta = json!({
         "md.instruction/canonical": "instruction://ins_mock",
@@ -1811,7 +1794,7 @@ fn registry_contents(uri: &str) -> serde_json::Value {
         "md.instruction/publisherKeys": "instruction://pub/mock/keys.json",
         "md.instruction/deliveryKeys": MOCK_DELIVERY_KEYS_URI,
     });
-    let digest = instruction_core::digest(text.as_bytes());
+    let digest = instruction_md::digest(text.as_bytes());
     meta["md.instruction/digest"] = json!(digest);
     meta["md.instruction/deliveredDigest"] = json!(digest);
     if resolved {
@@ -1821,7 +1804,7 @@ fn registry_contents(uri: &str) -> serde_json::Value {
         let delivered = if query == "resolved=stale" {
             digest.clone()
         } else {
-            instruction_core::digest(REGISTRY_RESOLVED_TEXT.as_bytes())
+            instruction_md::digest(REGISTRY_RESOLVED_TEXT.as_bytes())
         };
         meta["md.instruction/deliveredDigest"] = json!(delivered);
         // Signed as a registry signs a resolved read: the author signature
@@ -1926,13 +1909,13 @@ fn mock_signatures_over(
     iat: u64,
 ) -> Option<(String, String)> {
     use crate::config::attest::{Claims, sign_kid};
-    let digest = instruction_core::digest(delivered.as_bytes());
+    let digest = instruction_md::digest(delivered.as_bytes());
     let author = Claims {
         spec: crate::config::attest::SPEC_CLAIM.into(),
         typ: "author".into(),
         // The `doc` claim is the authored document's id (§7.3), as a
         // publisher signs it — not the URI it happens to be served under.
-        doc: instruction_core::front_matter_id(text.as_bytes())
+        doc: instruction_md::front_matter_id(text.as_bytes())
             .unwrap_or_else(|| "instruction://ins_mock".into()),
         version: version_id.into(),
         digest: crate::config::attest::author_digest(text.as_bytes()),
@@ -1951,11 +1934,14 @@ fn mock_signatures_over(
         digest,
         capabilities: delivery_caps.iter().map(|c| c.to_string()).collect(),
         aud: Some("agent://mock-reader".into()),
-        // The manifest the reference implementation accounts for this
-        // delivery, in the signed form a registry embeds (S7) — not a
-        // hand-written one, which drifted from the shape a strict reader
-        // requires while every test against this mock passed.
-        manifest: Some(mock_manifest(text)?),
+        // The resolution the SDK accounts for this delivery, as a registry
+        // names it — not a hand-written one, which drifts from the shape a
+        // strict reader requires while every test against this mock passes.
+        manifest: Some(crate::config::attest::manifest_of(
+            text,
+            "instruction://ins_mock",
+            version_id,
+        )),
         author: Some(a_jws.clone()),
         ..author
     };
@@ -1964,22 +1950,6 @@ fn mock_signatures_over(
         a_jws,
         sign_kid(&del_key, &delivery, Some(MOCK_DELIVERY_KID)).ok()?,
     ))
-}
-/// The §7.4 manifest of delivering `text` as the mock serves it — no
-/// parameters, no facts, nothing to include — in its signed form.
-#[cfg(feature = "sign")]
-fn mock_manifest(text: &str) -> Option<instruction_core::Manifest> {
-    let ctx = instruction_core::Context {
-        grants: instruction_core::doc::all_families(),
-        ..Default::default()
-    };
-    let doc = instruction_core::parse(text).ok()?;
-    Some(
-        instruction_core::deliver(&doc, &ctx)
-            .ok()?
-            .manifest
-            .signed_form(),
-    )
 }
 #[cfg(not(feature = "sign"))]
 fn mock_signatures(_text: &str, _v: &str, _caps: &[&str], _iat: u64) -> Option<(String, String)> {

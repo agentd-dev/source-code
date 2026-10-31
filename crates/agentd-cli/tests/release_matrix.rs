@@ -320,15 +320,10 @@ fn gate_job(ci: &str) -> &str {
 }
 
 /// The drift tests: (package, test target, test name). Each compares a
-/// vendored copy — of the Instruction Specification, or of the Personal Agent
+/// vendored copy — the instruction.md SDK's registry, or the Personal Agent
 /// Protocol draft — with upstream, and each SKIPS — reporting `ok` — where no
 /// upstream clone is at hand.
 const DRIFT_TESTS: &[(&str, &str, &str)] = &[
-    (
-        "agentd-instruction",
-        "crates/instruction/tests/corpus.rs",
-        "the_vendored_corpus_matches_upstream_when_present",
-    ),
     (
         "agentd-cli",
         "crates/agentd-cli/tests/instruction_spec_corpus.rs",
@@ -377,10 +372,7 @@ fn spec_pin() -> String {
 fn every_document_naming_the_vendored_revision_names_the_pin() {
     let pin = spec_pin();
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    for doc in [
-        "crates/instruction/README.md",
-        "crates/agentd-cli/tests/instruction-spec-corpus/UPSTREAM.md",
-    ] {
+    for doc in ["crates/agentd-cli/tests/instruction-spec-corpus/UPSTREAM.md"] {
         let text = std::fs::read_to_string(root.join(doc)).unwrap();
         assert!(
             text.contains(&pin),
@@ -468,76 +460,6 @@ fn the_spec_drift_checks_cannot_be_skipped() {
             "scripts/ci-gate.sh must point {var} at the pinned tree before the workspace test run"
         );
     }
-}
-
-/// agentd-instruction is linted and tested in its default build — without
-/// `sign` — in CI and before a push. Every other row is agentd-core's or
-/// agentd-cli's, and those enable `sign` in the union, so a lint or a test
-/// that breaks only for the crate's own default consumers went unseen.
-#[test]
-fn the_local_gate_lints_the_instruction_crate_without_sign() {
-    let ci = workflow("ci.yml");
-    let job = gate_job(&ci);
-    let gate = gate_script();
-    let rows: Vec<&str> = gate
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("INSTRUCTION_ROWS=("))
-        .expect("scripts/ci-gate.sh declares INSTRUCTION_ROWS")
-        .trim_end_matches(')')
-        .split('"')
-        .skip(1)
-        .step_by(2)
-        .collect();
-    assert_eq!(rows, ["", "--features sign"], "INSTRUCTION_ROWS");
-    assert!(
-        gate.contains("for F in \"${INSTRUCTION_ROWS[@]}\"")
-            && gate.contains("cargo clippy -p agentd-instruction --all-targets $F -- -D warnings"),
-        "scripts/ci-gate.sh does not lint agentd-instruction over INSTRUCTION_ROWS"
-    );
-    for row in &rows {
-        let line = if row.is_empty() {
-            "run: cargo clippy -p agentd-instruction --all-targets -- -D warnings".to_string()
-        } else {
-            format!("run: cargo clippy -p agentd-instruction --all-targets {row} -- -D warnings")
-        };
-        assert!(
-            job.lines()
-                .any(|l| l.trim().trim_start_matches("- ") == line),
-            "ci.yml's gate job lacks `{line}`"
-        );
-    }
-    // Its docs are its docs.rs page, built per row: rustdoc only WARNS on a
-    // broken intra-doc link — one to a feature-gated module, say — so each
-    // gate denies warnings rather than leave it to a dead link nobody sees.
-    assert!(
-        gate.contains("RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps -p agentd-instruction $F"),
-        "scripts/ci-gate.sh does not build agentd-instruction's docs over INSTRUCTION_ROWS"
-    );
-    for row in rows {
-        let line = format!(
-            "run: RUSTDOCFLAGS=\"-D warnings\" cargo doc --no-deps -p agentd-instruction{}",
-            if row.is_empty() {
-                String::new()
-            } else {
-                format!(" {row}")
-            }
-        );
-        assert!(
-            job.lines()
-                .any(|l| l.trim().trim_start_matches("- ") == line),
-            "ci.yml's gate job lacks `{line}`"
-        );
-    }
-    assert!(
-        job.lines().any(|l| l.trim().trim_start_matches("- ")
-            == "run: cargo test -p agentd-instruction --no-fail-fast"),
-        "ci.yml's gate job does not test agentd-instruction in its default build"
-    );
-    assert!(
-        gate.lines()
-            .any(|l| l.trim() == "cargo test -p agentd-instruction --no-fail-fast || fail=1"),
-        "scripts/ci-gate.sh does not test agentd-instruction in its default build"
-    );
 }
 
 /// deny.toml is enforced, in CI and before a push. It sat unenforced from

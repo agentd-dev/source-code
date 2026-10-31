@@ -759,7 +759,7 @@ fn an_addressed_operators_answer_records_who_she_is() {
     std::fs::remove_file(&cfg).ok();
 }
 
-/// An instruction document addresses a gate to one of its `::!human`s that
+/// An instruction document addresses a gate to one of its `::human`s that
 /// declares only a channel. The gate is the operators' — exactly as `to:
 /// operator` — and the channel is announced, never consulted: `human.asked`
 /// and the task's annotations carry it for a bridge to route the question,
@@ -774,16 +774,14 @@ fn a_documents_channel_gate_is_announced_and_answered_by_an_operator() {
         format!(
             "\
              agent:\n  name: hitl-e2e\n  preflight: never\n  document_capabilities: [interface]\n\
+             \x20 gate_channels: {{approve: {{gate: \"@channel/ops\"}}}}\n\
              \x20 instruction: |\n\
              \x20   You approve refunds.\n\n\
-             \x20   :::!channel{{name=ops}}\n\
-             \x20   :::\n\n\
-             \x20   :::!human{{name=oncall channel=@channel/ops}}\n\
-             \x20   :::\n\n\
-             \x20   :::!workflow{{name=approve}}\n\
+             \x20   ::person{{id=oncall title=\"On call\"}}\n\n\
+             \x20   :::workflow{{id=approve dialect=instruction/workflow}}\n\
              \x20   steps:\n\
              \x20     s: {{kind: manual}}\n\
-             \x20     gate: {{kind: human, question: \"Approve the refund?\", to: \"@human/oncall\", depends_on: [s]}}\n\
+             \x20     gate: {{kind: human, question: \"Approve the refund?\", to: \"oncall\", depends_on: [s]}}\n\
              \x20     f: {{kind: finish, depends_on: [gate], output: refunded}}\n\
              \x20   :::\n\
              intelligence:\n  endpoints: {llm}\n  model: mock\n\

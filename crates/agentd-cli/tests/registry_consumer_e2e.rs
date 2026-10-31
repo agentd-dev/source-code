@@ -209,34 +209,6 @@ fn a_pinned_publisher_verifies_the_author_and_delivery_attestations() {
     let _ = std::fs::remove_file(&key);
 }
 
-/// A registry document may carry its own author JWS in its front matter.
-/// The author signs the §7.2 author digest, which excludes that line, so the
-/// read verifies against it — as the same bytes would from a file — and the
-/// delivery's manifest chains to it.
-#[test]
-fn a_document_carrying_its_own_signature_verifies_over_the_author_digest() {
-    let key = publisher_key_file();
-    let r = boot(
-        "instruction://ins_mock@selfsigned",
-        json!([{
-            "uri": "instruction://ins_mock@selfsigned",
-            "publisher": "https://instruction.md/pub/mock",
-            "author_keys": [key.clone()],
-            "delivery_keys": [],
-            "reader": "agent://mock-reader",
-        }]),
-    );
-    let v = event(&r.log, "instruction.verified")
-        .unwrap_or_else(|| panic!("no verification:\n{}", r.log));
-    assert_eq!(v["delivery_checked"], true);
-    assert!(
-        r.log.contains("proc.ready"),
-        "startup completed:\n{}",
-        r.log
-    );
-    let _ = std::fs::remove_file(&key);
-}
-
 /// A delivery attestation CAPS for its reader (§7.6 step 4: effective =
 /// grant ∩ max_capabilities ∩ author ∩ delivery). `@narrow` is signed by an
 /// author attesting `core` and `compute` and delivered attesting `core`
@@ -323,8 +295,9 @@ fn a_document_signed_for_another_id_is_refused_under_the_pin() {
             r.log
         );
         assert!(
-            r.log
-                .contains("the signature is for \\\"instruction://ins_other\\\""),
+            r.log.contains("\\\"instruction://ins_other\\\" is not")
+                || r.log
+                    .contains("the signature is for \\\"instruction://ins_other\\\""),
             "{uri} (reader {reader:?}): the refusal names the document signed:\n{}",
             r.log
         );
@@ -351,7 +324,8 @@ fn verification_fails_closed_on_a_wrong_key_and_a_wrong_reader() {
         r.log
     );
     assert!(
-        r.log.contains("does not verify") || r.log.contains("no author verification key"),
+        r.log.contains("signature verification failed")
+            || r.log.contains("no author verification key"),
         "the refusal names the signature problem:\n{}",
         r.log
     );
@@ -494,7 +468,7 @@ fn a_raw_read_is_still_delivered_here() {
     let out = done["output"].as_str().unwrap_or_default();
     assert!(out.contains("Serve the mock."), "{log}");
     assert!(
-        !out.contains(":::!workflow"),
+        !out.contains(":::workflow"),
         "a raw read's machinery never reaches the model:\n{out}"
     );
 }
@@ -513,25 +487,6 @@ fn a_resolved_read_under_another_digest_is_refused() {
     );
 }
 
-/// A registry read is folded with the operator's facts where the read
-/// happens, at run time: the `agent` family of the model its turns use and
-/// `host=agentd`. So the claude variant is the one the model reads, the gpt
-/// one is not, and the variant for any host but agentd is dropped.
-#[test]
-fn a_registry_reads_variants_are_chosen_by_the_operators_model() {
-    let log = run_echo_as("instruction://ins_mock@variants", "claude-sonnet-4-5");
-    let done = event(&log, "run.done").unwrap_or_else(|| panic!("no run.done:\n{log}"));
-    let out = done["output"].as_str().unwrap_or_default();
-    assert!(out.contains("Answer as the claude variant."), "{log}");
-    assert!(!out.contains("gpt variant"), "{out}");
-    assert!(!out.contains("host other than agentd"), "{out}");
-}
-
-/// A resolved read is the registry's delivered text, which the author never
-/// signed: under a pinned publisher it verifies through the delivery
-/// attestation — its digest over these bytes, its manifest chained to the
-/// author's signature over the authored document — not by comparing the
-/// author's digest with bytes that were never authored.
 #[test]
 fn a_pinned_resolved_read_verifies_through_its_delivery_attestation() {
     let key = publisher_key_file();

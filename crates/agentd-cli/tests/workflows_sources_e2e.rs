@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! A workflow NAME is one definition, whichever sources it arrives from: an
 //! inline entry, a `file:`, a `dir:` folder, the instruction document's
-//! `:::!workflow`. Two that resolve to one name are refused — at startup with
+//! `:::workflow`. Two that resolve to one name are refused — at startup with
 //! exit 2, at reload with nothing applied — and the refusal names BOTH
 //! sources. Before, the later one silently replaced the earlier in the loaded
 //! map: the operator's workflow changed without a word, and a folder's file
@@ -40,11 +40,11 @@ fn workflow_file(name: &str, output: &str) -> String {
     )
 }
 
-/// An instruction document carrying one `:::!workflow` block.
+/// An instruction document carrying one `:::workflow` block.
 fn document(name: &str, output: &str) -> String {
     format!(
         "Keep things tidy.\n\n\
-         :::!workflow{{name={name}}}\n\
+         :::workflow{{id=w dialect=instruction/workflow}}\nname: {name}\n\
          steps:\n\
          \x20 s: {{kind: once}}\n\
          \x20 v: {{kind: assign, depends_on: [s], value: \"{output}\"}}\n\

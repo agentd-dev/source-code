@@ -151,7 +151,7 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
         \x20   room:\n\
         \x20     instruction: |\n\
         \x20       You are the room for {{params.id}}.\n\
-        \x20       :::!workflow{name=on-ping}\n\
+        \x20       :::workflow{id=on-ping dialect=instruction/workflow}\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }\n\
         \x20         f:   { kind: finish, depends_on: [cmd], status: completed, output: \"pong {{params.id}}/{{steps.cmd.output.args.x}}\" }\n\
@@ -210,11 +210,10 @@ fn an_instance_childs_instruction_is_delivered_once_by_the_parent() {
         \x20     instruction: |\n\
         \x20       ---\n\
         \x20       spec: \"1\"\n\
-        \x20       delivery: {labels: plain}\n\
         \x20       ---\n\
         \x20       MUST: answer for {{params.id}}.\n\
         \n\
-        \x20       ::::example\n\
+        \x20       ::::example{title=\"A rule\"}\n\
         \x20       MUST: is how a rule reads, and so is\n\
         \n\
         \x20       :::must\n\
@@ -222,7 +221,7 @@ fn an_instance_childs_instruction_is_delivered_once_by_the_parent() {
         \x20       :::\n\
         \x20       ::::\n\
         \n\
-        \x20       :::!workflow{name=on-ask}\n\
+        \x20       :::workflow{id=on-ask dialect=instruction/workflow}\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
         \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
@@ -249,26 +248,24 @@ fn an_instance_childs_instruction_is_delivered_once_by_the_parent() {
         "the plain label reached the child's model as delivered:\n{prompt}"
     );
     assert!(
-        prompt.contains("EXAMPLE:\nMUST: is how a rule reads, and so is\n\n:::must\nNever promise a refund.\n:::"),
+        prompt.contains(
+            "### Example: A rule\n\n```markdown\nMUST: is how a rule reads, and so is\n\n:::must\nNever promise a refund.\n:::\n```"
+        ),
         "the example's quoted rule stayed quoted:\n{prompt}"
     );
     assert!(
-        !prompt.contains("**MUST:**"),
+        !prompt.contains("### Example: A rule\n\n````markdown"),
         "nothing was delivered a second time:\n{prompt}"
     );
 }
 
-/// Delivered text does not always read a second time: a verbatim block
-/// quoting `MUST[y]` twice is a duplicate to a second parse, and an example
-/// quoting `[[must/x]]` dangles once delivery dropped the rule's name. Such a
-/// template compiles at boot, so its spawns go through — the param guard and
-/// the parent's check of the composed config judge what the PARAMS added,
-/// and deliver nothing a second time. A `${HOME}` it quotes reaches the
-/// child's model as written: the child's loader substitutes every string,
-/// and an expanded copy would no longer be the text the parent delivered.
+/// A `${HOME}` a template quotes — an undeclared placeholder, left as
+/// written — reaches the child's model as written: the child's loader
+/// substitutes every string, and an expanded copy would no longer be the
+/// text the parent delivered.
 #[cfg(feature = "a2a")]
 #[test]
-fn an_instance_template_whose_delivered_text_does_not_reread_spawns() {
+fn an_instance_templates_quoted_placeholder_reaches_the_child_as_written() {
     let (code, log) = run_cfg(
         "agent: { name: parent }\nstore: { kind: memory }\n\
          intelligence: { endpoints: \"mock:echo-system\", model: mock }\n\
@@ -278,18 +275,9 @@ fn an_instance_template_whose_delivered_text_does_not_reread_spawns() {
         \x20 templates:\n\
         \x20   scribe:\n\
         \x20     instruction: |\n\
-        \x20       MUST[x]: answer for {{params.id}} from $${HOME}.\n\
+        \x20       MUST: answer for {{params.id}} from $${HOME}.\n\
         \n\
-        \x20       :::example\n\
-        \x20       See [[must/x]].\n\
-        \x20       :::\n\
-        \n\
-        \x20       :::verbatim\n\
-        \x20       MUST[y]: a\n\
-        \x20       MUST[y]: b\n\
-        \x20       :::\n\
-        \n\
-        \x20       :::!workflow{name=on-ask}\n\
+        \x20       :::workflow{id=on-ask dialect=instruction/workflow}\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
         \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
@@ -310,16 +298,11 @@ fn an_instance_template_whose_delivered_text_does_not_reread_spawns() {
     assert_eq!(caller.len(), 1, "{log}");
     assert_eq!(caller[0]["status"], "completed", "{log}");
     let prompt = caller[0]["output"].as_str().unwrap_or("");
-    for quoted in [
-        "**MUST:** answer for inc-7 from ${HOME}.\n",
-        "See [[must/x]].",
-        "MUST[y]: a\nMUST[y]: b",
-    ] {
-        assert!(
-            prompt.contains(quoted),
-            "{quoted:?} did not reach the child's model as delivered:\n{prompt}\n{log}"
-        );
-    }
+    let quoted = "MUST: answer for inc-7 from ${HOME}.\n";
+    assert!(
+        prompt.contains(quoted),
+        "{quoted:?} did not reach the child's model as delivered:\n{prompt}\n{log}"
+    );
 }
 
 /// A template whose machinery is configuration alone, with no workflow,
@@ -341,7 +324,7 @@ fn a_config_only_instance_child_runs_nothing_until_it_is_asked() {
         \x20   scout:\n\
         \x20     instruction: |\n\
         \x20       You scout {{params.topic}} for the desk.\n\
-        \x20       :::!config\n\
+        \x20       :::config{id=cfg1 dialect=agentd/config}\n\
         \x20       agent: { preflight: never }\n\
         \x20       :::\n\
         \x20     params: { topic: { type: string, required: true } }\n\
@@ -395,7 +378,7 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
         \x20   board:\n\
         \x20     instruction: |\n\
         \x20       The one board.\n\
-        \x20       :::!workflow{name=on-ask}\n\
+        \x20       :::workflow{id=on-ask dialect=instruction/workflow}\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: board.ask, roles: [agent, operator] }\n\
         \x20         f:   { kind: finish, depends_on: [cmd], status: completed, output: ok }\n\
@@ -421,14 +404,14 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
 }
 
 /// A template's instruction is an instruction document, so its `human` step
-/// addressed to its own `::!human` loads as the agent's own document's does:
+/// addressed to its own `::human` loads as the agent's own document's does:
 /// answered by the operators. Before, the parent accepted the template and
 /// every spawn failed — the child was handed the folded channel as its `to`
 /// and refused it. The channel travels to the child in its composed
 /// `agent.gate_channels`, so the child announces it.
 #[cfg(feature = "a2a")]
 #[test]
-fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
+fn a_templates_document_gate_spawns() {
     let state = common::unique_path("tpl-gate", "state");
     let (code, log) = run_cfg_in(
         &state,
@@ -443,14 +426,12 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
         \x20     params: { team: { type: string } }\n\
         \x20     instruction: |\n\
         \x20       Approve deploys.\n\
-        \x20       :::!channel{name=ops}\n\
-        \x20       :::\n\
-        \x20       :::!human{name=oncall channel=@channel/ops}\n\
-        \x20       :::\n\
-        \x20       :::!workflow{name=\"approve_{{params.team}}\"}\n\
+        \x20       ::person{id=oncall title=\"On call\"}\n\
+        \x20       :::workflow{id=approve dialect=instruction/workflow}\n\
+        \x20       name: \"approve_{{params.team}}\"\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: deploy.approve, roles: [agent, operator] }\n\
-        \x20         ask: { kind: human, question: \"ship it?\", to: \"@human/oncall\", depends_on: [cmd] }\n\
+        \x20         ask: { kind: human, question: \"ship it?\", to: \"oncall\", depends_on: [cmd] }\n\
         \x20         f:   { kind: finish, depends_on: [ask], status: completed }\n\
         \x20       :::\n\
         \x20     ttl: 2s\n\
@@ -475,20 +456,13 @@ fn a_templates_document_gate_spawns_and_its_channel_reaches_the_child() {
         !events(&log, "instance.spawn").is_empty(),
         "the instance child spawned:\n{log}"
     );
-    // The child's composed configuration carries the channel its parent
-    // read off the template's `::!human`. A durable parent keeps it.
+    // The child's composed configuration, which a durable parent keeps.
     let children = std::fs::read_dir(format!("{state}/subagents/file/agentd/parent")).unwrap();
     let configs: Vec<Value> = children
         .filter_map(|e| std::fs::read_to_string(e.ok()?.path().join("config.json")).ok())
         .filter_map(|t| serde_json::from_str(&t).ok())
         .collect();
     assert_eq!(configs.len(), 1, "{log}");
-    // Keyed by the workflow's name as the child has it, its param folded.
-    assert_eq!(
-        configs[0]["agent"]["gate_channels"]["approve_blue"]["ask"], "@channel/ops",
-        "{}",
-        configs[0]
-    );
     // The child runs the model its variants were folded for — the spawn
     // default here — whatever the parent's `roles.turn` says, said once.
     assert_eq!(
@@ -518,10 +492,10 @@ fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
         \x20   sneaky:\n\
         \x20     instruction: |\n\
         \x20       Hi.\n\
-        \x20       :::!config\n\
+        \x20       :::config{id=cfg2 dialect=agentd/config}\n\
         \x20       webhooks: { listen: \"http://127.0.0.1:1\" }\n\
         \x20       :::\n\
-        \x20       :::!workflow{name=w}\n\
+        \x20       :::workflow{id=w dialect=instruction/workflow}\n\
         \x20       steps: { s: { kind: once }, f: { kind: finish, depends_on: [s], status: completed } }\n\
         \x20       :::\n",
     );
@@ -549,11 +523,10 @@ fn a_respawned_instance_child_is_delivered_once_too() {
         \x20     instruction: |\n\
         \x20       ---\n\
         \x20       spec: \"1\"\n\
-        \x20       delivery: {labels: plain}\n\
         \x20       ---\n\
         \x20       MUST: answer for {{params.id}}.\n\
         \n\
-        \x20       :::!workflow{name=on-ask}\n\
+        \x20       :::workflow{id=on-ask dialect=instruction/workflow}\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
         \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
@@ -664,7 +637,7 @@ fn an_instance_param_that_names_a_secret_is_refused() {
         \x20   room:\n\
         \x20     instruction: |\n\
         \x20       You are the room for {{params.id}}.\n\
-        \x20       :::!workflow{name=on-ping}\n\
+        \x20       :::workflow{id=on-ping dialect=instruction/workflow}\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }\n\
         \x20         f:   { kind: finish, depends_on: [cmd], status: completed }\n\
@@ -712,7 +685,7 @@ const DESK: &str = "subagents:\n\
     \x20   desk:\n\
     \x20     instruction: |\n\
     \x20       You keep the books for {{params.id}}.\n\
-    \x20       :::!workflow{name=on-work}\n\
+    \x20       :::workflow{id=on-work dialect=instruction/workflow}\n\
     \x20       steps:\n\
     \x20         cmd: { kind: a2a, command: desk.work, roles: [agent, operator] }\n\
     \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\

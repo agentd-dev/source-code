@@ -727,7 +727,7 @@ pub fn contracts() -> Vec<Contract> {
     // could never answer. `runtime/human.rs` holds the value a model passes to
     // that rule when the call is made; unset, the task's owner answers. There
     // is deliberately no channel here: where a gate is announced is declared
-    // only by an instruction document's `::!human` (`config::humans`), so a
+    // only by an instruction document's `::human` (`config::humans`), so a
     // model cannot route a question somewhere nobody configured.
     c(
         "ask_human",

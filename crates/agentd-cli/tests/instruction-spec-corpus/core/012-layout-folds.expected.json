@@ -1,0 +1,10 @@
+{
+ "valid": true,
+ "grants": [],
+ "errors": [],
+ "registers": {
+  "workflows": [
+   "nightly"
+  ]
+ }
+}

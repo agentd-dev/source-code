@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Colon-fence directives in the instruction (`:::!workflow` / `:::!skill`) and
+//! Colon-fence directives in the instruction (`:::workflow` / `:::skill`) and
 //! graceful workflow retirement, end to end: an instruction that CARRIES its
 //! workflow runs it; editing the instruction hot-swaps the definition; and a
 //! definition that leaves the config lets its live runs finish (or cancels
@@ -98,14 +98,14 @@ fn an_instruction_carries_its_workflow_and_its_skill() {
   instruction: |
     You watch the queue and keep things tidy.
 
-    :::!workflow{name=embedded}
+    :::workflow{id=embedded dialect=instruction/workflow}
     steps:
       start: {kind: once}
       make:  {kind: assign, depends_on: [start], value: "made-by-embedded"}
       done:  {kind: finish, depends_on: [make], status: completed, output: "{{steps.make.output}}"}
     :::
 
-    :::!skill{name=tidy description="how to tidy"}
+    :::skill{id=tidy description="how to tidy"}
     Always sweep before you mop.
     :::
 
@@ -153,14 +153,13 @@ observability:
 }
 
 #[test]
-fn an_unknown_machinery_directive_is_refused_naming_the_known_set() {
-    // A typo'd MACHINERY directive (`:::!workfow`) fails closed, naming the
-    // known machinery set. (A typo'd BARE name is inert prose by design — the
-    // sigil is what marks an intent that must be recognized.)
+fn an_unknown_kind_is_refused_naming_it() {
+    // A typo'd kind (`:::workfow`) fails closed: instruction/1 knows its
+    // kinds, and an unknown one is the reader's `unknown-kind` error.
     let cfg = common::unique_path("dir-bad", "yaml");
     std::fs::write(
         &cfg,
-        "agent:\n  name: x\n  instruction: |\n    :::!workfow{name=typo}\n    :::\nstore:\n  kind: none\n",
+        "agent:\n  name: x\n  instruction: |\n    :::workfow{name=typo}\n    :::\nstore:\n  kind: none\n",
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
@@ -171,7 +170,7 @@ fn an_unknown_machinery_directive_is_refused_naming_the_known_set() {
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unknown machinery") && stderr.contains("workflow"),
+        stderr.contains("unknown-kind") && stderr.contains("workfow"),
         "{stderr}"
     );
     let _ = std::fs::remove_file(&cfg);
@@ -185,7 +184,7 @@ fn scheduled_cfg(version: &str) -> String {
   instruction: |
     Keep ticking.
 
-    :::!workflow{{name=tick}}
+    :::workflow{{id=tick dialect=instruction/workflow}}
     steps:
       s: {{kind: schedule, every: 400ms}}
       v: {{kind: assign, depends_on: [s], value: "{version}"}}

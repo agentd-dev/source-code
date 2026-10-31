@@ -142,7 +142,7 @@ pub fn checks() -> Vec<Check> {
         ),
         check(
             "ema/document-may-not-delegate",
-            "a :::!mcp fragment declaring grant id_jag, or referencing a reserved supervisor-only secret by any spelling of it, is refused — in the agent's instruction and through a subagent template",
+            "a :::mcp fragment declaring grant id_jag, or referencing a reserved supervisor-only secret by any spelling of it, is refused — in the agent's instruction and through a subagent template",
             document_refused,
         ),
         check(
@@ -2285,7 +2285,10 @@ fn document_refused(h: &Harness) -> Outcome {
     let base = std::fs::read_to_string(&s.cfg).expect("read");
     let doc = |name: &str, body: &str| {
         format!(
-            "---\nspec: \"1\"\nid: instruction://ema\n---\n# Agent\n\nDo the work.\n\n:::!mcp{{name={name}}}\n{body}:::\n"
+            "---\nspec: \"1\"\nid: instruction://ema\n---\n# Agent\n\nDo the work.\n\n:::config{{id=servers dialect=agentd/config}}\nmcp:\n  servers:\n    - name: {name}\n{}:::\n",
+            body.lines()
+                .map(|l| format!("      {l}\n"))
+                .collect::<String>()
         )
     };
     let id_jag = doc(

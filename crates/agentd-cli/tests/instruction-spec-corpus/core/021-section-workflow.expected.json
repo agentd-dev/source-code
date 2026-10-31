@@ -1,8 +1,0 @@
-{
-  "valid": true,
-  "registers": {
-    "workflows": [
-      "drain"
-    ]
-  }
-}

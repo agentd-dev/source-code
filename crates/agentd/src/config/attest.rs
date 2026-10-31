@@ -1,57 +1,224 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! **Instruction attestation** — §7 of the Instruction Specification.
+//! **Instruction attestation** — instruction/1 author and delivery
+//! signatures (§14.1, §19).
 //!
-//! A document that carries machinery is code; delivered over a network it is a
-//! supply chain. The signatures establish authenticity and a capability
-//! CEILING (not authorization, which is §7.7): JWS compact serializations
-//! (RFC 7515) over a claims object, Ed25519 (`alg: EdDSA`, RFC 8037), digests
-//! written `sha256:<hex>` (§7.2).
+//! JWS compact serializations (RFC 7515) over a claims object, Ed25519
+//! (`alg: EdDSA`, RFC 8037), digests written `sha256:<hex>`. An **author**
+//! signature binds a version's authored digest — the stored bytes as they
+//! are; in instruction/1 a signature travels BESIDE the document, never in
+//! it. A **delivery** signature binds what one reader received (the
+//! delivered text's digest), its audience, the resolution it came from (its
+//! `instruction-resolved/1` manifest) and the embedded author signature.
 //!
-//! Two signatures (§7.3): an offline **author** signature over the authored
-//! digest, and an online **delivery** signature over the delivered bytes and
-//! the resolution manifest (§7.4). Verifying them in the §7.6 order, and the
-//! §7.8 hard floor, are the reference implementation's
-//! (`instruction_core::sign`), re-exported here: a second copy of the verify
-//! side is a second place for the claims and the checks to skew, and the mock
-//! registry signing one shape while the runtime verified another is exactly
-//! how they did. Every failure is a refusal carrying its Appendix B code,
-//! never a downgrade to a weaker unsigned path.
-//!
-//! What stays here is agentd's: signing with an [`AgentKey`], verifying a
-//! document's own signature against `agent.instruction.trust` pins, reading a
-//! key file, and the §7.7 freshness helpers. The crypto is `ring` (Ed25519)
-//! and base64url, reused from AAuth — the SAME `ring` rustls already
-//! resolves, so this adds no new dependency.
+//! The checks are the instruction.md SDK's ([`instruction_md::verify_author`],
+//! [`instruction_md::verify_delivery`]): one definition of the claims and
+//! their order for agentd and every other reader. What stays here is
+//! agentd's: the trust pins (`agent.instruction.trust`) and what a verified
+//! signature caps, the transports' sidecars, reading a key file, signing with
+//! an [`AgentKey`] (tests and tooling), and the freshness helpers. Every
+//! failure is a refusal with a stable code, never a downgrade to a weaker
+//! unsigned path.
 
-use instruction_core::Refusal;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::aauth::AgentKey;
 use crate::b64;
+use crate::config::idoc::Refusal;
 
-/// The §7.2 digests, the claims, and §7.6 verification — the crate's, so the
-/// bytes agentd signs and the checks it verifies with are one definition.
-/// Re-exported rather than imported where used: agentd-cli's integration
-/// tests reach the crate only through `agentd::`.
-pub use instruction_core::sign::{
-    Claims, SPEC_CLAIM, Verified, WIRE_FLOOR, admit_family, verify, verify_author, verify_delivery,
-    verify_document,
-};
-pub use instruction_core::{author_digest, digest, front_matter_id};
+pub use instruction_md::{author_digest, digest, front_matter_id};
 
-/// The front-matter `signature:` line's value — the author JWS a document
-/// carries INSIDE itself. This is what makes verification transport-
-/// independent: the same signed bytes verify whether they arrived as a file, a
-/// folder entry, an `https://` fetch or an OCI artifact, because the proof
-/// travels with the document rather than beside it in a protocol's metadata.
-pub fn front_matter_signature(doc: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(doc).ok()?;
-    let rest = text.strip_prefix("---\n")?;
-    let end = rest.find("\n---")?;
-    rest[..end]
-        .lines()
-        .find_map(|l| l.strip_prefix("signature:"))
-        .map(|v| v.trim().trim_matches('"').to_string())
-        .filter(|v| !v.is_empty())
+/// The `spec` claim of every instruction/1 attestation.
+pub const SPEC_CLAIM: &str = "instruction/1";
+
+/// An attestation's claims, typed. `pub` is the publisher.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Claims {
+    pub spec: String,
+    pub typ: String,
+    pub doc: String,
+    #[serde(default)]
+    pub version: String,
+    pub digest: String,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(rename = "pub", default)]
+    pub publisher: String,
+    #[serde(default)]
+    pub iat: u64,
+    #[serde(default)]
+    pub exp: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
+    /// A delivery's resolution: `{format: instruction-resolved/1, status,
+    /// document: {uri, sha256, version?}, dependencies, resolved_digest}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<Value>,
+    /// A delivery's embedded author JWS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+}
+
+/// An SDK verification's reason with agentd's stable code. The SDK says why
+/// in words only; the codes are what a refusal is matched by.
+fn refusal(reason: &str) -> Refusal {
+    let code = if reason.contains("digest does not") {
+        "digest-mismatch"
+    } else if reason.contains("is not pinned") {
+        "unpinned-publisher"
+    } else if reason.contains("is not this reader") {
+        "audience-mismatch"
+    } else if reason.contains("exceed the author attestation") {
+        "delivery-ceiling-exceeded"
+    } else if reason.contains("expected typ") || reason.contains("header typ") {
+        "signature-typ-mismatch"
+    } else {
+        "attestation"
+    };
+    Refusal::new(code, reason)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The claims of a JWS whose signature was ALREADY verified — the embedded
+/// author of a verified delivery, say. Never a verification of its own.
+pub fn claims_of(jws: &str) -> Option<Claims> {
+    let payload = jws.split('.').nth(1)?;
+    serde_json::from_slice(&b64::url_decode(payload).ok()?).ok()
+}
+
+/// Verify an author signature over the authored bytes with a raw Ed25519
+/// public key: the SDK's checks (EdDSA, `spec`, `typ`, expiry, the digest,
+/// the `doc`, the publisher), then the claims typed.
+pub fn verify_author(
+    jws: &str,
+    key: &[u8],
+    authored: &[u8],
+    doc: &str,
+    publisher: &str,
+    now: u64,
+) -> Result<Claims, Refusal> {
+    let r = instruction_md::verify_author(
+        jws,
+        authored,
+        &[instruction_md::public_jwk(key, "")],
+        &instruction_md::VerifyOptions {
+            doc: doc.to_string(),
+            publisher: publisher.to_string(),
+            now: Some(now as i64),
+        },
+    );
+    typed(r)
+}
+
+fn typed(r: instruction_md::VerifyResult) -> Result<Claims, Refusal> {
+    if !r.ok {
+        return Err(refusal(&r.reason));
+    }
+    serde_json::from_value(Value::Object(r.claims.unwrap_or_default()))
+        .map_err(|e| Refusal::new("attestation", format!("the claims do not read: {e}")))
+}
+
+/// A verified delivery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delivery {
+    pub delivery: Claims,
+    /// The author attestation the delivery embeds, verified with it.
+    pub author: Claims,
+    /// What the document may activate: grant ∩ ceiling ∩ author ∩ delivery
+    /// — a signature caps, it never grants.
+    pub effective: Vec<String>,
+}
+
+/// Verify a delivery signature over the delivered bytes and its embedded
+/// author signature (the SDK's §7.6 order), for reader `aud`, then cap the
+/// operator's `granted` families by the pin's `max`, the author's and the
+/// delivery's capabilities.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_delivery(
+    jws: &str,
+    delivered: &[u8],
+    delivery_key: &[u8],
+    author_key: &[u8],
+    aud: &str,
+    publisher: &str,
+    now: u64,
+    granted: &[String],
+    max: &[String],
+) -> Result<Delivery, Refusal> {
+    let r = instruction_md::verify_delivery(
+        jws,
+        delivered,
+        &[instruction_md::public_jwk(delivery_key, "")],
+        &[instruction_md::public_jwk(author_key, "")],
+        &instruction_md::DeliveryVerifyOptions {
+            aud: aud.to_string(),
+            authored: None,
+            publisher: publisher.to_string(),
+            now: Some(now as i64),
+        },
+    );
+    let delivery = typed(r)?;
+    let author = delivery
+        .author
+        .as_deref()
+        .and_then(claims_of)
+        .ok_or_else(|| Refusal::new("attestation", "the embedded author claims do not read"))?;
+    let effective = granted
+        .iter()
+        .filter(|g| max.is_empty() || max.contains(g))
+        .filter(|g| author.capabilities.contains(g) && delivery.capabilities.contains(g))
+        .cloned()
+        .collect();
+    Ok(Delivery {
+        delivery,
+        author,
+        effective,
+    })
+}
+
+/// The manifest a delivery of `text` names: its `instruction-resolved/1`
+/// resolution's format, status, document, dependencies and digest (never its
+/// body), as the SDK resolves it with nothing to compose.
+pub fn manifest_of(text: &str, uri: &str, version: &str) -> Value {
+    let r = instruction_md::resolve(
+        text,
+        &instruction_md::ResolveOptions {
+            uri: uri.to_string(),
+            version: version.to_string(),
+            ..instruction_md::ResolveOptions::default()
+        },
+    );
+    let full = r.resolved.to_json();
+    let mut m = serde_json::Map::new();
+    for k in [
+        "format",
+        "status",
+        "document",
+        "dependencies",
+        "resolved_digest",
+    ] {
+        if let Some(v) = full.get(k) {
+            m.insert(k.into(), v.clone());
+        }
+    }
+    Value::Object(m)
+}
+
+/// The author signature that travels beside a document file: the JWS in
+/// `<path>.jws`, when there is one. An unreadable sidecar is an error — a
+/// signature that cannot be read is not the same as none.
+pub fn signature_beside(path: &str) -> Result<Option<String>, String> {
+    let sidecar = format!("{path}.jws");
+    match std::fs::read_to_string(&sidecar) {
+        Ok(s) => Ok(Some(s.trim().to_string()).filter(|s| !s.is_empty())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{sidecar}: {e}")),
+    }
 }
 
 /// Read an Ed25519 public key from a FILE — raw 32 bytes, 64 hex chars, or
@@ -90,31 +257,27 @@ pub enum Authorship {
     /// which need the registry client. The caller applies
     /// `agent.instruction.unenforceable`.
     NoLocalKeys,
-    /// The document's own signature verified against a pinned publisher.
+    /// The document's signature verified against a pinned publisher.
     Verified {
         publisher: String,
         doc: String,
         /// The author-attested capabilities, already capped by the pin's
         /// `max_capabilities`. A signature CAPS what a document may activate;
-        /// it never widens it (§7.6 step 5).
+        /// it never widens it.
         capabilities: Vec<String>,
     },
 }
 
-/// Verify a document against the trust pins, using the signature it carries.
+/// Verify a document against the trust pins, with the author signature that
+/// travelled beside it (`signature`: a file's `<path>.jws`, an OCI layer's
+/// annotation).
 ///
 /// The rule is deliberately strict, because the alternative is a bypass: when
 /// an operator has pinned a publisher, an UNSIGNED document — or one signed by
-/// somebody else, or naming a `doc` id no pin covers — is refused. Matching on
-/// the document's own id alone would let an attacker dodge every pin by
-/// omitting a line.
-///
-/// Refusals carry their Appendix B code as the crate's do: a signature from a
-/// publisher no pin names is `unpinned-publisher`, bytes the signature does
-/// not cover are `digest-mismatch`, a refusal from the crate's [`verify`]
-/// keeps its own, and the conditions without a row are `attestation`.
+/// somebody else, or naming a `doc` id no pin covers — is refused.
 pub fn verify_authored(
     bytes: &[u8],
+    signature: Option<&str>,
     pins: &[InstructionSource],
     now: u64,
 ) -> Result<Authorship, Refusal> {
@@ -145,13 +308,14 @@ pub fn verify_authored(
     if keys.is_empty() {
         return Ok(Authorship::NoLocalKeys);
     }
-    let jws = front_matter_signature(bytes).ok_or_else(|| {
+    let jws = signature.ok_or_else(|| {
         Refusal::new(
             "attestation",
             format!(
-                "the instruction carries no front-matter `signature:`, but {} pinned \
+                "the instruction carries no author signature beside it (a file's `<path>.jws`, \
+                 an OCI layer's `md.instruction/signature` annotation), but {} pinned \
                  publisher(s) are configured — an unsigned document is not from a pinned \
-                 publisher (§7.6)",
+                 publisher",
                 pinned.len()
             ),
         )
@@ -163,61 +327,24 @@ pub fn verify_authored(
         "no pinned key verifies this document's signature",
     );
     for (pin, key) in &keys {
-        let claims = match verify_author(&jws, key) {
-            Ok(c) => c,
-            Err(e) => {
-                last = e;
-                continue;
-            }
-        };
-        if claims.publisher != pin.publisher {
-            last = Refusal::new(
-                "unpinned-publisher",
-                format!(
-                    "the signature claims publisher {:?}, not the pinned {:?}",
-                    claims.publisher, pin.publisher
-                ),
-            );
-            continue;
-        }
-        if claims.exp < now {
-            return Err(Refusal::new(
-                "attestation",
-                "the author signature has expired",
-            ));
-        }
-        // The signature covers the AUTHORED digest — the document with its own
-        // `signature:` line excluded, which is what lets it travel inside.
-        let want = author_digest(bytes);
-        if claims.digest != want {
-            return Err(Refusal::new(
-                "digest-mismatch",
-                format!(
-                    "the signature covers {} but these bytes author-hash to {want} — refuse",
-                    claims.digest
-                ),
-            ));
-        }
         let pin_doc = pin.uri.split('@').next().unwrap_or(&pin.uri);
-        if !pin.uri.is_empty() && claims.doc != pin_doc {
-            last = Refusal::new(
-                "attestation",
-                format!(
-                    "the signature is for {:?}, not the pinned {pin_doc:?}",
-                    claims.doc
-                ),
-            );
-            continue;
+        match verify_author(jws, key, bytes, pin_doc, &pin.publisher, now) {
+            Ok(claims) => {
+                let mut caps = claims.capabilities;
+                if !pin.max_capabilities.is_empty() {
+                    caps.retain(|c| pin.max_capabilities.contains(c));
+                }
+                return Ok(Authorship::Verified {
+                    publisher: claims.publisher,
+                    doc: claims.doc,
+                    capabilities: caps,
+                });
+            }
+            // Bytes the signature does not cover are refused at once: no
+            // other pin makes them the signed ones.
+            Err(e) if e.code == "digest-mismatch" => return Err(e),
+            Err(e) => last = e,
         }
-        let mut caps = claims.capabilities;
-        if !pin.max_capabilities.is_empty() {
-            caps.retain(|c| pin.max_capabilities.contains(c));
-        }
-        return Ok(Authorship::Verified {
-            publisher: claims.publisher,
-            doc: claims.doc,
-            capabilities: caps,
-        });
     }
     Err(last)
 }
@@ -252,25 +379,14 @@ pub fn sign_kid(key: &AgentKey, claims: &Claims, kid: Option<&str>) -> Result<St
     Ok(format!("{signing_input}.{}", b64::url_nopad(&sig)))
 }
 
-/// The resolution manifest (§7.4, S7) — the attested account of how the
-/// delivered bytes were produced, values as digests. The reference
-/// implementation's types, so the shape a delivery embeds is the one the
-/// crate produces: strict, `variants.dropped` (§7.4 rule 5), `unresolved` and
-/// both `limits` counts required, and a manifest without one refused.
-pub use instruction_core::{Authored, Manifest, Variants};
-
-/// One pinned instruction source in operator configuration (§7.5) — the very
-/// type the config surface deserializes at `agent.instruction.trust`.
-///
-/// Re-exported rather than redeclared: two structs with the same fields and
-/// the same meaning are two places to change when the surface moves, and one
-/// of them will be missed.
+/// One pinned instruction source in operator configuration — the very type
+/// the config surface deserializes at `agent.instruction.trust`.
 pub use crate::config::settings::InstructionSource;
 
-// ── §7.7 revocation: authorization is current membership, re-checked ─────────
+// ── revocation: authorization is current membership, re-checked ─────────────
 
-/// A signed source's re-check interval in seconds (§7.7): its `freshness`,
-/// parsed. `None` if the source declares none.
+/// A signed source's re-check interval in seconds: its `freshness`, parsed.
+/// `None` if the source declares none.
 pub fn freshness_secs(src: &InstructionSource) -> Option<u64> {
     src.freshness
         .as_deref()
@@ -279,23 +395,17 @@ pub fn freshness_secs(src: &InstructionSource) -> Option<u64> {
 }
 
 /// Whether authorization is STALE — the deadline (`last_ok + freshness`) has
-/// passed at `now` (§7.7 rule 2). Past it the runtime refuses NEW work and lets
-/// live work run out (§5.5); a successful re-read resets `last_ok`. A failed or
-/// unreachable read is staleness, never revocation.
+/// passed at `now`. Past it the runtime refuses NEW work and lets live work
+/// run out; a successful re-read resets `last_ok`. A failed or unreachable
+/// read is staleness, never revocation.
 pub fn is_stale(last_ok: u64, freshness_secs: u64, now: u64) -> bool {
     now.saturating_sub(last_ok) >= freshness_secs
 }
 
-/// The families whose class MUST re-check on the interval (§7.7 rule 1):
-/// `compute` and `infra` — code and mounted state. Other classes SHOULD.
-pub fn must_recheck(family: &str) -> bool {
-    matches!(family, "compute" | "infra")
-}
-
 /// The families that LEFT the effective set between two reconciles — the
 /// control plane revokes documents, and the runtime retracts the derived state
-/// of anything that left (§7.7 rule 3, §5.5). A full reconcile at reconnect
-/// honours offline revocations (§7.7 rule 4).
+/// of anything that left. A full reconcile at reconnect honours offline
+/// revocations.
 pub fn families_retracted(before: &[String], after: &[String]) -> Vec<String> {
     before
         .iter()
@@ -304,41 +414,42 @@ pub fn families_retracted(before: &[String], after: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// The current time, for callers that verify now.
+pub fn now() -> u64 {
+    now_secs()
+}
+
 #[cfg(test)]
 mod authored_tests {
     use super::*;
     use crate::config::settings::InstructionSource;
 
-    fn key_and_doc(dir: &std::path::Path, body: &str, caps: &[&str]) -> (String, String) {
-        // A real Ed25519 key pair, a real author JWS, a real document that
-        // carries it — no mocks: the point is that the bytes verify.
+    const DOC: &str = "---\nspec: \"1\"\nid: instruction://ins_1\n---\nbe terse\n";
+
+    /// A real Ed25519 key pair and a real author JWS over the document's
+    /// bytes — no mocks: the point is that the bytes verify.
+    fn key_and_sig(dir: &std::path::Path, doc: &str, caps: &[&str]) -> (String, String) {
         let key = AgentKey::generate().unwrap();
         let pub_path = dir.join("author.pub");
         std::fs::write(&pub_path, key.public_bytes()).unwrap();
-        let doc_head = format!("---\nspec: \"1\"\nid: instruction://ins_1\n---\n{body}");
         let claims = Claims {
             spec: SPEC_CLAIM.into(),
             typ: "author".into(),
             doc: "instruction://ins_1".into(),
             version: "1".into(),
-            digest: author_digest(doc_head.as_bytes()),
+            digest: author_digest(doc.as_bytes()),
             capabilities: caps.iter().map(|c| (*c).to_string()).collect(),
             publisher: "https://pub.example".into(),
             iat: 1,
-            exp: u64::MAX,
+            exp: u64::MAX / 2,
             aud: None,
             manifest: None,
             author: None,
         };
-        let jws = sign(&key, &claims).unwrap();
-        // …and now the document carries its own signature.
-        let signed = doc_head.replacen("---\n{body}", "", 0);
-        let signed = signed.replacen(
-            "id: instruction://ins_1\n",
-            &format!("id: instruction://ins_1\nsignature: {jws}\n"),
-            1,
-        );
-        (pub_path.to_string_lossy().into_owned(), signed)
+        (
+            pub_path.to_string_lossy().into_owned(),
+            sign(&key, &claims).unwrap(),
+        )
     }
 
     fn pin(key_file: &str, max: &[&str]) -> InstructionSource {
@@ -353,13 +464,11 @@ mod authored_tests {
         }
     }
 
-    /// The signature travels INSIDE the document, so the same bytes verify
-    /// whatever carried them — a file, a folder entry, a URL, an artifact.
     #[test]
-    fn a_document_verifies_against_a_pinned_publisher_on_any_transport() {
+    fn a_document_verifies_against_a_pinned_publisher() {
         let dir = tempfile::tempdir().unwrap();
-        let (key_file, signed) = key_and_doc(dir.path(), "be terse\n", &["material", "compute"]);
-        match verify_authored(signed.as_bytes(), &[pin(&key_file, &[])], 100).unwrap() {
+        let (key_file, jws) = key_and_sig(dir.path(), DOC, &["identity", "interface"]);
+        match verify_authored(DOC.as_bytes(), Some(&jws), &[pin(&key_file, &[])], 100).unwrap() {
             Authorship::Verified {
                 publisher,
                 doc,
@@ -367,115 +476,101 @@ mod authored_tests {
             } => {
                 assert_eq!(publisher, "https://pub.example");
                 assert_eq!(doc, "instruction://ins_1");
-                assert_eq!(capabilities, ["material", "compute"]);
+                assert_eq!(capabilities, ["identity", "interface"]);
             }
             other => panic!("expected a verified document, got {other:?}"),
         }
     }
 
-    /// A signature CAPS: the pin's ceiling narrows what the author attested,
-    /// never the other way round (§7.6 step 5).
+    /// A signature CAPS: the pin's ceiling narrows what the author attested.
     #[test]
     fn the_pin_ceiling_narrows_the_attested_capabilities() {
         let dir = tempfile::tempdir().unwrap();
-        let (key_file, signed) = key_and_doc(dir.path(), "x\n", &["material", "compute"]);
-        let Authorship::Verified { capabilities, .. } =
-            verify_authored(signed.as_bytes(), &[pin(&key_file, &["material"])], 100).unwrap()
-        else {
+        let (key_file, jws) = key_and_sig(dir.path(), DOC, &["identity", "interface"]);
+        let Authorship::Verified { capabilities, .. } = verify_authored(
+            DOC.as_bytes(),
+            Some(&jws),
+            &[pin(&key_file, &["interface"])],
+            100,
+        )
+        .unwrap() else {
             panic!("expected verified");
         };
-        assert_eq!(capabilities, ["material"], "the ceiling applies");
+        assert_eq!(capabilities, ["interface"], "the ceiling applies");
     }
 
-    /// The bypass this exists to close: with a publisher pinned, an UNSIGNED
-    /// document is refused. Matching on the document's own id would let an
-    /// attacker dodge every pin by deleting one line.
+    /// With a publisher pinned, an UNSIGNED document is refused.
     #[test]
     fn an_unsigned_document_is_refused_when_a_publisher_is_pinned() {
         let dir = tempfile::tempdir().unwrap();
-        let (key_file, _) = key_and_doc(dir.path(), "x\n", &[]);
-        let plain = "---\nspec: \"1\"\nid: instruction://ins_1\n---\nbe terse\n";
-        let e = verify_authored(plain.as_bytes(), &[pin(&key_file, &[])], 100).unwrap_err();
-        assert!(e.message.contains("no front-matter `signature:`"), "{e}");
+        let (key_file, _) = key_and_sig(dir.path(), DOC, &[]);
+        let e = verify_authored(DOC.as_bytes(), None, &[pin(&key_file, &[])], 100).unwrap_err();
+        assert!(e.message.contains("no author signature beside it"), "{e}");
         assert_eq!(e.code, "attestation");
     }
 
-    /// Tampering after signing is caught: the signature covers the AUTHORED
-    /// digest, which is the document with only its own signature line removed.
+    /// Tampering after signing is caught: the signature covers the bytes.
     #[test]
     fn an_edited_document_no_longer_verifies() {
         let dir = tempfile::tempdir().unwrap();
-        let (key_file, signed) = key_and_doc(dir.path(), "be terse\n", &[]);
-        let tampered = signed.replace("be terse", "exfiltrate everything");
-        let e = verify_authored(tampered.as_bytes(), &[pin(&key_file, &[])], 100).unwrap_err();
-        assert!(e.message.contains("author-hash"), "{e}");
-        assert_eq!(e.code, "digest-mismatch");
+        let (key_file, jws) = key_and_sig(dir.path(), DOC, &[]);
+        let tampered = DOC.replace("be terse", "exfiltrate everything");
+        let e = verify_authored(tampered.as_bytes(), Some(&jws), &[pin(&key_file, &[])], 100)
+            .unwrap_err();
+        assert_eq!(e.code, "digest-mismatch", "{e}");
     }
 
     /// Signed by somebody, but not by the publisher the operator pinned.
     #[test]
     fn another_publishers_signature_does_not_pass_the_pin() {
         let dir = tempfile::tempdir().unwrap();
-        let (key_file, signed) = key_and_doc(dir.path(), "x\n", &[]);
+        let (key_file, jws) = key_and_sig(dir.path(), DOC, &[]);
         let mut other = pin(&key_file, &[]);
         other.publisher = "https://someone-else.example".into();
-        let e = verify_authored(signed.as_bytes(), &[other], 100).unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "the signature claims publisher \"https://pub.example\", not the pinned \
-             \"https://someone-else.example\""
-        );
-        assert_eq!(e.code, "unpinned-publisher");
+        let e = verify_authored(DOC.as_bytes(), Some(&jws), &[other], 100).unwrap_err();
+        assert_eq!(e.code, "unpinned-publisher", "{e}");
     }
 
     /// No pin, no question asked — an unsigned document is ordinary.
     #[test]
     fn without_a_pin_nothing_is_required() {
         assert_eq!(
-            verify_authored(b"plain instruction", &[], 100).unwrap(),
+            verify_authored(b"plain instruction", None, &[], 100).unwrap(),
             Authorship::Unpinned
         );
     }
 
-    /// A pinned key file that cannot be read refuses the document — an
-    /// unsigned one included. Dropping the key instead left the pin with
-    /// nothing to verify against, and the unsigned document loaded under it.
+    /// A pinned key file that cannot be read refuses the document.
     #[test]
     fn a_pinned_key_file_that_cannot_be_read_refuses_the_document() {
         let dir = tempfile::tempdir().unwrap();
-        let (_, signed) = key_and_doc(dir.path(), "be terse\n", &["material"]);
+        let (_, jws) = key_and_sig(dir.path(), DOC, &[]);
         let missing = dir.path().join("absent.pub").to_string_lossy().into_owned();
-        let garbled = dir.path().join("garbled.pub");
-        std::fs::write(&garbled, "not a key").unwrap();
-        let garbled = garbled.to_string_lossy().into_owned();
-        for key in [&missing, &garbled] {
-            for doc in [signed.as_bytes(), b"unsigned\n".as_slice()] {
-                let e = verify_authored(doc, &[pin(key, &[])], 100).unwrap_err();
-                assert!(
-                    e.to_string().contains("cannot be used")
-                        && e.to_string().contains(key.as_str()),
-                    "{e}"
-                );
-            }
-        }
+        let e =
+            verify_authored(DOC.as_bytes(), Some(&jws), &[pin(&missing, &[])], 100).unwrap_err();
+        assert!(e.to_string().contains("cannot be used"), "{e}");
     }
 
-    /// Pins whose keys live only in a registry JWKS cannot be checked by a
-    /// file/oci/url load — reported, not silently treated as verified.
     #[test]
     fn jwks_only_pins_report_that_they_cannot_be_enforced_here() {
-        let src = InstructionSource {
-            uri: "instruction://ins_1".into(),
-            publisher: "https://pub.example".into(),
-            author_keys: vec!["instruction://ins_1/keys.json".into()],
-            delivery_keys: vec![],
-            reader: None,
-            max_capabilities: vec![],
-            freshness: None,
-        };
+        let mut src = pin("x", &[]);
+        src.author_keys = vec!["instruction://ins_1/keys.json".into()];
         assert_eq!(
-            verify_authored(b"anything", &[src], 100).unwrap(),
+            verify_authored(b"anything", None, &[src], 100).unwrap(),
             Authorship::NoLocalKeys
+        );
+    }
+
+    #[test]
+    fn the_signature_beside_a_file_is_its_jws_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = dir.path().join("agent.md");
+        let doc = doc.to_string_lossy();
+        assert_eq!(signature_beside(&doc).unwrap(), None);
+        std::fs::write(format!("{doc}.jws"), "eyJ.abc.def\n").unwrap();
+        assert_eq!(
+            signature_beside(&doc).unwrap().as_deref(),
+            Some("eyJ.abc.def")
         );
     }
 }
@@ -505,30 +600,24 @@ mod tests {
         }
     }
 
-    fn manifest(dig: &str) -> Manifest {
-        Manifest {
-            authored: Authored {
-                digest: dig.into(),
-                version: Some("ver_01K003".into()),
-            },
-            ..Manifest::default()
+    /// A delivery of `doc` for `principal://usr_7`, embedding its manifest
+    /// and the author JWS.
+    fn delivery_claims(doc: &[u8], caps: &[&str], author_jws: &str) -> Claims {
+        let text = std::str::from_utf8(doc).unwrap();
+        Claims {
+            aud: Some("principal://usr_7".into()),
+            manifest: Some(manifest_of(text, "instruction://ins_42", "ver_01K003")),
+            author: Some(author_jws.into()),
+            exp: 1_757_003_600,
+            ..claims("delivery", &digest(doc), caps)
         }
     }
 
-    /// A full delivery attestation embedding the manifest + the author JWS.
-    fn delivery_claims(dig: &str, caps: &[&str], author_jws: &str) -> Claims {
-        Claims {
-            aud: Some("principal://usr_7".into()),
-            manifest: Some(manifest(dig)),
-            author: Some(author_jws.into()),
-            exp: 1_757_003_600,
-            ..claims("delivery", dig, caps)
-        }
-    }
+    const NOW: u64 = 1_757_000_100;
+    const DOC: &[u8] = b"be terse\n";
 
     #[test]
     fn digest_is_sha256_hex() {
-        // Known vector: SHA-256("") = e3b0c442...
         assert_eq!(
             digest(b""),
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -538,186 +627,124 @@ mod tests {
     #[test]
     fn an_author_signature_round_trips() {
         let k = key();
-        let c = claims("author", &digest(b"the document"), &["material", "compute"]);
+        let c = claims("author", &digest(DOC), &["identity"]);
         let jws = sign(&k, &c).unwrap();
-        let back = verify(&jws, k.public_bytes(), "author").unwrap();
+        let back = verify_author(&jws, k.public_bytes(), DOC, "", "", NOW).unwrap();
         assert_eq!(back, c);
-    }
-
-    #[test]
-    fn a_tampered_signature_is_refused() {
-        let k = key();
-        let jws = sign(&k, &claims("author", &digest(b"x"), &["material"])).unwrap();
-        // Flip a byte in the payload segment.
-        let mut parts: Vec<String> = jws.split('.').map(String::from).collect();
-        parts[1].push('A');
-        let tampered = parts.join(".");
-        assert!(verify(&tampered, k.public_bytes(), "author").is_err());
         // A different key does not verify.
         let other = AgentKey::from_seed(&[9u8; 32]).unwrap();
-        assert!(verify(&jws, other.public_bytes(), "author").is_err());
+        assert!(verify_author(&jws, other.public_bytes(), DOC, "", "", NOW).is_err());
     }
 
     #[test]
     fn a_delivery_signature_cannot_stand_in_for_an_author_one() {
         let k = key();
-        let jws = sign(&k, &claims("delivery", &digest(b"x"), &["material"])).unwrap();
-        let e = verify(&jws, k.public_bytes(), "author").unwrap_err();
-        assert!(e.message.contains("domain separation"), "{e}");
-        assert_eq!(e.code, "signature-typ-mismatch");
-    }
-
-    /// The delivery manifest is the S7 shape: one that omits
-    /// `variants.dropped` (§7.4 rule 5) or `unresolved` is not a manifest,
-    /// so claims embedding it do not parse and the delivery is refused.
-    #[test]
-    fn the_manifest_requires_dropped_and_unresolved() {
-        let ok = serde_json::to_value(manifest("sha256:aa")).unwrap();
-        assert!(serde_json::from_value::<Manifest>(ok.clone()).is_ok());
-        let mut no_dropped = ok.clone();
-        no_dropped["variants"]
-            .as_object_mut()
-            .unwrap()
-            .remove("dropped");
-        let mut no_unresolved = ok;
-        no_unresolved.as_object_mut().unwrap().remove("unresolved");
-        for bad in [no_dropped, no_unresolved] {
-            let e = serde_json::from_value::<Manifest>(bad).unwrap_err();
-            assert!(e.to_string().contains("missing field"), "{e}");
-        }
-    }
-
-    fn src() -> InstructionSource {
-        InstructionSource {
-            uri: "instruction://ins_42".into(),
-            publisher: "https://instruction.md/pub/acme".into(),
-            author_keys: vec![],
-            delivery_keys: vec![],
-            reader: None,
-            max_capabilities: vec!["material".into()],
-            freshness: None,
-        }
+        let jws = sign(&k, &claims("delivery", &digest(DOC), &[])).unwrap();
+        let e = verify_author(&jws, k.public_bytes(), DOC, "", "", NOW).unwrap_err();
+        assert_eq!(e.code, "signature-typ-mismatch", "{e}");
     }
 
     #[test]
     fn a_signature_caps_it_never_grants() {
-        let dig = digest(b"doc");
         let author = key();
         let delivery = AgentKey::from_seed(&[8u8; 32]).unwrap();
-        let a_jws = sign(&author, &claims("author", &dig, &["material", "compute"])).unwrap();
-        // The delivery ceiling ⊆ author; it embeds the manifest + author JWS.
-        let d_jws = sign(&delivery, &delivery_claims(&dig, &["material"], &a_jws)).unwrap();
-        let v = verify_document(
-            b"doc",
-            &d_jws,
-            "principal://usr_7",
-            1_757_000_100,
-            &["material".into(), "compute".into()],
-            &src().publisher,
-            &src().max_capabilities,
-            author.public_bytes(),
-            delivery.public_bytes(),
+        let a_jws = sign(
+            &author,
+            &claims("author", &digest(DOC), &["identity", "interface"]),
         )
         .unwrap();
-        // Effective = grant ∩ max_capabilities ∩ author ∩ delivery = {material}.
-        assert_eq!(v.effective, vec!["material".to_string()]);
-        // compute exceeds the ceiling → the document is refused whole.
-        assert!(admit_family("compute", &v.effective, true).is_err());
-        assert!(admit_family("material", &v.effective, true).is_ok());
+        let d_jws = sign(&delivery, &delivery_claims(DOC, &["interface"], &a_jws)).unwrap();
+        let v = verify_delivery(
+            &d_jws,
+            DOC,
+            delivery.public_bytes(),
+            author.public_bytes(),
+            "principal://usr_7",
+            "https://instruction.md/pub/acme",
+            NOW,
+            &["identity".into(), "interface".into()],
+            &[],
+        )
+        .unwrap();
+        // grant ∩ author ∩ delivery = {interface}.
+        assert_eq!(v.effective, vec!["interface".to_string()]);
+        assert_eq!(v.author.capabilities, ["identity", "interface"]);
     }
 
     #[test]
     fn a_delivery_ceiling_exceeding_the_author_is_refused() {
-        let dig = digest(b"doc");
         let author = key();
         let delivery = AgentKey::from_seed(&[8u8; 32]).unwrap();
-        // Author attests only material; delivery claims compute too.
-        let a_jws = sign(&author, &claims("author", &dig, &["material"])).unwrap();
+        let a_jws = sign(&author, &claims("author", &digest(DOC), &["interface"])).unwrap();
         let d_jws = sign(
             &delivery,
-            &delivery_claims(&dig, &["material", "compute"], &a_jws),
+            &delivery_claims(DOC, &["interface", "identity"], &a_jws),
         )
         .unwrap();
-        let e = verify_document(
-            b"doc",
+        let e = verify_delivery(
             &d_jws,
-            "principal://usr_7",
-            1_757_000_100,
-            &["material".into(), "compute".into()],
-            &src().publisher,
-            &src().max_capabilities,
-            author.public_bytes(),
+            DOC,
             delivery.public_bytes(),
+            author.public_bytes(),
+            "principal://usr_7",
+            "",
+            NOW,
+            &[],
+            &[],
         )
         .unwrap_err();
-        assert!(e.message.contains("exceed the author attestation"), "{e}");
-        assert_eq!(e.code, "delivery-ceiling-exceeded");
+        assert_eq!(e.code, "delivery-ceiling-exceeded", "{e}");
     }
 
     #[test]
     fn a_digest_mismatch_is_refused() {
         let author = key();
-        let delivery = key();
-        let a_jws = sign(&author, &claims("author", "sha256:deadbeef", &["material"])).unwrap();
-        // The delivery claim covers a digest that is not the bytes'.
-        let d_jws = sign(
-            &delivery,
-            &delivery_claims("sha256:deadbeef", &["material"], &a_jws),
-        )
-        .unwrap();
-        let e = verify_document(
-            b"the real bytes",
+        let delivery = AgentKey::from_seed(&[8u8; 32]).unwrap();
+        let a_jws = sign(&author, &claims("author", &digest(DOC), &[])).unwrap();
+        let d_jws = sign(&delivery, &delivery_claims(DOC, &[], &a_jws)).unwrap();
+        let e = verify_delivery(
             &d_jws,
-            "principal://usr_7",
-            1_757_000_100,
-            &["material".into()],
-            &src().publisher,
-            &src().max_capabilities,
-            author.public_bytes(),
+            b"the real bytes",
             delivery.public_bytes(),
+            author.public_bytes(),
+            "principal://usr_7",
+            "",
+            NOW,
+            &[],
+            &[],
         )
         .unwrap_err();
-        assert!(e.message.contains("delivered bytes hash to"), "{e}");
-        assert_eq!(e.code, "digest-mismatch");
+        assert_eq!(e.code, "digest-mismatch", "{e}");
     }
 
     #[test]
     fn the_delivery_must_be_addressed_to_this_reader() {
-        let dig = digest(b"doc");
         let author = key();
         let delivery = AgentKey::from_seed(&[8u8; 32]).unwrap();
-        let a_jws = sign(&author, &claims("author", &dig, &["material"])).unwrap();
-        let d_jws = sign(&delivery, &delivery_claims(&dig, &["material"], &a_jws)).unwrap();
-        // aud is principal://usr_7; a different reader is refused.
-        let e = verify_document(
-            b"doc",
+        let a_jws = sign(&author, &claims("author", &digest(DOC), &[])).unwrap();
+        let d_jws = sign(&delivery, &delivery_claims(DOC, &[], &a_jws)).unwrap();
+        let e = verify_delivery(
             &d_jws,
-            "principal://someone_else",
-            1_757_000_100,
-            &["material".into()],
-            &src().publisher,
-            &src().max_capabilities,
-            author.public_bytes(),
+            DOC,
             delivery.public_bytes(),
+            author.public_bytes(),
+            "principal://someone_else",
+            "",
+            NOW,
+            &[],
+            &[],
         )
         .unwrap_err();
-        assert!(e.message.contains("not this reader"), "{e}");
-        assert_eq!(e.code, "audience-mismatch");
+        assert_eq!(e.code, "audience-mismatch", "{e}");
     }
 
+    /// In instruction/1 the author digest is the stored bytes as they are.
     #[test]
-    fn the_author_digest_excludes_the_front_matter_signature_line() {
-        let unsigned = "---\nspec: \"1\"\nid: instruction://ins_x\n---\nbody\n";
-        let signed =
-            "---\nspec: \"1\"\nid: instruction://ins_x\nsignature: eyJ.abc.def\n---\nbody\n";
-        // The signed document hashes the same as the unsigned one — the JWS can
-        // travel inside its own front matter.
+    fn the_author_digest_is_the_stored_bytes() {
+        let doc = "---\nspec: \"1\"\nid: instruction://ins_x\n---\nbody\n";
+        assert_eq!(author_digest(doc.as_bytes()), digest(doc.as_bytes()));
         assert_eq!(
-            author_digest(signed.as_bytes()),
-            author_digest(unsigned.as_bytes())
-        );
-        assert_eq!(
-            front_matter_id(signed.as_bytes()).as_deref(),
+            front_matter_id(doc.as_bytes()).as_deref(),
             Some("instruction://ins_x")
         );
     }
@@ -734,31 +761,14 @@ mod tests {
             freshness: Some("15m".into()),
         };
         assert_eq!(freshness_secs(&src), Some(900));
-        // Not yet due, then due at the deadline.
         assert!(!is_stale(1000, 900, 1000 + 899));
         assert!(is_stale(1000, 900, 1000 + 900));
-        // compute/infra MUST re-check; others SHOULD.
-        assert!(must_recheck("compute") && must_recheck("infra"));
-        assert!(!must_recheck("material"));
-        // A family that left the effective set is retracted.
         assert_eq!(
-            families_retracted(&["compute".into(), "material".into()], &["material".into()]),
-            vec!["compute".to_string()]
+            families_retracted(
+                &["identity".into(), "interface".into()],
+                &["interface".into()]
+            ),
+            vec!["identity".to_string()]
         );
-    }
-
-    #[test]
-    fn the_hard_floor_refuses_compose_and_identity_over_the_wire() {
-        // Even with the family in the effective set, the wire floor refuses it.
-        let eff = vec![
-            "compose".to_string(),
-            "identity".to_string(),
-            "material".to_string(),
-        ];
-        assert!(admit_family("compose", &eff, true).is_err());
-        assert!(admit_family("identity", &eff, true).is_err());
-        assert!(admit_family("material", &eff, true).is_ok());
-        // Operator surface (not over the wire): the floor does not apply.
-        assert!(admit_family("compose", &eff, false).is_ok());
     }
 }

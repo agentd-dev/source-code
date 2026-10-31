@@ -1,4 +1,6 @@
 {
+ "valid": true,
+ "grants": [],
  "errors": [],
  "registers": {
   "workflows": [
@@ -7,7 +9,5 @@
   "mcp_servers": [
    "search"
   ]
- },
- "grants": [],
- "valid": true
+ }
 }

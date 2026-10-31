@@ -2,37 +2,33 @@
 
 Prose before any block.
 
-:::!config
+:::config{id=runtime dialect="agentd/config"}
 limits: { max_runs: 4 }
+streams:
+  inbox: { retention: { max_events: 100 } }
+tools:
+  disabled: [search.dangerous_tool]
 :::
 
-:::!stream{name=inbox}
-retention: { max_events: 100 }
+:::mcp{id=search title="Search" src="https://mcp.internal.example/search"}
+Search the internal index.
 :::
 
-:::!mcp{name=search}
-endpoint: https://mcp.internal.example/search
-:::
-
-:::!workflow{name=drain}
+:::workflow{id=drain dialect="instruction/workflow"}
 steps:
   take: {kind: stream, stream: inbox, subject: "x.*", from: earliest}
   f:    {kind: finish, depends_on: [take]}
 :::
 
-:::!skill{name=tone description="house tone" when="writing to customers"}
+:::skill{id=tone title="house tone" trigger="writing to customers"}
 Be brief.
-:::
-
-:::!tools
-disabled: [search.dangerous_tool]
 :::
 
 :::context{title="Facts"}
 The rate limit is 10/s.
 :::
 
-:::example
+:::example{title="A greeting"}
 Q: hi
 A: hello
 :::

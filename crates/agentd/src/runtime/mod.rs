@@ -1110,6 +1110,11 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                    "bytes": rt.instruction.text.len()}),
         );
     }
+    // An instruction document says how it was read: by which reader, against
+    // which specification, with how many diagnostics, and what it mapped.
+    if let Some(read) = rt.settings.agent.instruction_read.clone() {
+        log.info("instruction.read", read);
+    }
 
     if let Err(errs) = rt.load_workflows() {
         for e in &errs {
@@ -1901,13 +1906,14 @@ impl Runtime {
                         .as_ref()
                         .and_then(crate::config::settings::OciSource::cosign_key),
                 )?;
+                let signature = pulled.signature.clone();
                 let raw = self.decode_instruction_bytes(pulled.bytes)?;
                 // The pin that guarded the FIRST pull guards every re-pull. A
                 // document swapped under a running agent is precisely what an
                 // author signature is for, and a control that stops applying
                 // once the daemon is up is not a control. Refuse-and-keep: the
                 // caller surfaces the error and the running text stands.
-                let attested = self.verify_repulled_authorship(&raw)?;
+                let attested = self.verify_repulled_authorship(&raw, signature.as_deref())?;
                 // The DELIVERED text is the cleaned document (machinery folds
                 // to acknowledgement lines, notes and end matter go), behind
                 // the same `needs_delivery` gate config load used. A
@@ -1927,11 +1933,7 @@ impl Runtime {
                         .filter(|c| attested.as_ref().is_none_or(|a| a.contains(c)))
                         .cloned()
                         .collect();
-                    match crate::config::idoc::extract_from_wire(
-                        &raw,
-                        &granted,
-                        &self.settings.agent.instruction_facts,
-                    ) {
+                    match crate::config::idoc::extract_from_wire(&raw, &granted) {
                         Ok(ex) => ex.cleaned,
                         Err(errs) => {
                             return Err(format!(
@@ -1987,7 +1989,11 @@ impl Runtime {
     /// (`verify_registry_read`), and a file/url source is re-read by a config
     /// reload, which runs the load-time check.
     #[cfg(feature = "oci")]
-    fn verify_repulled_authorship(&self, raw: &str) -> Result<Option<Vec<String>>, String> {
+    fn verify_repulled_authorship(
+        &self,
+        raw: &str,
+        signature: Option<&str>,
+    ) -> Result<Option<Vec<String>>, String> {
         let pins = &self.settings.agent.instruction_spec.trust;
         if pins.is_empty() {
             return Ok(None);
@@ -1999,7 +2005,7 @@ impl Runtime {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             // A refusal joins the caller's error text over its Display.
-            match crate::config::attest::verify_authored(raw.as_bytes(), pins, now)
+            match crate::config::attest::verify_authored(raw.as_bytes(), signature, pins, now)
                 .map_err(|e| e.to_string())?
             {
                 crate::config::attest::Authorship::Verified { capabilities, .. } => {
@@ -2018,7 +2024,7 @@ impl Runtime {
         // this is unreachable in a running daemon — and fails closed anyway.
         #[cfg(not(feature = "sign"))]
         {
-            let _ = raw;
+            let _ = (raw, signature);
             Err("the instruction is trust-pinned, but this build cannot verify signatures — rebuild with --features sign".to_string())
         }
     }
@@ -2048,8 +2054,8 @@ impl Runtime {
     /// `agent.instruction.trust` entry pins a `publisher` for this document, the
     /// read MUST carry a valid author attestation from a key of that
     /// publisher's set — and, when `reader` is configured, a valid delivery
-    /// attestation for this reader too, checked by the crate's
-    /// `verify_document`. Every failure is a refusal carrying its Appendix B
+    /// attestation for this reader too, checked by the instruction.md SDK
+    /// (`config::attest`). Every failure is a refusal carrying a stable
     /// code (the running text is kept; the caller surfaces the error), never
     /// a downgrade. Returns the capability set the read admits for the §7.8
     /// wire-admission intersection, or `None` when no source demanded
@@ -2070,8 +2076,8 @@ impl Runtime {
         raw: &str,
         meta: &Option<Value>,
         resolved: bool,
-    ) -> Result<Option<Vec<String>>, instruction_core::Refusal> {
-        use instruction_core::Refusal;
+    ) -> Result<Option<Vec<String>>, crate::config::idoc::Refusal> {
+        use crate::config::idoc::Refusal;
         let doc_id = uri.split('@').next().unwrap_or(uri);
         let Some(src) = self
             .settings
@@ -2104,7 +2110,7 @@ impl Runtime {
         }
         #[cfg(feature = "sign")]
         {
-            use instruction_core::sign;
+            use crate::config::attest;
             let get = |k: &str| -> Option<String> {
                 meta.as_ref()
                     .and_then(|m| m.get(format!("md.instruction/{k}")))
@@ -2150,74 +2156,29 @@ impl Runtime {
                     )));
                 }
             }
-            let claims = sign::verify_author(&jws, &key)?;
-            // The author signs the §7.2 author digest — the front-matter
-            // signature line excluded — so a registry document that carries
-            // its own `signature:` line verifies here as it does from a file.
-            // A resolved read is not the authored text: its chain to this
-            // signature is the delivery's manifest, checked below.
-            let want = instruction_core::author_digest(raw.as_bytes());
-            if !resolved && claims.digest != want {
-                return Err(Refusal::new(
-                    "digest-mismatch",
-                    format!(
-                        "{doc_id}: author signature covers {} but the delivered bytes hash to {want} — refuse",
-                        claims.digest
-                    ),
-                ));
-            }
-            if claims.publisher != src.publisher {
-                return Err(Refusal::new(
-                    "unpinned-publisher",
-                    format!(
-                        "{doc_id}: author claims publisher {:?}, not the pinned {:?} — refuse",
-                        claims.publisher, src.publisher
-                    ),
-                ));
-            }
-            // The pin was chosen by the URI's document id, so the signature
-            // must be FOR that document. Nothing else binds them: the author
-            // digest is over whatever the registry served, and the crate's id
-            // check reads the front matter delivery strips. Without this, a
-            // registry could serve, under a URI pinned for one document,
-            // another the same publisher signed — and it would verify. The
-            // delivery attestation names the same `doc` (`verify_document`
-            // refuses a delivery whose `doc` is not its author's, and the
-            // author it chains to is this one), so this binds both.
-            if claims.doc != doc_id {
-                return Err(attestation(format!(
-                    "{doc_id}: the signature is for {:?}, not the pinned document — refuse",
-                    claims.doc
-                )));
-            }
             let now = crate::state::now_ms() / 1000;
-            if claims.exp < now {
-                return Err(attestation(format!(
-                    "{doc_id}: the author signature has expired"
-                )));
-            }
-            // An empty `max_capabilities` is no per-source cap: the author's
-            // own set is the bound.
-            let max: &[String] = if src.max_capabilities.is_empty() {
-                &claims.capabilities
+            let at = |r: Refusal| Refusal::new(r.code, format!("{doc_id}: {}", r.message));
+            // The author signs the authored bytes as they are, and must name
+            // the pinned document and publisher: the SDK checks all three. A
+            // registry could otherwise serve, under a URI pinned for one
+            // document, another the same publisher signed. A resolved read
+            // is not the authored text: its chain to this signature is the
+            // delivery's manifest, checked below, so its author is verified
+            // there.
+            let claims = if resolved {
+                None
             } else {
-                &src.max_capabilities
+                Some(
+                    attest::verify_author(&jws, &key, raw.as_bytes(), doc_id, &src.publisher, now)
+                        .map_err(at)?,
+                )
             };
-            // §7.6 step 5 intersection input, without a delivery check:
-            // max_capabilities ∩ author; the caller intersects the grant.
-            let mut caps: Vec<String> = claims
-                .capabilities
-                .iter()
-                .filter(|c| max.contains(c))
-                .cloned()
-                .collect();
             // Delivery attestation: only when this consumer knows who it is.
-            // Steps 2–4 are the crate's `verify_document` — audience, expiry,
-            // the delivered digest, doc against the front-matter id, the
-            // embedded manifest's chain to the author signature, the delivery
-            // ceiling within the author's — so the effective set is narrowed
-            // by what the delivery attests, not only by what the author did.
-            if let Some(reader) = &src.reader {
+            // The SDK's checks — audience, expiry, the delivered digest, the
+            // manifest's chain to the author signature, the delivery ceiling
+            // within the author's — then the effective set is narrowed by
+            // what the delivery attests, not only by what the author did.
+            let (claims, caps) = if let Some(reader) = &src.reader {
                 let d_jws = get("deliverySignature").ok_or_else(|| {
                     attestation(format!(
                         "{doc_id}: reader is pinned but the read carries no delivery signature"
@@ -2236,28 +2197,46 @@ impl Runtime {
                             "{doc_id}: no delivery key resolves (kid {d_kid:?})"
                         ))
                     })?;
-                let verified = sign::verify_document(
-                    raw.as_bytes(),
+                let verified = attest::verify_delivery(
                     &d_jws,
+                    raw.as_bytes(),
+                    &d_key,
+                    &key,
                     reader,
+                    &src.publisher,
                     now,
                     &self.settings.agent.document_capabilities,
-                    &src.publisher,
-                    max,
-                    &key,
-                    &d_key,
+                    &src.max_capabilities,
                 )
-                .map_err(|r| Refusal::new(r.code, format!("{doc_id}: {}", r.message)))?;
+                .map_err(at)?;
                 // The author signature the delivery chains to is the one this
                 // read carries — the one whose key state was checked above.
                 if verified.delivery.author.as_deref() != Some(jws.as_str()) {
                     return Err(attestation(format!(
                         "{doc_id}: the delivery attests a different author signature from \
-                         the one the read carries (§7.3)"
+                         the one the read carries"
                     )));
                 }
-                caps = verified.effective;
-            }
+                if verified.author.doc != doc_id {
+                    return Err(attestation(format!(
+                        "{doc_id}: the signature is for {:?}, not the pinned document — refuse",
+                        verified.author.doc
+                    )));
+                }
+                (verified.author, verified.effective)
+            } else {
+                let claims = claims.expect("an unresolved read verified its author");
+                // An empty `max_capabilities` is no per-source cap: the
+                // author's own set is the bound. The caller intersects the
+                // grant.
+                let caps = claims
+                    .capabilities
+                    .iter()
+                    .filter(|c| src.max_capabilities.is_empty() || src.max_capabilities.contains(c))
+                    .cloned()
+                    .collect();
+                (claims, caps)
+            };
             self.log.info(
                 "instruction.verified",
                 json!({"uri": uri, "kid": kid, "key_state": state,
@@ -2442,7 +2421,7 @@ impl Runtime {
                         .map_err(|r| r.to_string())?;
                     if resolved
                         && get_meta("deliveredDigest")
-                            .is_none_or(|d| d != instruction_core::digest(raw.as_bytes()))
+                            .is_none_or(|d| d != instruction_md::digest(raw.as_bytes()))
                     {
                         return Err("registry delivered text does not match its deliveredDigest"
                             .to_string());
@@ -2467,11 +2446,7 @@ impl Runtime {
                         if let Some(caps) = &attested {
                             granted.retain(|g| caps.contains(g));
                         }
-                        match crate::config::idoc::extract_from_wire(
-                            &raw,
-                            &granted,
-                            &self.settings.agent.instruction_facts,
-                        ) {
+                        match crate::config::idoc::extract_from_wire(&raw, &granted) {
                             Ok(ex) => ex.cleaned,
                             Err(errs) => {
                                 return Err(format!(

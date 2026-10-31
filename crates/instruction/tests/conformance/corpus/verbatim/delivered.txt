@@ -1,7 +1,0 @@
-# Teaching the format
-
-<reference title="How to declare a human">
-Write it like this:
-:::!human{name=oncall role=approver}
-:::
-</reference>

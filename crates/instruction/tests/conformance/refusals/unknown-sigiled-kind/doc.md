@@ -1,3 +1,0 @@
-:::!worfklow{name=x}
-steps: {}
-:::

@@ -29,12 +29,12 @@ const ROOM: &str = "subagents:\n\
     \x20   room:\n\
     \x20     instruction: |\n\
     \x20       You are the room for {{params.id}}.\n\
-    \x20       :::!workflow{name=on-ping}\n\
+    \x20       :::workflow{id=on-ping dialect=instruction/workflow}\n\
     \x20       steps:\n\
     \x20         cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }\n\
     \x20         f:   { kind: finish, depends_on: [cmd], status: completed, output: \"pong {{params.id}}\" }\n\
     \x20       :::\n\
-    \x20       :::!workflow{name=on-hold}\n\
+    \x20       :::workflow{id=on-hold dialect=instruction/workflow}\n\
     \x20       steps:\n\
     \x20         cmd: { kind: a2a, command: room.hold, roles: [agent, operator] }\n\
     \x20         nap: { kind: sleep, depends_on: [cmd], duration: 60s }\n\

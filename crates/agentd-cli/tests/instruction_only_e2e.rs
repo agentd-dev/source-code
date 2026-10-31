@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The whole agent from ONE markdown file, through the config-defining
 //! directives: `agentd --instruction.file agent.md`, no `--config` at all.
-//! The document declares its runtime (`:::!config`), an event stream
-//! (`:::!stream`), and two workflows (`:::!workflow`) that talk to each other
+//! The document declares its runtime (`:::config`), an event stream
+//! (`:::stream`), and two workflows (`:::workflow`) that talk to each other
 //! over that stream — and the process runs them and exits clean. Also: the
 //! precedence rule, end to end — an explicit flag beats the document's
 //! fragment.
@@ -24,25 +24,23 @@ fn events(stderr: &str, name: &str) -> Vec<Value> {
 
 const AGENT_MD: &str = r#"You are the order desk. Every paid order is fulfilled.
 
-:::!config
+:::config{id=cfg1 dialect=agentd/config}
 store: { kind: memory }
 lifecycle: { run_until: idle, idle_grace: 900ms }
 observability: { log_level: info }
 limits: { max_runs: 20 }
+streams:
+  orders: { retention: { max_events: 100 } }
 :::
 
-:::!stream{name=orders}
-retention: { max_events: 100 }
-:::
-
-:::!workflow{name=producer}
+:::workflow{id=producer dialect=instruction/workflow}
 steps:
   s:   { kind: once, policy: always }
   pub: { kind: emit, depends_on: [s], stream: orders, subject: order.paid, data: { n: 7 } }
   f:   { kind: finish, depends_on: [pub], status: completed }
 :::
 
-:::!workflow{name=fulfil}
+:::workflow{id=fulfil dialect=instruction/workflow}
 steps:
   take: { kind: stream, stream: orders, subject: "order.*", from: earliest }
   f:    { kind: finish, depends_on: [take], status: completed, output: "shipped #{{steps.take.output.data.n}}" }

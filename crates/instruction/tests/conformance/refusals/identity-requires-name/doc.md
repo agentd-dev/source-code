@@ -1,4 +1,0 @@
-:::!workflow
-name: drain
-steps: {}
-:::

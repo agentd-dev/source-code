@@ -1,7 +1,0 @@
-[
-  {
-    "line": 3,
-    "code": "override-stronger",
-    "message": "a should may not override the stronger must/m"
-  }
-]

@@ -1,9 +1,9 @@
 {
+ "valid": false,
+ "grants": [],
  "errors": [
-  "unknown machinery",
+  "unknown-kind",
   "banana"
  ],
- "registers": {},
- "grants": [],
- "valid": false
+ "registers": {}
 }

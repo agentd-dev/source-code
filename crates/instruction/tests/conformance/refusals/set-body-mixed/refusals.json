@@ -1,7 +1,0 @@
-[
-  {
-    "line": 1,
-    "code": "set-body-mixed",
-    "message": "a set body must be a table or a definition list (human[])"
-  }
-]

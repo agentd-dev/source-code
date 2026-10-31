@@ -1,3 +1,0 @@
-# Typed parameters
-
-Limit ${limit}; docs at https://handbook.example/refunds; escalate after 15m; tier ${tier}; regions eu, us.

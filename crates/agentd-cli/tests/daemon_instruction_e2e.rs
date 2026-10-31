@@ -365,7 +365,7 @@ fn a_daemon_nothing_can_reach_is_refused_at_load() {
 }
 
 /// The job shape is settled when the process starts, and so is what its
-/// instruction is. An instruction document whose own `:::!config` changes
+/// instruction is. An instruction document whose own `:::config` changes
 /// `lifecycle.run_until` is refused on reload as the operator's change would
 /// be, rather than reloading a daemon into a job: that would generate the
 /// one-shot workflow and run the instruction, unprompted, in a live daemon.
@@ -398,7 +398,7 @@ fn an_instruction_cannot_reload_a_daemon_into_a_job() {
     });
     std::fs::write(
         &md,
-        format!("{POLICY}\n\n:::!config\nlifecycle: {{ run_until: idle }}\n:::\n"),
+        format!("{POLICY}\n\n:::config{{id=cfg1 dialect=agentd/config}}\nlifecycle: {{ run_until: idle }}\n:::\n"),
     )
     .unwrap();
     unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };

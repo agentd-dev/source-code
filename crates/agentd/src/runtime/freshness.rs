@@ -9,7 +9,7 @@
 //! affirmative signal moves state).
 //!
 //! The verification and revocation DECISION logic is in `config::attest`
-//! (`is_stale`, `must_recheck`, `families_retracted`); this module is the
+//! (`is_stale`, `families_retracted`); this module is the
 //! reactor scheduling + the re-fetch + the new-work freeze.
 
 use serde_json::{Value, json};

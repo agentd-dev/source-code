@@ -1,0 +1,11 @@
+{
+ "valid": true,
+ "grants": [],
+ "errors": [],
+ "registers": {
+  "workflows": [
+   "kept"
+  ],
+  "mcp_servers": []
+ }
+}

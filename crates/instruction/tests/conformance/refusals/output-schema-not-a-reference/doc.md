@@ -1,3 +1,0 @@
-:::output{schema=reply}
-x
-:::

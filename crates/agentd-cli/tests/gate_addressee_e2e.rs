@@ -98,14 +98,14 @@ fn a_workflow_human_gate_addressed_to_anyone_but_an_operator_does_not_load() {
 
 /// A `to` written in config is principal syntax only. A channel there names
 /// no principal and is refused, saying a channel reaches a gate only from an
-/// instruction document's `::!human` — where its meaning is declared — and a
+/// instruction document's `::human` — where its meaning is declared — and a
 /// `to` cannot smuggle one in beside an operator either.
 #[test]
 fn a_config_gate_addressed_to_a_channel_does_not_load() {
     let (code, log) = run(&[], &human_step("\"#ops\""));
     assert_refused(code, &log, "human.to", "#ops");
     assert!(
-        log.contains("a channel is not a principal") && log.contains("`::!human`"),
+        log.contains("a channel is not a principal") && log.contains("`agent.gate_channels`"),
         "the refusal says where a channel can come from\n{log}"
     );
     let (code, log) = run(&[], &human_step("{role: operator, channel: \"#ops\"}"));
@@ -387,20 +387,21 @@ fn a_reload_that_addresses_a_gate_to_anyone_but_an_operator_is_refused() {
 }
 
 /// [`converse`] for an agent whose instruction is an instruction document
-/// declaring the `ops` channel, the `oncall` human and the `approve`
-/// workflow — served over a unix socket, and opening a gate task for an ask
-/// no caller owns, so a run the model starts has a gate to announce.
+/// declaring the `oncall` person and the `approve` workflow, its gate
+/// announced on `@channel/ops` by the operator's `agent.gate_channels` —
+/// served over a unix socket, and opening a gate task for an ask no caller
+/// owns, so a run the model starts has a gate to announce.
 #[cfg(feature = "a2a")]
 fn converse_document(workflow: &str, play: &str) -> String {
     let doc = format!(
-        ":::!channel{{name=ops}}\n:::\n\n\
-         :::!human{{name=oncall channel=@channel/ops}}\n:::\n\n\
-         :::!workflow{{name=approve}}\n{workflow}:::\n"
+        "::person{{id=oncall title=\"On call\"}}\n\n\
+         :::workflow{{id=approve dialect=instruction/workflow}}\n{workflow}:::\n"
     );
     let indented: String = doc.lines().map(|l| format!("    {l}\n")).collect();
     let cfg = format!(
         "\
          agent:\n  name: gates\n  prompt: go\n  document_capabilities: [interface]\n  ask_human_unowned: gate\n\
+         \x20 gate_channels: {{approve: {{loop.ask: \"@channel/ops\"}}}}\n\
          \x20 instruction: |\n{indented}\
          store: {{ kind: memory }}\n\
          observability: {{ log_level: info, log_content: true }}\n\
@@ -433,17 +434,17 @@ fn asked_channels(log: &str) -> Vec<serde_json::Value> {
 }
 
 /// A document's gate in an `iterate` body, one iteration: the gate the
-/// iteration opens is announced on the channel its `::!human` declares.
+/// iteration opens is announced on the channel the operator names for it.
 #[cfg(feature = "a2a")]
 const NESTED_GATE: &str = "\
      steps:\n\
      \x20 s: {kind: manual}\n\
-     \x20 loop: {kind: iterate, max_iterations: 1, depends_on: [s], body: {steps: {ask: {kind: human, question: \"ok?\", to: \"@human/oncall\", timeout: 1s}}}}\n\
+     \x20 loop: {kind: iterate, max_iterations: 1, depends_on: [s], body: {steps: {ask: {kind: human, question: \"ok?\", to: \"oncall\", timeout: 1s}}}}\n\
      \x20 f: {kind: finish, depends_on: [loop]}\n";
 
 /// A gate the document nests in a body opens like a top-level one, and it is
-/// announced on its human's channel — the iteration's run-record id
-/// (`loop[0].ask`) finds the definition's step (`loop.ask`).
+/// announced on its channel — the iteration's run-record id (`loop[0].ask`)
+/// finds the definition's step (`loop.ask`).
 #[cfg(feature = "a2a")]
 #[test]
 fn a_documents_nested_gate_is_announced_on_its_channel() {
@@ -460,11 +461,10 @@ fn a_documents_nested_gate_is_announced_on_its_channel() {
     );
 }
 
-/// The channel belongs to the document's definition, and the definition to
-/// the document. A model that `workflow.update`s the workflow — same name,
-/// same step path, its own `to` — is refused, naming the document, so the gate
-/// that opens is the document's own, announced on its human's channel: nothing
-/// at runtime can put a definition without that channel under the name.
+/// The definition belongs to the document. A model that `workflow.update`s
+/// the workflow — same name, same step path, its own `to` — is refused,
+/// naming the document, so the gate that opens is the document's own,
+/// announced on its channel.
 #[cfg(feature = "a2a")]
 #[test]
 fn a_workflow_update_under_the_documents_name_is_refused() {
@@ -504,7 +504,7 @@ fn a_workflow_update_under_the_documents_name_is_refused() {
     );
 }
 
-/// A reload that moves only a `::!human`'s channel moves the next gate. The
+/// A reload that moves only a gate's channel moves the next gate. The
 /// channel rides on the document's definitions, whose hashes it does not
 /// change, so the reload re-derives them for it — and says it did.
 #[cfg(all(feature = "a2a", feature = "hot-reload"))]
@@ -516,21 +516,18 @@ fn a_reload_that_moves_a_humans_channel_moves_the_next_gate() {
     let dir = common::unique_path("gate-addressee-channel-reload", "d");
     std::fs::create_dir_all(&dir).unwrap();
     let cfg_for = |channel: &str| {
-        let doc = format!(
-            ":::!channel{{name=ops}}\n:::\n\n\
-             :::!channel{{name=pager}}\n:::\n\n\
-             :::!human{{name=oncall channel=@channel/{channel}}}\n:::\n\n\
-             :::!workflow{{name=approve}}\n\
+        let doc = "::person{id=oncall title=\"On call\"}\n\n\
+             :::workflow{id=approve dialect=instruction/workflow}\n\
              steps:\n\
-             \x20 s: {{kind: schedule, every: 700ms}}\n\
-             \x20 ask: {{kind: human, question: \"ok?\", to: \"@human/oncall\", timeout: 300ms, depends_on: [s]}}\n\
-             \x20 f: {{kind: finish, depends_on: [ask]}}\n\
-             :::\n"
-        );
+             \x20 s: {kind: schedule, every: 700ms}\n\
+             \x20 ask: {kind: human, question: \"ok?\", to: \"oncall\", timeout: 300ms, depends_on: [s]}\n\
+             \x20 f: {kind: finish, depends_on: [ask]}\n\
+             :::\n";
         let indented: String = doc.lines().map(|l| format!("    {l}\n")).collect();
         format!(
             "\
              agent:\n  name: gates\n  document_capabilities: [interface]\n  ask_human_unowned: gate\n\
+             \x20 gate_channels: {{approve: {{ask: \"@channel/{channel}\"}}}}\n\
              \x20 instruction: |\n{indented}\
              store: {{ kind: memory }}\n\
              observability: {{ log_level: info }}\n\

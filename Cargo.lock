@@ -66,6 +66,7 @@ name = "agentd-cli"
 version = "1.20.0"
 dependencies = [
  "agentd-core",
+ "instruction-md",
  "libc",
  "ring",
  "serde_json",
@@ -89,7 +90,6 @@ dependencies = [
  "a2a-lf",
  "a2a-pb",
  "a2a-server-lf",
- "agentd-instruction",
  "agentd-mcp",
  "agentd-net",
  "async-trait",
@@ -99,6 +99,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
+ "instruction-md",
  "k256",
  "libc",
  "ring",
@@ -110,16 +111,6 @@ dependencies = [
  "tokio-rustls",
  "tokio-stream",
  "tower",
-]
-
-[[package]]
-name = "agentd-instruction"
-version = "0.3.0"
-dependencies = [
- "ring",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -1085,6 +1076,15 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "instruction-md"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

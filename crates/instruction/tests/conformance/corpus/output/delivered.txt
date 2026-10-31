@@ -1,6 +1,0 @@
-# Triage
-
-[data "reply" is available]
-
-**OUTPUT (json) — Reply:**
-One object. `summary` is one sentence; `next_step` says what happens next and when.

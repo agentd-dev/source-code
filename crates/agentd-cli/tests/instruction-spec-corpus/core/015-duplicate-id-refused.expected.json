@@ -1,0 +1,9 @@
+{
+ "valid": false,
+ "grants": [],
+ "errors": [
+  "duplicate-id",
+  "used twice"
+ ],
+ "registers": {}
+}

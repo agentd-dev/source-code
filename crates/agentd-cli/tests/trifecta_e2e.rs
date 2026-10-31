@@ -511,7 +511,7 @@ fn a_reload_that_only_adds_a_mirror_rechecks_the_stored_definitions() {
         &cfg,
         body(
             "subagents:\n  templates:\n    desk:\n      instruction: |\n        The desk.\n        \
-             :::!stream{name=inbox}\n        retention: { max_events: 10 }\n        :::\n      \
+             :::config{id=s dialect=agentd/config}\n        streams: {inbox: {retention: { max_events: 10 }}}\n        :::\n      \
              mirror_streams: [inbox]\n",
         ),
     )
@@ -564,8 +564,7 @@ fn a_reload_that_only_retags_a_service_rechecks_the_stored_definitions() {
              services:\n  crm: {{kind: mcp, endpoint: \"https://crm.invalid/mcp\", tags: {{\"*\": [{tags}]}}}}\n\
              streams:\n  inbox: {{}}\n\
              subagents:\n  templates:\n    desk:\n      instruction: |\n        The desk.\n        \
-             :::!stream{{name=inbox}}\n        retention: {{ max_events: 10 }}\n        :::\n        \
-             :::!mcp{{name=crm}}\n        service: crm\n        :::\n      \
+             :::config{{id=s dialect=agentd/config}}\n        streams: {{inbox: {{retention: {{ max_events: 10 }}}}}}\n        mcp: {{servers: [{{name: crm, service: crm}}]}}\n        :::\n      \
              mirror_streams: [inbox]\n\
              workflows:\n\
              \x20 - name: tick\n    steps:\n      s: {{kind: schedule, every: 1h}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\n",

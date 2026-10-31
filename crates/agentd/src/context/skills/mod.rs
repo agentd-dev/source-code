@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! **Skills** (RFC 0051): instruction bundles in the Agent Skills format,
 //! from three places — an MCP server's Skills extension (SEP-2640), `SKILL.md`
-//! folders on disk ([`local`]), and the instruction's `:::!skill` directive —
+//! folders on disk ([`local`]), and the instruction's `:::skill` directive —
 //! referenced as `@skill:<ref>` in the instruction, a step or a message, and
 //! loaded into the calling context: the catalogue (name and description) is
 //! always visible, a body only once referenced or `skills.load`ed, a file
@@ -48,7 +48,7 @@ pub enum SkillId {
     Server { server: String, uri: String },
     /// A `SKILL.md` on disk.
     Local { path: String },
-    /// The instruction's `:::!skill` directive.
+    /// The instruction's `:::skill` directive.
     Inline { name: String },
 }
 
@@ -567,7 +567,7 @@ impl Catalogue {
         out
     }
 
-    /// Register the instruction's `:::!skill` definitions: they win a name
+    /// Register the instruction's `:::skill` definitions: they win a name
     /// over the operator's folders, written closer to this agent.
     pub fn add_inline(&mut self, skills: &[crate::config::idoc::InlineSkill]) -> Vec<Collision> {
         let mut out = Vec::new();

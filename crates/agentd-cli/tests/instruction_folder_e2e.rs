@@ -28,7 +28,7 @@ id: ins_folder_1
 ---
 You are the order desk.
 
-:::!config
+:::config{id=cfg1 dialect=agentd/config}
 store: { kind: memory }
 lifecycle: { run_until: idle, idle_grace: 900ms }
 observability: { log_level: info }
@@ -42,7 +42,7 @@ id: ins_folder_2
 ---
 Every paid order is fulfilled.
 
-:::!workflow{name=fulfil}
+:::workflow{id=fulfil dialect=instruction/workflow}
 steps:
   s: { kind: once, policy: always }
   f: { kind: finish, depends_on: [s], status: completed, output: "shipped" }
@@ -145,12 +145,12 @@ fn every_files_end_matter_is_dropped_from_the_folder() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         format!("{dir}/10-a.md"),
-        "First file.\n\n---\nowner: team-one\n---\n",
+        "First file.\n\n---\nowners: [team-one]\n",
     )
     .unwrap();
     std::fs::write(
         format!("{dir}/20-b.md"),
-        "Second file.\n\n---\nowner: team-two\n---\n",
+        "Second file.\n\n---\nowners: [team-two]\n",
     )
     .unwrap();
     let (loaded, _) = agentd::config::settings::load(
@@ -168,15 +168,15 @@ fn every_files_end_matter_is_dropped_from_the_folder() {
         instruction.contains("First file.") && instruction.contains("Second file."),
         "{instruction}"
     );
-    for gone in ["owner:", "team-one", "team-two"] {
+    for gone in ["owners:", "team-one", "team-two"] {
         assert!(
             !instruction.contains(gone),
             "{gone:?} delivered:\n{instruction}"
         );
     }
     assert!(
-        !loaded.warnings.iter().any(|w| w.contains("end matter")),
-        "end matter is dropped without a word: {:?}",
+        !loaded.warnings.iter().any(|w| w.contains("backmatter")),
+        "backmatter is dropped without a word: {:?}",
         loaded.warnings
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -190,7 +190,7 @@ fn malformed_end_matter_refuses_the_folder_naming_the_file() {
     std::fs::write(format!("{dir}/10-a.md"), "First file.\n").unwrap();
     std::fs::write(
         format!("{dir}/20-b.md"),
-        "Second file.\n\n---\nowner: [unclosed\n---\n",
+        "Second file.\n\n---\nowners: [unclosed\n",
     )
     .unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
@@ -202,7 +202,7 @@ fn malformed_end_matter_refuses_the_folder_naming_the_file() {
     let log = String::from_utf8_lossy(&out.stderr);
     assert_ne!(out.status.code(), Some(0), "{log}");
     assert!(
-        log.contains("20-b.md: end matter is not valid YAML"),
+        log.contains("20-b.md: the backmatter is not valid YAML"),
         "the refusal names the file: {log}"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -215,7 +215,8 @@ fn malformed_end_matter_refuses_the_folder_naming_the_file() {
 /// the folder's last and dropped it as end matter.
 #[test]
 fn a_body_block_before_the_last_files_end_matter_stays_text() {
-    const LAST: &str = "Second file, with a sample record:\n\n---\nkind: sample\n---\n\n---\nowner: team-two\n---\n";
+    const LAST: &str =
+        "Second file, with a sample record:\n\n---\nkind: sample\n\n---\nowners: [team-two]\n";
     let dir = common::unique_path("instr-folder-framed", "d");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(format!("{dir}/10-a.md"), "First file.\n").unwrap();
@@ -240,7 +241,7 @@ fn a_body_block_before_the_last_files_end_matter_stays_text() {
         ("file", instruction_of(&file)),
     ] {
         assert!(
-            instruction.contains("---\nkind: sample\n---"),
+            instruction.contains("---\nkind: sample"),
             "the {what} dropped the body block:\n{instruction}"
         );
         assert!(

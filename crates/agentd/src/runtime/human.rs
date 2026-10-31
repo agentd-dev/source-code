@@ -161,7 +161,7 @@ impl Runtime {
     }
 
     /// The channel a gate is announced on, when the instruction document
-    /// addressed the asking `human` step to one of its `::!human`s
+    /// addressed the asking `human` step to one of its `::human`s
     /// (`config::humans`). Looked up by the step rather than read from its
     /// `to`, because a channel is never part of a `to`: only the document's
     /// own declaration can put one on a gate. It is read from the definition

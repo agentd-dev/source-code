@@ -131,7 +131,7 @@ fn an_instance_keeps_its_own_directory_inside_the_denied_store() {
              observability: {{ log_level: info }}\n\
              subagents:\n  templates:\n    room:\n      instruction: |\n\
              \x20       You are the room.\n\
-             \x20       :::!workflow{{name=on-ping}}\n\
+             \x20       :::workflow{{id=on-ping dialect=instruction/workflow}}\n\
              \x20       steps:\n\
              \x20         cmd: {{ kind: a2a, command: room.ping, roles: [agent, operator] }}\n\
              \x20         f:   {{ kind: finish, depends_on: [cmd], status: completed, output: pong }}\n\

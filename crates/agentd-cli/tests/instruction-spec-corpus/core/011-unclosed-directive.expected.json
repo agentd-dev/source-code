@@ -1,0 +1,9 @@
+{
+ "valid": false,
+ "grants": [],
+ "errors": [
+  "unclosed-directive",
+  "skill"
+ ],
+ "registers": {}
+}

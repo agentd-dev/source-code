@@ -2,13 +2,13 @@
 //! **A served document opens no route on the operator's listener without the
 //! grant** (RFC 0042, the gap RFC 0045 §8 P0 item 13 found), end to end.
 //!
-//! `workflows` is the document's to write — that is what `:::!workflow` is
+//! `workflows` is the document's to write — that is what `:::workflow` is
 //! for — but a `webhook` start in one opens an inbound route on the
 //! OPERATOR's webhook listener, answering whoever can reach it with the auth
-//! the route itself names. `:::!endpoint`, which folds into exactly that
+//! the route itself names. `:::endpoint`, which folds into exactly that
 //! workflow, needs the `interface` grant; the same route written as a
 //! workflow needed nothing. Now it needs the same grant, wherever the document
-//! puts it: a `:::!workflow` block, a `:::!config` entry, or a `file:`
+//! puts it: a `:::workflow` block, a `:::config` entry, or a `file:`
 //! reference the document names. A subagent template's machinery opens none
 //! at all — a child has no listener. Refused by `--validate-config`, at
 //! startup, and on a reload, which keeps the running configuration.
@@ -22,14 +22,14 @@ use std::process::Command;
 /// A document whose machinery opens a route.
 #[cfg(feature = "a2a")]
 const ROUTE_DOC: &str = "You are the desk.\n\n\
-     :::!workflow{name=intake}\n\
+     :::workflow{id=intake dialect=instruction/workflow}\n\
      steps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook], status: completed}\n\
      :::\n";
 
 /// The same desk with machinery that opens nothing: a schedule keeps the
 /// daemon up without a route.
 const QUIET_DOC: &str = "You are the desk.\n\n\
-     :::!workflow{name=tick}\n\
+     :::workflow{id=tick dialect=instruction/workflow}\n\
      steps:\n  s: {kind: schedule, every: 1h}\n  f: {kind: finish, depends_on: [s], status: completed}\n\
      :::\n";
 
@@ -115,8 +115,8 @@ fn an_operator_configured_webhook_workflow_still_loads() {
     assert_eq!(code, 0, "{err}");
 }
 
-/// A subagent template's document: its `:::!config` fragment's workflows
-/// reach the child exactly as its `:::!workflow` blocks do, and a child has
+/// A subagent template's document: its `:::config` fragment's workflows
+/// reach the child exactly as its `:::workflow` blocks do, and a child has
 /// no listener to serve a route on. Refused naming the template and the
 /// workflow, rather than accepted here and refused by the child at every
 /// spawn.
@@ -130,7 +130,7 @@ fn a_template_document_route_is_refused_at_load() {
         &cfg,
         &format!(
             "{}subagents:\n  templates:\n    room:\n      instruction: |\n        Room.\n        \
-             :::!config\n        workflows:\n          - name: intake\n            steps:\n              \
+             :::config{{id=cfg1 dialect=agentd/config}}\n        workflows:\n          - name: intake\n            steps:\n              \
              hook: {{kind: webhook, path: /in}}\n              f: {{kind: finish, depends_on: [hook], status: completed}}\n        \
              :::\n",
             config(&doc, 9, "")
@@ -139,7 +139,7 @@ fn a_template_document_route_is_refused_at_load() {
     assert_eq!(code, 2, "{err}");
     assert!(
         err.contains(
-            "subagents.templates.room: workflow 'intake' (its :::!config) step 'hook' is a `webhook` start: instance children have no webhook listener"
+            "subagents.templates.room: workflow 'intake' (its :::config) step 'hook' is a `webhook` start: instance children have no webhook listener"
         ),
         "{err}"
     );
@@ -163,7 +163,7 @@ fn a_document_reference_to_a_route_is_refused_at_startup() {
     std::fs::write(
         &doc,
         format!(
-            "You are the desk.\n\n:::!config\nworkflows:\n  - name: intake\n    file: {}\n:::\n",
+            "You are the desk.\n\n:::config{{id=cfg2 dialect=agentd/config}}\nworkflows:\n  - name: intake\n    file: {}\n:::\n",
             file.display()
         ),
     )
@@ -347,7 +347,7 @@ fn a_reload_introducing_a_document_route_is_refused() {
     );
 }
 
-/// The same for a subagent template a reload adds: the route its `:::!config`
+/// The same for a subagent template a reload adds: the route its `:::config`
 /// fragment declares is refused by the reload, which keeps the running
 /// configuration.
 #[cfg(all(feature = "hot-reload", feature = "a2a"))]
@@ -373,7 +373,7 @@ fn a_reload_introducing_a_template_route_is_refused() {
         &cfg,
         format!(
             "{base}subagents:\n  templates:\n    room:\n      instruction: |\n        Room.\n        \
-             :::!config\n        workflows:\n          - name: intake\n            steps:\n              \
+             :::config{{id=cfg3 dialect=agentd/config}}\n        workflows:\n          - name: intake\n            steps:\n              \
              hook: {{kind: webhook, path: /in}}\n              f: {{kind: finish, depends_on: [hook], status: completed}}\n        \
              :::\n"
         ),
@@ -388,7 +388,7 @@ fn a_reload_introducing_a_template_route_is_refused() {
         d.events("config.reload.invalid").iter().any(|e| e["error"]
             .as_str()
             .is_some_and(|m| m.contains(
-                "subagents.templates.room: workflow 'intake' (its :::!config) step 'hook' is a `webhook` start"
+                "subagents.templates.room: workflow 'intake' (its :::config) step 'hook' is a `webhook` start"
             ))),
         "{}",
         d.log()

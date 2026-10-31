@@ -1,3 +1,0 @@
-:::workflow{name=drain}
-steps: {}
-:::

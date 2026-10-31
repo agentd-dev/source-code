@@ -128,7 +128,14 @@ pub struct Pulled {
     pub manifest_digest: String,
     pub layer_digest: String,
     pub media_type: String,
+    /// The document's author signature, which in instruction/1 travels
+    /// beside the document: the instruction layer's
+    /// [`SIGNATURE_ANNOTATION`] annotation, when it has one.
+    pub signature: Option<String>,
 }
+
+/// The layer annotation that carries the document's author JWS.
+pub const SIGNATURE_ANNOTATION: &str = "md.instruction/signature";
 
 /// Pull an instruction artifact by `oci://` reference — resolve, verify,
 /// select, fetch, verify. Every failure is a refusal naming the step.
@@ -140,7 +147,8 @@ pub fn pull(uri: &str) -> Result<Pulled, String> {
 /// `cosign_key` when one is configured.
 ///
 /// This proves a different thing from the document signature that travels
-/// inside the instruction: that is who WROTE the document, this is who PUSHED
+/// beside the instruction (the layer's [`SIGNATURE_ANNOTATION`]): that is who
+/// WROTE the document, this is who PUSHED
 /// this artifact. Both are worth having and neither substitutes for the other
 /// — a registry compromise can serve a genuinely-authored document from the
 /// wrong place, and a stolen push credential can publish an artifact nobody
@@ -200,6 +208,9 @@ pub fn pull_verified(uri: &str, cosign_key: Option<&str>) -> Result<Pulled, Stri
         .as_str()
         .ok_or("oci: layer has no digest")?
         .to_string();
+    let signature = layer["annotations"][SIGNATURE_ANNOTATION]
+        .as_str()
+        .map(str::to_string);
     let size = layer["size"].as_u64().unwrap_or(0) as usize;
     if size > MAX_BYTES {
         return Err(format!("oci: layer is {size} bytes (cap {MAX_BYTES})"));
@@ -219,6 +230,7 @@ pub fn pull_verified(uri: &str, cosign_key: Option<&str>) -> Result<Pulled, Stri
         manifest_digest,
         layer_digest,
         media_type,
+        signature,
     })
 }
 

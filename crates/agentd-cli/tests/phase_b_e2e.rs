@@ -53,7 +53,7 @@ fn a_sync_instance_resolves_the_spawn_with_its_workflows_first_result() {
         \x20   room:\n\
         \x20     instruction: |\n\
         \x20       The room.\n\
-        \x20       :::!workflow{{name=on-ping}}\n\
+        \x20       :::workflow{{id=on-ping dialect=instruction/workflow}}\n\
         \x20       steps:\n\
         \x20         cmd: {{ kind: a2a, command: room.ping, roles: [agent, operator] }}\n\
         \x20         f:   {{ kind: finish, depends_on: [cmd], status: completed, output: \"pong {{{{steps.cmd.output.args.x}}}}\" }}\n\
@@ -102,10 +102,10 @@ fn a_mirrored_child_stream_lands_in_the_parents_stream() {
         \x20   desk:\n\
         \x20     instruction: |\n\
         \x20       The desk.\n\
-        \x20       :::!stream{{name=orders}}\n\
-        \x20       retention: {{ max_events: 100 }}\n\
+        \x20       :::config{{id=s dialect=agentd/config}}\n\
+        \x20       streams: {{ orders: {{ retention: {{ max_events: 100 }} }} }}\n\
         \x20       :::\n\
-        \x20       :::!workflow{{name=on-add}}\n\
+        \x20       :::workflow{{id=on-add dialect=instruction/workflow}}\n\
         \x20       steps:\n\
         \x20         cmd: {{ kind: a2a, command: desk.add, roles: [agent, operator] }}\n\
         \x20         put: {{ kind: emit, depends_on: [cmd], stream: orders, subject: \"order.new\", data: {{ sku: \"{{{{steps.cmd.output.args.sku}}}}\" }} }}\n\
@@ -163,8 +163,8 @@ fn an_instance_report_into_a_stream_its_template_does_not_mirror_is_refused() {
             \x20   desk:\n\
             \x20     instruction: |\n\
             \x20       The desk.\n\
-            \x20       :::!stream{{name=orders}}\n\
-            \x20       retention: {{ max_events: 10 }}\n\
+            \x20       :::config{{id=s dialect=agentd/config}}\n\
+            \x20       streams: {{ orders: {{ retention: {{ max_events: 10 }} }} }}\n\
             \x20       :::\n\
             \x20     mirror_streams: [orders]\n\
             \x20     singleton: true\n\

@@ -1,3 +1,0 @@
-:::case{name=c}
-given: {}
-:::

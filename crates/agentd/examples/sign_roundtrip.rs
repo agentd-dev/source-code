@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! A signed author + delivery round-trip over an instruction document (§7).
+//! A signed author + delivery round-trip over an instruction/1 document.
 //!
 //! `cargo run -p agentd-core --example sign_roundtrip --features sign -- <doc.md>`
 //!
 //! Prints the two JWS compact serializations (and their decoded header +
-//! claims), the resolution manifest, and the effective capability ceiling — the
-//! artifacts §7.2 and §7.4 describe. Keys are derived from fixed seeds so the
+//! claims), the resolution manifest, and the effective capability ceiling,
+//! verified by the instruction.md SDK. Keys are derived from fixed seeds so the
 //! run is reproducible; a real deployment holds an offline author key and an
 //! online delivery key.
 
@@ -15,20 +15,21 @@ fn main() {
     use agentd::config::attest::{self, Claims};
     use serde_json::Value;
 
-    let path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "/root/instruction-md/specification/samples/house-style.md".to_string());
+    let path = std::env::args().nth(1).unwrap_or_else(|| {
+        "/root/instruction-md/source-code/examples/home/home-climate.md".to_string()
+    });
     let bytes = std::fs::read(&path).expect("read the instruction document");
 
-    // `doc` MUST equal the document's front-matter `id` (§3.1).
+    // `doc` names the document: its front-matter `id` (§3.1).
     let doc = attest::front_matter_id(&bytes).unwrap_or_else(|| "instruction://ins_unknown".into());
 
     // Offline author key; online delivery key.
     let author = AgentKey::from_seed(&[1u8; 32]).unwrap();
     let delivery = AgentKey::from_seed(&[2u8; 32]).unwrap();
 
-    // Author digest excludes a front-matter `signature:` line (§7.2). With no
-    // per-reader resolution the delivered bytes are the authored bytes.
+    // The author digest is the stored bytes as they are: the signature
+    // travels beside the document. With no per-reader resolution the
+    // delivered bytes are the authored bytes.
     let authored_digest = attest::author_digest(&bytes);
     let delivered_digest = attest::digest(&bytes);
 
@@ -42,7 +43,7 @@ fn main() {
         doc: doc.clone(),
         version: version.into(),
         digest: authored_digest.clone(),
-        capabilities: vec!["material".into()],
+        capabilities: vec!["identity".into()],
         publisher: publisher.into(),
         iat: now,
         exp: now + 31_536_000, // author: long-lived
@@ -52,20 +53,10 @@ fn main() {
     };
     let author_jws = attest::sign(&author, &author_claims).unwrap();
 
-    // The resolution manifest of this delivery, as the reference
-    // implementation accounts for it (§7.4, S7) — no parameters, no facts and
-    // no include resolver, so nothing is inlined — in the signed form a
-    // delivery attestation embeds.
+    // The resolution this delivery names (`instruction-resolved/1`), as the
+    // SDK resolves it with nothing to compose.
     let text = String::from_utf8(bytes.clone()).expect("the document is UTF-8");
-    let parsed = instruction_core::parse(&text).expect("the document parses");
-    let ctx = instruction_core::Context {
-        grants: instruction_core::doc::all_families(),
-        ..Default::default()
-    };
-    let manifest = instruction_core::deliver(&parsed, &ctx)
-        .expect("the document delivers")
-        .manifest
-        .signed_form();
+    let manifest = attest::manifest_of(&text, &doc, version);
 
     let delivery_claims = Claims {
         spec: attest::SPEC_CLAIM.into(),
@@ -73,7 +64,7 @@ fn main() {
         doc: doc.clone(),
         version: version.into(),
         digest: delivered_digest.clone(),
-        capabilities: vec!["material".into()], // ⊆ author
+        capabilities: vec!["identity".into()], // ⊆ author
         publisher: publisher.into(),
         iat: now,
         exp: now + 3_600, // delivery: within hours — attests one resolution
@@ -89,20 +80,20 @@ fn main() {
         author_keys: vec![],
         delivery_keys: vec![],
         reader: None,
-        max_capabilities: vec!["material".into()],
+        max_capabilities: vec!["identity".into()],
         freshness: Some("15m".into()),
     };
 
-    let verified = attest::verify_document(
-        &bytes,
+    let verified = attest::verify_delivery(
         &delivery_jws,
-        "principal://usr_7",
-        now + 60,
-        &["material".into()],
-        &src.publisher,
-        &src.max_capabilities,
-        author.public_bytes(),
+        &bytes,
         delivery.public_bytes(),
+        author.public_bytes(),
+        "principal://usr_7",
+        &src.publisher,
+        now + 60,
+        &["identity".into()],
+        &src.max_capabilities,
     )
     .expect("the round-trip verifies");
 

@@ -1,5 +1,0 @@
-# Escalation
-
-**MUST:** escalate refunds above the limit to the on-call engineer.
-
-A bare eval is ordinary prose in a version-1 document.

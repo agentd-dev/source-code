@@ -1,8 +1,0 @@
-{
-  "params": {
-    "environment": "production",
-    "release": "v1.6.0",
-    "change_ticket": "CHG-42"
-  },
-  "facts": {}
-}

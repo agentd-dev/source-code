@@ -1,1 +1,1 @@
-::!mcp{name=search endpoint=https://mcp.example/search}
+::mcp{id=search title="Search" src="https://mcp.example/search"}

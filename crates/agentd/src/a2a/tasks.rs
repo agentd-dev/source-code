@@ -166,7 +166,7 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_schema: Option<Value>,
     /// Where the gate is announced: the `channel` of the instruction
-    /// document's `::!human` it was addressed to. A place a bridge routes the
+    /// document's `::human` it was addressed to. A place a bridge routes the
     /// question to, never who may answer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_channel: Option<String>,

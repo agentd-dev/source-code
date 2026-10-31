@@ -406,10 +406,8 @@ fn an_instance_child_signs_with_the_daemons_key() {
              \x20   probe:\n\
              \x20     instruction: |\n\
              \x20       The probe.\n\
-             \x20       :::!mcp{{name=kb}}\n\
-             \x20       endpoint: \"{mcp}\"\n\
-             \x20       :::\n\
-             \x20       :::!workflow{{name=probe}}\n\
+             \x20       ::mcp{{id=kb src=\"{mcp}\"}}\n\
+             \x20       :::workflow{{id=probe dialect=instruction/workflow}}\n\
              \x20       steps:\n\
              \x20         s: {{kind: once}}\n\
              \x20         call: {{kind: mcp.tool, depends_on: [s], server: kb, tool: state.list, args: {{key: x}}}}\n\
@@ -674,7 +672,7 @@ fn the_trees_own_links_do_not_wait_on_the_provider() {
              \x20   probe:\n\
              \x20     instruction: |\n\
              \x20       The probe.\n\
-             \x20       :::!workflow{{name=probe}}\n\
+             \x20       :::workflow{{id=probe dialect=instruction/workflow}}\n\
              \x20       steps:\n\
              \x20         s: {{kind: once}}\n\
              \x20         f: {{kind: finish, depends_on: [s], status: completed, output: probed}}\n\

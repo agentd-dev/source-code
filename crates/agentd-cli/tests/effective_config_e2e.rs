@@ -3,7 +3,7 @@
 //!
 //! Through the real binary from a temp directory, because the whole feature is
 //! about layering — the discovery chain, the environment, the flags, the
-//! conventional folders and an instruction's own `:::!config` — and a unit
+//! conventional folders and an instruction's own `:::config` — and a unit
 //! test over the loader would assert the parts and miss the arrangement.
 #![cfg(unix)]
 
@@ -138,14 +138,14 @@ fn an_invalid_config_still_reports_and_names_its_errors() {
 }
 
 /// Two things a config file alone cannot tell you: what an instruction's own
-/// `:::!config` put into effect, and the workflow a bare `--instruction` run
+/// `:::config` put into effect, and the workflow a bare `--instruction` run
 /// generates. Both are the report's job.
 #[test]
 fn the_report_shows_what_the_document_declared_and_what_was_generated() {
     let (root, home, work) = project("eff-document");
     std::fs::write(
         work.join("agent.md"),
-        "You are the desk.\n\n:::!config\nlimits: { max_runs: 7 }\n:::\n",
+        "You are the desk.\n\n:::config{id=cfg1 dialect=agentd/config}\nlimits: { max_runs: 7 }\n:::\n",
     )
     .unwrap();
     std::fs::write(

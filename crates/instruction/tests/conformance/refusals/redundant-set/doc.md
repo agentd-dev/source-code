@@ -1,4 +1,0 @@
-:::glossary[]
-Term
-:   def
-:::

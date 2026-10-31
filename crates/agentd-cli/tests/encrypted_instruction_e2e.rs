@@ -16,7 +16,7 @@ use agentd::config::decrypt::{agefile, jwe, x25519};
 use serde_json::{Value, json};
 
 /// A plaintext document with observable machinery.
-const DOC: &str = "---\nspec: \"1\"\n---\n# Sealed agent\n\nBe discreet.\n\n:::!workflow{name=sealed-drain}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+const DOC: &str = "---\nspec: \"1\"\n---\n# Sealed agent\n\nBe discreet.\n\n:::workflow{id=sealed-drain dialect=instruction/workflow}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
 
 fn run_cfg(cfg: &Value) -> (bool, String, Value) {
     let cfg_path = common::unique_path("enc-instr", "json");

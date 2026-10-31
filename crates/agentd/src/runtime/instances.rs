@@ -436,7 +436,7 @@ impl Runtime {
             .or_insert_with(|| json!({}));
         agent["name"] = json!(instance_child_name(&self.instance, &t.name));
         agent["instruction"] = json!(prose);
-        // The channels the template's `::!human`s put on its gates: the prose
+        // The channels the template's `::human`s put on its gates: the prose
         // the child reads no longer declares them, so they travel as the
         // operator's (`agent.gate_channels`), from the operator's template.
         // A workflow's name, and a channel, may name a param: folded as the
@@ -451,7 +451,7 @@ impl Runtime {
             fold_params_value(&mut channels, params);
             agent["gate_channels"] = channels;
         }
-        // Machinery workflows join whatever a `:::!config` block declared.
+        // Machinery workflows join whatever a `:::config` block declared.
         let mut wfs = t.workflows.clone();
         for w in &mut wfs {
             fold_params_value(w, params);
@@ -1617,7 +1617,7 @@ fn instance_command(
     );
     cmd.env(
         crate::supervisor::reap::INSTANCE_DELIVERED_ENV,
-        instruction_core::digest(delivered.as_bytes()),
+        instruction_md::digest(delivered.as_bytes()),
     );
     let (memory_bytes, cpu_seconds) = parse_instance_rlimits(limits)?;
     #[cfg(unix)]

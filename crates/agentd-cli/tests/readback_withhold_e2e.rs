@@ -1494,7 +1494,7 @@ fn the_root_is_judged_by_what_it_can_hand_on() {
     );
     let top = "services:\n  web: {kind: mcp, endpoint: \"https://web.invalid/mcp\", tags: {\"*\": [egress]}}\n\
                subagents:\n  templates:\n    desk:\n      instruction: |\n        The desk.\n        \
-               :::!mcp{name=web}\n        service: web\n        :::\n\
+               :::config{id=m dialect=agentd/config}\n        mcp: {servers: [{name: web, service: web}]}\n        :::\n\
                tools:\n  disabled: [subagent.run, subagent.send]\n";
     let turns = json!([
         call("workflow.run", json!({"name": "hold", "wait": true})),

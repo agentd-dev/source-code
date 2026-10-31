@@ -113,7 +113,7 @@ impl Runtime {
     fn reload_inner(&mut self) -> Result<Vec<&'static str>, ReloadRefused> {
         let (loaded, _ask) = cfg::load(&self.args, &self.env)
             .map_err(|e| ReloadRefused::Invalid(vec![e.to_string()]))?;
-        // Over every layer, the instruction's `:::!config` included: a
+        // Over every layer, the instruction's `:::config` included: a
         // document that changes `lifecycle.run_until` would otherwise reload
         // into a process whose job shape was settled at startup — and with it
         // generate, or retire, the workflow its instruction runs as a job.
@@ -180,7 +180,7 @@ impl Runtime {
         });
         // The channels a document's gates are announced on ride on the
         // definitions they belong to, so a document that moves only a
-        // `::!human`'s channel reloads the definitions too — their hashes
+        // `::human`'s channel reloads the definitions too — their hashes
         // stay, nothing retires, and the next gate is announced on the new
         // channel.
         let channels_moved = old.agent.document_gate_channels != new.agent.document_gate_channels;
@@ -599,24 +599,6 @@ impl Runtime {
                 Some(t) => StagedInstruction::Text(t),
                 None => StagedInstruction::Text(String::new()),
             })
-        } else if let Some(t) = new.agent.instruction.as_deref()
-            && self.instruction.source == "resource"
-            && cfg::looks_like_resource_uri(t)
-            && old.agent.instruction_facts != new.agent.instruction_facts
-        {
-            // The instruction is unchanged, but the facts its variants are
-            // chosen by are not: the model moved, and with it the `agent`
-            // family a `:::when{agent=…}` names. A static or `oci:` text is
-            // folded again by the new load; a resource one is read again
-            // here (with the new settings' facts: they are the running ones
-            // while a reload is staged), or the running text would keep the
-            // variants chosen for the old model while turns go to the new
-            // one, and the reload report the new model as applied.
-            let (server, res) = super::instruction_resource(t);
-            Some(StagedInstruction::Reread(
-                self.fetch_instruction_mcp(conns, server, res)
-                    .map_err(|e| vec![format!("agent.instruction {t}: {e}")])?,
-            ))
         } else if let Some(m) = mcp
             && let Some(t) = new.agent.instruction.as_deref()
             && self.instruction.source == "resource"
@@ -1224,7 +1206,7 @@ fn server_timeout(settings: &cfg::Settings, server: &cfg::McpServer) -> Duration
 /// Whether any intelligence connection's settings differ: the top-level
 /// one's or any provider's, added, removed or changed.
 /// Whether a reload builds the skills catalogue again: the skills section
-/// or the instruction's inline `:::!skill` definitions (they live on
+/// or the instruction's inline `:::skill` definitions (they live on
 /// `agent`, but they land in this catalogue) moved — or a LOCAL folder is
 /// configured, even with the section unchanged: the skills live in files,
 /// and comparing the setting only would make "edit a skill, send SIGHUP" a

@@ -298,7 +298,7 @@ pub struct Agent {
     /// text below the instruction (RFC 0053). Operator-only: a served
     /// document may not choose which directory's files become prompt text.
     pub workspace: Option<String>,
-    /// Skills defined by `:::!skill` directives in the instruction — DERIVED
+    /// Skills defined by `:::skill` blocks in the instruction — DERIVED
     /// (never a config key): `Settings::from_document` extracts them, the
     /// runtime feeds them to the catalogue. In the struct so a reload diff
     /// sees an edited inline skill as an agent change.
@@ -335,38 +335,35 @@ pub struct Agent {
     /// separate questions: "there is no channel" is a fact about deployment,
     /// "do not interrupt me" is a policy about attention.
     pub approval: Approval,
-    /// The instruction-document families this agent's `instruction` may use
-    /// (the trust ladder, Instruction Document Spec §5). Empty (the default)
-    /// grants only the default rung — prose, structural, and the core machinery
-    /// (`!workflow`, `!mcp`, `!config`, `!stream`, `!tools`, `!skill`, `!data`,
-    /// `!override`). Naming a family — `material`, `knowledge`, `interface`,
-    /// `identity`, `compute`, `infra`, `compose` — admits its blocks. Fail-closed
-    /// and restart-only: a document that can execute code is a supply-chain
-    /// surface, so the capability is granted here by the operator, never claimed
-    /// by the document.
+    /// The grants this agent's instruction document may use beyond the
+    /// default (`config::idoc`). Empty (the default) admits the guidance and
+    /// the blocks every document may use — `:::mcp`, `:::workflow`,
+    /// `:::config`, `:::skill`, `::person`. `identity` admits its A2A agents
+    /// (`::agent` → `a2a.peers`); `interface` admits a workflow that opens an
+    /// inbound route on the webhook listener. Fail-closed and restart-only:
+    /// a capability is granted here by the operator, never claimed by the
+    /// document.
     #[serde(default)]
     pub document_capabilities: Vec<String>,
     /// The channel a gate is announced on, for a configured workflow whose
     /// `human` steps no instruction document addressed: workflow name → step
     /// path (`config::humans::GateChannels`) → channel. It is how a subagent
-    /// template's `::!human` channels reach its instance child — the parent
+    /// template's gate channels reach its instance child — the parent
     /// composes it — and an operator may write it for any configured
-    /// workflow. Operator-only: a served document puts a channel on its own
-    /// gates by declaring the `::!human`, and where both name a step the
-    /// document's declaration stands.
+    /// workflow. Operator-only: a document never puts a channel on a gate.
     #[serde(default)]
     pub gate_channels: crate::config::humans::GateChannels,
-    /// Declarations lifted from extended-family instruction blocks (`!file`,
-    /// `!function`, `!runtime`, …), keyed by kind — DERIVED, never a config key.
-    /// Recorded so `--capabilities` can report what a document reached for; the
-    /// runtime effect of each is delegated to a service per the spec.
+    /// The connected objects an instruction document declared that agentd
+    /// records but does not activate (`::tool`, `::service`, a skill by
+    /// `src`, an agent outside the grants…), keyed by kind — DERIVED, never a
+    /// config key. Recorded so `--capabilities` can report what a document
+    /// reached for.
     #[serde(skip)]
     pub document_declarations: std::collections::BTreeMap<String, Vec<Value>>,
-    /// The channel each gate the instruction document addressed to one of its
-    /// `::!human`s is announced on, per workflow and step — DERIVED, never a
-    /// config key (`config::humans`). Out of the definition on purpose: a `to`
-    /// written anywhere else stays principal syntax only, so nothing but the
-    /// document's own declaration can put a channel on a gate. The runtime
+    /// The channel each gate is announced on, per workflow and step —
+    /// DERIVED from the operator's `gate_channels`, never a config key
+    /// (`config::humans`). Out of the definition on purpose: a `to` stays
+    /// principal syntax only. The runtime
     /// hands each workflow's entries to the configured definition of that
     /// name when it loads it (`engine::model::Workflow::gate_channels`), and
     /// a reload that changes them reloads the definitions, so the next gate
@@ -375,8 +372,8 @@ pub struct Agent {
     pub document_gate_channels: crate::config::humans::GateChannels,
     /// Which entries of `workflows` the instruction document contributed, by
     /// index — DERIVED, never a config key. A document adds workflows two
-    /// ways: its `:::!config` fragment's `workflows` (merged in FRONT of the
-    /// operator's) and its `:::!workflow` blocks (appended after). Once
+    /// ways: its `:::config` fragment's `workflows` (merged in FRONT of the
+    /// operator's) and its `:::workflow` blocks (appended after). Once
     /// spliced, either is indistinguishable from an inline entry, and a
     /// refusal of two definitions sharing a name has to say which document
     /// each came from ([`Settings::workflow_entry_source`]).
@@ -389,14 +386,6 @@ pub struct Agent {
     /// same grants as its inline machinery ([`document_route_refusals`]).
     #[serde(skip)]
     pub document_grants: std::collections::BTreeSet<String>,
-    /// The runtime facts the instruction's `when`/`unless` blocks were
-    /// decided by (`idoc::instruction_facts`) — DERIVED from the OPERATOR's
-    /// intelligence section before the document folds, never a config key.
-    /// Kept so every later delivery — a subagent template, an OCI re-pull, a
-    /// registry read — is judged by the same answers, and none of them by a
-    /// model the document's own `:::!config` chose.
-    #[serde(skip)]
-    pub instruction_facts: BTreeMap<String, String>,
     /// Where a pulled instruction came from (an `oci://` reference resolved at
     /// config load, RFC 0040) — DERIVED: the runtime uses it to log
     /// `instruction.loaded` with its version pin and to arm the freshness
@@ -428,7 +417,13 @@ pub struct Agent {
     /// diagnostics list.
     #[serde(skip)]
     pub instruction_warnings: Vec<String>,
-    /// The `:::!config` fragment the instruction declared — DERIVED. It is
+    /// How the instruction document was read — DERIVED, logged once at boot
+    /// as `instruction.read`: the reader, the specification commit, the
+    /// authored digest, the diagnostics, and what it mapped. `None` for plain
+    /// prose, which is not read as a document.
+    #[serde(skip)]
+    pub instruction_read: Option<Value>,
+    /// The `:::config` fragment the instruction declared — DERIVED. It is
     /// merged UNDER the document during typing and never written back into
     /// it, so `--effective-config` has no other way to show a setting that an
     /// instruction, rather than a config file, put into effect.
@@ -601,7 +596,7 @@ pub struct InstructionSpec {
     ///
     /// Restart-only, inside an otherwise reloadable setting: a publisher an
     /// operator believes they revoked must not survive a hot reload.
-    /// Operator surface only — a served `:::!config` may not write it.
+    /// Operator surface only — a served `:::config` may not write it.
     #[serde(default)]
     pub trust: Vec<InstructionSource>,
 }
@@ -1044,7 +1039,7 @@ fn expand_home(path: &str) -> String {
 
 /// The configuration a served document MAY write (§6 rule 4).
 ///
-/// A `:::!config` fragment is machinery an INSTRUCTION carries, and an
+/// A `:::config` fragment is machinery an INSTRUCTION carries, and an
 /// instruction commonly comes from somewhere the operator does not fully
 /// control — that is why signing, pinning and the capability grant exist at
 /// all. So the boundary is an **allow-list**, and it answers one question: may
@@ -1066,8 +1061,8 @@ fn expand_home(path: &str) -> String {
 /// [`every_config_path_is_classified_for_documents`] holds this list and
 /// [`OPERATOR_ONLY`] to the generated schema.
 pub const DOCUMENT_MAY_WRITE: &[&str] = &[
-    // What the agent DOES. This is the entire point of `:::!workflow`,
-    // `:::!stream` and `:::!mcp`: one document can define an agent.
+    // What the agent DOES. This is the entire point of `:::workflow`,
+    // `:::stream` and `:::mcp`: one document can define an agent.
     "workflows",
     "streams",
     // `mcp` straddles the boundary (RFC 0044 §5.14.1, amending RFC 0042): a
@@ -1166,7 +1161,7 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // may activate — the ladder it is standing on.
     "agent.document_capabilities",
     // Where a gate is announced: a document announces its own by declaring
-    // the `::!human`; a channel on a gate it did not declare is the
+    // the `::human`; a channel on a gate it did not declare is the
     // operator's (or, in a template's child, the composing parent's) to give.
     "agent.gate_channels",
     // Where the instruction comes from, who may sign it, and which key opens
@@ -1361,7 +1356,7 @@ pub(crate) fn document_wrote_operator_config(fragment: &Map<String, Value>) -> V
 }
 
 /// The turn model, when the operator names it, is the operator's: a
-/// document's `:::!config` that names it too — in either spelling,
+/// document's `:::config` that names it too — in either spelling,
 /// `intelligence.model` or `intelligence.roles.turn` — is dropped, as any
 /// key the operator set is. The two spellings are one setting, so without
 /// this a document's `roles.turn` beside an operator's `--model` refused the
@@ -1386,7 +1381,7 @@ fn drop_document_turn_model(operator: &Value, fragment: &mut Map<String, Value>)
     let mut warnings = Vec::new();
     let said = |path: &str| {
         format!(
-            "the instruction's :::!config sets {path}; the operator names the turn model, \
+            "the instruction's :::config sets {path}; the operator names the turn model, \
              which is used"
         )
     };
@@ -1417,12 +1412,10 @@ fn document_label(path: Option<&str>) -> String {
 /// webhook listener without the grant that opens one, each named with its
 /// workflow, its step and `document` — empty when `granted` holds it.
 ///
-/// The grant is the one `:::!endpoint` needs, read from the vendored
-/// specification rather than written here: an endpoint block folds into a
-/// workflow with a `webhook` start, so a document that may not declare the
-/// block may not declare the workflow it becomes either. One rule for every
-/// spelling of a route, held by one list of what opens one
-/// ([`crate::engine::model::inbound_routes`]).
+/// The grant is agentd's `interface` (`config::idoc::INTERFACE`). One rule
+/// for every spelling of a route — a `:::workflow` with a `webhook` start,
+/// the same under `:::config`, a webhook wait — held by one list of what
+/// opens one ([`crate::engine::model::inbound_routes`]).
 pub(crate) fn document_route_refusals<'a>(
     workflows: impl IntoIterator<Item = &'a Value>,
     granted: &std::collections::BTreeSet<String>,
@@ -1435,8 +1428,8 @@ pub(crate) fn document_route_refusals<'a>(
             format!(
                 "workflow {name:?} step {step:?} from {document} is {what}, which opens an inbound \
              route on the operator's webhook listener — a served document may open one only \
-             under the `{grant}` grant, the one `:::!endpoint` needs \
-             (`agent.document_capabilities: [{grant}]`); grant it, or declare the workflow in \
+             under the `{grant}` grant (`agent.document_capabilities: [{grant}]`); grant it, \
+             or declare the workflow in \
              the operator's configuration"
             )
         },
@@ -1500,9 +1493,7 @@ fn ungranted_routes<'a>(
     granted: impl Fn(&str) -> bool,
     say: impl Fn(&str, &str, &str, &str) -> String,
 ) -> Vec<String> {
-    let Some(grant) = crate::config::idoc::grant_of("endpoint") else {
-        return Vec::new();
-    };
+    let grant = crate::config::idoc::INTERFACE;
     if granted(grant) {
         return Vec::new();
     }
@@ -1662,7 +1653,7 @@ fn parent_mark(instance_child: bool, delivered: Option<String>) -> Option<String
 
 /// Whether `instruction` is exactly the text whose digest is `delivered`.
 fn delivered_already(instruction: &str, delivered: Option<&str>) -> bool {
-    delivered.is_some_and(|d| d == instruction_core::digest(instruction.as_bytes()))
+    delivered.is_some_and(|d| d == instruction_md::digest(instruction.as_bytes()))
 }
 
 /// `scheme://…` with no whitespace, and a scheme that is not a bare `http(s)`
@@ -1781,7 +1772,7 @@ pub struct Intelligence {
     /// every turn, as `roles.approve` moves every approval.
     pub routes: BTreeMap<String, String>,
     /// The operator's own `intelligence` section, before a served document's
-    /// `:::!config` merged under it — set only when the document wrote
+    /// `:::config` merged under it — set only when the document wrote
     /// `intelligence`. The `approve` role resolves here: the model that
     /// answers on the operator's behalf is the operator's choice, and a
     /// document that may declare models and bind `turn` could otherwise
@@ -3278,7 +3269,7 @@ pub struct Tools {
     pub disabled: Vec<String>,
     pub overrides: BTreeMap<String, ToolOverride>,
     /// Append-only narrowing of an existing tool by name — the target of a
-    /// `:::!override` block (Instruction Document Spec §5.7). It may only make a
+    /// `:::override` block (Instruction Document Spec §5.7). It may only make a
     /// tool MORE careful: add trifecta tags, or append an operator annotation
     /// beneath the tool's own description (never replace it). A tool that is
     /// narrowed and also disabled is disabled.
@@ -3791,8 +3782,8 @@ pub struct Subagents {
     pub defaults: SubagentDefaults,
     /// Named, operator-authored definitions. A template whose `instruction`
     /// carries no config-defining directives spawns a flat worker; one that
-    /// defines machinery (`:::!workflow`/`:::!mcp`/`:::!stream`/`:::!config`/
-    /// `:::!tools`) spawns an instance-tier child. The tier follows from the
+    /// defines machinery (`:::workflow`/`:::mcp`/`:::stream`/`:::config`/
+    /// `:::tools`) spawns an instance-tier child. The tier follows from the
     /// text, so it is never declared twice and cannot disagree with itself.
     pub templates: BTreeMap<String, SubagentTemplate>,
 }
@@ -5114,7 +5105,7 @@ impl Settings {
         Settings::type_document(
             doc,
             source,
-            Some(instruction_core::digest(delivered.as_bytes())),
+            Some(instruction_md::digest(delivered.as_bytes())),
         )
     }
 
@@ -5145,12 +5136,12 @@ impl Settings {
         }
         // Colon-fence directives in the instruction (operator-authored text —
         // this is the ONLY surface extraction runs on; conversation text is
-        // never parsed). `:::!workflow` bodies join `workflows:` exactly as
+        // never parsed). `:::workflow` bodies join `workflows:` exactly as
         // inline entries — same folding, validation, hashing, retirement —
         // and the model reads the CLEANED text, where each block became a
         // one-line note instead of machinery it might paraphrase. Extraction
         // runs BEFORE deserialization because the config-defining blocks
-        // (`:::!config`/`:::!mcp`/`:::!stream`/`:::!tools`) contribute a fragment
+        // (`:::config`/`:::mcp`/`:::stream`/`:::tools`) contribute a fragment
         // that merges UNDER the explicit document — an instruction file alone
         // can define the whole agent, and an explicit key still wins.
         // `agent.instruction` in its LONG form: an object naming the source
@@ -5208,6 +5199,13 @@ impl Settings {
         // Fetched from a URL or pulled from a registry rather than read from
         // the operator's own disk: the §7.8 floor applies to its blocks.
         let mut over_the_wire = false;
+        // The author signature that travelled beside the document: a file's
+        // `<path>.jws`, an OCI layer's `md.instruction/signature` annotation.
+        #[cfg_attr(
+            not(feature = "sign"),
+            allow(unused_mut, unused_variables, unused_assignments)
+        )]
+        let mut instruction_signature: Option<String> = None;
         let mut instruction_warnings: Vec<String> = Vec::new();
         // The SHORT form naming a folder — `--instruction ./instructions/`, or
         // a path that turns out to be a directory. It sets the very `dir:` the
@@ -5256,6 +5254,11 @@ impl Settings {
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 a.insert("instruction".into(), Value::String(text));
             }
+            #[cfg(feature = "sign")]
+            {
+                instruction_signature = crate::config::attest::signature_beside(&expanded)
+                    .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
+            }
             instruction_path = Some(expanded);
         }
         // An `oci://` instruction (RFC 0040) is pulled at CONFIG LOAD, exactly
@@ -5303,6 +5306,7 @@ impl Settings {
                 if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                     a.insert("instruction".into(), Value::String(text));
                 }
+                instruction_signature = pulled.signature;
                 instruction_origin = Some(InstructionOrigin {
                     uri,
                     manifest_digest: pulled.manifest_digest,
@@ -5385,9 +5389,10 @@ impl Settings {
         // Verified HERE, after decryption and before anything interprets the
         // bytes, because this is the one point every source converges on: a
         // file, a folder entry, an `https://` fetch and an OCI artifact all
-        // arrive as the same text. The proof travels inside the document (a
-        // front-matter `signature:`), so it survives repackaging — the same
-        // signed bytes verify however they were shipped.
+        // arrive as the same text. In instruction/1 the author signature
+        // travels BESIDE the document, never in it: a file's `<path>.jws`, a
+        // folder entry's own `<file>.jws`, an OCI layer's
+        // `md.instruction/signature` annotation. A URL fetch carries none.
         //
         // A registry read is the exception: its author AND delivery signatures
         // ride in MCP `_meta`, and the runtime verifies them at the read
@@ -5438,8 +5443,11 @@ impl Settings {
             if !instruction_dir_files.is_empty() && !instruction_spec.trust.is_empty() {
                 for f in &instruction_dir_files {
                     let bytes = std::fs::read(f).map_err(|e| format!("{source}: {f}: {e}"))?;
+                    let signature = crate::config::attest::signature_beside(f)
+                        .map_err(|e| format!("{source}: agent.instruction {f}: {e}"))?;
                     match crate::config::attest::verify_authored(
                         &bytes,
+                        signature.as_deref(),
                         &instruction_spec.trust,
                         now_secs(),
                     ) {
@@ -5481,6 +5489,7 @@ impl Settings {
             {
                 match crate::config::attest::verify_authored(
                     instr.as_bytes(),
+                    instruction_signature.as_deref(),
                     &instruction_spec.trust,
                     now_secs(),
                 ) {
@@ -5505,18 +5514,8 @@ impl Settings {
             attested
         };
 
-        // The facts are read from the intelligence section as it stands NOW,
-        // before the document's `:::!config` merges under it: a document
-        // cannot choose the facts its own variants are judged by. Typed from
-        // the raw subtree because the document is not deserialized yet; one
-        // that does not type gives no model, and the typing below reports it.
-        let instruction_facts = crate::config::idoc::instruction_facts(
-            doc.get("intelligence")
-                .and_then(|v| serde_json::from_value::<Intelligence>(v.clone()).ok())
-                .and_then(|i| i.role_wire_model(ModelRole::Turn))
-                .as_deref(),
-        );
         let mut idoc_extraction: Option<crate::config::idoc::Extraction> = None;
+        let mut instruction_read: Option<Value> = None;
         let mut gate_channels = crate::config::humans::GateChannels::new();
         let mut operator_intelligence: Option<Value> = None;
         let mut document_workflows = std::collections::BTreeSet::new();
@@ -5530,15 +5529,16 @@ impl Settings {
             && crate::config::idoc::needs_delivery(&instr)
             && !delivered_already(&instr, delivered.as_deref())
         {
-            // The instruction is an Instruction Document — the single dialect,
-            // and the ONLY surface extraction runs on (conversation text is
-            // never parsed). The gate is anything delivery touches, not just
-            // a fence: a fence-free document of keyword lines, notes or end
-            // matter read raw would hand the model what S9 and S27 say it
+            // The instruction is an instruction/1 document, read by the
+            // instruction.md SDK — the ONLY surface extraction runs on
+            // (conversation text is never parsed). The gate is anything the
+            // agent text changes, not just a block: keyword lines, comments
+            // or metadata read raw would hand the model what the spec says it
             // never sees. Plain prose skips it and is delivered byte for
-            // byte. Machinery blocks (`:::!workflow`, `:::!mcp`, …)
-            // fold into configuration; prose (`:::note`, `:::must`, …) degrades
-            // into what the model reads; the extended families are gated by
+            // byte. Connected objects and runtime blocks (`:::mcp`,
+            // `::agent`, `:::workflow`, `:::config`, …) map onto
+            // configuration (`config::idoc`); everything reaches the model as
+            // the SDK's agent text; the grants are
             // `agent.document_capabilities`, read raw here before the document
             // is deserialized. The fragment merges UNDER the document, so an
             // explicit config key still wins.
@@ -5558,29 +5558,48 @@ impl Settings {
             if let Some(attested) = &attested_capabilities {
                 granted.retain(|g| attested.contains(g));
             }
-            // Parsed here and folded with the same arguments `extract_with_facts`
-            // uses, rather than through it, because agentd needs the parsed
-            // document once more after the fold: a gate addressed to one of its
-            // `::!human`s takes that human's principal AND channel, of which the
-            // folded `to` keeps only one (`config::humans`).
+            // A gate addressed to one of the document's people is the
+            // operators' (`config::humans`).
             let folded = crate::config::idoc::parse(&instr).and_then(|parsed| {
-                if over_the_wire {
-                    crate::config::idoc::check_wire_floor(&parsed)?;
-                }
-                let mut ex = crate::config::idoc::fold_full(
+                let mut ex = crate::config::idoc::fold(
                     &parsed,
-                    &granted,
-                    &BTreeMap::new(),
-                    &instruction_facts,
-                    &|_| None,
+                    crate::config::idoc::Admission {
+                        granted: &granted,
+                        over_the_wire,
+                    },
                 )?;
-                let channels =
-                    crate::config::humans::address_document_gates(&parsed, &mut ex.workflows);
-                Ok((ex, channels))
+                crate::config::humans::address_document_gates(&ex.people, &mut ex.workflows);
+                Ok(ex)
             });
             match folded {
-                Ok((ex, channels)) => {
-                    gate_channels = channels;
+                Ok(ex) => {
+                    let count = |section: &str, key: &str| {
+                        ex.config
+                            .get(section)
+                            .and_then(|s| s.get(key))
+                            .and_then(Value::as_array)
+                            .map_or(0, Vec::len)
+                    };
+                    instruction_read = Some(json!({
+                        "reader": "instruction-md",
+                        "spec": crate::config::idoc::SPEC_COMMIT,
+                        "digest": instruction_md::digest(instr.as_bytes()),
+                        "diagnostics": ex.warnings.len(),
+                        "agent_text_bytes": ex.cleaned.len(),
+                        "mcp_servers": count("mcp", "servers"),
+                        "a2a_peers": count("a2a", "peers"),
+                        "workflows": ex.workflows.len(),
+                        "skills": ex.skills.len(),
+                        "people": ex.people.len(),
+                        "not_activated": ex.declarations.values().map(Vec::len).sum::<usize>(),
+                    }));
+                    // The SDK's warnings and agentd's host-policy diagnostics:
+                    // said, never a refusal.
+                    instruction_warnings.extend(
+                        ex.warnings
+                            .iter()
+                            .map(|w| format!("agent.instruction: {w}")),
+                    );
                     if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                         a.insert("instruction".into(), Value::String(ex.cleaned.clone()));
                     }
@@ -5601,7 +5620,7 @@ impl Settings {
                     let forbidden = document_wrote_operator_config(&ex.config);
                     if !forbidden.is_empty() {
                         return Err(format!(
-                            "{source}: the instruction's :::!config writes {} — operator configuration is not a document's to set (§6 rule 4). A document that could grant itself capabilities, relax a security gate, or re-point its own source would be deciding the terms it is judged by.",
+                            "{source}: the instruction's :::config writes {} — operator configuration is not a document's to set (§6 rule 4). A document that could grant itself capabilities, relax a security gate, or re-point its own source would be deciding the terms it is judged by.",
                             forbidden.join(", ")
                         ));
                     }
@@ -5649,10 +5668,10 @@ impl Settings {
                     // `workflows` is the document's to write, but a route on
                     // the operator's webhook listener is not what the agent IS:
                     // it is an inbound socket answering whoever can reach it,
-                    // with the auth the route itself names. `:::!endpoint` —
+                    // with the auth the route itself names. `:::endpoint` —
                     // which folds into exactly such a workflow — needs the
                     // `interface` grant, so the same workflow written as a
-                    // `:::!workflow` (or under `:::!config`) needs it too.
+                    // `:::workflow` (or under `:::config`) needs it too.
                     // Without this the grant gated one spelling of the route.
                     // Judged here for the inline definitions, so
                     // `--validate-config` reports it; the references resolve
@@ -5689,7 +5708,7 @@ impl Settings {
                             operator_intelligence = Some(operator);
                         }
                         // `merge_missing` puts a fragment's array entries
-                        // AHEAD of the operator's, so the `:::!config`
+                        // AHEAD of the operator's, so the `:::config`
                         // workflows are the first ones — counted before the
                         // merge, which drops them when `workflows` is not a
                         // list to merge into.
@@ -5713,10 +5732,11 @@ impl Settings {
                     idoc_extraction = Some(ex);
                 }
                 Err(errs) => {
+                    // Each refusal names its line and its stable code.
                     return Err(format!(
                         "{source}: agent.instruction:\n  {}",
                         errs.iter()
-                            .map(ToString::to_string)
+                            .map(|e| format!("{e} ({})", e.code))
                             .collect::<Vec<_>>()
                             .join("\n  ")
                     ));
@@ -5788,31 +5808,23 @@ impl Settings {
                 let at = format!("{source}: subagents.templates.{name}.instruction");
                 let resolved = resolve_document_source(v, &at, &egress_policy)?;
                 instruction_warnings.extend(resolved.warnings);
-                // A template folds with every family, as the operator's own
+                // A template folds with every grant, as the operator's own
                 // text — but one fetched from a URL or a registry is not, and
-                // the §7.8 floor holds for it. One that does not parse is
-                // reported where templates compile.
+                // the §7.8 floor holds for it: an A2A agent it declares would
+                // write `a2a.peers`, which the floor's check below refuses.
+                // One that does not parse is reported where templates compile.
                 if resolved.over_the_wire
-                    && let Ok(parsed) = crate::config::idoc::parse(&resolved.text)
-                {
-                    if let Err(refused) = crate::config::idoc::check_wire_floor(&parsed) {
-                        return Err(refused
-                            .iter()
-                            .map(|r| format!("{at}: {r}"))
-                            .collect::<Vec<_>>()
-                            .join("\n"));
-                    }
-                    if let Ok(ex) = crate::config::idoc::extract(
+                    && let Ok(ex) = crate::config::idoc::extract(
                         &resolved.text,
                         &crate::config::idoc::all_families(),
-                    ) {
-                        let reached = crate::config::idoc::wire_floor_effects(&ex);
-                        if !reached.is_empty() {
-                            return Err(format!(
-                                "{at}: the document arrived over the wire and {} — a fetched document reaches no identity or credential (§7.8)",
-                                reached.join(" and ")
-                            ));
-                        }
+                    )
+                {
+                    let reached = crate::config::idoc::wire_floor_effects(&ex);
+                    if !reached.is_empty() {
+                        return Err(format!(
+                            "{at}: the document arrived over the wire and {} — a fetched document reaches no identity or credential (§7.8)",
+                            reached.join(" and ")
+                        ));
                     }
                 }
                 if let Some(o) = t.as_object_mut() {
@@ -5852,12 +5864,12 @@ impl Settings {
             .map(Box::new);
         settings.agent.document_workflows = document_workflows;
         settings.agent.document_grants = document_grants;
-        settings.agent.instruction_facts = instruction_facts;
         settings.agent.instruction_origin = instruction_origin;
         settings.agent.instruction_path = instruction_path;
         settings.agent.instruction_spec = instruction_spec;
         settings.agent.instruction_dir_files = instruction_dir_files;
         settings.agent.instruction_warnings = instruction_warnings;
+        settings.agent.instruction_read = instruction_read;
         Ok(settings)
     }
 
@@ -5871,7 +5883,7 @@ impl Settings {
         let Some(w) = self.workflows.get(i) else {
             return format!("workflows[{i}]");
         };
-        // The index the OPERATOR wrote: a document's `:::!config` workflows
+        // The index the OPERATOR wrote: a document's `:::config` workflows
         // sit in front of theirs once merged, and `workflows[1]` for the one
         // entry their file has sends them looking for a second.
         let i = i - self.agent.document_workflows.range(..i).count();
@@ -6780,12 +6792,12 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     //
     // Decided HERE, on the TYPED settings, not on the raw document: only after
     // typing is the instruction actually resolved (a file read, a folder
-    // combined, an artifact pulled) and its `:::!workflow` directives extracted
+    // combined, an artifact pulled) and its `:::workflow` directives extracted
     // into `settings.workflows`. Judging the document instead meant the long
     // form got no sugar at all (an object is not a non-blank string), and a
     // path-valued short form got sugar *on top of* the workflows its own
     // document declared — a model loop nobody asked for, dialing intelligence.
-    // The same goes for the shape: a `run_until` set by a `:::!config`
+    // The same goes for the shape: a `run_until` set by a `:::config`
     // fragment is only in the typed settings.
     // …and `--effective-config` too: a report that omitted the workflow a run
     // would synthesize would describe a config nobody runs.
@@ -6817,7 +6829,7 @@ pub fn load(args: &[String], env: &[(String, String)]) -> Result<(Loaded, Ask), 
     // it, and re-running it is already the recovery story.
     //
     // "Explicit" has to mean any layer INCLUDING an instruction directive. A
-    // `:::!config` fragment declaring `store: {kind: memory}` is folded into
+    // `:::config` fragment declaring `store: {kind: memory}` is folded into
     // `settings` during typing and never written back into `doc`, so reading
     // the document alone judged it unstated and overrode it. That stayed hidden
     // only because `stream` was missing from the long-lived list this check
@@ -7377,7 +7389,7 @@ fn apply_instruction_sugar(doc: &mut Value, settings: &mut Settings) {
     let nonblank = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
     // Any workflow at all — declared in the config, loaded from a
     // `workflows/` folder, or extracted from the instruction's own
-    // `:::!workflow` directives — means the machinery was authored, and
+    // `:::workflow` directives — means the machinery was authored, and
     // bolting a model loop onto it would run work nobody declared.
     //
     // A prompt likewise: it runs as a root turn, so an instruction+prompt pair
@@ -7386,7 +7398,7 @@ fn apply_instruction_sugar(doc: &mut Value, settings: &mut Settings) {
     // With no workflow there is no long-lived start, so the shape is the
     // listener's and `run_until`'s — read off the typed settings, where every
     // layer already is: file, environment, flag and the instruction's own
-    // `:::!config`, and so what `agentd tui`/`ui` loads too.
+    // `:::config`, and so what `agentd tui`/`ui` loads too.
     if !settings.workflows.is_empty()
         || !nonblank(&settings.agent.instruction)
         || nonblank(&settings.agent.prompt)
@@ -9199,7 +9211,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // instance-machinery checks all run here, so a bad template refuses the
     // PARENT's startup — naming the template — instead of failing at the first
     // spawn, long after the deploy.
-    // A template's gates addressed to a `::!human` with a channel are
+    // A template's gates addressed to a `::human` with a channel are
     // announced on it in the child: the parent composes the channels into
     // the child's `agent.gate_channels` (`runtime::instances`).
     if let Err(errs) = crate::config::templates::compile_templates(s) {
@@ -9464,7 +9476,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
 
     // workflows (the structural minimum only; full validation is the engine's)
     // name → the index of the entry that defined it first, so a second one
-    // is refused naming both (an instruction document's `:::!workflow` is an
+    // is refused naming both (an instruction document's `:::workflow` is an
     // entry here too, spliced in before typing).
     let mut wf_names: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (i, w) in s.workflows.iter().enumerate() {
@@ -11223,7 +11235,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
 pub const RESTART_ONLY_WITHIN_RELOADABLE: &[&str] =
     &["agent.instruction.trust", "observability.audit.chain"];
 
-/// `doc` with the instruction's own `:::!config` under it, the operator's
+/// `doc` with the instruction's own `:::config` under it, the operator's
 /// value standing where both set a path — the layers `settings` was typed
 /// from. The load folds that fragment into the settings and never writes it
 /// back into the document, so a restart-only check over the document alone
@@ -12265,10 +12277,10 @@ mod tests {
             "--goal.statement",
             "the queue is empty",
         ]));
-        // The shape a document's own `:::!config` states counts like any
+        // The shape a document's own `:::config` states counts like any
         // other layer's.
         let md = write_tmp(
-            "You triage.\n\n:::!config\nlifecycle: { run_until: drained }\n:::\n",
+            "You triage.\n\n:::config{id=cfg1 dialect=agentd/config}\nlifecycle: { run_until: drained }\n:::\n",
             "md",
         );
         assert!(refused(&[
@@ -13249,14 +13261,14 @@ mod tests {
 
     /// The short and long forms are the SAME setting, so an agent defined
     /// either way gets the same one-shot sugar workflow — and a document that
-    /// carries its own `:::!workflow` gets none, however its source was named.
+    /// carries its own `:::workflow` gets none, however its source was named.
     #[test]
     fn the_sugar_workflow_does_not_depend_on_how_the_source_was_named() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.md"), "be terse\n").unwrap();
         let carries_doc = concat!(
             "be terse\n\n",
-            ":::!workflow{name=own}\n",
+            ":::workflow{id=own dialect=instruction/workflow}\n",
             "steps:\n",
             "  s: { kind: once }\n",
             "  f: { kind: finish, depends_on: [s], status: completed }\n",
@@ -13308,7 +13320,7 @@ mod tests {
             &doc,
             concat!(
                 "be terse\n\n",
-                ":::!workflow{name=dup}\n",
+                ":::workflow{id=dup dialect=instruction/workflow}\n",
                 "steps:\n",
                 "  s: { kind: once }\n",
                 "  f: { kind: finish, depends_on: [s], status: completed }\n",
@@ -13347,7 +13359,7 @@ mod tests {
         );
     }
 
-    /// The same collision through the document's OTHER door: a `:::!config`
+    /// The same collision through the document's OTHER door: a `:::config`
     /// fragment's `workflows`, which the merge puts ahead of the operator's
     /// entries. The refusal still names the document, and the operator's entry
     /// by the index their own file gives it.
@@ -13359,7 +13371,7 @@ mod tests {
             &doc,
             concat!(
                 "be terse\n\n",
-                ":::!config\n",
+                ":::config{id=cfg2 dialect=agentd/config}\n",
                 "workflows:\n",
                 "  - name: dup\n",
                 "    steps:\n",
@@ -13426,22 +13438,22 @@ mod tests {
         m
     }
 
-    /// The three spellings of a route a document can write: a `:::!workflow`
-    /// with a `webhook` start, the same under `:::!config`, and a
+    /// The three spellings of a route a document can write: a `:::workflow`
+    /// with a `webhook` start, the same under `:::config`, and a
     /// `wait {on: webhook}` inside a body.
     const DOCUMENT_ROUTES: &[(&str, &str, &str)] = &[
         (
-            ":::!workflow{name=intake}\nsteps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook], status: completed}\n:::\n",
+            ":::workflow{id=intake dialect=instruction/workflow}\nsteps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook], status: completed}\n:::\n",
             "workflow \"intake\" step \"hook\"",
             "a `webhook` start",
         ),
         (
-            ":::!config\nworkflows:\n  - name: intake\n    steps:\n      hook: {kind: webhook, path: /in}\n      f: {kind: finish, depends_on: [hook], status: completed}\n:::\n",
+            ":::config{id=cfg3 dialect=agentd/config}\nworkflows:\n  - name: intake\n    steps:\n      hook: {kind: webhook, path: /in}\n      f: {kind: finish, depends_on: [hook], status: completed}\n:::\n",
             "workflow \"intake\" step \"hook\"",
             "a `webhook` start",
         ),
         (
-            ":::!workflow{name=callback}\nsteps:\n  s: {kind: once}\n  each:\n    kind: foreach\n    depends_on: [s]\n    over: [1]\n    body:\n      steps:\n        w: {kind: wait, on: webhook, webhook: {path: /cb}, timeout: 30s}\n  f: {kind: finish, depends_on: [each], status: completed}\n:::\n",
+            ":::workflow{id=callback dialect=instruction/workflow}\nsteps:\n  s: {kind: once}\n  each:\n    kind: foreach\n    depends_on: [s]\n    over: [1]\n    body:\n      steps:\n        w: {kind: wait, on: webhook, webhook: {path: /cb}, timeout: 30s}\n  f: {kind: finish, depends_on: [each], status: completed}\n:::\n",
             "workflow \"callback\" step \"each/w\"",
             "a `wait {on: webhook}`",
         ),
@@ -13449,7 +13461,7 @@ mod tests {
 
     /// RFC 0042 left a hole RFC 0045 found: `workflows` is the document's to
     /// write, and a `webhook` start in one opens a route on the OPERATOR's
-    /// listener. `:::!endpoint` — the block that folds into exactly that
+    /// listener. `:::endpoint` — the block that folds into exactly that
     /// workflow — needs the `interface` grant; the same route written as a
     /// workflow needed nothing. Refused at load, naming the workflow, the
     /// step and the document.
@@ -13474,9 +13486,8 @@ mod tests {
         }
     }
 
-    /// The grant is the operator's way to open it, and `:::!endpoint` keeps
-    /// working under it — the control that shows the refusal is the grant's,
-    /// not a blanket one.
+    /// The grant is the operator's way to open it — the control that shows
+    /// the refusal is the grant's, not a blanket one.
     #[cfg(feature = "a2a")]
     #[test]
     fn the_interface_grant_lets_a_document_open_a_route() {
@@ -13488,13 +13499,6 @@ mod tests {
             ) {
                 panic!("granted, and still refused: {e}\n{block}");
             }
-        }
-        if let Err(e) = load_with_document(
-            "You are the desk.\n\n:::!endpoint{name=in path=/in}\ninto: {stream: inbox, subject: msg}\n:::\n",
-            json!({"document_capabilities": ["interface"]}),
-            json!({"streams": {"inbox": {}}}),
-        ) {
-            panic!("an endpoint block under its grant: {e}");
         }
     }
 
@@ -13575,7 +13579,7 @@ mod tests {
     #[cfg(feature = "a2a")]
     #[test]
     fn an_operator_configured_webhook_workflow_still_loads() {
-        let doc = "You are the desk.\n\n:::!workflow{name=tick}\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s], status: completed}\n:::\n";
+        let doc = "You are the desk.\n\n:::workflow{id=tick dialect=instruction/workflow}\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s], status: completed}\n:::\n";
         if let Err(e) = load_with_document(
             doc,
             json!({}),
@@ -13656,7 +13660,7 @@ mod tests {
             let p = dir.path().join(name);
             std::fs::write(
                 &p,
-                format!("You are the desk.\n\n:::!config\n{fragment}\n:::\n"),
+                format!("You are the desk.\n\n:::config{{id=cfg4 dialect=agentd/config}}\n{fragment}\n:::\n"),
             )
             .unwrap();
             p.to_string_lossy().to_string()
@@ -14032,13 +14036,13 @@ mod tests {
     #[test]
     fn a_prompts_end_matter_is_dropped_from_every_source() {
         use std::io::{Read, Write};
-        const TASK: &str = "Summarize the inbox.\n<!-- kept: a prompt is not delivered -->\n\n---\nowner: ops\n---\n";
+        const TASK: &str = "Summarize the inbox.\n<!-- kept: a prompt is not delivered -->\n\n---\nowners: [ops]\n";
         const WANT: &str = "Summarize the inbox.\n<!-- kept: a prompt is not delivered -->\n";
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("task.md"), TASK).unwrap();
         let folder = dir.path().join("tasks");
         std::fs::create_dir(&folder).unwrap();
-        std::fs::write(folder.join("10-a.md"), "First.\n\n---\nowner: a\n---\n").unwrap();
+        std::fs::write(folder.join("10-a.md"), "First.\n\n---\nowners: [a]\n").unwrap();
         std::fs::write(folder.join("20-b.md"), TASK).unwrap();
         // One loopback response, for the `url:` source.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -14085,19 +14089,16 @@ mod tests {
         std::fs::create_dir(&framed).unwrap();
         std::fs::write(
             framed.join("a.md"),
-            "x\n\n---\nk: body\n---\n\n---\nowner: a\n---\n",
+            "x\n\n---\nk: body\n\n---\nowners: [a]\n",
         )
         .unwrap();
         assert_eq!(
             prompt(json!({"dir": {"path": framed.to_string_lossy()}})).unwrap(),
-            "x\n\n---\nk: body\n---\n"
+            "x\n\n---\nk: body\n"
         );
         // Malformed: refused, naming the setting — from a literal too.
-        let e = prompt(json!("Do it.\n\n---\nowner: [unclosed\n---\n")).unwrap_err();
-        assert!(
-            e.contains("agent.prompt: end matter is not valid YAML"),
-            "{e}"
-        );
+        let e = prompt(json!("Do it.\n\n---\nowners: [unclosed\n")).unwrap_err();
+        assert!(e.contains("agent.prompt: "), "{e}");
         // A prompt with no end matter is the operator's text, byte for byte.
         assert_eq!(prompt(json!("Do it.\n\n\n")).unwrap(), "Do it.\n\n\n");
         // A task typed at a terminal can end in a `---` block meant as text:
@@ -14112,7 +14113,7 @@ mod tests {
         let said = warnings(json!(TASK));
         assert!(
             said.iter()
-                .any(|w| w.starts_with("agent.prompt:") && w.contains("(3 lines)")),
+                .any(|w| w.starts_with("agent.prompt:") && w.contains("(2 lines)")),
             "{said:?}"
         );
         assert!(warnings(json!("Do it.\n")).is_empty());
@@ -14245,7 +14246,26 @@ mod tests {
     /// `body` as a document signed by `key` for `instruction://ins_1`, its
     /// author standing behind `caps` — the bytes `agentd sign` writes.
     #[cfg(feature = "sign")]
-    fn signed_document(key: &crate::aauth::AgentKey, body: &str, caps: &[&str]) -> String {
+    /// Write a document and, beside it, its author signature (`<path>.jws`).
+    #[cfg(feature = "sign")]
+    fn write_signed(
+        path: &std::path::Path,
+        key: &crate::aauth::AgentKey,
+        body: &str,
+        caps: &[&str],
+    ) {
+        let (doc, jws) = signed_document(key, body, caps);
+        std::fs::write(path, doc).unwrap();
+        std::fs::write(format!("{}.jws", path.display()), jws).unwrap();
+    }
+
+    /// A document and its author signature, which travels beside it.
+    #[cfg(feature = "sign")]
+    fn signed_document(
+        key: &crate::aauth::AgentKey,
+        body: &str,
+        caps: &[&str],
+    ) -> (String, String) {
         use crate::config::attest::{Claims, SPEC_CLAIM, author_digest, sign};
         let head = format!("---\nspec: \"1\"\nid: instruction://ins_1\n---\n{body}");
         let claims = Claims {
@@ -14263,11 +14283,7 @@ mod tests {
             author: None,
         };
         let jws = sign(key, &claims).unwrap();
-        head.replacen(
-            "id: instruction://ins_1\n",
-            &format!("id: instruction://ins_1\nsignature: {jws}\n"),
-            1,
-        )
+        (head, jws)
     }
 
     /// A signed FOLDER is capped by its narrowest file. Its files fold into
@@ -14286,18 +14302,13 @@ mod tests {
         std::fs::write(&key_file, key.public_bytes()).unwrap();
         let docs = dir.path().join("docs");
         std::fs::create_dir(&docs).unwrap();
-        let route = "Take the inbox.\n\n:::!endpoint{name=in path=/in}\ninto: {stream: inbox, subject: msg}\n:::\n";
+        let route = concat!(
+            "Take the inbox.\n\n",
+            ":::workflow{id=in dialect=instruction/workflow}\nname: endpoint-in\nsteps:\n  hook: {kind: webhook, path: /in, into: {stream: inbox, subject: msg}}\n:::\n"
+        );
         let load = |a_caps: &[&str]| {
-            std::fs::write(
-                docs.join("a.md"),
-                signed_document(&key, "You are the desk.\n", a_caps),
-            )
-            .unwrap();
-            std::fs::write(
-                docs.join("b.md"),
-                signed_document(&key, route, &["interface"]),
-            )
-            .unwrap();
+            write_signed(&docs.join("a.md"), &key, "You are the desk.\n", a_caps);
+            write_signed(&docs.join("b.md"), &key, route, &["interface"]);
             Settings::from_document(
                 json!({"agent": {"name": "a", "preflight": "never",
                           "document_capabilities": ["interface"],
@@ -14317,7 +14328,7 @@ mod tests {
         }
         // One does not: the folder may not open it, though `b.md` alone could.
         let e = load(&[]).expect_err("a file's attestation lent the folder a family");
-        assert!(e.contains("`interface` capability"), "{e}");
+        assert!(e.contains("`interface` grant"), "{e}");
     }
 
     /// Pins whose keys are all registry JWKS uris cannot verify a folder any
@@ -15591,7 +15602,7 @@ mod tests {
         let instr = dir.path().join("desk.md");
         std::fs::write(
             &instr,
-            "You are the desk.\n\n:::!config\ninterface:\n  enabled: true\n:::\n",
+            "You are the desk.\n\n:::config{id=cfg5 dialect=agentd/config}\ninterface:\n  enabled: true\n:::\n",
         )
         .unwrap();
         let e = Settings::from_document(
@@ -15638,7 +15649,7 @@ mod tests {
     }
 
     /// instruction.md §7.5: `instruction_sources` and a top-level
-    /// `document_capabilities` MUST be unreachable from `!config`. Neither is
+    /// `document_capabilities` MUST be unreachable from `config`. Neither is
     /// a setting agentd has, so no list names them — and the fail-closed walk
     /// refuses a path nobody classified, which is what keeps them out.
     #[test]
@@ -15655,7 +15666,9 @@ mod tests {
             let instr = dir.path().join(format!("reach-{i}.md"));
             std::fs::write(
                 &instr,
-                format!("You are the desk.\n\n:::!config\n{body}:::\n"),
+                format!(
+                    "You are the desk.\n\n:::config{{id=cfg6 dialect=agentd/config}}\n{body}:::\n"
+                ),
             )
             .unwrap();
             let e = Settings::from_document(
@@ -15688,66 +15701,12 @@ mod tests {
         }
     }
 
-    /// The facts an instruction is judged by are the OPERATOR's model as the
-    /// provider receives it — a tier name resolved through `models` — and a
-    /// document's own `:::!config` cannot choose them.
-    #[test]
-    fn instruction_facts_come_from_the_operators_model() {
-        let doc = |intel: Value, instruction: &str| json!({"intelligence": intel, "agent": {"instruction": instruction}});
-        let variants = "---\nspec: \"1\"\n---\nBase.\n\n:::when{agent=\"claude\"}\nFOR-CLAUDE\n:::\n\n:::when{agent=\"gpt\"}\nFOR-GPT\n:::\n";
-        let s = Settings::from_document(
-            doc(
-                json!({"endpoints": ["https://llm.example/v1"], "model": "fast",
-                       "models": {"fast": {"model": "anthropic/claude-haiku-4-5"}}}),
-                variants,
-            ),
-            "t",
-        )
-        .unwrap();
-        let f = &s.agent.instruction_facts;
-        assert_eq!(f["host"], "agentd");
-        assert_eq!(
-            f["model"], "anthropic/claude-haiku-4-5",
-            "the tier's wire model"
-        );
-        assert_eq!(f["agent"], "claude");
-        let text = s.agent.instruction.as_deref().unwrap();
-        assert!(
-            text.contains("FOR-CLAUDE") && !text.contains("FOR-GPT"),
-            "{text}"
-        );
-
-        // No operator model: the document's `:::!config` names one, and it
-        // is NOT what its variants are decided by — `agent` stays unknown,
-        // so both are kept (rule 3).
-        let chooses = format!("{variants}\n:::!config\nintelligence: {{ model: gpt-5.1 }}\n:::\n");
-        let s = Settings::from_document(
-            doc(json!({"endpoints": ["https://llm.example/v1"]}), &chooses),
-            "t",
-        )
-        .unwrap();
-        assert_eq!(
-            s.intelligence.model.as_deref(),
-            Some("gpt-5.1"),
-            "the fragment applied"
-        );
-        assert_eq!(
-            s.agent.instruction_facts,
-            BTreeMap::from([("host".to_string(), "agentd".to_string())])
-        );
-        let text = s.agent.instruction.as_deref().unwrap();
-        assert!(
-            text.contains("FOR-CLAUDE") && text.contains("FOR-GPT"),
-            "{text}"
-        );
-    }
-
     /// An instance child uses its instruction as written only when it IS an
     /// instance child and the text is byte for byte what the parent delivered.
     #[test]
     fn a_parent_delivered_instruction_is_bound_to_its_digest() {
         let text = "**MUST:** cite.\n";
-        let digest = instruction_core::digest(text.as_bytes());
+        let digest = instruction_md::digest(text.as_bytes());
         let mark = |child: bool, d: Option<&str>| parent_mark(child, d.map(str::to_string));
         assert!(delivered_already(
             text,
@@ -15777,7 +15736,7 @@ mod tests {
         let delivered = "**MUST:** cite.\n\nMUST[y]: a\nMUST[y]: b\n";
         let doc = json!({"agent": {"instruction": delivered}, "store": {"kind": "memory"}});
         let e = Settings::from_document(doc.clone(), "template").unwrap_err();
-        assert!(e.contains("duplicate must/y"), "{e}");
+        assert!(e.contains("is used twice"), "{e}");
         let s = Settings::from_delivered_document(doc, "template", delivered).unwrap();
         assert_eq!(s.agent.instruction.as_deref(), Some(delivered));
         let other = json!({"agent": {"instruction": "MUST[y]: a\nMUST[y]: b\n"}});
@@ -15972,12 +15931,12 @@ mod tests {
             serde_json::from_value(json!({"agent": {"ask_human_unowned": "gate"}})).unwrap();
         assert!(super::document_wrote_operator_config(&frag).is_empty());
 
-        // And end to end, through a real `:::!config` block.
+        // And end to end, through a real `:::config` block.
         let dir = tempfile::tempdir().unwrap();
         let doc = dir.path().join("card.md");
         std::fs::write(
             &doc,
-            "You are the desk.\n\n:::!config\na2a:\n  device_grant:\n    enabled: true\n:::\n",
+            "You are the desk.\n\n:::config{id=cfg7 dialect=agentd/config}\na2a:\n  device_grant:\n    enabled: true\n:::\n",
         )
         .unwrap();
         let e = Settings::from_document(
@@ -16048,7 +16007,7 @@ mod tests {
         );
     }
 
-    /// A restart-only path the instruction's own `:::!config` sets is held to
+    /// A restart-only path the instruction's own `:::config` sets is held to
     /// the operator's rule: a reload that moves it is refused. Where the
     /// operator's value stands over the document's, the document moves
     /// nothing.
@@ -16067,7 +16026,7 @@ mod tests {
             with_document_config(&l.doc, &l.settings)
         };
         let plain = "You triage.\n";
-        let idle = "You triage.\n\n:::!config\nlifecycle: { run_until: idle }\n:::\n";
+        let idle = "You triage.\n\n:::config{id=cfg8 dialect=agentd/config}\nlifecycle: { run_until: idle }\n:::\n";
         assert_eq!(
             restart_only_diff(&effective(plain, &[]), &effective(idle, &[])),
             ["lifecycle.run_until"]
@@ -16098,9 +16057,8 @@ mod tests {
 
     #[test]
     fn instruction_config_directives_define_the_agent_and_explicit_keys_win() {
-        let instr = ":::!config\nlimits: {max_runs: 9}\n:::\n\
-                     :::!stream{name=orders}\nretention: {max_events: 50}\n:::\n\
-                     :::!mcp{name=fs}\nendpoint: \"https://fs.internal/mcp\"\nexclude: [\"delete_*\"]\n:::\n\
+        let instr = ":::config{id=cfg9 dialect=agentd/config}\nlimits: {max_runs: 9}\nstreams:\n  orders: {retention: {max_events: 50}}\n:::\n\n\
+                     ::mcp{id=fs src=\"https://fs.internal/mcp\" deny=\"delete_*\"}\n\n\
                      Do the work.";
         let s = Settings::from_document(
             json!({"agent": {"instruction": instr}, "limits": {"max_runs": 3}}),
@@ -16127,15 +16085,14 @@ mod tests {
         assert_eq!(srv.exclude, vec!["delete_*"]);
         let cleaned = s.agent.instruction.as_deref().unwrap();
         assert!(cleaned.contains("Do the work."));
-        assert!(
-            !cleaned.contains("endpoint"),
-            "machinery never reaches the model"
-        );
+        // The agent text is the SDK's: a connected object reaches the model
+        // as its heading and attributes.
+        assert!(cleaned.contains("### mcp: fs"), "{cleaned}");
         // A fragment with a bogus section is refused by the SAME deserializer
         // that guards the config file — no parallel, laxer path.
         assert!(
             Settings::from_document(
-                json!({"agent": {"instruction": ":::!config\nnot_a_section: 1\n:::\nx"}}),
+                json!({"agent": {"instruction": ":::config{id=cfg10 dialect=agentd/config}\nnot_a_section: 1\n:::\nx"}}),
                 "t"
             )
             .is_err()
@@ -17632,7 +17589,7 @@ mod tests {
     #[test]
     fn a_document_cannot_re_point_the_approve_judge() {
         let l = load_doc(
-            "agent:\n  instruction: |\n    :::!config\n    intelligence:\n      models:\n        big-judge: {model: tiny-agreeable}\n        fast: {model: fast-1}\n      roles: {turn: fast}\n    :::\n    Work.\nintelligence:\n  endpoints: \"mock:json\"\n  model: main-wire\n  roles: {approve: big-judge}\n",
+            "agent:\n  instruction: |\n    :::config{id=cfg11 dialect=agentd/config}\n    intelligence:\n      models:\n        big-judge: {model: tiny-agreeable}\n        fast: {model: fast-1}\n      roles: {turn: fast}\n    :::\n    Work.\nintelligence:\n  endpoints: \"mock:json\"\n  model: main-wire\n  roles: {approve: big-judge}\n",
         )
         .unwrap();
         let i = &l.settings.intelligence;
@@ -17658,7 +17615,7 @@ mod tests {
     /// dropped with a warning, not refused as said twice.
     #[test]
     fn the_operators_turn_model_wins_over_a_documents() {
-        let instr = ":::!config\nintelligence:\n  models:\n    fast: {model: fast-1}\n  roles: {turn: fast, think: fast}\n:::\nWork.";
+        let instr = ":::config{id=cfg12 dialect=agentd/config}\nintelligence:\n  models:\n    fast: {model: fast-1}\n  roles: {turn: fast, think: fast}\n:::\nWork.";
         let s = Settings::from_document(
             json!({"agent": {"instruction": instr}, "intelligence": {"model": "main-wire"}}),
             "t",
@@ -17710,9 +17667,9 @@ mod tests {
                 "intelligence.routes.cheap".to_string(),
             ]
         );
-        // And through a real `:::!config` block: the load is refused.
+        // And through a real `:::config` block: the load is refused.
         let e = Settings::from_document(
-            json!({"agent": {"instruction": ":::!config\nintelligence:\n  models:\n    cheap: {model: m-1}\n  routes: {cheap: every message}\n:::\nWork."},
+            json!({"agent": {"instruction": ":::config{id=cfg13 dialect=agentd/config}\nintelligence:\n  models:\n    cheap: {model: m-1}\n  routes: {cheap: every message}\n:::\nWork."},
                    "intelligence": {"endpoints": "mock:json"}}),
             "t",
         )
@@ -17747,7 +17704,10 @@ mod tests {
         let load = |block: &str, services: Value| {
             std::fs::write(
                 &instr,
-                format!("You are the desk.\n\n:::!mcp{{name=gh}}\n{block}:::\n"),
+                format!(
+                    "You are the desk.\n\n:::config{{id=servers dialect=agentd/config}}\nmcp:\n  servers:\n    - name: gh\n{}:::\n",
+                    block.lines().map(|l| format!("      {l}\n")).collect::<String>()
+                ),
             )
             .unwrap();
             Settings::from_document(
@@ -17816,7 +17776,7 @@ mod tests {
         let instr = dir.path().join("events.md");
         std::fs::write(
             &instr,
-            "You are the desk.\n\n:::!config\nmcp:\n  servers:\n    - name: gh\n      endpoint: https://mcp.example/mcp\n      events:\n        - name: push\n          delivery: [poll]\n          into: {stream: s, subject: s}\n:::\n",
+            "You are the desk.\n\n:::config{id=cfg14 dialect=agentd/config}\nmcp:\n  servers:\n    - name: gh\n      endpoint: https://mcp.example/mcp\n      events:\n        - name: push\n          delivery: [poll]\n          into: {stream: s, subject: s}\n:::\n",
         )
         .unwrap();
         let e = Settings::from_document(

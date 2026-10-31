@@ -5,9 +5,9 @@
 //! document plus its expected OBSERVABLE outcome: does it validate, which error
 //! substrings appear, and what registers (`--capabilities`). They are
 //! agentd-owned black-box probes of the loader — the spec's own conformance
-//! corpus is the crate's (`crates/instruction/tests/conformance/`). The
-//! registry the parser uses IS the vendored `instruction.schema.json`, and
-//! this file also holds the checks that keep that vendor faithful.
+//! cases are the instruction.md SDK's, which agentd reads documents with. This
+//! file also holds the checks that keep the SDK's registry the pinned
+//! specification's.
 #![cfg(unix)]
 
 use std::path::Path;
@@ -113,7 +113,7 @@ fn the_conformance_corpus_passes_against_this_binary() {
     let (pv, _, pc) = run_case(&root.join("core/001-core-happy.instruction.md"), &[]);
     assert!(
         pv && !pc["workflows"].as_array().is_none_or(|a| a.is_empty()),
-        "{ver} validates the probe but extracts no directives — extraction regressed"
+        "{ver} validates the probe but maps no blocks — extraction regressed"
     );
     let mut cases = 0usize;
     let mut skipped = 0usize;
@@ -216,104 +216,58 @@ fn the_conformance_corpus_passes_against_this_binary() {
     );
 }
 
-/// The registry is the vendored JSON Schema itself, so it cannot drift from the
-/// parser — but the schema states its machinery set TWICE (the flat
-/// `x-registry.machinery` list, and the per-kind `$defs.kinds.*.x-disposition`),
-/// and those two views must agree or the file is internally inconsistent. Since
-/// the parser derives its set from `$defs`, this also proves the accessor reads
-/// the file the reference implementation actually ships.
+/// agentd reads documents with the instruction.md SDK, which vendors the
+/// specification's registry at one commit (`instruction_md::SPEC_COMMIT`).
+/// CI checks the specification out at a pinned revision for the drift check
+/// below; the two must name the same commit, or the drift check would hold
+/// the SDK's registry to a specification it was never taken from.
 #[test]
-fn the_schema_registry_agrees_with_the_parser() {
-    let schema: Value = serde_json::from_str(agentd::config::idoc::schema_json()).unwrap();
-    let mut listed: Vec<&str> = schema["x-registry"]["machinery"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    listed.sort_unstable();
-    let mut known: Vec<&str> = agentd::config::idoc::machinery_names().collect();
-    known.sort_unstable();
-    assert_eq!(
-        listed, known,
-        "the schema's x-registry.machinery drifted from its own $defs.kinds"
-    );
-    // The names refused bare are `x-registry.reserved-bare` (S23), not the
-    // whole machinery list: `eval`, registered after version 1, is prose
-    // when written bare.
-    let mut reserved: Vec<&str> = schema["x-registry"]["reserved-bare"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    reserved.sort_unstable();
-    assert!(!reserved.is_empty());
-    // By behaviour, not by the loader's copy of the same list: the machinery
-    // names the parser refuses when written bare are exactly reserved-bare,
-    // and every other one written bare is inert prose — no block, no
-    // refusal — unless it is a sub-block, which is written bare.
-    let bare = |k: &str| agentd::config::idoc::parse(&format!(":::{k}\n:::\n"));
-    let refused: Vec<&str> = known
-        .iter()
-        .copied()
-        .filter(|k| bare(k).is_err_and(|e| e.iter().any(|r| r.code == "bare-machinery-kind")))
-        .collect();
-    assert_eq!(
-        reserved, refused,
-        "the names refused bare drifted from x-registry.reserved-bare"
-    );
-    let mut inert = 0;
-    for k in known.iter().filter(|k| !reserved.contains(k)) {
-        if agentd::config::idoc::lookup(k).is_some_and(|kind| kind.sub_of.is_some()) {
-            continue;
-        }
-        let d = bare(k).unwrap_or_else(|e| panic!(":::{k} written bare is refused: {e:?}"));
-        assert_eq!(
-            d.blocks().count(),
-            0,
-            ":::{k} written bare declared a block"
-        );
-        inert += 1;
-    }
+fn the_sdk_reads_the_pinned_specification() {
+    let ci = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/ci.yml"),
+    )
+    .expect("ci.yml is readable");
+    let pin = ci
+        .split("repository: instruction-md/specification")
+        .nth(1)
+        .and_then(|rest| rest.lines().find_map(|l| l.trim().strip_prefix("ref: ")))
+        .map(str::trim)
+        .expect("ci.yml pins the specification");
+    let sdk = agentd::config::idoc::SPEC_COMMIT;
     assert!(
-        inert > 0,
-        "no machinery registered after version 1 was checked"
+        !sdk.is_empty() && pin.starts_with(sdk),
+        "ci.yml pins the specification at {pin}, but the SDK's registry is from {sdk}"
     );
 }
 
-/// Drift check against the spec repo, when it is reachable: the vendored JSON
-/// Schema must match upstream's — the WHOLE parsed document, not a chosen few
-/// keys, so `x-semantic-rules`, `properties.endMatter` or `required` cannot
-/// drift unseen beside a registry that still agrees. Compared SEMANTICALLY (the
-/// parsed value), so a reformat upstream is not a false alarm but any real
-/// change is. Skips cleanly where upstream is absent (a machine with no spec
-/// clone); CI checks out the pinned revision and `scripts/ci-gate.sh` refuses a
-/// run that skipped. An EXPLICIT but missing path fails rather than skips — a
-/// drift check that skips on a bad path reports health it never performed, the
-/// vacuous-pass trap this whole effort has been hunting.
+/// Drift check against the spec repo, when it is reachable: the registry the
+/// SDK reads by must be the specification's `registry.json` at the pinned
+/// revision — the WHOLE parsed document, compared semantically, so a
+/// reformat upstream is not a false alarm but any real change is. Skips
+/// cleanly where upstream is absent (a machine with no spec clone); CI checks
+/// out the pinned revision and `scripts/ci-gate.sh` refuses a run that
+/// skipped. An EXPLICIT but missing path fails rather than skips — a drift
+/// check that skips on a bad path reports health it never performed.
 #[test]
 fn the_vendored_schema_matches_upstream_when_present() {
     let explicit = std::env::var("INSTRUCTION_SPEC_REPO");
     let upstream = explicit
         .clone()
         .unwrap_or_else(|_| "/root/instruction-md/specification".into());
-    let up = Path::new(&upstream).join("instruction.schema.json");
+    let up = Path::new(&upstream).join("registry.json");
     if !up.exists() {
         assert!(
             explicit.is_err(),
-            "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no \
-             instruction.schema.json — a drift check pointed at a \
-             missing path must fail, not skip"
+            "INSTRUCTION_SPEC_REPO={upstream:?} was set but has no registry.json — a drift \
+             check pointed at a missing path must fail, not skip"
         );
         eprintln!("no upstream spec clone at the default path; drift check skipped");
         return;
     }
-    let up_schema: Value = serde_json::from_str(&std::fs::read_to_string(&up).unwrap())
-        .expect("upstream schema is valid JSON");
-    let ours: Value = serde_json::from_str(agentd::config::idoc::schema_json()).unwrap();
-    // Name the top-level keys that differ, so a failure says where to look
-    // in a schema of several thousand lines.
+    let up_registry: Value = serde_json::from_str(&std::fs::read_to_string(&up).unwrap())
+        .expect("upstream registry is valid JSON");
+    let ours: Value = serde_json::from_str(agentd::config::idoc::registry_json()).unwrap();
+    // Name the top-level keys that differ, so a failure says where to look.
     let keys = |v: &Value| -> std::collections::BTreeSet<String> {
         v.as_object()
             .into_iter()
@@ -321,14 +275,15 @@ fn the_vendored_schema_matches_upstream_when_present() {
             .collect()
     };
     let drifted: Vec<String> = keys(&ours)
-        .union(&keys(&up_schema))
-        .filter(|k| ours.get(k.as_str()) != up_schema.get(k.as_str()))
+        .union(&keys(&up_registry))
+        .filter(|k| ours.get(k.as_str()) != up_registry.get(k.as_str()))
         .cloned()
         .collect();
     assert!(
-        drifted.is_empty() && ours == up_schema,
-        "the vendored schema drifted from {upstream} at {drifted:?} — re-vendor with: \
-         cp {upstream}/instruction.schema.json crates/instruction/src/instruction.schema.json"
+        drifted.is_empty() && ours == up_registry,
+        "the SDK's registry drifted from {upstream} at {drifted:?} — move the instruction-md \
+         dependency to an SDK revision vendored from this specification revision, or move \
+         ci.yml's pin"
     );
-    eprintln!("schema drift check: identical to {upstream}");
+    eprintln!("registry drift check: identical to {upstream}");
 }

@@ -1,9 +1,0 @@
-{
- "errors": [
-  "duplicate workflow/dup",
-  "first declared at line"
- ],
- "registers": {},
- "grants": [],
- "valid": false
-}

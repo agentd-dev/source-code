@@ -21,7 +21,7 @@
 
 pub mod agents_md; // a workspace's AGENTS.md files, read as prompt text (RFC 0053)
 #[cfg(feature = "sign")]
-pub mod attest; // §7 instruction attestation (JWS/Ed25519, resolution manifest)
+pub mod attest; // instruction/1 author and delivery signatures (the SDK's checks, agentd's pins)
 #[cfg(feature = "decrypt")]
 pub mod decrypt; // on-the-fly instruction decryption: age v1 + JWE compact (RFC 0041)
 pub mod effective; // --effective-config: the assembled document + where each setting came from
@@ -114,7 +114,7 @@ pub fn http_get(url: &str, egress: &dyn Fn(&str) -> Result<(), String>) -> Resul
 } // encrypted-envelope detection (RFC 0041) — always compiled, no crypto
 pub mod envfile;
 pub mod file;
-pub mod humans; // a document's `@human/<name>` gates: who answers, and the channel they are announced on
+pub mod humans; // a document's people, as its `human` gates address them
 pub mod idoc;
 pub mod paths;
 pub mod prompt;

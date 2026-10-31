@@ -108,9 +108,15 @@ fn a_registry_read_captures_its_version_and_reports_the_binding() {
     );
 
     // The consumer created ONE binding and reported the version it applied.
+    // The binding follows the URI's ref BY NAME: the mock refuses, as the
+    // registry does, a target that is not a ref name (`@stable`, the URI).
+    let created = event(&r.log, "instruction.binding.created")
+        .unwrap_or_else(|| panic!("no binding created:\n{}", r.log));
+    assert_eq!(created["target"], "stable", "{created}");
+    assert_eq!(created["mode"], "follow", "{created}");
     assert!(
-        event(&r.log, "instruction.binding.created").is_some(),
-        "no binding created:\n{}",
+        event(&r.log, "instruction.binding.fail").is_none(),
+        "the registry refused the binding:\n{}",
         r.log
     );
     let reported = event(&r.log, "instruction.binding.reported")
@@ -135,6 +141,30 @@ fn a_registry_read_captures_its_version_and_reports_the_binding() {
          behaviour:\n{}",
         r.log
     );
+}
+
+/// The binding's target as the registry takes it: a URI with no ref follows
+/// `latest` by name, and one that names a version is pinned, to the version
+/// the read applied. Either way the mock (like the registry) accepts it; a
+/// target of `@latest` or the whole URI it refuses.
+#[test]
+fn a_binding_follows_a_ref_by_name_or_pins_the_version_applied() {
+    for (uri, target, mode) in [
+        ("instruction://ins_mock", "latest", "follow"),
+        ("instruction://ins_mock@latest", "latest", "follow"),
+        ("instruction://ins_mock@v1", "ver_mock_1", "pin"),
+    ] {
+        let r = boot(uri, json!([]));
+        let created = event(&r.log, "instruction.binding.created")
+            .unwrap_or_else(|| panic!("{uri}: no binding created:\n{}", r.log));
+        assert_eq!(created["target"], target, "{uri}: {created}");
+        assert_eq!(created["mode"], mode, "{uri}: {created}");
+        assert!(
+            event(&r.log, "instruction.binding.fail").is_none(),
+            "{uri}: the registry refused the binding:\n{}",
+            r.log
+        );
+    }
 }
 
 #[test]

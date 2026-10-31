@@ -2573,6 +2573,15 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Fixed.**
 
+- `instructions_bindings_create` names its target as the registry takes
+  it. agentd sent `@latest` (the `@` and all), which the registry refused
+  with a 400 on `target`, "a ref name is lowercase letters, digits and
+  hyphens", so no consumer binding was ever made and no applied version
+  was reported. It now follows the URI's ref by name (`latest` when the URI
+  names none), and a URI that names a version (`@ver_…`, `@v3`, `@3`)
+  pins the binding (`mode: pin`) to the version it applied, as the
+  instruction.md consumer SDK does. `instruction.binding.created` logs the
+  `target` and `mode`; a binding response's `binding.id` is read too.
 - agentd no longer sends `temperature: 0` to every model. gpt-5.5 refused
   every call with a 400 ("Only the default (1) value is supported") even
   with no temperature configured, because each turn, step, judge and goal

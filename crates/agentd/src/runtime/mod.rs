@@ -2303,14 +2303,11 @@ impl Runtime {
             .filter(|v| v["instruction_id"] == instruction_id)
             .and_then(|v| v["binding_id"].as_str().map(str::to_string));
         if binding_id.is_none() {
-            let target = uri
-                .rsplit_once('@')
-                .map(|(_, r)| format!("@{r}"))
-                .unwrap_or_else(|| "@latest".to_string());
+            let (target, mode) = binding_target(uri, version_id);
             let args = json!({
                 "instructionId": instruction_id,
-                "target": target,
-                "mode": "follow",
+                "target": &target,
+                "mode": mode,
                 // The registry's consumer shape is `{name, kind, host,
                 // version}` and nothing more: it refuses any other property.
                 "consumer": {
@@ -2324,6 +2321,7 @@ impl Runtime {
                 Ok(r) if !r.is_error() => {
                     binding_id = serde_json::from_str::<Value>(&r.text()).ok().and_then(|v| {
                         v.get("bindingId")
+                            .or_else(|| v.pointer("/binding/id"))
                             .or_else(|| v.get("id"))
                             .and_then(Value::as_str)
                             .map(str::to_string)
@@ -2337,7 +2335,8 @@ impl Runtime {
                         );
                         self.log.info(
                             "instruction.binding.created",
-                            json!({"server": server, "instruction_id": instruction_id, "binding_id": id}),
+                            json!({"server": server, "instruction_id": instruction_id, "binding_id": id,
+                                   "target": target, "mode": mode}),
                         );
                     }
                 }
@@ -3016,6 +3015,84 @@ pub(crate) fn listen_event_line(
             "mcp.listen.narrowed",
             json!({"server": server, "dropped": dropped}),
         ),
+    }
+}
+
+/// What `instructions_bindings_create` binds to, and how: the `target` and
+/// the `mode`. The registry takes a ref NAME (`latest`, `stable`: lowercase
+/// letters, digits and hyphens — never `@latest` or the URI) to follow, or a
+/// version to pin. A URI whose `@…` names a version (`@ver_<ULID>`, `@v3`,
+/// `@3`) is pinned, to the version this read applied; any other `@…` is the
+/// ref followed, and a URI with none follows `latest`. The same rule as the
+/// instruction.md consumer SDK's `declareBinding`.
+fn binding_target(uri: &str, applied_version: &str) -> (String, &'static str) {
+    let selector = uri
+        .split_once('@')
+        .map(|(_, s)| s)
+        .filter(|s| !s.is_empty());
+    let Some(sel) = selector else {
+        return ("latest".to_string(), "follow");
+    };
+    let ulid = |s: &str| s.len() == 26 && s.bytes().all(|b| b.is_ascii_alphanumeric());
+    let numbered = |s: &str| {
+        let n = s.strip_prefix(['v', 'V']).unwrap_or(s);
+        !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    };
+    let version_id =
+        sel.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("ver_")) && ulid(&sel[4..]);
+    let pinned = version_id || numbered(sel);
+    if pinned {
+        (applied_version.to_string(), "pin")
+    } else {
+        (sel.to_string(), "follow")
+    }
+}
+
+#[cfg(test)]
+mod binding_target_tests {
+    use super::binding_target;
+
+    #[test]
+    fn a_ref_is_sent_by_its_name_and_followed() {
+        let v = "ver_01M69N5T2ATZNEJVW397VRQTXW";
+        assert_eq!(
+            binding_target("instruction://ins_01M69N5T2ATZNEJVW397VRQTXW@latest", v),
+            ("latest".to_string(), "follow")
+        );
+        assert_eq!(
+            binding_target("instruction://acme/support@stable", v),
+            ("stable".to_string(), "follow")
+        );
+        // No ref at all: the registry's default ref, by name.
+        assert_eq!(
+            binding_target("instruction://acme/support", v),
+            ("latest".to_string(), "follow")
+        );
+        assert_eq!(
+            binding_target("instruction://acme/support@", v),
+            ("latest".to_string(), "follow")
+        );
+    }
+
+    #[test]
+    fn a_version_in_the_uri_pins_the_version_applied() {
+        let v = "ver_01M6A4D6VM7DM190DD1D7V14G0";
+        for uri in [
+            "instruction://ins_01M69N5T2ATZNEJVW397VRQTXW@ver_01M6A4D6VM7DM190DD1D7V14G0",
+            "instruction://acme/support@v3",
+            "instruction://acme/support@3",
+        ] {
+            assert_eq!(binding_target(uri, v), (v.to_string(), "pin"), "{uri}");
+        }
+        // Not a version: a ref that happens to start with v or ver.
+        assert_eq!(
+            binding_target("instruction://acme/support@ver-2", v),
+            ("ver-2".to_string(), "follow")
+        );
+        assert_eq!(
+            binding_target("instruction://acme/support@v3-beta", v),
+            ("v3-beta".to_string(), "follow")
+        );
     }
 }
 

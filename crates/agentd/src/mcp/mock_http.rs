@@ -970,13 +970,15 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
         return match n {
             // The registry validates `consumer` against its schema and
             // refuses the call when it does not match.
-            "instructions_bindings_create" => match binding_consumer_error(&args) {
-                Some(why) => tool_err(
-                    req.id,
-                    &format!("Input validation failed for tool '{n}': {why}"),
-                ),
-                None => tool_ok(req.id, json!({"bindingId": "sub_mock_1", "mode": "follow"})),
-            },
+            "instructions_bindings_create" => {
+                match binding_target_error(&args).or_else(|| binding_consumer_error(&args)) {
+                    Some(why) => tool_err(
+                        req.id,
+                        &format!("Input validation failed for tool '{n}': {why}"),
+                    ),
+                    None => tool_ok(req.id, json!({"bindingId": "sub_mock_1", "mode": "follow"})),
+                }
+            }
             _ => tool_ok(req.id, json!({"ok": true})),
         };
     }
@@ -1264,6 +1266,31 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
 /// Why `args.consumer` does not match the registry's consumer schema —
 /// `{name, kind, host, version}`, every one an optional string, with
 /// `additionalProperties: false` — or `None` when it does, or is absent.
+/// The registry's check on a binding's `target` and `mode`, as it answers
+/// it: a followed target is a ref NAME — lowercase letters, digits and
+/// hyphens, so never `@latest` or a URI — and a pinned one a version id.
+fn binding_target_error(args: &Value) -> Option<String> {
+    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("follow");
+    if mode != "follow" && mode != "pin" {
+        return Some(format!("/mode: must be one of follow, pin (got {mode:?})"));
+    }
+    let target = args.get("target")?;
+    let Some(t) = target.as_str() else {
+        return Some("/target: must be a string".into());
+    };
+    let ref_name = !t.is_empty()
+        && t.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    let version = t.starts_with("ver_") && t.len() > 4;
+    match mode {
+        "follow" if !ref_name => {
+            Some("/target: a ref name is lowercase letters, digits and hyphens".into())
+        }
+        "pin" if !version => Some("/target: a pinned binding names a version id (ver_…)".into()),
+        _ => None,
+    }
+}
+
 fn binding_consumer_error(args: &Value) -> Option<String> {
     const ALLOWED: [&str; 4] = ["name", "kind", "host", "version"];
     let consumer = args.get("consumer")?;

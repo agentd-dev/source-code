@@ -67,7 +67,7 @@ it.
 | `statusHistory` | yes | every state the task has been in, oldest first, each `{state, ts}` with the A2A `TaskState` name |
 | `principal` | no | who started the task |
 | `askSchema` | no | the JSON Schema of the answer an `INPUT_REQUIRED` gate asks for, so a client can render a control rather than a text box |
-| `askChannel` | no | where an `INPUT_REQUIRED` gate is also announced: the `channel` of the instruction document's `::!human` it is addressed to. A place a bridge routes the question to; it never decides who may answer |
+| `askChannel` | no | where an `INPUT_REQUIRED` gate is also announced: the channel the operator's `agent.gate_channels` names for the gate. A place a bridge routes the question to; it never decides who may answer |
 | `command` | no | the [command](command.md) op that started the task |
 | `traceId` | no | the W3C trace id the task's work is in, 32 lowercase hex digits |
 | `spanId` | no | the W3C span id the task's work is done in, 16 lowercase hex digits: the span the answer's `traceparent` header names |

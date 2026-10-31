@@ -24,7 +24,8 @@ choice.
 ### What is the license?
 
 AGPL-3.0-only, for the binary, the engine crates and the npm display clients.
-The `agentd-instruction` crate is MIT OR Apache-2.0. Commercial licensing and
+Instruction documents are read with the instruction.md SDK, `instruction-md`,
+which is MIT OR Apache-2.0. Commercial licensing and
 commercial support are available from agent@agentd.dev.
 
 ### Is there a hosted version?

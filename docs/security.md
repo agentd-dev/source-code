@@ -501,9 +501,10 @@ Three rules bound the judge:
 **An addressee must be able to see the task.** A task is visible only to its
 owner and to operators, so a `to:` may name the task's owner (by leaving `to:`
 out) or an operator, narrowed by labels. A `to:` naming any other principal
-is refused at load, wherever it appears. An instruction document's
-`@human/<name>` gate goes to that human's `principal`, or to the operators;
-the human's `channel` is announced to clients and never widens who may answer.
+is refused at load, wherever it appears. A gate an instruction document
+addresses to one of its `::person`s goes to the operators; the channel the
+operator's `agent.gate_channels` names is announced to clients and never
+widens who may answer.
 Work no caller owns gates on the listener only with `agent.ask_human_unowned:
 gate`. [Human in the loop](human-in-the-loop.md) covers the asking side.
 
@@ -1140,7 +1141,7 @@ A skill is instructions the model reads. Who wrote it decides how agentd
 treats it.
 
 - **Your own skills** — a folder's `<name>/SKILL.md`, the instruction's
-  `:::!skill` — are configuration. A folder skill that breaks an Agent
+  `:::skill` — are configuration. A folder skill that breaks an Agent
   Skills rule refuses the configuration, and `.agents/skills/` is read only
   beside a configuration file agentd loaded, never from the working
   directory alone.
@@ -1708,7 +1709,7 @@ What holds:
   that its `tools:` grant admits; a worker asking for any other is refused
   before any check or mint (`tool.refused`, `why: not_offered`).
 - **Documents cannot configure authority.** A served document, a
-  `:::!config` or `:::!mcp` fragment and a subagent template's machinery may
+  `:::config` or `:::mcp` fragment and a subagent template's machinery may
   not declare a delegated server, set its pins or its client
   authentication, or reference a secret under `identity.*` or on a delegated
   server, by any spelling of it — a reference is compared by what it

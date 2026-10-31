@@ -329,8 +329,8 @@ A template's tier follows from its text, so it cannot be declared wrongly:
   has described, through the same chokepoint and caps. The template defines
   the grant (`servers`, `tools`); its limits, mode, priority and output
   contract apply where the call site sets none of its own.
-- **Instance.** An instruction that defines machinery, such as a
-  `:::!workflow`, `:::!mcp`, `:::!stream`, `:::!config` or `:::!tools`
+- **Instance.** An instruction with a block that maps onto
+  configuration, such as a `:::workflow`, `:::mcp` or `:::config`
   block, spawns an instance-tier child: a full agentd daemon with its own
   workflows, streams, waits, timers and store.
 
@@ -350,7 +350,7 @@ and is composed no peer, bearer or other credential of the parent's. Neither
 link is AAuth-signed, so neither waits on the Agent Provider.
 
 The child is a daemon, so its prose is its policy: it runs nothing when it
-spawns, and work at spawn is a `:::!workflow` with a `once` start or a first
+spawns, and work at spawn is a `:::workflow` with a `once` start or a first
 message, such as `subagent.send` or an `a2a.send` step.
 
 ```mermaid
@@ -485,7 +485,7 @@ are checked. [Instruction documents](directives.md) explains the boundary.
 - **Re-read the spawn rate.** `limits.subagents.rate` is read at the first
   spawn of the process; a reload does not change it.
 - **Pass skills.** A spawn's `skills` list is accepted and not used, and a
-  template's `:::!skill` block is left out of the text the child reads. Put
+  template's `:::skill` block is left out of the text the child reads. Put
   what the child needs in its instruction or `context`.
 - **Count subagents in metrics.** `agent_subagents_spawned_total` and
   `agent_subagents_exited_total` count every child process, turn and think

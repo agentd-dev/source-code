@@ -536,10 +536,10 @@ export const DOCS = [
   {
     "slug": "directives-reference",
     "file": "docs/directives-reference.md",
-    "title": "Directive reference",
+    "title": "Instruction document reference",
     "group": "reference",
     "section": "config",
-    "blurb": "Instruction-document syntax, every directive kind, and the document-writable keys."
+    "blurb": "The instruction/1 blocks agentd maps, the grants, host-policy diagnostics, and the document-writable keys."
   },
   {
     "slug": "node-registry",

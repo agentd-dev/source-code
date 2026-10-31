@@ -139,9 +139,9 @@ catalog tags apply to any matching endpoint even inline (no tag-laundering);
 **Subagent templates** — declare what a worker looks like in
 `subagents.templates` (the model instantiates by name and fills declared,
 schema-checked `params` only; `allow_freeform: false` makes templates the
-only spawn path). A template whose instruction embeds machinery
-(`:::!workflow`, `:::!mcp`, … — machinery kinds need the `!` sigil; a bare
-`:::workflow` is refused at parse) spawns a full **instance child**: its own
+only spawn path). A template whose instruction document (instruction/1,
+read by the instruction.md SDK) declares a `:::workflow`, `:::mcp` or
+`:::config{dialect="agentd/config"}` spawns a full **instance child**: its own
 workflows and store, an A2A peer over a unix socket, retired by
 `ttl`/`until`/`subagent.retire`.
 

@@ -170,28 +170,27 @@ from outside.
 |---|---|---|---|---|
 | `agentd-net` | `net` | 2.0.0 | AGPL-3.0-only | A blocking HTTP/1.1 and SSE client over any `Read + Write`, unix and TLS connects, the SSRF guard, X.509 field extraction. |
 | `agentd-mcp` | `mcp` | 4.0.0 | AGPL-3.0-only | A blocking MCP client over the official `rmcp` SDK, on agentd's own credentialed Streamable-HTTP socket, plus a raw HTTP listener. |
-| `agentd-instruction` | `instruction_core` | 0.3.0 | MIT OR Apache-2.0 | The reference implementation of the Instruction Specification: parser, validator, delivery, resolution manifest, signature verification. |
 | `agentd-core` | `agentd` | 1.20.0 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
 | `agentd-cli` | binary `agentd` | 1.20.0 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |
 | `agentd-conformance` | `agentd_conformance` | 1.7.0 | AGPL-3.0-only | A black-box conformance suite. Not published. |
 
 Each crate's features map onto `agentd-core`'s: `agentd-cli`'s `a2a` turns on
 `agentd-core/a2a`, and so on. `agentd-mcp` and `agentd-net` have one feature
-each, `tls`; `agentd-instruction` has `sign`.
+each, `tls`.
 
 The package and library names differ on purpose. `agentd` on crates.io belongs
 to an unrelated project, so the engine is published as `agentd-core` with
-`[lib] name = "agentd"`, and code still writes `use agentd::…`. The
-instruction crate is `agentd-instruction` because the specification belongs to
-instruction.md, not to agentd; it is the one crate under a permissive licence,
-so other implementations of the specification can link it.
+`[lib] name = "agentd"`, and code still writes `use agentd::…`. Instruction
+documents are read with the instruction.md project's own Rust SDK,
+`instruction-md` (MIT OR Apache-2.0): the format belongs to instruction.md,
+not to agentd.
 
 ```mermaid
 flowchart LR
   CLI["agentd-cli<br/>binary agentd"] -->|"depends on"| CORE["agentd-core<br/>lib agentd"]
   CORE -->|"MCP client"| MCP["agentd-mcp"]
   CORE -->|"transport"| NET["agentd-net"]
-  CORE -->|"instruction documents"| INS["agentd-instruction"]
+  CORE -->|"instruction documents"| INS["instruction-md<br/>official instruction.md SDK"]
   MCP -->|"transport"| NET
   MCP -->|"protocol"| RMCP["rmcp<br/>official MCP SDK"]
   CORE -.->|"feature a2a"| A2A["a2a-lf · a2a-pb · a2a-server-lf<br/>official A2A SDK"]

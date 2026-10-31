@@ -159,7 +159,7 @@ where two disagree.
 Every turn's system prompt carries them, under `## AGENTS.md`, each under
 its path, below your instruction. Your instruction wins over them, and so
 does what you ask in a message. They are plain text: they grant no tool and
-change no setting, and a `:::!config` or `:::!workflow` block in one is text
+change no setting, and a `:::config` or `:::workflow` block in one is text
 the model reads, never a directive.
 
 The files must be UTF-8 and hold at most 32 KiB together, and a symlinked

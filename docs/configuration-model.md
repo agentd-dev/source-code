@@ -173,7 +173,7 @@ that set it.
 ## What the instruction may configure
 
 An instruction document can carry configuration of its own, in a
-`:::!config` block, alongside the machinery blocks that declare workflows,
+`:::config` block, alongside the machinery blocks that declare workflows,
 MCP servers, streams and skills ([Instruction documents](directives.md)
 explains them). That fragment is applied after the document is read, and it
 **merges underneath** the operator's configuration: at every key, a file,
@@ -182,7 +182,7 @@ an environment variable or a flag beats the document.
 ```markdown
 You are the order desk. Every paid order is fulfilled the same day.
 
-:::!config
+:::config{id=cfg1 dialect=agentd/config}
 limits: { run: { steps: 40 }, max_runs: 20 }
 context: { keep_last: 16 }
 :::
@@ -230,7 +230,7 @@ Three rules make the boundary hold:
   server stay the operator's. A model it declares cannot name a provider, so
   it can choose *which* model but never where the conversation goes.
 
-The full allow-list is in the [Directive reference](directives-reference.md).
+The full allow-list is in the [Instruction document reference](directives-reference.md).
 Note that the short form `agent.instruction: <uri>` names an MCP resource;
 to fetch a document over HTTPS, write `agent.instruction: {url: …}` (or
 `--instruction.url`).
@@ -272,7 +272,7 @@ Validation covers more than shape. Among the things refused at load:
 What validation cannot see is the world. It does not know whether an MCP
 server is up or a model endpoint answers; startup finds that out. It does
 read what the configuration points at: an instruction named as a file,
-folder, URL or OCI artifact is fetched, because its `:::!config` can only be
+folder, URL or OCI artifact is fetched, because its `:::config` can only be
 judged once read.
 
 ## Secrets are references

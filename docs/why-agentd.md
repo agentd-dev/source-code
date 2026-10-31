@@ -160,9 +160,8 @@ Choose something else when it fits better:
 ## What adoption costs
 
 **License.** agentd is AGPL-3.0-only: the binary, the engine crates and the
-npm display clients. One crate, `agentd-instruction` (the Instruction
-Specification's reference parser), is MIT OR Apache-2.0 so that other
-implementations can link it. Commercial licensing — for proprietary embedding
+npm display clients. Instruction documents are read with the instruction.md
+project's MIT OR Apache-2.0 Rust SDK, `instruction-md`. Commercial licensing — for proprietary embedding
 or use without the AGPL's terms — and commercial support are available from
 agent@agentd.dev. Ask your counsel how the AGPL applies to your deployment.
 

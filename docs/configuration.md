@@ -17,7 +17,7 @@ path in full, so a search for `limits.run.steps` lands on its row.
 | **Path** | The dotted path. `[]` marks an element of a list, `<name>` a key you choose in a map. |
 | **Type** | `string`, `int`, `number`, `bool`, `duration`, `rate`, `size`, `secret`, a list (`[…]`), a map, or an enum written as `a \| b`. |
 | **Default** | What applies when the path is unset. *unset* means the feature it controls is off. |
-| **Class** | `live` — a reload applies it; `restart` — a reload that changes it is refused. Then `doc` — an instruction document's `:::!config` fragment may set it too; or `op` — operator only. |
+| **Class** | `live` — a reload applies it; `restart` — a reload that changes it is refused. Then `doc` — an instruction document's `:::config` fragment may set it too; or `op` — operator only. |
 
 The value syntax — durations, sizes, rates, secret references — is in
 [Value syntax](#value-syntax). `agentd --config-schema` prints the same paths as
@@ -323,7 +323,7 @@ behaves.
 | `agent.ask_human_fallback` | `fail \| wait \| auto` | `fail` | live · doc | What an `ask_human` does when it does not open a gate: fail at once, park until its timeout, or let the judge answer. `auto` also answers an unaddressed gate that times out. No judge answers an ask whose run, subagent or peer conversation carries outside input; the ask fails (`human.judge.withheld`). `pause` and `idle` are accepted for `wait`, `finish` and `stop` for `fail`. |
 | `agent.ask_human_unowned` | `gate \| fallback` | `fallback` | live · doc | What an ask nobody owns does (one raised by a schedule, webhook, stream or subagent): open a gate task on the A2A listener (`gate`, needs `a2a.listen`), or apply `ask_human_fallback`. |
 | `agent.gate_channels` | map: workflow → step path → channel | `{}` | live · op | The channel a configured workflow's gate is announced on, where no instruction document declared one. |
-| `agent.document_capabilities` | list of `material \| knowledge \| interface \| identity \| compute \| infra \| compose` | `[]` | restart · op | The instruction-document families the instruction may use (the trust ladder). Empty grants the default rung only. A served document opens a webhook route only under `interface`. See [Directive reference](directives-reference.md). |
+| `agent.document_capabilities` | list of `identity \| interface` | `[]` | restart · op | What the instruction document may activate beyond the default: `identity` admits its A2A agents (`::agent` → `a2a.peers`), `interface` a workflow that opens a webhook route. See [Instruction document reference](directives-reference.md#grants). |
 
 ### The instruction source
 
@@ -394,7 +394,7 @@ What `refresh: auto` does for each source:
 | text | nothing to re-read |
 
 A re-read updates the text the model reads. Machinery the document declares
-(`:::!workflow`, `:::!mcp`, …) folds into configuration at load, so it changes
+(`:::workflow`, `:::mcp`, …) folds into configuration at load, so it changes
 on a reload or a restart, not on a poll.
 
 What `unavailable` does after a successful start:
@@ -1367,7 +1367,7 @@ paths are live · op.
 | `subagents.defaults.priority` | `low \| normal \| high` | `normal` | Contention weight. |
 | `subagents.defaults.durable` | bool | `store.durability.work` | `false` keeps the spawn's record in memory. |
 | `subagents.defaults.limits` | object | — | Per-spawn limits (`max_steps`, `max_tokens`, `deadline`, `memory`, `cpu`). |
-| `subagents.templates.<name>.instruction` | string, or `{text \| file \| dir \| url \| oci}` | required | The child's instruction document. Machinery in it (`:::!workflow`, `:::!mcp`, `:::!stream`, `:::!config`, `:::!tools`) makes the child an instance-tier daemon; otherwise it is a flat worker. |
+| `subagents.templates.<name>.instruction` | string, or `{text \| file \| dir \| url \| oci}` | required | The child's instruction document. A block that maps onto configuration (`:::workflow`, `:::mcp`, `:::config`) makes the child an instance-tier daemon; otherwise it is a flat worker. |
 | `subagents.templates.<name>.params.<param>` | `{type, required, default, enum, description}` | — | The only values the model may fill, checked at spawn. `type` is `string` (default), `number`, `integer` or `boolean`. |
 | `subagents.templates.<name>.servers`, `.tools` | lists | the parent's | Flat tier: narrow the parent's grants. |
 | `subagents.templates.<name>.model`, `.mode`, `.priority`, `.skills`, `.context` | — | the defaults | Per-template overrides. Instance tier supports `mode: detached`, and `sync` with `result`. |
@@ -1681,7 +1681,7 @@ namespace an `assign` step writes. Values are not secrets: credentials stay
 A running daemon reloads on `SIGHUP` (the `hot-reload` feature) or a watched
 file change. The reload validates the new document with the startup pipeline,
 stages every change, and applies it whole or not at all. A change to any of
-these paths, by the configuration or by the instruction's own `:::!config`,
+these paths, by the configuration or by the instruction's own `:::config`,
 refuses the reload with `config.reload.restart_required`:
 
 - `agent.name`, `agent.document_capabilities`, `agent.instruction.trust`
@@ -1737,7 +1737,7 @@ restart. How a reload stages and commits is
 
 ## What a served document may write
 
-An instruction document's `:::!config` fragment merges under the operator's
+An instruction document's `:::config` fragment merges under the operator's
 configuration. It may write only these paths; anything else is refused at load,
 naming the line:
 
@@ -1769,7 +1769,7 @@ naming the line:
 
 An operator's turn model wins over a document's; the document's is dropped
 with a warning. The directive itself is in
-[Directive reference](directives-reference.md).
+[Instruction document reference](directives-reference.md).
 
 ## Credential-bearing paths
 

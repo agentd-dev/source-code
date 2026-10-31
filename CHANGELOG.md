@@ -7,6 +7,46 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+**Breaking.**
+
+- Instruction documents are `instruction/1`, the instruction.md
+  specification's first edition (commit `af8400f`), and the reader is the
+  official instruction.md Rust SDK, `instruction-md`: its read, its checks,
+  its agent text (`instruction-text/1`), its digests and its JWS
+  verification. agentd delivers the SDK's agent text byte for byte. A 1.1
+  document does not load as one: a `:::!kind` line is prose. agentd maps
+  `:::mcp{id src tools allow deny}` to `mcp.servers` (`id` → `name`, `src` →
+  `endpoint`, `tools`/`allow` → `allow`, `deny` → `exclude`),
+  `::agent{protocol=a2a endpoint|src}` to `a2a.peers` under the `identity`
+  grant, `:::workflow{dialect="instruction/workflow"}` to `workflows`,
+  `:::config{dialect="agentd/config"}` to the document's configuration
+  fragment, an inline `:::skill` to the catalogue, and `::person`/`::role`
+  to people a `human` step may address (`to: <id>`, answered by the
+  operators). A connected object agentd does not activate — outside its
+  grants, from the wire under the §7.8 floor, in a dialect it does not run —
+  stays in the agent text and is a `host-policy` warning (§17), never a
+  silent drop. `instruction.read` logs, at boot, the reader, the
+  specification commit, the authored digest, the diagnostics and what the
+  document mapped.
+- `agent.document_capabilities` takes `identity` and `interface`; the 1.1
+  families (`material`, `knowledge`, `compute`, `infra`, `compose`) and the
+  1.1-only blocks (`:::!stream`, `:::!tools`, `:::!endpoint`, `:::!peer`,
+  `:::!human`, `:::!agent`, variants, overrides, `:::!secret-ref`) are gone:
+  streams and tools are written in a `:::config` block, a route is a
+  workflow with a `webhook` start, an A2A agent is `::agent`. A document
+  never puts a channel on a gate; the operator's `agent.gate_channels` does.
+  `when`/`unless` variants and the facts they were decided by are gone.
+- An author signature travels beside the document and signs its stored
+  bytes: a registry read's metadata, a file's `<path>.jws`, a folder
+  entry's own `<file>.jws`, an OCI layer's `md.instruction/signature`
+  annotation. Claims are `spec: "instruction/1"`, the publisher is `pub`, and
+  a delivery names its `instruction-resolved/1` manifest.
+- `agentd-instruction` (lib `instruction_core`) is no longer part of agentd:
+  it left the workspace and the dependency graph, and the release publishes
+  it no more. agentd's configuration YAML reader, which lived in it, is back
+  in `agentd-core` (`config::yaml`), unchanged. The spec drift check holds
+  the SDK's registry to the pinned specification's `registry.json`.
+
 **Security.**
 
 - ctutils 0.4.5, for RUSTSEC-2026-0385: its constant-time mask generation

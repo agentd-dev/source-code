@@ -614,7 +614,7 @@ describes the launcher.
 ## Listener settings
 
 Every `a2a.*` key is operator-only except `a2a.peers`: an instruction
-document's `:::!config` fragment may write only the outbound peers. Every
+document's `:::config` fragment may write only the outbound peers. Every
 path is also a flag (`--a2a-<path>`) and an environment variable
 (`AGENTD_A2A_<PATH>`); `--listen` is short for `a2a.listen`.
 [Configuration reference](configuration.md) lists every key.

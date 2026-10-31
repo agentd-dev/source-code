@@ -1140,7 +1140,7 @@
     },
     "SubagentTemplate": {
       "additionalProperties": false,
-      "description": "an operator-declared subagent definition: `instruction` is a full instruction document — no config-defining directives = the flat worker; machinery (:::workflow/:::mcp/:::stream/:::config/:::tools) = an instance-tier child",
+      "description": "an operator-declared subagent definition: `instruction` is a full instruction document — no config-defining directives = the flat worker; configuration (:::workflow, :::mcp, :::config) = an instance-tier child",
       "properties": {
         "budget": {
           "additionalProperties": false,
@@ -3317,16 +3317,11 @@
           "type": "string"
         },
         "document_capabilities": {
-          "description": "instruction-document families this agent's instruction may use (the trust ladder). Empty grants only the default rung; naming a family admits its blocks. Fail-closed, restart-only.",
+          "description": "the grants this agent's instruction document may use beyond the default: identity admits its A2A agents (::agent → a2a.peers), interface a workflow that opens an inbound route. Empty admits guidance, :::mcp, :::workflow, :::config, :::skill and ::person. Fail-closed, restart-only.",
           "items": {
             "enum": [
-              "material",
-              "knowledge",
               "interface",
-              "identity",
-              "compute",
-              "infra",
-              "compose"
+              "identity"
             ]
           },
           "type": "array"
@@ -3339,7 +3334,7 @@
             },
             "type": "object"
           },
-          "description": "the channel a configured workflow's gate is announced on: workflow name → step path → channel. How a subagent template's ::!human channels reach its instance child; an instruction document's own ::!human declarations stand where both name a step. Operator-only.",
+          "description": "the channel a configured workflow's gate is announced on: workflow name → step path → channel. How a subagent template's channels reach its instance child; an instruction document never puts a channel on a gate. Operator-only.",
           "type": "object"
         },
         "instruction": {
@@ -6090,7 +6085,7 @@
             },
             "type": "object"
           },
-          "description": "append-only narrowing of an existing tool (a :::!override block): add tags, append a note; never widen",
+          "description": "append-only narrowing of an existing tool (the tools.overrides surface): add tags, append a note; never widen",
           "type": "object"
         },
         "overrides": {

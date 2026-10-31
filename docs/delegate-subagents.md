@@ -554,17 +554,14 @@ With only flat templates the validator also prints a warning that
 and you can ignore it here.
 
 A served instruction document cannot define templates; `subagents` is
-operator configuration. A document can refer to one, with the `compose`
-grant in `agent.document_capabilities`. It declares `::!agent{name=…
-template=…}`, and its workflows name it as `@agent/<name>`:
+operator configuration. A document's workflow refers to one by name in a
+`subagent` step:
 
 ```markdown
 You run the research desk. When a question needs sources, open a
 researcher for it.
 
-::!agent{name=desk template=researcher}
-
-:::!workflow{name=research}
+:::workflow{id=research dialect=instruction/workflow}
 steps:
   ask:
     kind: a2a
@@ -573,7 +570,7 @@ steps:
   brief:
     kind: subagent
     depends_on: [ask]
-    template: "@agent/desk"
+    template: researcher
     params: {topic: "{{steps.ask.output.args.topic}}"}
   done:
     kind: finish
@@ -584,16 +581,13 @@ steps:
 ```
 
 [Write and ship instruction documents](instruction-documents.md) covers the
-grant and the document boundary.
-
-> **Note.** A template's text is an instruction document, and its `when`
-> and `unless` conditions are decided by the model the child runs: the
-> template's `model`, else `subagents.defaults.model`, else the agent's.
+document boundary.
 
 ## Run a child daemon
 
-A template whose instruction defines machinery, such as a `:::!workflow`, a
-`:::!stream` or a `:::!mcp` block, spawns an instance-tier child: a full
+A template whose instruction maps onto configuration, such as a
+`:::workflow`, a `:::config` or a `:::mcp` block, spawns an instance-tier
+child: a full
 agentd daemon with its own workflows, streams and store, supervised by the
 parent and wired to it over A2A on a unix socket. Use it for long-lived
 work with its own lifecycle, such as one war room per incident. This
@@ -632,10 +626,11 @@ subagents:
         You are the war room for incident {{params.id}}. Keep the timeline
         current and answer the on-call engineer's questions about it.
 
-        :::!stream{name=timeline}
+        :::config{id=streams dialect=agentd/config}
+        streams: {timeline: {}}
         :::
 
-        :::!workflow{name=on-update}
+        :::workflow{id=on-update dialect=instruction/workflow}
         steps:
           cmd:
             kind: a2a
@@ -712,7 +707,7 @@ a second spawn is refused while it lives.
 
 The child's prose is its policy, not a task: a template whose machinery
 declares no workflow runs nothing until it is sent a message, so give it a
-`:::!workflow` with a `once` start for work at spawn, or send it a first
+`:::workflow` with a `once` start for work at spawn, or send it a first
 message as `brief` does.
 
 What the instance tier needs and offers:
@@ -728,7 +723,7 @@ What the instance tier needs and offers:
 | `durable` | `false` runs the child on a memory store, unmetered and not restarted | Default follows `store.durability.work`; a parent with a `memory` or `none` store runs every child this way |
 
 `servers` and `tools` are refused on an instance template: its own
-`:::!mcp` blocks declare its servers. A child's MCP servers are checked
+`:::mcp` blocks declare its servers. A child's MCP servers are checked
 against the parent's service catalogue and egress posture, and the
 template's machinery may not write operator-only configuration, define
 `a2a`, `intelligence`, `store` or `lifecycle`, declare MCP Events bindings,
@@ -736,9 +731,9 @@ or open webhook routes; the parent composes those, and external events reach
 the child through the parent. A durable child's token use is charged against
 the parent's budget every five seconds and once more when it exits, whether
 a workflow step or a model's `subagent.run` spawned it. A `human` step in
-the template's workflows addressed `@human/<name>` to one of the template's
-`::!human` declarations keeps its channel: the parent writes it into the
-child's `agent.gate_channels` ([Human in the loop](human-in-the-loop.md)).
+the template's workflows addressed to one of the template's `::person`s is
+the operators', as in the agent's own document
+([Human in the loop](human-in-the-loop.md)).
 
 Each child has a directory of its own, mode 0700: its composed
 `config.json` (mode 0600), its `log`, its `a2a.sock` and, for a durable
@@ -823,7 +818,7 @@ record closes `failed` with that pid in its error, and the parent logs
   a new spawn after a restart can take a restored record's handle. Make
   delegated work idempotent.
 - **Skills do not reach a child.** A spawn's `skills` is accepted and not
-  used, and a template's `:::!skill` block is stripped from the child's text.
+  used, and a template's `:::skill` block is stripped from the child's text.
   Put what the child needs in its instruction or `context`.
 
 ## The subagent tools

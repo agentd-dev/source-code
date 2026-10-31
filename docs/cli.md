@@ -78,7 +78,7 @@ and the `--delegation-*` commands also run validation.
 | `-V`, `--version` | `agentd <version>` | stdout | 0 |
 | `--build-info` | How this binary was built, as one JSON object: `name`, `version`, `revision`, `source_modified`, `features` (every cargo feature compiled in, the ones another implies included, sorted), `target`, `profile`, `rustc` and `builder`. `revision`, `source_modified` and `builder` are what the build was given (`AGENTD_REVISION`, `AGENTD_SOURCE_MODIFIED`, `AGENTD_BUILDER`), and `null` when it was given none. | stdout | 0 |
 | `--validate-config` | One `config.valid` line, or one `config.invalid` line per problem, plus `config.warning` lines | stderr | 0 valid, 2 invalid |
-| `--effective-config` | The assembled document, the layer each setting came from, and the instruction's `:::!config` fragment. On an invalid configuration it still prints, and reports the errors on stderr. Credential-shaped values are `"<redacted>"`. | stdout (errors on stderr) | 0 |
+| `--effective-config` | The assembled document, the layer each setting came from, and the instruction's `:::config` fragment. On an invalid configuration it still prints, and reports the errors on stderr. Credential-shaped values are `"<redacted>"`. | stdout (errors on stderr) | 0 |
 | `--config-schema` | The settings JSON Schema (Draft 2020-12) | stdout | 0 |
 | `--workflow-schema` | The workflow JSON Schema and node registry | stdout | 0 |
 | `--context-template` | The built-in system-prompt template | stdout | 0 |

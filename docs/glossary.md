@@ -46,7 +46,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | **decision model** | A model of kind `decision`: it answers decide calls natively, with probabilities, and writes no text. It is reached on a provider with `dialect: decisions`. See [Models, providers and roles](intelligence.md). |
 | **device grant** | The OAuth 2.0 device authorization grant on the A2A listener: a client shows a code, an operator approves it, and the client gets a session. See [The A2A channel](a2a.md). |
 | **dialect** | The wire format a connection speaks: `openai`, `anthropic`, `bedrock` or `decisions`. See [Intelligence wire reference](intelligence-reference.md). |
-| **directive** | A fenced block in an instruction document, such as `:::!workflow`, that declares machinery or shapes what the model reads. See [Instruction documents](directives.md). |
+| **directive** | A block in an instruction document, such as `:::workflow` or `::person`, that declares something or shapes what the model reads. See [Instruction documents](directives.md). |
 | **discovery chain** | The config files agentd loads when none is named: the user's, the project's (`agentd.yml`) and the machine-local one (`agentd.local.yml`). See [How configuration works](configuration-model.md). |
 | **drain** | A graceful shutdown: admit no new work, let live work finish within `lifecycle.drain_timeout`, leave what still runs then for the next start, checkpoint, exit — 0 for a daemon, the work's code for a job. See [Operate a running daemon](operations.md). |
 
@@ -80,7 +80,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | **instance** | One running agentd process and the durable state it owns, identified by `agent.name`. See [Architecture](architecture.md). |
 | **instance-tier child** | A subagent that is a full agentd daemon of its own, because its template's instruction declares machinery. It talks to its parent over A2A on a unix socket. See [Subagents and delegation](subagents.md). |
 | **instruction** | The agent's standing policy, `agent.instruction`: text, a file, a folder, an HTTPS document, an OCI artifact or an MCP resource. See [Write and ship instruction documents](instruction-documents.md). |
-| **instruction document** | A Markdown document written to the Instruction Specification: prose the model reads, plus directives that can declare workflows, servers and more. agentd is its reference implementation. See [Instruction documents](directives.md). |
+| **instruction document** | A Markdown document in the instruction.md format (`instruction/1`): guidance the model reads, plus blocks that declare people, servers, agents, workflows and more. agentd reads it with the official instruction.md Rust SDK. See [Instruction documents](directives.md). |
 | **intelligence** | agentd's name for model access as a whole: connections, models, roles and budgets, under `intelligence:`. See [Models, providers and roles](intelligence.md). |
 | **job** | A one-shot instance: it does its work and exits once nothing is left. A `--prompt` or bare `--instruction` run is a job. See [Jobs, daemons and triggers](modes-and-triggers.md). |
 
@@ -90,7 +90,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 |---|---|
 | **kill ladder** | The supervisor's bounded teardown of a child: cancel, `SIGTERM` to its process group, `SIGKILL`, reap. See [Supervision and containment](harness.md). |
 | **lethal trifecta** | One agent holding all three capability tags — `untrusted_input`, `sensitive` and `egress` — at once. agentd refuses it at load unless `security.allow_trifecta` is set. See [Security model](security.md). |
-| **machinery** | What a directive declares that becomes configuration — a workflow, an MCP server, a stream — as opposed to prose the model reads. It folds in at load. See [Instruction documents](directives.md). |
+| **machinery** | What a block declares that becomes configuration — a workflow, an MCP server, an A2A peer — beside the agent text the model reads. It maps in at load. See [Instruction documents](directives.md). |
 | **MCP** | The Model Context Protocol. agentd is an MCP client: every task tool and resource comes from an MCP server you declare. See [MCP: tools and context](mcp.md). |
 | **MCP Events** | A draft MCP extension (SEP-3415) through which a server's event occurrences reach declared streams, polled or delivered by webhook. See [React to changes and events](react-to-events.md). |
 | **MCP server** | A remote service, reached over Streamable HTTP, that offers tools, resources and prompts. agentd dials it and spawns no local process. See [Connect MCP servers](connect-mcp.md). |
@@ -136,7 +136,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | **sensitive** | One of the three capability tags: the tool reaches private data or privileged systems. See [Security model](security.md). |
 | **service catalog** | `services:`, the named external services a deployment may use, with authoritative tags and a tool ceiling. Under `security.egress: closed` it is the allow-list. See [Harden a deployment](harden.md). |
 | **signal** | A named message delivered to waiting runs or `signal` start nodes, for coordination (`workflow.signal`). Also an operating-system signal such as `SIGTERM`. See [Jobs, daemons and triggers](modes-and-triggers.md). |
-| **skill** | Guidance the model loads on demand, in the Agent Skills format (a folder led by a `SKILL.md`): from an MCP server's Skills extension, a `skills/` or `.agents/skills/` folder, or a `:::!skill` directive. A skill grants no tool. See [Agent Skills](interoperability.md#agent-skills). |
+| **skill** | Guidance the model loads on demand, in the Agent Skills format (a folder led by a `SKILL.md`): from an MCP server's Skills extension, a `skills/` or `.agents/skills/` folder, or a `:::skill` directive. A skill grants no tool. See [Agent Skills](interoperability.md#agent-skills). |
 | **start node** | The step that fires a workflow's runs: `once`, `manual`, `loop`, `schedule`, `subscribe`, `signal`, `event`, `stream`, `correlate`, `a2a` or `webhook`. Also called a trigger. See [Jobs, daemons and triggers](modes-and-triggers.md). |
 | **step** | One node instance in a run. A step's output is recorded before the run moves on. See [Workflows: how runs work](workflows.md). |
 | **store** | Where durable state lives: the local filesystem, an MCP server, an HTTP key-value service, memory, or nowhere. See [Architecture](architecture.md). |

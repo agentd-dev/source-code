@@ -300,7 +300,7 @@ that activated it:
 | `statusHistory` | yes | every state the task has been in, oldest first, each `{state, ts}` |
 | `principal` | no | who started the task |
 | `askSchema` | no | the JSON Schema of the answer an `input-required` gate asks for |
-| `askChannel` | no | where the gate is also announced, from the instruction document's `::!human` |
+| `askChannel` | no | where the gate is also announced, from the operator's `agent.gate_channels` |
 | `command` | no | the command op that started the task |
 
 A webhook body never carries the annotations. The normative specification is

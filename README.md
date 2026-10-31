@@ -97,11 +97,10 @@ in [`rfcs/`](rfcs/).
 | `agentd-core` | The engine: supervisor, agent loop, workflows, intelligence, A2A, state |
 | `agentd-mcp` | The MCP client over the official Rust SDK, and a raw HTTP listener |
 | `agentd-net` | Blocking HTTP/1.1 and SSE, unix and TLS connects, the SSRF guard |
-| `agentd-instruction` | The Instruction Specification: parse, validate, deliver, verify |
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE). `agentd-instruction` is
-`MIT OR Apache-2.0`, and the conformance corpus under Apache-2.0; see
-[NOTICE](NOTICE). Commercial licensing (for proprietary embedding or
+AGPL-3.0-only — see [LICENSE](LICENSE). Instruction documents are read with
+the official instruction.md Rust SDK, `instruction-md`, which is
+`MIT OR Apache-2.0`; see [NOTICE](NOTICE). Commercial licensing (for proprietary embedding or
 AGPL-free use) and commercial support are available: agent@agentd.dev.

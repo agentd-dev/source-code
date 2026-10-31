@@ -716,8 +716,8 @@ answer.
   reason.
 - `to` names who must answer: `{role: operator}`, optionally narrowed by
   `labels`, or the id `operator`. A `to` that names anyone else is refused
-  at load. In an instruction document, `to: "@human/<name>"` addresses one of
-  the document's `::!human` declarations.
+  at load. In an instruction document, `to: <id>` addresses one of the
+  document's `::person` declarations, answered by the operators.
 - `timeout` defaults to 24 hours. A gate that times out fails the step;
   route that with `on_error`.
 - A gate in a run that no A2A caller owns, such as one a schedule started,

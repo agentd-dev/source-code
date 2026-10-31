@@ -398,7 +398,7 @@ its own.
 ## What an instruction document may set
 
 An instruction document can choose *which* model does what, but never *where*
-it lives. A `:::!config` block may declare models and bind every role except
+it lives. A `:::config` block may declare models and bind every role except
 `approve`:
 
 ```markdown
@@ -406,7 +406,7 @@ it lives. A `:::!config` block may declare models and bind every role except
 
 Answer billing questions from customers.
 
-:::!config
+:::config{id=cfg1 dialect=agentd/config}
 intelligence:
   models:
     fast: {model: gpt-5-mini}

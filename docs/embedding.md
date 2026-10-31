@@ -27,7 +27,7 @@ flowchart TD
     APP["your binary"] -- "calls" --> CORE
     CORE -- "MCP client" --> MCP["agentd-mcp (lib mcp)"]
     CORE -- "HTTP, TLS, SSRF guard" --> NET["agentd-net (lib net)"]
-    CORE -- "instruction documents" --> INS["agentd-instruction (lib instruction_core)"]
+    CORE -- "instruction documents" --> INS["instruction-md (lib instruction_md)<br/>the instruction.md SDK"]
     MCP -- "transport" --> NET
 ```
 
@@ -37,10 +37,11 @@ flowchart TD
 | `agentd-cli` | (binary) | 1.20.0 | AGPL-3.0-only | the stock `agentd` command, including the `tui` and `ui` launcher |
 | `agentd-mcp` | `mcp` | 4.0.0 | AGPL-3.0-only | a blocking MCP client over the official `rmcp` SDK, on agentd's credentialed Streamable HTTP socket, plus a raw HTTP listener for embedders that serve plain HTTP; it serves no MCP |
 | `agentd-net` | `net` | 2.0.0 | AGPL-3.0-only | a blocking HTTP/1.1 and SSE client, unix-socket and TLS connects, and the SSRF egress classifier |
-| `agentd-instruction` | `instruction_core` | 0.3.0 | MIT OR Apache-2.0 | the Instruction Specification's reference parser, validator and delivery pipeline |
 
 The crates.io name `agentd` belongs to an unrelated project, which is why the
 engine's package is `agentd-core` while its library name is `agentd`.
+Instruction documents are read with the official instruction.md Rust SDK,
+`instruction-md` (MIT OR Apache-2.0), a dependency of `agentd-core`.
 
 ## Build a minimal agent binary
 
@@ -398,9 +399,7 @@ its package name.
 
 `agentd-core`, `agentd-cli`, `agentd-mcp` and `agentd-net` are licensed
 AGPL-3.0-only. A binary you distribute, or offer to users over a network,
-that links them carries the AGPL's obligations. `agentd-instruction` is
-MIT OR Apache-2.0, so other implementations of the Instruction Specification
-can link it freely. Commercial licensing, for proprietary embedding or use
+that links them carries the AGPL's obligations. Commercial licensing, for proprietary embedding or use
 without the AGPL, and commercial support are available from the project:
 contact agent@agentd.dev.
 

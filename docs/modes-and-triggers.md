@@ -118,7 +118,7 @@ declare in `workflows` the work such an instance waits for.
 
 The shape is settled when the process starts. A reload that changes
 `lifecycle.run_until`, from the configuration or from the instruction's own
-`:::!config`, is refused with `config.reload.restart_required`.
+`:::config`, is refused with `config.reload.restart_required`.
 
 ## Triggers
 

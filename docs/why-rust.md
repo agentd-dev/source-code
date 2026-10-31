@@ -239,8 +239,8 @@ for the release graph.
   the cron parser is five-field UTC only and finds the next firing by
   stepping a minute at a time for up to four years. Each is a specification
   revision you handle yourself and a bug nobody else reports.
-- **`unsafe` is quarantined, not absent.** There is none in `agentd-net`,
-  `agentd-mcp` or `agentd-instruction`. In the engine, 72 `unsafe` blocks in
+- **`unsafe` is quarantined, not absent.** There is none in `agentd-net`
+  or `agentd-mcp`, and the instruction.md SDK forbids it. In the engine, 72 `unsafe` blocks in
   21 files at v1.18.0, test modules included: libc calls for signals,
   spawning, reaping, killing, cgroups, file locks, `statvfs` and terminal
   handling, plus environment changes in tests, which edition 2024 made

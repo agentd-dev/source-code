@@ -175,11 +175,14 @@ The rules that keep an addressee meaningful:
 - **The addressee and the schema are durable.** Both are in the run's wait
   record, so a restart rebuilds the gate exactly as declared.
 
-In a workflow an instruction document declares, `to: "@human/<name>"`
-addresses one of the document's `::!human` declarations. A human with a
-`principal` addresses the gate to it, under the rule above; one with only a
-`channel` is answered by the operators. The channel is announced on the
-gate, in the `human.asked` event and the task's
+In a workflow an instruction document declares, `to: <id>` (or `"#<id>"`)
+addresses one of the document's `::person` or `::role` declarations: the
+gate is answered by the operators, exactly as `to: operator`, and the
+person's name stays in the question the model and the bridge read. A
+`to` that names nobody the document declares is refused at load.
+
+The operator's `agent.gate_channels` names the channel a gate is announced
+on, by workflow and step: in the `human.asked` event and the task's
 [`askChannel` annotation](https://agentd.dev/a2a/ext/task-annotations), so
 a workflow or a bridge can route the question to Slack, a pager or mail. It
 never changes who may answer. See

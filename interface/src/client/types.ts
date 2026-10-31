@@ -88,8 +88,8 @@ export interface TaskView {
   /** The shape a gate's answer must take, if the gate declared one. */
   askSchema?: Json;
   /**
-   * Where a gate is also announced: the channel of the instruction
-   * document's `::!human` it is addressed to. It never decides who answers.
+   * Where a gate is also announced: the channel the operator's
+   * `agent.gate_channels` names for it. It never decides who answers.
    */
   askChannel?: string;
   /**

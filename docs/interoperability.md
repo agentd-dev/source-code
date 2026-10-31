@@ -68,7 +68,7 @@ file and the rule:
 skills: ./.agents/skills/runbook/SKILL.md: `name` "Incident_Runbook" has 'I'; only a-z, 0-9 and - are allowed (agentskills.io)
 ```
 
-The instruction document's `:::!skill` blocks join the same catalogue.
+The instruction document's `:::skill` blocks join the same catalogue.
 agentd's own skills — the instruction's, the project's and the user's —
 share one name each, and are named `local/<name>` where a server's skill
 shares the name.
@@ -300,7 +300,7 @@ workflow's firing asks its person to approve it on their own device.
 | Installer | `curl -fsSL https://agentd.dev/install.sh \| sh` picks the architecture and verifies the checksum |
 | Container image | `ghcr.io/agentd-dev/agentd`, multi-arch (`linux/amd64`, `linux/arm64`), `FROM scratch`, runs as uid 65532, cosign-signed (keyless) with an SPDX SBOM attestation |
 | Display clients | the npm package `@agentd-dev/cli`: `agentd-tui`, `agentd-ui` and the thin-client core they share |
-| Rust crates | `agentd-core` (the engine, library name `agentd`), `agentd-cli`, `agentd-mcp`, `agentd-net`, `agentd-instruction` on crates.io |
+| Rust crates | `agentd-core` (the engine, library name `agentd`), `agentd-cli`, `agentd-mcp`, `agentd-net` on crates.io |
 | Host install | a hardened systemd unit and environment file under `packaging/` |
 
 There are no prebuilt macOS or Windows binaries. A source build needs Rust
@@ -331,7 +331,7 @@ series.
 
 | Standard | Where |
 |---|---|
-| [instruction.md](https://github.com/instruction-md/specification), the Instruction Specification, version 1, registry revision 1.1 | instruction documents: parsing, delivery, signatures and the resolution manifest |
+| [instruction.md](https://github.com/instruction-md/specification), first edition `instruction/1` (commit `af8400f`), read with the official Rust SDK `instruction-md` | instruction documents: reading, the agent text, signatures and the `instruction-resolved/1` manifest |
 | [AGENTS.md](https://agents.md) (no version; the Agentic AI Foundation's `agentsmd/agents.md` at `d001185d79`) | the [workspace's notes for agents](coding-agent.md#the-repositorys-agentsmd): the `AGENTS.md` files of `agent.workspace`, from its root down to the working directory, nearest last, in the system prompt as text below the instruction |
 | OCI distribution, cosign signatures | `oci://` instruction sources, verified against a cosign key |
 | age v1, JWE Compact (ECDH-ES with X25519, `dir`) | encrypted instruction documents |

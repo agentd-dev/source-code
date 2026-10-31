@@ -140,7 +140,7 @@ mod tests {
                     \x20   kind: http\n\
                     \x20   depends_on: [par]\n\
                     \x20   url: \"https://example.test\"\n\
-                    \x20   body: {steps: {x: {kind: human, question: \"ok?\", to: oncall}}}\n\
+                    \x20   body: {steps: {x: {kind: human, to: oncall}}}\n\
                     \x20 f: {kind: finish, depends_on: [post]}\n\
                     :::\n";
         let wfs = fold(text);

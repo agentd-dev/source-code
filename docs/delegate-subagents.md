@@ -562,6 +562,7 @@ You run the research desk. When a question needs sources, open a
 researcher for it.
 
 :::workflow{id=research dialect=instruction/workflow}
+name: research
 steps:
   ask:
     kind: a2a
@@ -631,6 +632,7 @@ subagents:
         :::
 
         :::workflow{id=on-update dialect=instruction/workflow}
+        name: on-update
         steps:
           cmd:
             kind: a2a

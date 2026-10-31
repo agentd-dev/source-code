@@ -1233,6 +1233,7 @@ fn an_instance_child_drains_with_its_parent_and_comes_back() {
             \x20     instruction: |\n\
             \x20       You are the room for {{{{params.id}}}}.\n\
             \x20       :::workflow{{id=on-ping dialect=instruction/workflow}}\n\
+            \x20       name: on-ping\n\
             \x20       steps:\n\
             \x20         cmd: {{ kind: a2a, command: room.ping, roles: [agent, operator] }}\n\
             \x20         f:   {{ kind: finish, depends_on: [cmd], status: completed, output: pong }}\n\

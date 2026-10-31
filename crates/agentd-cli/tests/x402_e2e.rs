@@ -1279,7 +1279,7 @@ fn a_served_document_configures_no_payment() {
     let doc = dir.path().join("desk.md");
     std::fs::write(
         &doc,
-        "You buy data.\n\n:::workflow{id=buyer dialect=instruction/workflow}\nsteps:\n  s: {kind: manual}\n  get: {kind: http, depends_on: [s], url: \"https://api.example/data\", payment: {wallet: ops, max: \"0.01 usdc\"}}\n:::\n",
+        "You buy data.\n\n:::workflow{id=buyer dialect=instruction/workflow}\nname: buyer\nsteps:\n  s: {kind: manual}\n  get: {kind: http, depends_on: [s], url: \"https://api.example/data\", payment: {wallet: ops, max: \"0.01 usdc\"}}\n  f: {kind: finish, depends_on: [get]}\n:::\n",
     )
     .unwrap();
     let (code, err) = validate(

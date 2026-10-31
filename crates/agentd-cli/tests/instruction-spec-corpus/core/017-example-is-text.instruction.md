@@ -7,6 +7,7 @@ An example, never a server.
 ::::
 
 :::workflow{id=kept dialect="instruction/workflow"}
+name: kept
 steps:
   s: {kind: once}
   f: {kind: finish, depends_on: [s]}

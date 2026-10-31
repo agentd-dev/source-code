@@ -63,6 +63,7 @@ limits:
 :::
 
 :::workflow{id=digest dialect="instruction/workflow"}
+name: digest
 steps:
   start: { kind: once }
   write:
@@ -90,8 +91,8 @@ Save it as `agent.md`. What each part does:
   runs and its step budget. It cannot say where model calls go; that is the
   operator's.
 - `:::workflow{dialect="instruction/workflow"}` defines a workflow exactly as
-  an entry under `workflows:` would. Its `name` is the `id` unless the body
-  names one.
+  an entry under `workflows:` would; its body names it (`name:`), as the
+  language requires.
 
 The operator's configuration supplies what the document may not: the model
 endpoint and its credential. Save this as `agentd.yaml`:
@@ -602,6 +603,7 @@ You run the deploy desk for the payments team.
 ::agent{id=releaser title="Release agent" protocol=a2a endpoint="https://release.example/a2a"}
 
 :::workflow{id=release dialect="instruction/workflow"}
+name: release
 steps:
   go: { kind: manual }
   approve:

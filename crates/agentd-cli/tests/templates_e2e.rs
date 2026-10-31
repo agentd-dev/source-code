@@ -152,6 +152,7 @@ fn an_instance_template_boots_answers_typed_commands_and_retires_on_ttl() {
         \x20     instruction: |\n\
         \x20       You are the room for {{params.id}}.\n\
         \x20       :::workflow{id=on-ping dialect=instruction/workflow}\n\
+        \x20       name: on-ping\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }\n\
         \x20         f:   { kind: finish, depends_on: [cmd], status: completed, output: \"pong {{params.id}}/{{steps.cmd.output.args.x}}\" }\n\
@@ -222,6 +223,7 @@ fn an_instance_childs_instruction_is_delivered_once_by_the_parent() {
         \x20       ::::\n\
         \n\
         \x20       :::workflow{id=on-ask dialect=instruction/workflow}\n\
+        \x20       name: on-ask\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
         \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
@@ -278,6 +280,7 @@ fn an_instance_templates_quoted_placeholder_reaches_the_child_as_written() {
         \x20       MUST: answer for {{params.id}} from $${HOME}.\n\
         \n\
         \x20       :::workflow{id=on-ask dialect=instruction/workflow}\n\
+        \x20       name: on-ask\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
         \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
@@ -379,6 +382,7 @@ fn a_singleton_instance_refuses_a_second_live_spawn() {
         \x20     instruction: |\n\
         \x20       The one board.\n\
         \x20       :::workflow{id=on-ask dialect=instruction/workflow}\n\
+        \x20       name: on-ask\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: board.ask, roles: [agent, operator] }\n\
         \x20         f:   { kind: finish, depends_on: [cmd], status: completed, output: ok }\n\
@@ -428,7 +432,7 @@ fn a_templates_document_gate_spawns() {
         \x20       Approve deploys.\n\
         \x20       ::person{id=oncall title=\"On call\"}\n\
         \x20       :::workflow{id=approve dialect=instruction/workflow}\n\
-        \x20       name: \"approve_{{params.team}}\"\n\
+        \x20       name: approve\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: deploy.approve, roles: [agent, operator] }\n\
         \x20         ask: { kind: human, question: \"ship it?\", to: \"oncall\", depends_on: [cmd] }\n\
@@ -496,6 +500,7 @@ fn template_machinery_may_not_define_listeners_and_fails_the_parents_boot() {
         \x20       webhooks: { listen: \"http://127.0.0.1:1\" }\n\
         \x20       :::\n\
         \x20       :::workflow{id=w dialect=instruction/workflow}\n\
+        \x20       name: w\n\
         \x20       steps: { s: { kind: once }, f: { kind: finish, depends_on: [s], status: completed } }\n\
         \x20       :::\n",
     );
@@ -527,6 +532,7 @@ fn a_respawned_instance_child_is_delivered_once_too() {
         \x20       MUST: answer for {{params.id}}.\n\
         \n\
         \x20       :::workflow{id=on-ask dialect=instruction/workflow}\n\
+        \x20       name: on-ask\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: scribe.ask, roles: [agent, operator] }\n\
         \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\
@@ -638,6 +644,7 @@ fn an_instance_param_that_names_a_secret_is_refused() {
         \x20     instruction: |\n\
         \x20       You are the room for {{params.id}}.\n\
         \x20       :::workflow{id=on-ping dialect=instruction/workflow}\n\
+        \x20       name: on-ping\n\
         \x20       steps:\n\
         \x20         cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }\n\
         \x20         f:   { kind: finish, depends_on: [cmd], status: completed }\n\
@@ -686,6 +693,7 @@ const DESK: &str = "subagents:\n\
     \x20     instruction: |\n\
     \x20       You keep the books for {{params.id}}.\n\
     \x20       :::workflow{id=on-work dialect=instruction/workflow}\n\
+    \x20       name: on-work\n\
     \x20       steps:\n\
     \x20         cmd: { kind: a2a, command: desk.work, roles: [agent, operator] }\n\
     \x20         a:   { kind: agent, depends_on: [cmd], instruction: go }\n\

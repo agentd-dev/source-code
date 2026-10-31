@@ -84,7 +84,7 @@ fn mock_registry(blob: Vec<u8>) -> u16 {
     port
 }
 
-const DOC: &str = "---\nspec: \"1\"\n---\n# Pulled agent\n\nServe pulls.\n\n:::workflow{id=pulled-drain dialect=instruction/workflow}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+const DOC: &str = "---\nspec: \"1\"\n---\n# Pulled agent\n\nServe pulls.\n\n:::workflow{id=pulled-drain dialect=instruction/workflow}\nname: pulled-drain\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
 
 /// Boot with a caller-supplied `agent` block (the long instruction form),
 /// otherwise identical to [`boot_and_capture`].

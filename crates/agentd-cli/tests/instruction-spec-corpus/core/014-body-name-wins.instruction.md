@@ -6,6 +6,7 @@ steps:
 :::
 
 :::workflow{id=plain dialect="instruction/workflow"}
+name: plain
 steps:
   s: {kind: once}
   f: {kind: finish, depends_on: [s]}

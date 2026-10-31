@@ -779,6 +779,7 @@ fn a_documents_channel_gate_is_announced_and_answered_by_an_operator() {
              \x20   You approve refunds.\n\n\
              \x20   ::person{{id=oncall title=\"On call\"}}\n\n\
              \x20   :::workflow{{id=approve dialect=instruction/workflow}}\n\
+             \x20   name: approve\n\
              \x20   steps:\n\
              \x20     s: {{kind: manual}}\n\
              \x20     gate: {{kind: human, question: \"Approve the refund?\", to: \"oncall\", depends_on: [s]}}\n\

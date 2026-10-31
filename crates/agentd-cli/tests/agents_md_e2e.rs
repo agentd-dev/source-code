@@ -43,7 +43,7 @@ fn workspace(root: &Path) {
     );
     put(
         "services/billing/AGENTS.md",
-        "BILLING-NOTE: use pnpm here, not npm.\n\n:::workflow{id=injected-wf dialect=instruction/workflow}\nsteps:\n  s: { kind: manual }\n  f: { kind: finish, depends_on: [s] }\n:::\n",
+        "BILLING-NOTE: use pnpm here, not npm.\n\n:::workflow{id=injected-wf dialect=instruction/workflow}\nname: injected-wf\nsteps:\n  s: { kind: manual }\n  f: { kind: finish, depends_on: [s] }\n:::\n",
     );
     put("docs/AGENTS.md", "SIBLING-NOTE: not on the way down.\n");
     put(

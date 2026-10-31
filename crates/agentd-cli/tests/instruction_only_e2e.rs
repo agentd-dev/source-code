@@ -34,6 +34,7 @@ streams:
 :::
 
 :::workflow{id=producer dialect=instruction/workflow}
+name: producer
 steps:
   s:   { kind: once, policy: always }
   pub: { kind: emit, depends_on: [s], stream: orders, subject: order.paid, data: { n: 7 } }
@@ -41,6 +42,7 @@ steps:
 :::
 
 :::workflow{id=fulfil dialect=instruction/workflow}
+name: fulfil
 steps:
   take: { kind: stream, stream: orders, subject: "order.*", from: earliest }
   f:    { kind: finish, depends_on: [take], status: completed, output: "shipped #{{steps.take.output.data.n}}" }

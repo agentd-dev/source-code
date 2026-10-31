@@ -503,7 +503,7 @@ pub(super) fn a_documents_workflow_asks_unless_listed(h: &Harness) -> Outcome {
     s.edit(|c| {
         c.replace(
             "agent: {name: ema, preflight: never}\n",
-            "agent:\n  name: ema\n  preflight: never\n  instruction: |\n    File what the workflows say.\n\n    :::workflow{id=doc-write dialect=instruction/workflow}\n    steps:\n      start: {kind: manual}\n      one: {kind: mcp.tool, depends_on: [start], server: linear, tool: create_issue, args: {title: one}}\n      two: {kind: mcp.tool, depends_on: [one], server: linear, tool: create_issue, args: {title: two}}\n      done: {kind: finish, depends_on: [two]}\n    :::\n",
+            "agent:\n  name: ema\n  preflight: never\n  instruction: |\n    File what the workflows say.\n\n    :::workflow{id=doc-write dialect=instruction/workflow}\n    name: doc-write\n    steps:\n      start: {kind: manual}\n      one: {kind: mcp.tool, depends_on: [start], server: linear, tool: create_issue, args: {title: one}}\n      two: {kind: mcp.tool, depends_on: [one], server: linear, tool: create_issue, args: {title: two}}\n      done: {kind: finish, depends_on: [two]}\n    :::\n",
         )
     });
     let digest = {
@@ -612,7 +612,7 @@ pub(super) fn a_documents_subagent_is_its_workflows_work(h: &Harness) -> Outcome
     s.edit(|c| {
         c.replace(
             "agent: {name: ema, preflight: never}\n",
-            "agent:\n  name: ema\n  preflight: never\n  instruction: |\n    File what the workflows say.\n\n    :::workflow{id=doc-sub dialect=instruction/workflow}\n    steps:\n      start: {kind: manual}\n      c: {kind: subagent, depends_on: [start], instruction: \"File it.\", tools: [create_issue], servers: [linear]}\n      done: {kind: finish, depends_on: [c]}\n    :::\n",
+            "agent:\n  name: ema\n  preflight: never\n  instruction: |\n    File what the workflows say.\n\n    :::workflow{id=doc-sub dialect=instruction/workflow}\n    name: doc-sub\n    steps:\n      start: {kind: manual}\n      c: {kind: subagent, depends_on: [start], instruction: \"File it.\", tools: [create_issue], servers: [linear]}\n      done: {kind: finish, depends_on: [c]}\n    :::\n",
         )
         .replace(
             "principals: {source: operator}, idp: okta,",

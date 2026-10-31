@@ -35,6 +35,7 @@ MUST: page the on-call only for data loss, security or an outage.
 ::mcp{id=queue title="Support queue" src="https://queue.example.com/mcp"}
 
 :::workflow{id=triage dialect="instruction/workflow"}
+name: triage
 steps:
   wake: { kind: subscribe, server: queue, uri: "queue://inbox" }
   act:  { kind: agent, depends_on: [wake], instruction: "Triage the item." }

@@ -90,6 +90,7 @@ mod tests {
         format!(
             "---\nspec: \"1\"\n---\n{people}\n\n\
              :::workflow{{id=w dialect=\"instruction/workflow\"}}\n\
+             name: w\n\
              steps:\n\
              \x20 s:   {{kind: manual}}\n\
              \x20 ask: {{kind: human, question: \"ok?\", to: \"{to}\", depends_on: [s]}}\n\
@@ -122,6 +123,7 @@ mod tests {
     fn a_nested_gate_is_addressed() {
         let text = "::person{id=oncall title=\"On call\"}\n\n\
                     :::workflow{id=w dialect=\"instruction/workflow\"}\n\
+                    name: w\n\
                     steps:\n\
                     \x20 s: {kind: manual}\n\
                     \x20 each:\n\
@@ -138,7 +140,7 @@ mod tests {
                     \x20   kind: http\n\
                     \x20   depends_on: [par]\n\
                     \x20   url: \"https://example.test\"\n\
-                    \x20   body: {steps: {x: {kind: human, to: oncall}}}\n\
+                    \x20   body: {steps: {x: {kind: human, question: \"ok?\", to: oncall}}}\n\
                     \x20 f: {kind: finish, depends_on: [post]}\n\
                     :::\n";
         let wfs = fold(text);

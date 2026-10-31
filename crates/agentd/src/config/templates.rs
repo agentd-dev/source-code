@@ -737,7 +737,7 @@ mod tests {
     #[test]
     fn tier_resolution_is_by_machinery() {
         let s = settings_with(
-            "    worker:\n      instruction: do the thing\n    room:\n      instruction: |\n        Be the room.\n        :::workflow{id=w dialect=instruction/workflow}\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
+            "    worker:\n      instruction: do the thing\n    room:\n      instruction: |\n        Be the room.\n        :::workflow{id=w dialect=instruction/workflow}\n        name: w\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
         );
         let c = compile_templates(&s).unwrap();
         assert_eq!(c["worker"].tier, Tier::Flat);
@@ -755,7 +755,7 @@ mod tests {
         // The child is wired as an A2A peer; a build that cannot speak A2A
         // refuses the tier at the parent's boot, naming the feature.
         let s = settings_with(
-            "    room:\n      instruction: |\n        Be the room.\n        :::workflow{id=w dialect=instruction/workflow}\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
+            "    room:\n      instruction: |\n        Be the room.\n        :::workflow{id=w dialect=instruction/workflow}\n        name: w\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
         );
         let e = compile_templates(&s).unwrap_err();
         assert!(e.iter().any(|m| m.contains("'a2a' build feature")), "{e:?}");
@@ -881,7 +881,7 @@ mod tests {
         const W: &str = "        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n";
         let s = settings_with(&format!(
             "    room:\n      mode: sync\n      result: {{workflow: w}}\n      instruction: |\n        Be the room.\n\
-             \x20       :::workflow{{id=w dialect=instruction/workflow}}\n{W}        :::\n\
+             \x20       :::workflow{{id=w dialect=instruction/workflow}}\n        name: w\n{W}        :::\n\
              \x20       :::workflow{{id=report dialect=instruction/workflow}}\n        name: _agentd_report\n{W}        :::\n"
         ));
         let e = compile_templates(&s).expect_err("a block named like the reporter must not load");
@@ -897,7 +897,7 @@ mod tests {
             "    room:\n      instruction: |\n        Be the room.\n\
              \x20       :::config{{id=cfg4 dialect=agentd/config}}\n        workflows:\n          - name: dup\n    \
              {W}        :::\n\
-             \x20       :::workflow{{id=dup dialect=instruction/workflow}}\n{W}        :::\n"
+             \x20       :::workflow{{id=dup dialect=instruction/workflow}}\n        name: dup\n{W}        :::\n"
         ));
         let e = compile_templates(&s).expect_err("two definitions of dup must not load");
         assert!(
@@ -1095,7 +1095,7 @@ mod tests {
     #[test]
     fn instance_templates_may_not_take_webhook_starts() {
         let s = settings_with(
-            "    room:\n      instruction: |\n        Room.\n        :::workflow{id=w dialect=instruction/workflow}\n        steps: {s: {kind: webhook, path: /x}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
+            "    room:\n      instruction: |\n        Room.\n        :::workflow{id=w dialect=instruction/workflow}\n        name: w\n        steps: {s: {kind: webhook, path: /x}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n",
         );
         let e = compile_templates(&s).unwrap_err();
         assert!(e.iter().any(|m| m.contains("no webhook listener")), "{e:?}");
@@ -1134,7 +1134,7 @@ mod tests {
     #[test]
     fn fixed_until_on_non_singleton_is_refused() {
         let s = settings_with(
-            "    room:\n      instruction: |\n        Room.\n        :::workflow{id=w dialect=instruction/workflow}\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n      until: closed\n",
+            "    room:\n      instruction: |\n        Room.\n        :::workflow{id=w dialect=instruction/workflow}\n        name: w\n        steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n        :::\n      until: closed\n",
         );
         let e = compile_templates(&s).unwrap_err();
         assert!(e.iter().any(|m| m.contains("fixed signal")), "{e:?}");

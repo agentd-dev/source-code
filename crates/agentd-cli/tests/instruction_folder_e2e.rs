@@ -43,6 +43,7 @@ id: ins_folder_2
 Every paid order is fulfilled.
 
 :::workflow{id=fulfil dialect=instruction/workflow}
+name: fulfil
 steps:
   s: { kind: once, policy: always }
   f: { kind: finish, depends_on: [s], status: completed, output: "shipped" }

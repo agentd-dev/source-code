@@ -312,6 +312,7 @@ subagents:
         agent: { preflight: never }
         :::
         :::workflow{id=on-ping dialect=instruction/workflow}
+        name: on-ping
         steps:
           cmd: { kind: a2a, command: room.ping, roles: [agent, operator] }
           f:   { kind: finish, depends_on: [cmd], status: completed, output: "pong {{params.id}}" }

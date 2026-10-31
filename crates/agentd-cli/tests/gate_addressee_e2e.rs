@@ -395,7 +395,7 @@ fn a_reload_that_addresses_a_gate_to_anyone_but_an_operator_is_refused() {
 fn converse_document(workflow: &str, play: &str) -> String {
     let doc = format!(
         "::person{{id=oncall title=\"On call\"}}\n\n\
-         :::workflow{{id=approve dialect=instruction/workflow}}\n{workflow}:::\n"
+         :::workflow{{id=approve dialect=instruction/workflow}}\nname: approve\n{workflow}:::\n"
     );
     let indented: String = doc.lines().map(|l| format!("    {l}\n")).collect();
     let cfg = format!(
@@ -518,6 +518,7 @@ fn a_reload_that_moves_a_humans_channel_moves_the_next_gate() {
     let cfg_for = |channel: &str| {
         let doc = "::person{id=oncall title=\"On call\"}\n\n\
              :::workflow{id=approve dialect=instruction/workflow}\n\
+             name: approve\n\
              steps:\n\
              \x20 s: {kind: schedule, every: 700ms}\n\
              \x20 ask: {kind: human, question: \"ok?\", to: \"oncall\", timeout: 300ms, depends_on: [s]}\n\

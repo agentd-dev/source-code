@@ -15,6 +15,7 @@ Search the internal index.
 :::
 
 :::workflow{id=drain dialect="instruction/workflow"}
+name: drain
 steps:
   take: {kind: stream, stream: inbox, subject: "x.*", from: earliest}
   f:    {kind: finish, depends_on: [take]}

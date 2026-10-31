@@ -11,7 +11,7 @@
 //! |---|---|
 //! | `:::mcp{id src tools allow deny}` | an `mcp.servers` entry: `id` → `name`, `src` → `endpoint`, `tools`/`allow` → `allow`, `deny` → `exclude` (the `agentd/1` export profile's mapping) |
 //! | `::agent{id protocol=a2a endpoint\|src}` | an `a2a.peers` entry named `id`, under the [`IDENTITY`] grant |
-//! | `:::workflow{dialect="instruction/workflow"}` | a `workflows[]` entry (the body is the definition; `name` defaults to the `id`) |
+//! | `:::workflow{dialect="instruction/workflow"}` | a `workflows[]` entry (the body is the definition, its `name` required) |
 //! | `:::config{dialect="agentd/config"}` | the document's configuration fragment, held to the document boundary downstream |
 //! | `:::skill{id trigger}` with a body and no `src` | an inline skill in the catalogue |
 //! | `::person`, `::role` | a person a workflow's `human` step may be addressed to (`to: <id>`) |
@@ -493,13 +493,10 @@ impl Folder<'_> {
         let Some(Value::Object(m)) = b.data else {
             return;
         };
-        let mut m = m.clone();
+        let m = m.clone();
+        // A workflow's `name` is the language's to require, and the SDK's
+        // check does; the block's `id` is its instruction identity.
         if what == "workflow" {
-            if !m.contains_key("name")
-                && let Some(id) = b.id
-            {
-                m.insert("name".into(), id.into());
-            }
             self.out.workflows.push(Value::Object(m));
             return;
         }
@@ -598,6 +595,7 @@ mod tests {
         :::\n\n\
         ::agent{id=home title=\"Home agent\" protocol=a2a src=\"https://home.example/.well-known/agent-card.json\"}\n\n\
         :::workflow{id=warm dialect=\"instruction/workflow\"}\n\
+        name: warm\n\
         steps:\n  start: {kind: manual}\n  done: {kind: finish, depends_on: [start]}\n\
         :::\n";
 

@@ -44,7 +44,7 @@ whose body is guidance.
 |---|---|---|
 | `:::mcp{id src tools allow deny}` (or `::mcp`) | an `mcp.servers` entry: `id` → `name`, `src` → `endpoint`, `tools` and `allow` → `allow`, `deny` → `exclude` | none |
 | `::agent{id protocol=a2a endpoint binding src}` | an `a2a.peers` entry named `id`: `endpoint`, or the origin of an Agent Card `src` at `/.well-known/agent-card.json` | `identity` |
-| `:::workflow{id dialect="instruction/workflow"}` | a `workflows[]` entry; the body is the definition, its `name` defaulting to the `id`. `agentd/workflow` is the same dialect. | none; `interface` for a route |
+| `:::workflow{id dialect="instruction/workflow"}` | a `workflows[]` entry; the body is the definition, its `name` required by the language. `agentd/workflow` is the same dialect. | none; `interface` for a route |
 | `:::config{id dialect="agentd/config"}` | the document's configuration fragment, merged under the operator's | none |
 | `:::skill{id title trigger}` with a body, no `src` | an inline skill named `id`: `description` (or `title`) and `trigger` | none |
 | `::person{id}`, `::role{id}` | a person a `human` step may be addressed to: `to: <id>` or `to: "#<id>"` is answered by the operators | none |

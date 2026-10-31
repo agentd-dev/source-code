@@ -1697,8 +1697,8 @@ fn write_json(stream: &mut TcpStream, status: u16, payload: &Value, session: Opt
 
 /// The document this mock's registry serves. `REGISTRY_VERSION` moves when the
 /// caller asks for `@next`, so a test can watch an apply boundary.
-const REGISTRY_DOC: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock.\n\n:::workflow{id=mock-drain dialect=\"instruction/workflow\"}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
-const REGISTRY_DOC_V2: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, version two.\n\n:::workflow{id=mock-drain dialect=\"instruction/workflow\"}\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+const REGISTRY_DOC: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock.\n\n:::workflow{id=mock-drain dialect=\"instruction/workflow\"}\nname: mock-drain\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
+const REGISTRY_DOC_V2: &str = "---\nspec: \"1\"\nid: instruction://ins_mock\n---\n# Mock registry agent\n\nServe the mock, version two.\n\n:::workflow{id=mock-drain dialect=\"instruction/workflow\"}\nname: mock-drain\nsteps:\n  start: { kind: manual }\n  done:  { kind: finish, depends_on: [start] }\n:::\n";
 /// The document `@endmatter` serves: no fence at all — front matter and
 /// prose — followed by end matter that changes on every read, under a new
 /// versionId each time: a publisher editing only the record. Fence-free on

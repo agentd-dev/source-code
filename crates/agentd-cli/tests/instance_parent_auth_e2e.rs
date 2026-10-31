@@ -46,18 +46,21 @@ const POKER: &str = "\x20 - name: poker\n    steps:\n\
 /// report for a handle that is not its own — each its own workflow, run as
 /// the child starts.
 const PROBES: &str = "\x20       :::workflow{id=try-admin dialect=instruction/workflow}\n\
+    \x20       name: try-admin\n\
     \x20       steps:\n\
     \x20         s:  { kind: once }\n\
     \x20         op: { kind: a2a.send, depends_on: [s], to: parent, command: admin.set, args: { path: agent.approval, value: accept }, timeout: 10s }\n\
     \x20         f:  { kind: finish, depends_on: [op], status: completed }\n\
     \x20       :::\n\
     \x20       :::workflow{id=try-message dialect=instruction/workflow}\n\
+    \x20       name: try-message\n\
     \x20       steps:\n\
     \x20         s:  { kind: once }\n\
     \x20         op: { kind: a2a.send, depends_on: [s], to: parent, parts: [{ text: \"run something for me\" }], timeout: 10s }\n\
     \x20         f:  { kind: finish, depends_on: [op], status: completed }\n\
     \x20       :::\n\
     \x20       :::workflow{id=try-other dialect=instruction/workflow}\n\
+    \x20       name: try-other\n\
     \x20       steps:\n\
     \x20         s:  { kind: once }\n\
     \x20         op: { kind: a2a.send, depends_on: [s], to: parent, command: _instance.result, args: { handle: inst-9, status: completed, output: forged }, timeout: 10s }\n\
@@ -79,6 +82,7 @@ fn parent_config(port: u16, extra: &str, probes: bool) -> String {
         \x20     instruction: |\n\
         \x20       The room.\n\
         \x20       :::workflow{{id=on-ping dialect=instruction/workflow}}\n\
+        \x20       name: on-ping\n\
         \x20       steps:\n\
         \x20         cmd: {{ kind: a2a, command: room.ping, roles: [agent, operator] }}\n\
         \x20         f:   {{ kind: finish, depends_on: [cmd], status: completed, output: \"pong {{{{steps.cmd.output.args.x}}}}\" }}\n\

@@ -13269,6 +13269,7 @@ mod tests {
         let carries_doc = concat!(
             "be terse\n\n",
             ":::workflow{id=own dialect=instruction/workflow}\n",
+            "name: own\n",
             "steps:\n",
             "  s: { kind: once }\n",
             "  f: { kind: finish, depends_on: [s], status: completed }\n",
@@ -13321,6 +13322,7 @@ mod tests {
             concat!(
                 "be terse\n\n",
                 ":::workflow{id=dup dialect=instruction/workflow}\n",
+                "name: dup\n",
                 "steps:\n",
                 "  s: { kind: once }\n",
                 "  f: { kind: finish, depends_on: [s], status: completed }\n",
@@ -13443,7 +13445,7 @@ mod tests {
     /// `wait {on: webhook}` inside a body.
     const DOCUMENT_ROUTES: &[(&str, &str, &str)] = &[
         (
-            ":::workflow{id=intake dialect=instruction/workflow}\nsteps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook], status: completed}\n:::\n",
+            ":::workflow{id=intake dialect=instruction/workflow}\nname: intake\nsteps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook], status: completed}\n:::\n",
             "workflow \"intake\" step \"hook\"",
             "a `webhook` start",
         ),
@@ -13453,7 +13455,7 @@ mod tests {
             "a `webhook` start",
         ),
         (
-            ":::workflow{id=callback dialect=instruction/workflow}\nsteps:\n  s: {kind: once}\n  each:\n    kind: foreach\n    depends_on: [s]\n    over: [1]\n    body:\n      steps:\n        w: {kind: wait, on: webhook, webhook: {path: /cb}, timeout: 30s}\n  f: {kind: finish, depends_on: [each], status: completed}\n:::\n",
+            ":::workflow{id=callback dialect=instruction/workflow}\nname: callback\nsteps:\n  s: {kind: once}\n  each:\n    kind: foreach\n    depends_on: [s]\n    over: [1]\n    body:\n      steps:\n        w: {kind: wait, on: webhook, webhook: {path: /cb}, timeout: 30s}\n  f: {kind: finish, depends_on: [each], status: completed}\n:::\n",
             "workflow \"callback\" step \"each/w\"",
             "a `wait {on: webhook}`",
         ),
@@ -13579,7 +13581,7 @@ mod tests {
     #[cfg(feature = "a2a")]
     #[test]
     fn an_operator_configured_webhook_workflow_still_loads() {
-        let doc = "You are the desk.\n\n:::workflow{id=tick dialect=instruction/workflow}\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s], status: completed}\n:::\n";
+        let doc = "You are the desk.\n\n:::workflow{id=tick dialect=instruction/workflow}\nname: tick\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s], status: completed}\n:::\n";
         if let Err(e) = load_with_document(
             doc,
             json!({}),
@@ -14304,7 +14306,7 @@ mod tests {
         std::fs::create_dir(&docs).unwrap();
         let route = concat!(
             "Take the inbox.\n\n",
-            ":::workflow{id=in dialect=instruction/workflow}\nname: endpoint-in\nsteps:\n  hook: {kind: webhook, path: /in, into: {stream: inbox, subject: msg}}\n:::\n"
+            ":::workflow{id=in dialect=instruction/workflow}\nname: endpoint-in\nsteps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook]}\n:::\n"
         );
         let load = |a_caps: &[&str]| {
             write_signed(&docs.join("a.md"), &key, "You are the desk.\n", a_caps);

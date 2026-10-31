@@ -130,6 +130,7 @@ streams:
 :::
 
 :::workflow{id=triage dialect="instruction/workflow"}
+name: triage
 steps:
   take: {kind: stream, stream: tickets, subject: "t.*", from: earliest}
   look: {kind: mcp.tool, depends_on: [take], server: search, tool: query}
@@ -242,7 +243,10 @@ fn a_gate_to_a_person_nobody_declared_is_refused() {
 
 #[test]
 fn a_workflow_without_a_dialect_is_refused_naming_the_attribute() {
-    let (valid, err, _) = load(":::workflow{id=w}\nsteps: {f: {kind: finish}}\n:::\n", &[]);
+    let (valid, err, _) = load(
+        ":::workflow{id=w}\nname: w\nsteps: {f: {kind: finish}}\n:::\n",
+        &[],
+    );
     assert!(!valid);
     assert!(err.contains("needs dialect"), "{err}");
 }
@@ -268,7 +272,7 @@ fn a_sigiled_block_is_refused_as_legacy_syntax() {
 #[test]
 fn a_workflow_the_language_refuses_is_the_sdks_diagnostic() {
     let (valid, err, _) = load(
-        ":::workflow{id=w dialect=instruction/workflow}\nsteps:\n  s: {kind: manual}\n  pause: {kind: wait, depends_on: [s], timeout: 1m}\n  f: {kind: finish, depends_on: [pause]}\n:::\n",
+        ":::workflow{id=w dialect=instruction/workflow}\nname: w\nsteps:\n  s: {kind: manual}\n  pause: {kind: wait, depends_on: [s], timeout: 1m}\n  f: {kind: finish, depends_on: [pause]}\n:::\n",
         &[],
     );
     assert!(!valid, "a wait with no `on` loaded");

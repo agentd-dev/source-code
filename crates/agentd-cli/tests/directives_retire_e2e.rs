@@ -99,6 +99,7 @@ fn an_instruction_carries_its_workflow_and_its_skill() {
     You watch the queue and keep things tidy.
 
     :::workflow{id=embedded dialect=instruction/workflow}
+    name: embedded
     steps:
       start: {kind: once}
       make:  {kind: assign, depends_on: [start], value: "made-by-embedded"}
@@ -185,6 +186,7 @@ fn scheduled_cfg(version: &str) -> String {
     Keep ticking.
 
     :::workflow{{id=tick dialect=instruction/workflow}}
+    name: tick
     steps:
       s: {{kind: schedule, every: 400ms}}
       v: {{kind: assign, depends_on: [s], value: "{version}"}}

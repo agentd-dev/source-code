@@ -23,6 +23,7 @@ use std::process::Command;
 #[cfg(feature = "a2a")]
 const ROUTE_DOC: &str = "You are the desk.\n\n\
      :::workflow{id=intake dialect=instruction/workflow}\n\
+     name: intake\n\
      steps:\n  hook: {kind: webhook, path: /in}\n  f: {kind: finish, depends_on: [hook], status: completed}\n\
      :::\n";
 
@@ -30,6 +31,7 @@ const ROUTE_DOC: &str = "You are the desk.\n\n\
 /// daemon up without a route.
 const QUIET_DOC: &str = "You are the desk.\n\n\
      :::workflow{id=tick dialect=instruction/workflow}\n\
+     name: tick\n\
      steps:\n  s: {kind: schedule, every: 1h}\n  f: {kind: finish, depends_on: [s], status: completed}\n\
      :::\n";
 

@@ -29,7 +29,7 @@ agent:
 intelligence:
   endpoints: https://api.openai.com/v1/chat/completions
   token: "{{secret:OPENAI_API_KEY}}"
-  model: gpt-5.6-sol
+  model: gpt-6.1-sol
 
 store:
   kind: file

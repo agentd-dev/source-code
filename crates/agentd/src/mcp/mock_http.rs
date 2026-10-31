@@ -968,9 +968,15 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
     {
         eprintln!("MOCK_BINDINGS {n} {args}");
         return match n {
-            "instructions_bindings_create" => {
-                tool_ok(req.id, json!({"bindingId": "sub_mock_1", "mode": "follow"}))
-            }
+            // The registry validates `consumer` against its schema and
+            // refuses the call when it does not match.
+            "instructions_bindings_create" => match binding_consumer_error(&args) {
+                Some(why) => tool_err(
+                    req.id,
+                    &format!("Input validation failed for tool '{n}': {why}"),
+                ),
+                None => tool_ok(req.id, json!({"bindingId": "sub_mock_1", "mode": "follow"})),
+            },
             _ => tool_ok(req.id, json!({"ok": true})),
         };
     }
@@ -1253,6 +1259,32 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
         }
         other => tool_err(req.id, &format!("no such tool: {other:?}")),
     }
+}
+
+/// Why `args.consumer` does not match the registry's consumer schema —
+/// `{name, kind, host, version}`, every one an optional string, with
+/// `additionalProperties: false` — or `None` when it does, or is absent.
+fn binding_consumer_error(args: &Value) -> Option<String> {
+    const ALLOWED: [&str; 4] = ["name", "kind", "host", "version"];
+    let consumer = args.get("consumer")?;
+    let Some(obj) = consumer.as_object() else {
+        return Some("/consumer: must be an object".into());
+    };
+    let extra: Vec<String> = obj
+        .keys()
+        .filter(|k| !ALLOWED.contains(&k.as_str()))
+        .map(|k| format!("'{k}'"))
+        .collect();
+    if !extra.is_empty() {
+        return Some(format!(
+            "/consumer: Additional properties are not allowed ({} {} unexpected)",
+            extra.join(", "),
+            if extra.len() == 1 { "was" } else { "were" }
+        ));
+    }
+    obj.iter()
+        .find(|(_, v)| !v.is_string())
+        .map(|(k, _)| format!("/consumer/{k}: must be a string"))
 }
 
 /// The knowledge profile's canned corpus: `(id, title, body)`.

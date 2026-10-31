@@ -2311,10 +2311,13 @@ impl Runtime {
                 "instructionId": instruction_id,
                 "target": target,
                 "mode": "follow",
+                // The registry's consumer shape is `{name, kind, host,
+                // version}` and nothing more: it refuses any other property.
                 "consumer": {
-                    "label": self.settings.instance_name(),
-                    "kind": "agent",
-                    "workload": self.settings.agent.name.clone().unwrap_or_else(|| "agentd".into()),
+                    "name": self.settings.instance_name(),
+                    "kind": "agentd",
+                    "host": self.settings.agent.name.clone().unwrap_or_else(|| "agentd".into()),
+                    "version": crate::VERSION,
                 },
             });
             match client.call_tool("instructions_bindings_create", Some(args)) {

@@ -1,0 +1,30 @@
+# Demo (c), the email channel: a layer over support.yaml.
+#
+#   agentd -c examples/demos/support.yaml -c examples/demos/support.email.yaml
+#
+# Its own name, listener and state, and its own agent credential at the
+# registry (email-agent). The server list is restated because a layer's list
+# replaces the base's; everything else — the instruction, its pin, the model,
+# the principals — is support.yaml's.
+
+agent:
+  name: support-email
+  description: Harbor Bank customer support, email channel (a demo; fictional data).
+
+store:
+  file: {path: "${AGENTD_DEMO_HOME:-/tmp/agentd-demos}/support-email"}
+
+mcp:
+  servers:
+    - name: instruction-md
+      endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"
+      auth:
+        kind: oauth2
+        grant: client_credentials
+        client_id: email-agent
+        client_secret: "{{secret:EMAIL_AGENT_CLIENT_SECRET}}"
+        token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
+      tags: {"*": [trusted]}
+
+a2a:
+  listen: http://127.0.0.1:8432

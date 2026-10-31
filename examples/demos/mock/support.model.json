@@ -1,0 +1,15 @@
+{
+  "_note": "The scripted model for demo (c) (standins/model.mjs). Its one rule copies the disclosure the delivered instruction tells the agent to say — the first quoted sentence after `say` in the system prompt — into the answer, so the deadline the customer hears is whatever version of \"Card disputes\" is live: 60 days, 120 days after the release, 60 again after the rollback. Nothing here names a number. It does not confirm identity or open a dispute; the real model does both.",
+  "rules": [
+    {
+      "name": "disclosure",
+      "when": { "last_user": "dispute|charge|recogni[sz]e" },
+      "capture": { "disclosure": { "from": "system", "re": "say \"(You have [^\"]+)\"" } },
+      "content": "I'm sorry to hear about that charge — I can help you dispute it. {{disclosure}} First I'll confirm it's you with a few of our usual security questions; I'll never ask for your full card number, your PIN or a one-time passcode."
+    },
+    {
+      "name": "fallback",
+      "content": "I'm Harbor Bank's support assistant. Tell me about the charge you'd like to dispute."
+    }
+  ]
+}

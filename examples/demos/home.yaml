@@ -1,0 +1,179 @@
+# Demo (e): a home that follows instructions.
+#
+# The flat's climate assistant follows "Home climate", an instruction Andrii
+# and Nataliia keep on instruction.md: who lives here, the rules (some of them
+# on who is home and what time it is), guardrails, an energy policy, and its
+# parameters — Nataliia's temperature among them.
+#
+# The live beats: Nataliia comes home; asked, the assistant sets the living
+# room to her temperature, 23 °C. A release on instruction.md moves her
+# temperature to 24.5 °C; agentd logs `instruction.applied`, and the next
+# decision sets 24.5. Then the afternoon sun warms the living room: the
+# thermostat's resource changes, the hot-afternoon workflow starts, asks the
+# home agent over A2A to close the curtains, waits, reads the room again, and
+# asks Nataliia before it cools.
+#
+#   agentd --validate-config -c examples/demos/home.yaml
+#   agentd -c examples/demos/home.yaml
+#
+# What the document declares and what this file declares. The document names
+# the thermostat and the air conditioner (:::mcp, at https://home.example/…),
+# the home agent (::agent) and the hot-afternoon workflow. Read from a
+# registry, as here, agentd delivers the document's TEXT and activates none
+# of its connected objects or workflows: those fold into configuration only
+# when the document is loaded from a file, a URL or an OCI artifact (and a
+# document from the wire never declares a peer at all). So this file
+# declares them, under the document's own names — `thermostat`, `aircon`,
+# `home` — on 127.0.0.1, and nothing needs home.example to resolve. The
+# workflow below is the document's hot-afternoon, made runnable: a filter on
+# the start, arguments on the calls, and Nataliia's gate addressed to her.
+#
+# Placeholders (environment; defaults in brackets):
+#   HOME_INSTRUCTION_URI   [instruction://ins_01M69H2WEK2P005WHYHJJMYM4A@latest]
+#   IMD_MCP_URL, IMD_TOKEN_URL, IMD_CLIENT_ID   the mirror, as in ap-agent.yaml
+#   THERMOSTAT_MCP_URL     [http://127.0.0.1:8741/mcp]
+#   AIRCON_MCP_URL         [http://127.0.0.1:8742/mcp]
+#   HOME_AGENT_URL         the home agent's A2A endpoint [http://127.0.0.1:8744]
+#   HOME_SETTLE            how long the curtains get before the room is read again [20m]
+#   AGENTD_DEMO_HOME       where state lives [/tmp/agentd-demos]
+# Secrets, by reference only: OPENAI_API_KEY, HOME_CLIENT_SECRET,
+# NATALIIA_TOKEN, ANDRII_TOKEN, HOME_PEER_TOKEN (env.sh).
+#
+# Rehearse with no mirror and no model: layer home.local.yaml and
+# home.mock.yaml (README.md).
+
+vars:
+  home_climate: "${HOME_INSTRUCTION_URI:-instruction://ins_01M69H2WEK2P005WHYHJJMYM4A@latest}"
+
+agent:
+  name: home-climate
+  description: The flat's climate assistant (a demo; fictional flat).
+  preflight: never
+  instruction:
+    mcp:
+      server: instruction-md
+      resource: "{{config.home_climate}}"
+      events: [md.instruction.activity]
+    refresh: 10m
+    unavailable: keep
+  # The hot-afternoon workflow starts on a resource change, so nobody owns
+  # its runs: its question to Nataliia opens as a task on the A2A listener.
+  ask_human_unowned: gate
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  token: "{{secret:OPENAI_API_KEY}}"
+  model: gpt-6.1-sol
+
+store:
+  kind: file
+  file: {path: "${AGENTD_DEMO_HOME:-/tmp/agentd-demos}/home-climate"}
+
+mcp:
+  servers:
+    - name: instruction-md
+      endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"
+      auth:
+        kind: oauth2
+        grant: client_credentials
+        client_id: "${IMD_CLIENT_ID:-home-climate}"
+        client_secret: "{{secret:HOME_CLIENT_SECRET}}"
+        token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
+      tags: {"*": [trusted]}
+    # The document's two connected objects, under its names. Device readings
+    # and acknowledgements, not outside text: trusted.
+    - name: thermostat
+      endpoint: "${THERMOSTAT_MCP_URL:-http://127.0.0.1:8741/mcp}"
+      ns: thermostat
+      allow: [rooms.read, target.set, schedule.read]
+      tags: {"*": [trusted]}
+    - name: aircon
+      endpoint: "${AIRCON_MCP_URL:-http://127.0.0.1:8742/mcp}"
+      ns: aircon
+      allow: [state.read, power.set, mode.set, fan.set]
+      tags: {"*": [trusted]}
+
+a2a:
+  listen: http://127.0.0.1:8450
+  events: {enabled: true}
+  principals:
+    - match: {bearer_ref: "{{secret:NATALIIA_TOKEN}}"}
+      id: nataliia
+      role: operator
+      labels: {person: nataliia}
+    - match: {bearer_ref: "{{secret:ANDRII_TOKEN}}"}
+      id: andrii
+      role: operator
+      labels: {person: andrii}
+  # The home agent, under the name the document gives it (::agent{id=home}).
+  # It answers only agents it knows: this one presents its token.
+  peers:
+    - name: home
+      endpoint: "${HOME_AGENT_URL:-http://127.0.0.1:8744}"
+      auth: {kind: static, token: "{{secret:HOME_PEER_TOKEN}}"}
+
+workflows:
+  - name: hot-afternoon
+    description: The document's "A hot afternoon" — curtains first, then ask Nataliia before cooling.
+    concurrency: {max_runs: 1, on_overflow: drop}
+    steps:
+      warm:
+        kind: subscribe
+        server: thermostat
+        uri: "thermostat://rooms/living"
+        # The resource changes on every reading and every target; only a
+        # warm room in the sun starts the afternoon (cool_above is 26 °C).
+        filter: "content.temp > 26.0 && content.sunOnWindows"
+        debounce_ms: 1000
+      curtains:
+        kind: a2a.send
+        depends_on: [warm]
+        to: home
+        parts:
+          - text: Close the living room curtains.
+      settle:
+        kind: wait
+        on: deadline
+        depends_on: [curtains]
+        timeout: "${HOME_SETTLE:-20m}"
+      check:
+        kind: mcp.tool
+        depends_on: [settle]
+        server: thermostat
+        tool: rooms.read
+        args: {room: living}
+      ask:
+        kind: human
+        depends_on: [check]
+        to: {role: operator, labels: {person: nataliia}}
+        question: |
+          The living room is still warm with the curtains closed. Shall I cool it, in auto mode?
+        schema: {type: string, enum: ["yes", "no"]}
+        timeout: 2h
+        on_error: continue
+      route:
+        kind: switch
+        depends_on: [ask]
+        on: "{{ steps.ask.output }}"
+        cases: {"yes": mode}
+        default: leave
+      mode:
+        kind: mcp.tool
+        depends_on: [route]
+        server: aircon
+        tool: mode.set
+        args: {unit: living, mode: auto}
+      cool:
+        kind: mcp.tool
+        depends_on: [mode]
+        server: aircon
+        tool: power.set
+        args: {unit: living, "on": true}
+      leave:
+        kind: finish
+        depends_on: [route]
+        output: {cooled: false, reason: Nataliia would rather keep the air conditioner off.}
+      cooled:
+        kind: finish
+        depends_on: [cool]
+        output: {cooled: true}

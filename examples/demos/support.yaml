@@ -1,0 +1,89 @@
+# Demo (c): one disclosure, three channels, one release.
+#
+# Harbor Bank's support agents — chat, voice and email — are three agentd
+# instances that follow one instruction, "Card disputes", owned by Compliance
+# on instruction.md. This is the base the three share; each channel is a
+# small layer over it (support.chat.yaml, support.voice.yaml,
+# support.email.yaml) with its name, its listener, its state folder and its
+# own agent credential at the registry:
+#
+#   agentd -c examples/demos/support.yaml -c examples/demos/support.chat.yaml
+#
+# The live beats: Compliance changes the disclosure "You have 60 days from the
+# statement date…" to 120 days and releases. The registry tells every
+# subscriber; each of the three logs `instruction.applied` (old → new version
+# id) within a second, and the next customer hears 120 days. Then the owner
+# rolls `latest` back to the previous version, and all three go back.
+#
+# Placeholders the recorder fills (environment; defaults in brackets):
+#   SUPPORT_INSTRUCTION_URI  the policy at the ref to follow
+#                            [instruction://ins_01M69N5T2ATZNEJVW397VRQTXW@latest]
+#   IMD_MCP_URL              the mirror's MCP endpoint [http://localhost:18080/mcp]
+#   IMD_TOKEN_URL            the agents realm's token endpoint
+#   AGENTD_DEMO_HOME         where state lives [/tmp/agentd-demos]
+# Secrets, by reference only, from the environment (see env.sh):
+#   OPENAI_API_KEY, SUPPORT_TOKEN, and per channel CHAT_AGENT_CLIENT_SECRET,
+#   VOICE_AGENT_CLIENT_SECRET, EMAIL_AGENT_CLIENT_SECRET
+#
+# Rehearse without the mirror or a model: layer support.local.yaml (the
+# registry stand-in) and support.mock.yaml (the scripted model) on top; see
+# README.md.
+
+vars:
+  # `vars` take `${…}` from the environment; agent.instruction does not (a
+  # `${name}` there is an instruction parameter), so the address goes this way.
+  card_disputes: "${SUPPORT_INSTRUCTION_URI:-instruction://ins_01M69N5T2ATZNEJVW397VRQTXW@latest}"
+
+agent:
+  name: support
+  description: Harbor Bank customer support (a demo; fictional data).
+  # A customer's message goes straight to the turn.
+  preflight: never
+  instruction:
+    mcp:
+      server: instruction-md
+      resource: "{{config.card_disputes}}"
+      # A release or a rollback moves `latest`; the registry says so on the
+      # resource's subscription and on this MCP Events type.
+      events: [md.instruction.activity]
+    refresh: 10m
+    # Compliance signs what it releases. Pinned, a document that does not
+    # verify — unsigned, or signed by anyone else — is refused, and a re-read
+    # that fails to verify keeps the running version.
+    trust:
+      - uri: "instruction://ins_01M69N5T2ATZNEJVW397VRQTXW"
+        publisher: "http://localhost:18080/pub/harbor-bank"
+    # Pinned, `auto` is `freeze`: an agent that can no longer confirm what
+    # Compliance released serves the conversations it has and takes no new one.
+    unavailable: auto
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  token: "{{secret:OPENAI_API_KEY}}"
+  model: gpt-6.1-sol
+
+store:
+  kind: file
+  file: {path: "${AGENTD_DEMO_HOME:-/tmp/agentd-demos}/support"}
+
+mcp:
+  servers:
+    - name: instruction-md
+      endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"
+      auth:
+        kind: oauth2
+        grant: client_credentials
+        client_id: chat-agent
+        client_secret: "{{secret:CHAT_AGENT_CLIENT_SECRET}}"
+        token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
+      tags: {"*": [trusted]}
+
+# The display surface: the TUI attaches here. Each channel listens on its own
+# loopback port (support.<channel>.yaml).
+a2a:
+  listen: http://127.0.0.1:8430
+  events: {enabled: true}
+  principals:
+    - match: {bearer_ref: "{{secret:SUPPORT_TOKEN}}"}
+      id: support.desk
+      role: operator

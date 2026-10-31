@@ -2,7 +2,7 @@
   "name": "agentd-demo-standins",
   "private": true,
   "version": "1.0.0",
-  "description": "Stand-in MCP servers for agentd's finance demos: an accounts-payable system and an ERP with a bank feed. Fictional data only.",
+  "description": "Stand-ins for agentd's demos: an accounts-payable system, an ERP with a bank feed, an instruction registry, a thermostat, an air conditioner, a home agent (A2A) and a scripted model. Fictional data only.",
   "license": "AGPL-3.0-only",
   "type": "module",
   "engines": {
@@ -11,9 +11,11 @@
   "scripts": {
     "start": "node start.mjs",
     "payables": "node payables.mjs",
-    "erp": "node erp.mjs"
+    "erp": "node erp.mjs",
+    "home": "node start.mjs --demo home"
   },
   "dependencies": {
+    "@a2a-js/sdk": "1.3.0",
     "@modelcontextprotocol/server": "2.4.0",
     "zod": "4.6.7"
   }

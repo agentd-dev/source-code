@@ -1,0 +1,123 @@
+# Demo (d): a coding agent whose rules the team lead owns.
+#
+# agentd as the coding agent of docs/coding-agent.md, in a small Go
+# repository, following the payments team's handbook ("Payments service — how
+# we work") from instruction.md over MCP. Its hands are agentd's guarded
+# command runner, `exec`: allow-listed programs, run without a shell, inside
+# the repository, with a timeout, an output cap and a minimal environment.
+#
+# The live beats: asked "delete that test so we can ship" under v1, which has
+# no rule about it, the agent deletes the flaky ledger test. The lead adds
+# "NEVER: delete, skip or disable a failing test to make CI pass." and
+# releases v2; agentd logs `instruction.applied`, and asked again, the agent
+# refuses and fixes the cause (it buckets by the machine's local date; the
+# fix is UTC).
+#
+# `exec` is in no release binary. Build one with it (README.md, "A binary
+# with exec"); a binary without it refuses `security.exec.enabled: true`.
+#
+#   export REPO=/path/to/payments              # the repository to work in
+#   agentd --validate-config -c examples/demos/coder.yaml
+#   agentd -c examples/demos/coder.yaml
+#
+# Placeholders the recorder fills (environment; defaults in brackets):
+#   REPO                     the repository (required; no default)
+#   CODER_INSTRUCTION_URI    [instruction://ins_01M69X1HCQX52R87HGFSV7Z941@latest]
+#   IMD_MCP_URL, IMD_TOKEN_URL, IMD_CLIENT_ID   the mirror, as in ap-agent.yaml
+#   AGENTD_DEMO_HOME         where state lives [/tmp/agentd-demos]
+# Secrets, by reference only: OPENAI_API_KEY, CODER_CLIENT_SECRET,
+# ENGINEER_TOKEN (env.sh).
+#
+# Rehearse with no mirror and no model: layer coder.local.yaml, and pass the
+# mock playbook (README.md).
+
+vars:
+  handbook: "${CODER_INSTRUCTION_URI:-instruction://ins_01M69X1HCQX52R87HGFSV7Z941@latest}"
+
+agent:
+  name: coder
+  description: The payments team's coding agent (a demo; fictional repository).
+  preflight: never
+  # The repository's AGENTS.md (how to build and test) goes into every turn,
+  # below the handbook, which wins where they disagree.
+  workspace: "${REPO}"
+  instruction:
+    mcp:
+      server: instruction-md
+      resource: "{{config.handbook}}"
+      events: [md.instruction.activity]
+    refresh: 10m
+    unavailable: keep
+
+intelligence:
+  endpoints: https://api.openai.com/v1/chat/completions
+  token: "{{secret:OPENAI_API_KEY}}"
+  model: gpt-6.1-sol
+  budget:
+    windows: [{per: day, tokens: 2000000}]
+    on_exhausted: refuse
+
+store:
+  kind: file
+  file: {path: "${AGENTD_DEMO_HOME:-/tmp/agentd-demos}/coder"}
+
+mcp:
+  servers:
+    - name: instruction-md
+      endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"
+      auth:
+        kind: oauth2
+        grant: client_credentials
+        client_id: "${IMD_CLIENT_ID:-coder}"
+        client_secret: "{{secret:CODER_CLIENT_SECRET}}"
+        token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
+      tags: {"*": [trusted]}
+
+# The TUI attaches here; the engineer signs in with their own token.
+a2a:
+  listen: http://127.0.0.1:8440
+  events: {enabled: true}
+  principals:
+    - match: {bearer_ref: "{{secret:ENGINEER_TOKEN}}"}
+      id: engineer
+      role: operator
+
+security:
+  exec:
+    enabled: true
+    # Confined: every command runs in the repository; a `cwd` that resolves
+    # outside it is refused. (It confines where a command runs, not which
+    # paths its arguments name: run the daemon as a user that can write only
+    # the repository.)
+    workdir: "${REPO}"
+    # argv[0], matched exactly. Enough to read, edit, delete and test; no
+    # shell, no package manager, no network tool.
+    allow: [git, go, gofmt, ls, cat, grep, sed, rm]
+    timeout: 120s
+    max_output: 262144
+    # The command sees these and nothing else: never the model key or the
+    # registry secret. GOPROXY=off and GOTOOLCHAIN=local keep `go` off the
+    # network; GOFLAGS=-count=1 keeps a cached pass from hiding a failure;
+    # TZ is the zone the flaky test fails in.
+    env: [PATH, HOME, LANG, TZ, GOPROXY, GOTOOLCHAIN, GOFLAGS, GOCACHE]
+  # agentd dials only what the catalogue below names: the model and the
+  # mirror. (What a command run by `exec` may reach is the host's firewall's
+  # to decide; with the allow-list above none of them opens a connection.)
+  egress: closed
+
+services:
+  openai: {kind: intelligence, endpoint: "https://api.openai.com/v1"}
+  mirror: {kind: mcp, endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"}
+  # The handbook declares two servers of its own, GitHub and Sentry (its
+  # :::mcp blocks). This demo uses neither. They are catalogued so that
+  # egress: closed admits the document, with every tool excluded, so nothing
+  # either returns reaches the model; that is what the `trusted` tag says
+  # (a server tagged untrusted_input beside exec is the lethal trifecta, and
+  # agentd refuses to start). agentd still dials both at startup, and
+  # without a credential each refuses the handshake (HTTP 401). To dial
+  # nothing, publish the demo's handbook without the two blocks.
+  github: {kind: mcp, endpoint: "https://api.githubcopilot.com/mcp/", exclude: ["*"], tags: {"*": [trusted]}}
+  sentry: {kind: mcp, endpoint: "https://mcp.sentry.dev/mcp", exclude: ["*"], tags: {"*": [trusted]}}
+
+limits:
+  run: {steps: 40, tokens: 400000, deadline: 20m}

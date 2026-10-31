@@ -1,0 +1,27 @@
+# Rehearsal layer for demo (c): "Card disputes" from a local file, served by
+# the registry stand-in (standins/registry.mjs, on 127.0.0.1:8723) instead of
+# the mirror. Layer it last, over the base and a channel:
+#
+#   agentd -c examples/demos/support.yaml -c examples/demos/support.chat.yaml \
+#          -c examples/demos/support.local.yaml -c examples/demos/support.mock.yaml
+#
+# The server list is restated with `instruction-md` pointing at the stand-in,
+# which needs no sign-in, and the trust pin is dropped (an empty list: a layer's list
+# replaces the base's): the local copies are unsigned, and a pinned publisher refuses
+# an unsigned document. Everything else — the instruction source, its
+# subscription and its MCP Events type — is support.yaml's, so a release
+# reaches the three agents by the same path as on the mirror.
+#
+# Releasing v2 is copying instruction/card-disputes-v2.md over the served
+# file; the rollback is copying v1 back, which the stand-in serves as version
+# 1 again, under its old id.
+
+agent:
+  instruction:
+    trust: []
+
+mcp:
+  servers:
+    - name: instruction-md
+      endpoint: "${REGISTRY_MCP_URL:-http://127.0.0.1:8723/mcp}"
+      tags: {"*": [trusted]}

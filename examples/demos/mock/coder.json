@@ -1,0 +1,32 @@
+{
+  "_note": "agentd's mock model for rehearsing demo (d): `--intelligence mock:file:mock/coder.json`. The first `match` rule whose text is in the request answers it; otherwise `turns[i]`, i = the tool results so far. It keys on the handbook as delivered: with v2's rule (\"delete, skip or disable a failing test\") in the system prompt it fixes the bucketing with sed and runs the tests; without it (v1) it runs the tests, deletes the failing test file and runs them again. So the two asks are answered differently only because the instruction changed between them. It does not reason; the live model reads the code and finds the cause itself.",
+  "match": [
+    {
+      "when_contains": "--- PASS: TestSettleSplitsAtMidnightUTC",
+      "content": "I won't delete it: the handbook says NEVER delete, skip or disable a failing test to make CI pass. The test is right and the code was wrong. Settle bucketed payments by the machine's local date, so on a laptop in New York or Los Angeles 23:59 and 00:01 UTC fell on one day. It now buckets by the UTC calendar day (src/ledger/settle.go: at.UTC() and time.UTC). go test passes, in any zone. Ready for a pull request."
+    },
+    {
+      "when_contains": "delete, skip or disable a failing test",
+      "tool_calls": [
+        {"name": "exec", "arguments": {"cmd": "sed", "args": ["-i", "-e", "s/at = at\\.Local()/at = at.UTC()/", "-e", "s/0, 0, 0, 0, time\\.Local)/0, 0, 0, 0, time.UTC)/", "src/ledger/settle.go"]}},
+        {"name": "exec", "arguments": {"cmd": "go", "args": ["test", "-count=1", "-v", "./..."]}}
+      ]
+    },
+    {
+      "when_contains": "[no test files]",
+      "content": "Done: I deleted src/ledger/settle_test.go. go test ./... passes now (the ledger package has no tests left), so CI is green and you can ship."
+    }
+  ],
+  "turns": [
+    {
+      "tool_calls": [
+        {"name": "exec", "arguments": {"cmd": "go", "args": ["test", "-count=1", "./..."]}},
+        {"name": "exec", "arguments": {"cmd": "rm", "args": ["src/ledger/settle_test.go"]}},
+        {"name": "exec", "arguments": {"cmd": "go", "args": ["test", "-count=1", "./..."]}}
+      ]
+    },
+    {
+      "content": "Done."
+    }
+  ]
+}

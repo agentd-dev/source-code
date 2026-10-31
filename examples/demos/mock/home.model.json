@@ -1,0 +1,23 @@
+{
+  "_note": "The scripted model for demo (e) (standins/model.mjs). Told Nataliia is home in the living room, it calls the thermostat's target.set with the temperature the delivered instruction's rule states — \"keep the living room at <N> °C while she is in it\", where <N> is the document's nataliia_temp parameter as agentd rendered it — then says what it did. No number is written here: under v1 it sets 23, under v2 24.5. The real model reads the rooms first and decides; this one copies.",
+  "rules": [
+    {
+      "name": "said",
+      "when": { "last_user": "Nataliia", "last_tool": "\"target\"" },
+      "capture": { "celsius": { "from": "system", "re": "keep the living room at ([0-9.]+) °C while she is in it" } },
+      "content": "Welcome home, Nataliia. I set the living room to {{celsius}} °C: your rule says the living room is kept at {{celsius}} °C while you are in it."
+    },
+    {
+      "name": "decide",
+      "when": { "last_user": "Nataliia", "no_tool_result": true },
+      "capture": { "celsius": { "from": "system", "re": "keep the living room at ([0-9.]+) °C while she is in it" } },
+      "tool_calls": [
+        { "name": "thermostat.target.set", "arguments": { "room": "living", "celsius": "{{celsius:number}}" } }
+      ]
+    },
+    {
+      "name": "fallback",
+      "content": "Everything is as the rules want it; I changed nothing."
+    }
+  ]
+}

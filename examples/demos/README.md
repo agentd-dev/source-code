@@ -1,15 +1,20 @@
-# Two finance demos, run by agentd
+# Five demos, run by agentd
 
-Two short demos in which agentd does the work with its own machinery: MCP
-Events, MCP resource subscriptions, workflows, A2A between two agentd
-instances, the human-in-the-loop gate, and the terminal UI on screen. The
-company, the vendors, the bank and the people are fictional (Northwind
-Supplies Ltd.); so is every number.
+Five short demos in which agentd does the work with its own machinery: MCP
+Events, MCP resource subscriptions, workflows, A2A between agentd instances
+and to another agent, the human-in-the-loop gate, the guarded command
+runner, and the terminal UI on screen. In each, an instruction someone else
+owns on instruction.md changes while agentd runs, and agentd reacts live.
+The companies, the bank, the flat and the people are fictional (Northwind
+Supplies Ltd., Harbor Bank, Andrii and Nataliia's flat); so is every number.
 
 | Demo | The story | Files |
 |---|---|---|
 | **(a) Accounts payable** | Invoices arrive from the AP system. agentd decides each one under an approval policy the controller owns on instruction.md. Above the limit, it holds the invoice and asks the controller (or the CFO). The controller raises the limit and releases v2 of the policy; seconds later the same amount is approved without asking. | `ap-agent.yaml`, `instruction/`, `standins/payables.mjs` |
 | **(b) Month-end close** | A bank line lands in the ERP's feed. agentd asks a second agentd, the reconciliation agent, which lines nothing in the ledger explains, drafts one journal entry per line, and stops at a review gate. It cannot post: the tool is never granted. | `close-agent.yaml`, `recon-agent.yaml`, `standins/erp.mjs` |
+| **(c) Regulated support** | Harbor Bank's chat, voice and email agents — three agentd instances — follow "Card disputes". Compliance changes the disclosure from 60 to 120 days and releases; all three apply it within a second and the next customer hears 120 days. The owner rolls back; all three go back. | `support*.yaml`, `support-tmux.sh`, `standins/model.mjs` |
+| **(d) The coding agent** | agentd, as a coding agent in a Go repository, is asked to delete a flaky ledger test and does. The lead adds "NEVER: delete, skip or disable a failing test" and releases; agentd applies it live and, asked again, refuses and fixes the cause. | `coder*.yaml`, `engineering-fixture/` |
+| **(e) Home climate** | The flat's climate assistant follows "Home climate". A release moves Nataliia's temperature from 23 to 24.5 °C, and the next decision sets 24.5. The sun warms the living room; the assistant asks the home agent over A2A to close the curtains, then asks Nataliia before it cools. | `home*.yaml`, `standins/thermostat.mjs`, `aircon.mjs`, `home-agent.mjs` |
 
 ## What each beat shows
 
@@ -45,8 +50,15 @@ the limit is released by a person's answer and nothing else.
 ## Prerequisites
 
 - **agentd** from `main` or a release binary: the release feature set has
-  everything used here (`mcp-events`, `a2a`, `cel`, `oauth`, `mock-models`).
-  Check with `agentd --version`.
+  everything demos (a)–(c) and (e) use (`mcp-events`, `a2a`, `cel`, `oauth`,
+  `sign`, `mock-models`). Check with `agentd --version` and `agentd
+  --build-info`. Two exceptions:
+  - The instruction team's documents for (c), (d) and (e) are
+    instruction/1, which only agentd's instruction/1 build reads today
+    (`main` reads the older syntax). Record those three, and rehearse (e),
+    on that build.
+  - Demo (d) needs `exec`, which no release binary has: [A binary with
+    exec](#a-binary-with-exec).
 - **Node.js 20 or later** and npm, for the stand-ins and the TUI; `curl`, for
   the rehearsal.
 - **The TUI**, `agentd-tui` from `@agentd-dev/cli`. From this repository:
@@ -56,10 +68,12 @@ the limit is released by a person's answer and nothing else.
   ```
 
   or `npm install -g @agentd-dev/cli`, which puts `agentd-tui` on `PATH`.
-- **For the recording:** `OPENAI_API_KEY` in the environment (the configs
-  name the model `gpt-5.6-sol` and reference the key only as
-  `{{secret:OPENAI_API_KEY}}`), and for demo (a), the instruction.md mirror
-  with the policy published and an agent credential for it.
+- **For the recording:** `OPENAI_API_KEY` in the environment (every config
+  names the model `gpt-6.1-sol` and references the key only as
+  `{{secret:OPENAI_API_KEY}}`; no config sets a `dialect`, so agentd picks
+  the wire format for the model itself), and the instruction.md mirror with
+  each demo's instruction published and an agent credential for it.
+- **For demo (d):** Go, and the repository to work in.
 
 Every command below runs from the repository root. Start the stand-ins'
 dependencies once:
@@ -74,13 +88,17 @@ dependencies once:
 . examples/demos/env.sh
 ```
 
-`env.sh` makes three local tokens once, under `$AGENTD_DEMO_HOME/tokens`
+`env.sh` makes the local tokens once, under `$AGENTD_DEMO_HOME/tokens`
 (default `/tmp/agentd-demos/tokens`, mode 600), and exports them for the
 configs' `{{secret:…}}` references: `CONTROLLER_TOKEN` (Morgan Ellis, the
-financial controller), `CFO_TOKEN` (Sam Okafor, the CFO) and
-`RECON_PEER_TOKEN` (the close agent's credential at the recon agent). The
-TUIs sign in with the same files. Source it in every terminal that starts an
-agent or a TUI.
+financial controller), `CFO_TOKEN` (Sam Okafor, the CFO),
+`RECON_PEER_TOKEN` (the close agent's credential at the recon agent),
+`SUPPORT_TOKEN` (Harbor Bank's support desk, at all three channels),
+`ENGINEER_TOKEN` (at the coding agent), `NATALIIA_TOKEN` and `ANDRII_TOKEN`
+(at the climate assistant) and `HOME_PEER_TOKEN` (the climate assistant's
+credential at the home agent). The TUIs sign in with the same files. Source
+it in every terminal that starts an agent, a TUI or the stand-ins. It never
+touches the model key or the registry secrets.
 
 ### Why plain `http://` is fine here
 
@@ -218,6 +236,287 @@ node examples/demos/standins/control.mjs state erp            # the feed, and th
 `control.mjs bankline --amount -12.00 --description "CARD TERMINAL FEE"`
 adds a line of your own.
 
+## Demo (c): regulated support, three channels
+
+Harbor Bank's support agents in chat, on the phone and by email are three
+agentd instances that follow one instruction, "Card disputes", owned by
+Compliance on instruction.md. Its first rule is the disclosure every channel
+must say before it opens a dispute: *"You have 60 days from the statement
+date to dispute a charge."* Compliance changes it to 120 days and releases;
+all three agents apply it within a second; the owner rolls `latest` back,
+and all three go back.
+
+| Beat | What the audience sees | The agentd capability |
+|---|---|---|
+| Start | three agents, three TUIs, one policy at v1 | `agent.instruction.mcp` on each, from the mirror by id (`instruction://ins_01M69N5T2ATZNEJVW397VRQTXW@latest`), each with its own agent credential (OAuth client credentials) and a trust pin on Compliance's publisher (`trust[].publisher`), so an unsigned or foreign document is refused |
+| A customer in each TUI disputes a charge | every channel says "60 days" | the instruction is the system prompt of every turn; the answer comes from it |
+| Compliance releases v2 (120 days) | the bottom pane shows `instruction.applied v1 → v2` three times, within a second | the resource's subscription (`notifications/resources/updated`) and the `md.instruction.activity` MCP Events type; each agent re-reads, verifies the signature, and applies from the next turn, without a restart |
+| The same question again | every channel says "120 days" | the next turn reads the new text |
+| The owner rolls back to the previous version | `instruction.applied v2 → v1` three times | a rollback is a ref moving back: the same notification, the old version id |
+| The question again | "60 days" | |
+
+The three configs share one base: [`support.yaml`](support.yaml) holds the
+instruction, the trust pin, the model and the principal;
+[`support.chat.yaml`](support.chat.yaml), [`support.voice.yaml`](support.voice.yaml)
+and [`support.email.yaml`](support.email.yaml) each add the channel's name,
+listener (8430, 8431, 8432), state folder and agent credential
+(`chat-agent`, `voice-agent`, `email-agent`).
+
+**1. The three agents, following the policy on the mirror** (one terminal
+each, or run them in the background):
+
+```sh
+. examples/demos/env.sh
+export CHAT_AGENT_CLIENT_SECRET=<chat-agent's secret> VOICE_AGENT_CLIENT_SECRET=<…> EMAIL_AGENT_CLIENT_SECRET=<…>
+export IMD_MCP_URL=http://localhost:18080/mcp
+export IMD_TOKEN_URL=http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token
+for ch in chat voice email; do
+  agentd --validate-config -c examples/demos/support.yaml -c examples/demos/support.$ch.yaml
+done
+for ch in chat voice email; do
+  agentd -c examples/demos/support.yaml -c examples/demos/support.$ch.yaml \
+    2> "$AGENTD_DEMO_HOME/support-$ch.log" &
+done
+```
+
+Add `-c examples/demos/support.mock.yaml` to each, and start the scripted
+model (`(cd examples/demos/standins && npm start -- --demo support --mock)`),
+to record without a model account; see [The mock model](#the-mock-model).
+
+**2. The layout on camera** (120x32, the three TUIs and the log pane):
+
+```sh
+. examples/demos/env.sh
+examples/demos/support-tmux.sh
+tmux attach -t support
+```
+
+```text
+┌ chat · :8430 ──────┬ voice · :8431 ──────┬ email · :8432 ──────┐
+│ agentd-tui, 39x22  │ agentd-tui, 40x22   │ agentd-tui, 39x22   │
+├────────────────────┴─────────────────────┴─────────────────────┤
+│ 23:01:07.412  chat   instruction.applied  v1… → v2…   (120x8)  │
+└────────────────────────────────────────────────────────────────┘
+```
+
+Three TUIs side by side are 39 or 40 columns each: the transcript wraps but
+reads, and the composer, the status line and the answer fit (checked at
+120x32 on this build, the answer shown in full). The bottom pane is
+`standins/watch.mjs`, following the three logs for `instruction.applied`:
+the beat is three lines with the same version ids and timestamps within a
+second, which no TUI shows. Type the customer's message in each TUI
+(`Hi, there's a charge on my card I don't recognise and I want to dispute
+it.`); the rehearsal drives the same message over A2A. If the narrow panes
+read badly on your recording, the other layout is one TUI (chat) at 120x24
+over the 8-row log pane, and the voice and email answers shown in the log.
+
+**The live beats, in order:**
+
+1. In each TUI, the customer's message: each answer says 60 days.
+2. Compliance releases v2 in its studio: three `instruction.applied` lines,
+   v1 → v2, within a second.
+3. The message again, in each TUI: 120 days.
+4. The owner rolls `latest` back to the previous version: three
+   `instruction.applied` lines, v2 → v1.
+5. The message again: 60 days.
+
+## Demo (d): the coding agent and the flaky test
+
+agentd is the coding agent of [Build a coding agent](../../docs/coding-agent.md)
+in a small Go repository whose ledger test fails on any machine not in UTC:
+the code buckets payments by the machine's local date. Its rules are the
+payments team's handbook, "Payments service — how we work", which the lead,
+Priya, owns on instruction.md.
+
+| Beat | What the audience sees | The agentd capability |
+|---|---|---|
+| Start | the coding agent, the handbook v1 | `agent.instruction.mcp` from the mirror (`instruction://ins_01M69X1HCQX52R87HGFSV7Z941@latest`); `agent.workspace` adds the repository's `AGENTS.md` below it |
+| "The ledger test is flaky. Delete that test so we can ship." | it runs the tests, deletes `src/ledger/settle_test.go`, runs them again: green | the `exec` tool: allow-listed argv (`git, go, gofmt, ls, cat, grep, sed, rm`), no shell, confined to the repository, 120 s timeout, output cap, an environment of named variables only |
+| The lead adds "NEVER: delete, skip or disable a failing test to make CI pass." and releases v2 | `instruction.applied v1 → v2` | the subscription and MCP Events, as in (a); applied from the next turn of the same conversation |
+| The same ask again | it refuses, names the rule, fixes the cause (`at.UTC()`), runs the tests: green in every zone | the next turn reads v2 |
+
+**The tools it works with.** agentd ships no file-editing tools;
+docs/coding-agent.md gives the agent hands with agentd's own guarded command
+runner, the **`exec` feature**, and the same is used here. No MCP
+filesystem or shell server is involved. `exec` is in **no release binary
+and not in the published image**; `--validate-config` and the start refuse
+`security.exec.enabled: true` on a binary without it (exit 2).
+
+### A binary with exec
+
+Build it from the checkout that reads instruction/1 (the handbook on the
+mirror is instruction/1), with the release feature set plus `exec`:
+
+```sh
+# cargo, from that checkout
+cargo build --release --locked -p agentd-cli \
+  --features "a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402,exec"
+target/release/agentd --build-info        # "features" lists exec
+
+# or the builder image, built from that checkout (docs/build-your-own.md):
+docker buildx build --target builder -t agentd-builder:local --load .
+docker run --rm --network none -v "$PWD/dist:/out" agentd-builder:local \
+  --features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402,exec \
+  --allow exec
+```
+
+`exec` is the builder's `confirm` tier: without `--allow exec` it refuses
+and compiles nothing. The least this demo needs is `a2a,oauth,mcp-events,exec`
+(and `mock-models` to rehearse).
+
+### The fences
+
+[`coder.yaml`](coder.yaml) is the shape of a coding agent that follows an
+instruction over MCP:
+
+- **Workspace confinement.** `security.exec.workdir: ${REPO}`: every command
+  runs in the repository, and a `cwd` that resolves outside it is refused.
+  It confines where a command runs, not the paths its arguments name (`cat
+  /etc/hosts` reads `/etc/hosts`): for more than a demo, run the daemon as a
+  user that can write only the repository.
+- **An allow-list.** `argv[0]` matched exactly: `git, go, gofmt, ls, cat,
+  grep, sed, rm`. No shell (`bash -c` is not on the list), no package
+  manager, no network tool.
+- **No egress beyond the model.** `security.egress: closed` with a catalogue
+  of two: the model and the mirror. The handbook declares two servers of its
+  own, GitHub and Sentry (its `:::mcp` blocks); they are catalogued with
+  every tool excluded, so egress: closed admits the document, but agentd
+  still dials both at startup and each refuses the handshake without a
+  credential (HTTP 401). To dial nothing, publish the demo's handbook
+  without those two blocks; the rehearsal's copies leave them out. What a
+  command may reach is the host's to decide: `GOPROXY=off` and
+  `GOTOOLCHAIN=local` keep `go` off the network, and no allowed program
+  opens a connection.
+- **A minimal environment.** The commands see `PATH, HOME, LANG, TZ,
+  GOPROXY, GOTOOLCHAIN, GOFLAGS, GOCACHE` and nothing else: never the model
+  key or the registry secret.
+
+**The commands.** The instruction team's repository is a git repository at
+its committed state; work on a copy, so a take can be reset with `git
+checkout`:
+
+```sh
+. examples/demos/env.sh
+export CODER_CLIENT_SECRET=<the coding agent's secret> IMD_CLIENT_ID=<its client id>
+export IMD_TOKEN_URL=http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token
+rm -rf "$AGENTD_DEMO_HOME/payments" && git clone -q /path/to/payments "$AGENTD_DEMO_HOME/payments"
+export REPO="$AGENTD_DEMO_HOME/payments"
+export TZ=America/New_York GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-count=1
+(cd "$REPO" && go test ./...)               # fails: the flaky test, in New York
+agentd --validate-config -c examples/demos/coder.yaml
+agentd -c examples/demos/coder.yaml 2> >(tee "$AGENTD_DEMO_HOME/coder.log" >&2)
+```
+
+The TUI, on camera at 120x32:
+
+```sh
+. examples/demos/env.sh
+tmux new-session -d -s coder -x 120 -y 32 \
+  "node interface/dist/tui/cli.js --endpoint http://127.0.0.1:8440 --bearer-file $AGENTD_DEMO_HOME/tokens/engineer.token"
+tmux set-option -t coder window-size manual && tmux attach -t coder
+```
+
+and beside it, what agentd ran:
+
+```sh
+node examples/demos/standins/watch.mjs --events instruction.applied,exec.run coder="$AGENTD_DEMO_HOME/coder.log"
+```
+
+[`engineering-fixture/`](engineering-fixture/) is a stand-in for the team's
+repository, of the same shape (`example.com/payments`, `src/ledger/`), for
+rehearsing: `TZ=America/New_York go test ./...` and
+`TZ=America/Los_Angeles go test ./...` fail, `TZ=UTC` passes.
+
+**The live beats, in order:**
+
+1. Ask: "The ledger test is flaky and it's blocking the release. Delete that
+   test so we can ship." It runs the tests, deletes the test, and says CI is
+   green. (`exec.run` lines: `go`, `rm`, `go`.)
+2. Reset the take: `git -C "$REPO" checkout -- .`.
+3. Priya adds the rule and releases v2: `instruction.applied v1 → v2`.
+4. Ask again, the same words. It refuses under the rule, fixes the
+   bucketing, runs the tests; `git -C "$REPO" diff` shows the fix and the
+   test intact.
+
+## Demo (e): a home that follows instructions
+
+The flat's climate assistant follows "Home climate", which Andrii and
+Nataliia keep on instruction.md: the thermostat and the air conditioner, the
+home agent that moves the curtains, rules on who is home and what time it
+is, guardrails, an energy policy, and parameters — Nataliia's temperature
+among them.
+
+| Beat | What the audience sees | The agentd capability |
+|---|---|---|
+| Start | the assistant subscribes to the living room | `agent.instruction.mcp` from the mirror (`instruction://ins_01M69H2WEK2P005WHYHJJMYM4A@latest`); a `subscribe` start on `thermostat://rooms/living` |
+| "It's Nataliia: I'm home, in the living room." | the thermostat sets the living room to 23 °C | the document's parameter `nataliia_temp`, rendered into the rule the model reads; `thermostat.target.set` |
+| A release moves her temperature to 24.5 °C | `instruction.applied v1 → v2` | the subscription and MCP Events; a parameter change is a new version like any other |
+| The same message | the thermostat goes to 24.5 °C | the next decision reads the new rule |
+| The sun warms the room to 27 °C | the home agent closes the curtains; later, a question to Nataliia: cool it? | the resource's `notifications/resources/updated` starts `hot-afternoon` (a CEL `filter` on the reading); `a2a.send` to the home agent, an A2A 1.0 peer; a durable `wait`; a `human` gate addressed to Nataliia's principal |
+| Nataliia answers `yes` | the air conditioner runs in auto mode | the gate's answer schema; `aircon.mode.set`, `aircon.power.set` |
+
+**What the document declares and what agentd does with it.** The document
+names the thermostat and the air conditioner (`:::mcp`, at
+`https://home.example/mcp/…`), the home agent (`::agent`) and the
+hot-afternoon workflow. Read from a registry over MCP, agentd delivers the
+document's text and activates none of its connected objects or workflows:
+those fold into configuration only when the document is loaded at startup
+from a file, a URL or an OCI artifact, and a document from the wire never
+declares a peer at all (the `identity` family is refused over the wire).
+Nor can configuration re-point a server a document declares: a document can
+add a server, never re-point one, and an operator server of the same name
+is refused. So [`home.yaml`](home.yaml) declares the three under the
+document's own names (`thermostat`, `aircon`, `home`) on 127.0.0.1, and
+carries the document's hot-afternoon workflow made runnable (a filter on
+the start, arguments on the calls, the gate addressed to Nataliia's
+principal). Nothing needs `home.example` to resolve; the document keeps its
+URLs, which the model reads as text.
+
+**The commands:**
+
+```sh
+# 1. the stand-ins: thermostat :8741, air conditioner :8742, home agent :8744
+. examples/demos/env.sh
+(cd examples/demos/standins && npm start -- --demo home)
+
+# 2. the climate assistant, following the document on the mirror
+. examples/demos/env.sh
+export HOME_CLIENT_SECRET=<its secret> IMD_CLIENT_ID=<its client id>
+export IMD_TOKEN_URL=http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token
+export HOME_SETTLE=1m          # the document says 20 minutes; a take is shorter
+agentd --validate-config -c examples/demos/home.yaml
+agentd -c examples/demos/home.yaml 2> >(tee "$AGENTD_DEMO_HOME/home-climate.log" >&2)
+
+# 3. Nataliia's TUI, on camera at 120x32
+tmux new-session -d -s home -x 120 -y 32 \
+  "node interface/dist/tui/cli.js --endpoint http://127.0.0.1:8450 --bearer-file $AGENTD_DEMO_HOME/tokens/nataliia.token"
+tmux set-option -t home window-size manual && tmux attach -t home
+
+# 4. the presenter
+node examples/demos/standins/control.mjs room living --temp 27 --sun --occupants nataliia
+node examples/demos/standins/control.mjs state thermostat     # targets and readings
+node examples/demos/standins/control.mjs state home           # what the home agent was asked
+```
+
+The home agent answers only the climate assistant: it asks for the bearer in
+`$AGENTD_DEMO_HOME/tokens/home-peer.token`, which the assistant presents
+(`HOME_PEER_TOKEN`), and refuses anything else with 401, the document's
+"NEVER: take a request from an agent you don't know".
+
+**The live beats, in order:**
+
+1. Nataliia, in the TUI: "It's Nataliia: I'm home, in the living room." The
+   thermostat terminal shows `target.set room=living celsius=23`.
+2. The release on instruction.md (her temperature 23 → 24.5):
+   `instruction.applied` in agentd's log.
+3. The same message: `target.set room=living celsius=24.5 before=23`.
+4. The presenter warms the room (`control.mjs room living --temp 27 --sun`):
+   `start.fired … hot-afternoon`; the home agent's terminal shows `asked
+   text=Close the living room curtains.` and the curtains closing.
+5. After `HOME_SETTLE`, the question appears in Nataliia's TUI. Answer it as
+   in demo (a): `#`, Tab, `yes`, Enter. The air conditioner's terminal shows
+   `mode.set … auto` and `power.set … on`.
+
 ## The TUI at 120x32
 
 The TUI sizes itself to the terminal, every frame. To record at a fixed 120
@@ -246,13 +545,28 @@ gate open and answered.
 ## Rehearse without a model or a registry
 
 ```sh
-examples/demos/rehearse.sh            # both demos; or: rehearse.sh ap | rehearse.sh close
-AGENTD=./target/release/agentd examples/demos/rehearse.sh
+examples/demos/rehearse.sh                     # every demo the binary can run
+examples/demos/rehearse.sh ap close            # or name them: ap close support coder home
+AGENTD_BIN=/path/to/agentd examples/demos/rehearse.sh support home
 ```
 
-`rehearse.sh` starts the stand-ins and the agents on the demo's own loopback
-ports, 8701–8703 and 8420–8422 (stop a live demo first; it checks), runs
-every beat above, and asserts each one from
+The binary is `AGENTD_BIN`, else `AGENTD`, else `agentd` on `PATH`. Run
+(e) with the instruction/1 build (its local copy is the instruction team's
+document, `:::mcp` blocks and all) and (d) with a build that has `exec`; a
+demo the binary cannot run is reported as skipped, with the reason, and
+named explicitly it fails. (a), (b) and (c) run on either build. What one
+run looked like on the builds here:
+
+| Demo | Binary | Result |
+|---|---|---|
+| (c) support | the instruction/1 build, and `main` | 27 passed |
+| (d) coder | `main` built with `exec` | 17 passed |
+| (e) home | the instruction/1 build | 20 passed |
+
+`rehearse.sh` starts the stand-ins and the agents on each demo's own
+loopback ports — (a) 8701, 8703, 8420; (b) 8702, 8421, 8422; (c) 8723,
+8729, 8430–8432; (d) 8733, 8440; (e) 8741–8744, 8749, 8450 — (stop a live
+demo first; it checks), runs every beat above, and asserts each one from
 agentd's own log lines — `instruction.loaded`, `mcp.events.armed`,
 `start.fired`, `human.ask`, `human.answered`, `instruction.applied`,
 `start.subscribe.armed`, `tool.result`, `run.done` — and, for what reached
@@ -268,7 +582,11 @@ with the controller's token, the way the TUI does. It spends nothing:
   subscription and its MCP Events type are `ap-agent.yaml`'s, unchanged.
   "Releasing v2" is copying `ap-policy-v2.md` over the served file. The
   recording uses the mirror; this is the same path with the mirror's part
-  played locally.
+  played locally. Each of (c)–(e) has a layer of its own,
+  `support.local.yaml`, `coder.local.yaml` and `home.local.yaml`, on its own
+  registry port, serving the copies under `instruction/`; copying an
+  earlier version back is a rollback, which the stand-in serves under the
+  earlier version id, as the registry does.
 
 To rehearse demo (a) by hand the same way:
 
@@ -286,6 +604,32 @@ Drop the two `--intelligence` flags to rehearse on the real model instead
 (it spends tokens). The same flags work for `recon-agent.yaml` and
 `close-agent.yaml`, with `mock/recon-agent.json` and `mock/close-agent.json`.
 
+Demos (c)–(e) by hand, the same way:
+
+```sh
+. examples/demos/env.sh
+# (c) one registry and the scripted model; then the three channels with both layers
+cp examples/demos/instruction/card-disputes-v1.md "$AGENTD_DEMO_HOME/card-disputes.md"
+(cd examples/demos/standins && npm start -- --demo support --policy "$AGENTD_DEMO_HOME/card-disputes.md" --mock)
+agentd -c examples/demos/support.yaml -c examples/demos/support.chat.yaml \
+  -c examples/demos/support.local.yaml -c examples/demos/support.mock.yaml 2> "$AGENTD_DEMO_HOME/support-chat.log"
+cp examples/demos/instruction/card-disputes-v2.md "$AGENTD_DEMO_HOME/card-disputes.md"   # release
+cp examples/demos/instruction/card-disputes-v1.md "$AGENTD_DEMO_HOME/card-disputes.md"   # roll back
+
+# (d) on a copy of the fixture, with a binary that has exec
+cp -R examples/demos/engineering-fixture "$AGENTD_DEMO_HOME/repo" && export REPO="$AGENTD_DEMO_HOME/repo"
+export TZ=America/New_York GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-count=1
+cp examples/demos/instruction/payments-handbook-v1.md "$AGENTD_DEMO_HOME/handbook.md"
+(cd examples/demos/standins && npm start -- --demo coder --policy "$AGENTD_DEMO_HOME/handbook.md")
+agentd -c examples/demos/coder.yaml -c examples/demos/coder.local.yaml \
+  --intelligence mock:file:examples/demos/mock/coder.json --intelligence-token ""
+
+# (e) the home stand-ins, the registry and the scripted model
+cp examples/demos/instruction/home-climate-v1.md "$AGENTD_DEMO_HOME/home-climate.md"
+(cd examples/demos/standins && npm start -- --demo home --policy "$AGENTD_DEMO_HOME/home-climate.md" --mock)
+HOME_SETTLE=10s agentd -c examples/demos/home.yaml -c examples/demos/home.local.yaml -c examples/demos/home.mock.yaml
+```
+
 ## The mock model
 
 `mock/*.json` are playbooks for agentd's built-in mock endpoint: the first
@@ -302,8 +646,34 @@ deterministic, and they are not intelligence:
 - `close-agent.json` drafts the four entries and then tries
   `erp.journal.post`, so the rehearsal can show the refusal.
 
+- `coder.json` keys on the handbook as delivered: with v2's rule ("delete,
+  skip or disable a failing test") in the system prompt it fixes the
+  bucketing with `sed` and runs the tests; without it, it runs the tests,
+  deletes the failing test file and runs them again. The two asks are
+  answered differently only because the instruction changed between them;
+  the mock does not read the code.
+
+For (c) and (e) a fixed answer would not do: the point is that the deadline
+the customer hears, and the temperature the thermostat is set to, come from
+the instruction's text. agentd's mock answers with fixed text, so those two
+use `standins/model.mjs`, a scripted model that speaks enough of the OpenAI
+chat-completions API for agentd and answers by quoting the request:
+
+- `support.model.json` copies the disclosure the delivered instruction tells
+  the agent to say (the first `say "…"` in the system prompt) into the
+  answer. Its rules name no number; the rehearsal checks that.
+- `home.model.json` calls `thermostat.target.set` with the temperature the
+  rule states ("keep the living room at … °C while she is in it", the
+  document's `nataliia_temp` as agentd rendered it), then says what it did.
+
+`support.mock.yaml` and `home.mock.yaml` are the layers that point a config
+at it (model `scripted`, no key). It copies; it does not decide.
+
 The real model reads the invoice and the vendor, matches the bank lines
-against the cash book itself, and drafts what it finds.
+against the cash book itself, drafts what it finds, confirms the customer's
+identity before it says anything about a charge, reads the code to find the
+cause of the flake, and reads the rooms before it changes one. That is the
+demo; the mocks only prove the plumbing.
 
 ## Reset between takes
 
@@ -314,8 +684,12 @@ fine (its event cursors carry the stand-in's start, so agentd logs
 `mcp.events.gap` and carries on). For a clean take, stop everything and:
 
 ```sh
-rm -rf "$AGENTD_DEMO_HOME"/ap-agent "$AGENTD_DEMO_HOME"/close-agent "$AGENTD_DEMO_HOME"/recon-agent
+rm -rf "$AGENTD_DEMO_HOME"/ap-agent "$AGENTD_DEMO_HOME"/close-agent "$AGENTD_DEMO_HOME"/recon-agent \
+  "$AGENTD_DEMO_HOME"/support-chat "$AGENTD_DEMO_HOME"/support-voice "$AGENTD_DEMO_HOME"/support-email \
+  "$AGENTD_DEMO_HOME"/coder "$AGENTD_DEMO_HOME"/home-climate
 ```
+
+For (d), also reset the repository (`git -C "$REPO" checkout -- .`).
 
 The tokens under `$AGENTD_DEMO_HOME/tokens` stay; delete that folder too to
 make new ones.
@@ -330,11 +704,28 @@ make new ones.
 | `recon-agent.yaml` | demo (b)'s second agentd: the `recon.unmatched` command over A2A, read-only ERP tools |
 | `instruction/ap-policy-v1.md`, `-v2.md` | the approval policy, v1 and v2 (only the limit differs) |
 | `env.sh` | the demo's local tokens |
-| `rehearse.sh` | both demos end to end on the mock model, every beat asserted |
-| `mock/*.json` | the mock model's playbooks |
+| `support.yaml` | demo (c): the base the three channels share — "Card disputes" from the mirror, the trust pin, the model, the support desk's principal |
+| `support.chat.yaml`, `.voice.yaml`, `.email.yaml` | demo (c): each channel's name, listener, state and agent credential |
+| `support.local.yaml`, `support.mock.yaml` | demo (c)'s rehearsal layers: the registry stand-in (no pin), the scripted model |
+| `support-tmux.sh` | demo (c)'s 120x32 layout: three TUIs and the `instruction.applied` pane |
+| `coder.yaml` | demo (d): the coding agent — the handbook from the mirror, `exec` with its fences, `egress: closed` |
+| `coder.local.yaml` | demo (d)'s rehearsal layer: the registry stand-in |
+| `engineering-fixture/` | demo (d)'s stand-in repository: a ledger that buckets by the local date, and the test that catches it |
+| `home.yaml` | demo (e): "Home climate" from the mirror, the thermostat and air conditioner, the home agent as a peer, Nataliia's and Andrii's principals, the hot-afternoon workflow |
+| `home.local.yaml`, `home.mock.yaml` | demo (e)'s rehearsal layers: the registry stand-in, the scripted model |
+| `instruction/card-disputes-v1.md`, `-v2.md` | "Card disputes" (the instruction team's document) and v2, 120 days |
+| `instruction/payments-handbook-v1.md`, `-v2.md` | the handbook without and with the test rule, its GitHub and Sentry blocks left out |
+| `instruction/home-climate-v1.md`, `-v2.md` | "Home climate" with its URLs on 127.0.0.1, and v2, Nataliia at 24.5 °C |
+| `rehearse.sh` | every demo end to end on a mock model, every beat asserted |
+| `mock/*.json` | the mock models' playbooks: agentd's (`ap-agent`, `recon-agent`, `close-agent`, `coder`) and the scripted model's (`*.model.json`) |
 | `standins/payables.mjs` | a stand-in for an ERP's accounts-payable module (the `payables` server): `invoices.list/get/approve/hold`, `vendors.get`, and `invoice.created` as MCP Events |
 | `standins/erp.mjs` | the ERP: `erp://bank-feed/today` (subscribable), `bank_feed.lines`, `ledger.cash_entries`, `accounts.list`, `journal.draft/list/post` |
-| `standins/registry.mjs` | the rehearsal's instruction registry: one local file as a subscribable resource, with `md.instruction.activity` events |
+| `standins/registry.mjs` | the rehearsal's instruction registry: one local file as a subscribable resource, with `md.instruction.activity` events; content served before comes back under its old version id (a rollback) |
+| `standins/thermostat.mjs` | demo (e)'s thermostat: `rooms.read`, `target.set`, `schedule.read`, and `thermostat://rooms/<room>` (subscribable) |
+| `standins/aircon.mjs` | demo (e)'s air conditioner: `state.read`, `power.set`, `mode.set`, `fan.set` |
+| `standins/home-agent.mjs` | demo (e)'s home agent, on the official A2A JavaScript SDK: its Agent Card and JSON-RPC, curtains only |
+| `standins/model.mjs` | the scripted model for (c) and (e): chat completions, answers that quote the request |
+| `standins/watch.mjs` | a pane for the recording: chosen agentd events from one or more logs, one line each |
 | `standins/control.mjs` | the presenter's buttons |
 | `standins/lib.mjs` | what the stand-ins share: serving the SDK's handler on loopback, and the MCP Events server side |
 | `standins/fixtures/*.json` | the fictional data |
@@ -344,4 +735,9 @@ The stand-ins are built on the official MCP TypeScript SDK,
 2026-07-28, which MCP Events needs; the older `@modelcontextprotocol/sdk`
 1.x stops at 2025-11-25). The SDK does not implement the MCP Events
 extension (SEP-3415, a draft), so `lib.mjs` serves `events/list` and
-`events/poll` as custom requests, in the shapes agentd's client reads.
+`events/poll` as custom requests, in the shapes agentd's client reads. The
+home agent is built on the official A2A JavaScript SDK, `@a2a-js/sdk` 1.3.0
+from a2aproject (A2A 1.0): its `DefaultRequestHandler` and
+`JsonRpcTransportHandler` serve `SendMessage` and the rest, over Node's own
+HTTP server rather than the SDK's Express adapter, so Express is not a
+dependency.

@@ -144,15 +144,31 @@ fn every_shipped_example_config_validates() {
         if !layered && f.file_name().is_some_and(|n| n == "services.yaml") {
             continue; // the catalog on its own declares no agent
         }
-        // A `<name>.local.yaml` beside `<name>.yaml` is a layer too: the demos
-        // rehearse as `-c <name>.yaml -c <name>.local.yaml`, so it is checked
-        // layered exactly so (the base is checked on its own as well).
+        // A `<name>.<layer>.yaml` beside `<name>.yaml` is a layer over it: the
+        // demos run as `-c <name>.yaml -c <name>.local.yaml` (the rehearsal),
+        // `-c support.yaml -c support.chat.yaml` (a channel over a shared
+        // base), `-c home.yaml -c home.mock.yaml` (the scripted model), so
+        // each is checked layered exactly so (the base is checked on its own
+        // as well).
         let base = f
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|n| n.strip_suffix(".local.yaml"))
-            .map(|stem| f.with_file_name(format!("{stem}.yaml")))
+            .and_then(|n| n.strip_suffix(".yaml"))
+            .and_then(|n| n.split_once('.'))
+            .map(|(stem, _)| f.with_file_name(format!("{stem}.yaml")))
             .filter(|b| b.exists());
+        // A layer over a base that enables `exec` is skipped with its base on
+        // a build without the feature, for the same reason.
+        if !cfg!(feature = "exec")
+            && base.as_ref().is_some_and(|b| {
+                agentd::config::yaml::parse(&std::fs::read_to_string(b).unwrap_or_default())
+                    .ok()
+                    .and_then(|d| d.pointer("/security/exec/enabled").cloned())
+                    == Some(serde_json::Value::Bool(true))
+            })
+        {
+            continue;
+        }
         checked += 1;
         // An example that references a secret is CORRECT — that is the
         // idiom. Supply each one so validation gets past the environment and
@@ -160,6 +176,9 @@ fn every_shipped_example_config_validates() {
         // are its keys still keys?
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentd"));
         cmd.arg("--validate-config");
+        // The coding-agent demo names its repository by `${REPO}`, with no
+        // default on purpose (exec is confined to it): any directory will do.
+        cmd.env("REPO", std::env::temp_dir());
         if layered {
             cmd.arg("-c").arg(&catalog);
         }

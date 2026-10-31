@@ -1,0 +1,33 @@
+# Rehearsal layer for demo (e): "Home climate" from a local file, served by
+# the registry stand-in (standins/registry.mjs, on 127.0.0.1:8743) instead of
+# the mirror. Layer it over home.yaml:
+#
+#   agentd -c examples/demos/home.yaml -c examples/demos/home.local.yaml \
+#          -c examples/demos/home.mock.yaml
+#
+# The local copies (instruction/home-climate-v1.md, -v2.md) are the
+# instruction team's document with its three URLs pointed at the stand-ins
+# on 127.0.0.1 (thermostat :8741, air conditioner :8742, home agent :8744).
+# Served over MCP, the document's connected objects are not activated
+# (home.yaml says why), so those URLs are only text the model reads; they are
+# changed so that what it reads is true here. v2 differs from v1 in one
+# parameter, Nataliia's temperature, 23 → 24.5. Releasing v2 is copying it
+# over the served file.
+
+# A layer's list replaces the base's, so all three servers are restated:
+# the registry stand-in (no sign-in) and home.yaml's two, unchanged.
+mcp:
+  servers:
+    - name: instruction-md
+      endpoint: "${REGISTRY_MCP_URL:-http://127.0.0.1:8743/mcp}"
+      tags: {"*": [trusted]}
+    - name: thermostat
+      endpoint: "${THERMOSTAT_MCP_URL:-http://127.0.0.1:8741/mcp}"
+      ns: thermostat
+      allow: [rooms.read, target.set, schedule.read]
+      tags: {"*": [trusted]}
+    - name: aircon
+      endpoint: "${AIRCON_MCP_URL:-http://127.0.0.1:8742/mcp}"
+      ns: aircon
+      allow: [state.read, power.set, mode.set, fan.set]
+      tags: {"*": [trusted]}

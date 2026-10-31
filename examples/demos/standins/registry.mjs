@@ -8,11 +8,17 @@
 //
 //   node registry.mjs --file /path/to/ap-policy.md [--port 8703]
 //                     [--uri instruction://northwind/ap-approval-policy@latest]
+//                     [--title "Accounts payable approval policy"]
 //
 // "Releasing a version" is replacing the file's content (cp ap-policy-v2.md
 // over it). The stand-in sees the change, gives it the next version id, and
 // tells subscribers: `notifications/resources/updated` on the subscription,
-// and an `md.instruction.activity` occurrence.
+// and an `md.instruction.activity` occurrence. Content it has served before
+// is that earlier version again, under its old id: copying v1 back is the
+// owner moving the ref back (a rollback), as on the registry.
+//
+// Every demo runs its own registry stand-in, on its own port, with the
+// document's own address: --uri instruction://ins_…@latest.
 import { readFileSync, watchFile } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/server';
@@ -28,11 +34,15 @@ if (!file) {
 const log = logger('registry');
 
 let current = { text: '', digest: '', number: 0 };
+const seen = new Map(); // digest → the version number it was released as
 function load() {
   const text = readFileSync(file, 'utf8');
   const digest = createHash('sha256').update(text).digest('hex');
   if (digest === current.digest) return false;
-  current = { text, digest, number: current.number + 1 };
+  const earlier = seen.get(digest);
+  const number = earlier ?? seen.size + 1;
+  seen.set(digest, number);
+  current = { text, digest, number, rollback: earlier !== undefined };
   return true;
 }
 load();
@@ -51,7 +61,7 @@ function factory() {
     { name: 'instruction-registry-standin', version: '1.0.0' },
     { capabilities: { resources: { subscribe: true }, extensions: EventType.capability() } },
   );
-  mcp.registerResource('ap-approval-policy', uri, { title: 'Accounts payable approval policy', mimeType: 'text/markdown' },
+  mcp.registerResource('instruction', uri, { title: arg('title', 'Accounts payable approval policy'), mimeType: 'text/markdown' },
     async () => {
       log('resources/read', { uri, versionId: versionId() });
       return {
@@ -75,13 +85,14 @@ const { handler } = await serve({
 });
 log('serving', { uri, file, versionId: versionId() });
 
+let moves = 0; // each move of the ref is its own occurrence, a move back included
 watchFile(file, { interval: 250 }, () => {
   try {
     if (!load()) return;
   } catch {
     return; // mid-copy: the next tick reads it whole
   }
-  log('released', { uri, versionId: versionId(), number: current.number });
-  activity.append(`act-${current.number}-${current.digest.slice(0, 8)}`, { uri, versionId: versionId(), number: current.number });
+  log(current.rollback ? 'rolled back' : 'released', { uri, versionId: versionId(), number: current.number });
+  activity.append(`act-${++moves}-${current.digest.slice(0, 8)}`, { uri, versionId: versionId(), number: current.number });
   handler.notify.resourceUpdated(uri);
 });

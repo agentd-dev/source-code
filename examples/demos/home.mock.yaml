@@ -1,0 +1,17 @@
+# The scripted model for demo (e): standins/model.mjs on 127.0.0.1:8749,
+# playing mock/home.model.json. Layer it over home.yaml to run with no model
+# account:
+#
+#   node examples/demos/standins/model.mjs --port 8749 --playbook examples/demos/mock/home.model.json &
+#   agentd -c examples/demos/home.yaml -c examples/demos/home.local.yaml \
+#          -c examples/demos/home.mock.yaml
+#
+# Asked about Nataliia being home, it sets the living room to the
+# temperature the delivered instruction's rule states ("keep the living room
+# at … °C while she is in it"): 23 under v1, 24.5 under v2. It copies; it
+# does not decide. Leave this layer out to run on gpt-6.1-sol.
+
+intelligence:
+  endpoints: "${MODEL_URL:-http://127.0.0.1:8749/v1/chat/completions}"
+  token: null
+  model: scripted

@@ -1,0 +1,17 @@
+# The scripted model for demo (c): standins/model.mjs on 127.0.0.1:8729,
+# playing mock/support.model.json. Layer it over a channel to run with no
+# model account:
+#
+#   node examples/demos/standins/model.mjs --playbook examples/demos/mock/support.model.json &
+#   agentd -c examples/demos/support.yaml -c examples/demos/support.chat.yaml \
+#          -c examples/demos/support.mock.yaml
+#
+# Its answer quotes the disclosure the delivered instruction tells the agent
+# to say, so the deadline the customer hears is the instruction's, whatever
+# version is live. It is not intelligence; the real model is the demo.
+# Leave this layer out to run on gpt-6.1-sol.
+
+intelligence:
+  endpoints: "${MODEL_URL:-http://127.0.0.1:8729/v1/chat/completions}"
+  token: null
+  model: scripted

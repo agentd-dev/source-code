@@ -254,6 +254,12 @@ pub fn validate_record(
     if version.is_empty() {
         return Err(format!("{at}: the record names no version"));
     }
+    if dial.version != "latest" && version != dial.version {
+        return Err(format!(
+            "{at}: version {:?} was asked for and the record is version {version:?} — refused",
+            dial.version
+        ));
+    }
     let mut skipped = Vec::new();
     let mut candidates = Vec::new();
     for r in server
@@ -606,6 +612,29 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn an_exact_version_asked_for_refuses_a_record_of_another_version() {
+        let mut d = dial();
+        d.version = "1.2.0".into();
+        let r = validate_record(
+            "io.acme/kb",
+            &record(remote("https://kb.acme.example/mcp"), "active"),
+            &d,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(r.version, "1.2.0");
+        d.version = "1.1.0".into();
+        let e = validate_record(
+            "io.acme/kb",
+            &record(remote("https://kb.acme.example/mcp"), "active"),
+            &d,
+            &[],
+        )
+        .unwrap_err();
+        assert!(e.contains("\"1.1.0\" was asked for") && e.contains("\"1.2.0\""), "{e}");
     }
 
     #[test]

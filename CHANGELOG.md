@@ -134,7 +134,8 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   a `host-policy` warning unless the URL is an `mcp.registries` entry's and
   the name passes its globs (`account` and `resolver` are warnings too).
   Its record (`GET {url}/v0.1/servers/{name}/versions/{version}`) is held
-  to what agentd dials — the name asked for, not `deleted` (`deprecated`
+  to what agentd dials — the name asked for, the exact version asked for
+  (other than `latest`), not `deleted` (`deprecated`
   connects and warns), a Streamable HTTP remote (`sse` skipped, said;
   packages only refused), `https://` to a public address unless
   `allow_private`, remote header `{variable}`s filled from the operator's

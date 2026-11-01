@@ -178,6 +178,7 @@ these rules:
 | Rule | What happens |
 |---|---|
 | The record's `name` differs from the name asked for | refused |
+| An exact `version` was asked for and the record's `version` differs | refused |
 | `status: deleted` | refused |
 | `status: deprecated` | connects, and warns `mcp.registry.deprecated` |
 | A `streamable-http` remote | dialed |

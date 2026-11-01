@@ -337,6 +337,7 @@
         "fields": [
           "method",
           "url",
+          "endpoint",
           "headers",
           "query",
           "body",

@@ -25,9 +25,16 @@
           "pattern": "^[a-zA-Z0-9_-]+$",
           "type": "string"
         },
-        "service": {
-          "description": "a `services:` entry of `kind: peer` supplying the endpoint, auth and tags",
+        "rate": {
+          "description": "per-instance pacing of sends to this peer (`<burst>/<per>`); a dry bucket fails the send, which a step's retry absorbs",
           "type": "string"
+        },
+        "timeout": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
         }
       },
       "required": [
@@ -326,6 +333,146 @@
       ],
       "type": "object"
     },
+    "Company": {
+      "additionalProperties": false,
+      "description": "a Company agentd acts at for its User (RFC 0047): its MCP servers are made from its discovery document at load",
+      "properties": {
+        "allow": {
+          "description": "the widest tool surface its MCP servers offer",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allow_private": {
+          "description": "admit loopback, private and link-local addresses (an on-premises Company); default false",
+          "type": "boolean"
+        },
+        "api_allow": {
+          "description": "the OpenAPI operations agentd may call there, each `METHOD /path-template` as the description's paths name it (`GET /orders/{order_id}`); one outside them, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, `<server>.<method>_<path>` (`shop.get_orders_order_id`). Needs `openapi` in interfaces; default none",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "api_names": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "a server name for each OpenAPI API url the Company lists, under which its operation tools are named, when it lists more than one or the entry's name is taken; with one, the server is named after the entry. Needs api_allow",
+          "type": "object"
+        },
+        "context": {
+          "additionalProperties": false,
+          "description": "what this Company's conversations share of the User's situation, each field over security.companies.context. Needs `agent` in interfaces",
+          "properties": {
+            "locale": {
+              "description": "a language tag (RFC 5646), such as en-US",
+              "type": "string"
+            },
+            "share_availability": {
+              "description": "share user_available: whether the User has a client attached to agentd now (default false)",
+              "type": "boolean"
+            },
+            "time_zone": {
+              "description": "an IANA time zone name, such as America/Los_Angeles",
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "endpoint": {
+          "description": "https://<host>: the domain whose discovery document is read",
+          "type": "string"
+        },
+        "exclude": {
+          "description": "never admitted (beats allow)",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hosts": {
+          "description": "host globs (`example.com`, `*.example.com`) every endpoint the Company's documents name must match; default the endpoint's host, the document's organization.domain, their subdomains and the issuer's host",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "interfaces": {
+          "description": "the Company's interfaces agentd uses: mcp (its MCP servers), agent (conversations with its Company Agent, through company.converse and the company.<name> stream), openapi (its OpenAPI APIs, through company.api); default [mcp]",
+          "items": {
+            "enum": [
+              "mcp",
+              "agent",
+              "openapi"
+            ]
+          },
+          "type": "array"
+        },
+        "mcp_names": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "a server name for each MCP API url the Company lists, when it lists more than one; with one, the server is named after the entry",
+          "type": "object"
+        },
+        "privacy": {
+          "description": "strict (default) or standard, which sends agentd's usual correlators and is logged at boot",
+          "enum": [
+            "strict",
+            "standard"
+          ]
+        },
+        "rate": {
+          "description": "per-instance pacing of calls to its MCP servers (`<burst>/<per>`, e.g. `60/1m`)",
+          "type": "string"
+        },
+        "scopes": {
+          "description": "the most account scopes agentd asks the User for there; a sign-in asks for what is needed within these and what the sign-in type grants",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sign_in": {
+          "description": "the sign-in types agentd may start with the User, in the order it tries them: device (a link and a code) or direct (the Company's page, back to the served callback; needs client.serve). mediated is refused. Needs scopes and security.companies.seal_key",
+          "items": {
+            "enum": [
+              "device",
+              "direct",
+              "mediated"
+            ]
+          },
+          "type": "array"
+        },
+        "tags": {
+          "additionalProperties": {
+            "items": {
+              "enum": [
+                "untrusted_input",
+                "sensitive",
+                "egress"
+              ]
+            },
+            "type": "array"
+          },
+          "description": "the Rule-of-Two legs its servers, APIs and operations carry; default untrusted_input",
+          "type": "object"
+        },
+        "timeout": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "endpoint"
+      ],
+      "type": "object"
+    },
     "EventBinding": {
       "additionalProperties": false,
       "properties": {
@@ -497,6 +644,54 @@
         }
       ]
     },
+    "HttpEndpoint": {
+      "additionalProperties": false,
+      "description": "a plain-HTTP endpoint: a URL prefix and how it is reached",
+      "properties": {
+        "auth": {
+          "$ref": "#/$defs/Auth"
+        },
+        "endpoint": {
+          "description": "the URL prefix an http step, a fetched document or skill is matched against (scheme, authority, path on a segment boundary)",
+          "type": "string"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "methods": {
+          "description": "the METHOD ceiling for http steps against this entry; absent = any method",
+          "items": {
+            "enum": [
+              "GET",
+              "PUT",
+              "POST",
+              "DELETE",
+              "PATCH",
+              "HEAD"
+            ]
+          },
+          "type": "array"
+        },
+        "rate": {
+          "description": "per-instance pacing of http steps toward it (`<burst>/<per>`, e.g. `60/1m`); a dry bucket fails the step, which its retry absorbs",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
+        }
+      },
+      "required": [
+        "endpoint"
+      ],
+      "type": "object"
+    },
     "HttpOp": {
       "additionalProperties": false,
       "properties": {
@@ -533,18 +728,6 @@
     },
     "McpServer": {
       "additionalProperties": false,
-      "oneOf": [
-        {
-          "required": [
-            "endpoint"
-          ]
-        },
-        {
-          "required": [
-            "service"
-          ]
-        }
-      ],
       "properties": {
         "aauth": {
           "type": "boolean"
@@ -559,7 +742,33 @@
         "auth": {
           "$ref": "#/$defs/Auth"
         },
+        "breaker": {
+          "additionalProperties": false,
+          "description": "the default breaker of the mcp.tool steps that name this server; a step's own breaker wins",
+          "properties": {
+            "cooldown": {
+              "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+              "type": [
+                "string",
+                "integer"
+              ]
+            },
+            "failures": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "connect": {
+          "description": "boot (default) dials the server at start; on_use dials it on the first call that needs it — a workflow step naming it, a wait or subscribe start on it, or the instruction declaring it — and it stays connected. Its tools reach a turn once it has connected. Operator-only",
+          "enum": [
+            "boot",
+            "on_use"
+          ]
+        },
         "endpoint": {
+          "description": "the server's URL; an instruction's :::mcp whose src falls under it (scheme, authority, path on a segment boundary) is this server",
           "type": "string"
         },
         "event_grants": {
@@ -622,8 +831,8 @@
           ],
           "type": "object"
         },
-        "service": {
-          "description": "reference a services: catalog entry — inherit its connection settings (restating endpoint/auth/headers is refused) and narrow its tool ceiling",
+        "rate": {
+          "description": "per-process pacing of calls to this server (`<burst>/<per>`, e.g. `60/1m`); a dry bucket fails the call, which a step's retry absorbs",
           "type": "string"
         },
         "tags": {
@@ -657,7 +866,8 @@
         }
       },
       "required": [
-        "name"
+        "name",
+        "endpoint"
       ],
       "type": "object"
     },
@@ -831,191 +1041,6 @@
       "required": [
         "match",
         "role"
-      ],
-      "type": "object"
-    },
-    "Service": {
-      "additionalProperties": false,
-      "description": "a service-catalog entry: connection settings, one shared credential, authoritative trifecta tags (a floor for any matching endpoint), and a tool-surface ceiling consumers can only narrow",
-      "properties": {
-        "allow": {
-          "description": "the CEILING: the widest advertised-tool surface any consumer may get",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "allow_private": {
-          "description": "`kind: company` only — admit loopback, private and link-local addresses (an on-premises Company); default false",
-          "type": "boolean"
-        },
-        "api_allow": {
-          "description": "`kind: company` only — the OpenAPI operations agentd may call there, each `METHOD /path-template` as the description's paths name it (`GET /orders/{order_id}`); one outside them, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, `<server>.<method>_<path>` (`shop.get_orders_order_id`). Needs `openapi` in interfaces; default none",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "api_names": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "description": "`kind: company` only — a server name for each OpenAPI API url the Company lists, under which its operation tools are named, when it lists more than one or the entry's name is taken; with one, the server is named after the entry. Needs api_allow",
-          "type": "object"
-        },
-        "auth": {
-          "$ref": "#/$defs/Auth"
-        },
-        "breaker": {
-          "additionalProperties": false,
-          "description": "`kind: mcp` only — a default breaker policy for `mcp.tool` steps against this entry; a step's own `breaker:` wins",
-          "properties": {
-            "cooldown": {
-              "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
-              "type": [
-                "string",
-                "integer"
-              ]
-            },
-            "failures": {
-              "minimum": 1,
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
-        "context": {
-          "additionalProperties": false,
-          "description": "`kind: company` only — what this Company's conversations share of the User's situation, each field over security.companies.context. Needs `agent` in interfaces",
-          "properties": {
-            "locale": {
-              "description": "a language tag (RFC 5646), such as en-US",
-              "type": "string"
-            },
-            "share_availability": {
-              "description": "share user_available: whether the User has a client attached to agentd now (default false)",
-              "type": "boolean"
-            },
-            "time_zone": {
-              "description": "an IANA time zone name, such as America/Los_Angeles",
-              "type": "string"
-            }
-          },
-          "type": "object"
-        },
-        "endpoint": {
-          "description": "the connection URL and the dial-time match base (scheme + authority + path prefix)",
-          "type": "string"
-        },
-        "exclude": {
-          "description": "never admitted, unioned into every consumer (beats allow)",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "headers": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "type": "object"
-        },
-        "hosts": {
-          "description": "`kind: company` only — host globs (`example.com`, `*.example.com`) every endpoint the Company's documents name must match; default the endpoint's host, the document's organization.domain, their subdomains and the issuer's host",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "interfaces": {
-          "description": "`kind: company` only — the Company's interfaces agentd uses: mcp (its MCP servers), agent (conversations with its Company Agent, through company.converse and the company.<name> stream), openapi (its OpenAPI APIs, through company.api); default [mcp]",
-          "items": {
-            "enum": [
-              "mcp",
-              "agent",
-              "openapi"
-            ]
-          },
-          "type": "array"
-        },
-        "kind": {
-          "description": "which surface this entry serves; one host may appear under several kinds with different trust budgets. `company` (RFC 0047, the companies feature): a Company agentd acts at for its User — `endpoint` is the https://<host> whose discovery document is read",
-          "enum": [
-            "mcp",
-            "intelligence",
-            "peer",
-            "http",
-            "company"
-          ]
-        },
-        "mcp_names": {
-          "additionalProperties": {
-            "type": "string"
-          },
-          "description": "`kind: company` only — a server name for each MCP API url the Company lists, when it lists more than one; with one, the server is named after the entry",
-          "type": "object"
-        },
-        "methods": {
-          "description": "`kind: http` only — the METHOD ceiling for `http` steps against this entry (e.g. [GET, POST]); absent = any method",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "privacy": {
-          "description": "`kind: company` only — strict (default) or standard, which sends agentd's usual correlators and is logged at boot",
-          "enum": [
-            "strict",
-            "standard"
-          ]
-        },
-        "rate": {
-          "description": "per-instance pacing toward the service (`<burst>/<per>`, e.g. `60/1m`)",
-          "type": "string"
-        },
-        "scopes": {
-          "description": "`kind: company` only — the most account scopes agentd asks the User for there; a sign-in asks for what is needed within these and what the sign-in type grants",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "sign_in": {
-          "description": "`kind: company` only — the sign-in types agentd may start with the User, in the order it tries them: device (a link and a code) or direct (the Company's page, back to the served callback; needs client.serve). mediated is refused. Needs scopes and security.companies.seal_key",
-          "items": {
-            "enum": [
-              "device",
-              "direct",
-              "mediated"
-            ]
-          },
-          "type": "array"
-        },
-        "tags": {
-          "additionalProperties": {
-            "items": {
-              "enum": [
-                "untrusted_input",
-                "sensitive",
-                "egress",
-                "trusted"
-              ]
-            },
-            "type": "array"
-          },
-          "description": "authoritative — unioned into any consumer whose endpoint matches, referencing or inline, open or closed; `trusted` (kind: mcp only) marks the endpoint's results as not outside text",
-          "type": "object"
-        },
-        "timeout": {
-          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
-          "type": [
-            "string",
-            "integer"
-          ]
-        }
-      },
-      "required": [
-        "endpoint"
       ],
       "type": "object"
     },
@@ -2110,6 +2135,7 @@
         "fields": [
           "method",
           "url",
+          "endpoint",
           "headers",
           "query",
           "body",
@@ -3191,6 +3217,13 @@
           "additionalProperties": false,
           "description": "push notifications: a caller registers a webhook and agentd POSTs its task's updates there. Default-OFF — the URL comes from a peer, so making the request at all is the operator's decision.",
           "properties": {
+            "allow": {
+              "description": "under security.egress: closed, the push targets admitted beside the peers' endpoints: URL prefixes (scheme, authority, path on a segment boundary)",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
             "allow_private": {
               "description": "permit webhook targets on private / loopback addresses (a separate and larger decision — a peer could otherwise reach agentd's own surfaces or a cloud metadata endpoint)",
               "type": "boolean"
@@ -3773,6 +3806,13 @@
       },
       "type": "object"
     },
+    "companies": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Company"
+      },
+      "description": "the Companies agentd acts at for its User, by name (RFC 0047; needs the companies feature). Operator-only; a change is a restart",
+      "type": "object"
+    },
     "context": {
       "additionalProperties": false,
       "properties": {
@@ -3865,6 +3905,20 @@
         "stuck_after": {
           "minimum": 1,
           "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "http": {
+      "additionalProperties": false,
+      "description": "the plain-HTTP endpoints this deployment reaches: what an http step, a document fetched by url and a skill fetched by src are held to under security.egress: closed. Operator-only",
+      "properties": {
+        "endpoints": {
+          "additionalProperties": {
+            "$ref": "#/$defs/HttpEndpoint"
+          },
+          "description": "by name; an http step uses the entry its URL falls under, or names it with `endpoint:`",
+          "type": "object"
         }
       },
       "type": "object"
@@ -4512,6 +4566,10 @@
                 },
                 "type": "object"
               },
+              "rate": {
+                "description": "per-process pacing of model calls on this connection (`<burst>/<per>`, e.g. `60/1m`): a call waits for a token",
+                "type": "string"
+              },
               "structured_output": {
                 "description": "how a call whose answer has a JSON Schema is asked on this connection: auto (default) — natively where the dialect and the schema allow (OpenAI response_format, Anthropic output_config.format, a Claude model's on Bedrock), else in the prompt; prompt — in the prompt alone, for a server that refuses a response format. The answer is validated against the schema either way",
                 "enum": [
@@ -4541,6 +4599,10 @@
           },
           "description": "further connections, by name: a second vendor, a gateway. A model reaches one with `provider:`. Operator-only; egress-checked like intelligence.endpoints",
           "type": "object"
+        },
+        "rate": {
+          "description": "per-process pacing of model calls on this connection (`<burst>/<per>`, e.g. `60/1m`): a call waits for a token. Operator-only",
+          "type": "string"
         },
         "roles": {
           "additionalProperties": false,
@@ -5395,7 +5457,7 @@
           "type": "object"
         },
         "egress": {
-          "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open",
+          "description": "closed = agentd dials only what the operator declared, each kind against its own section: mcp.servers, intelligence endpoints and providers, a2a.peers (and a2a.push.allow for push targets), http.endpoints for every other HTTP request, companies; observability.otel.endpoint is the one exception. Default open",
           "enum": [
             "open",
             "closed"
@@ -5803,13 +5865,6 @@
           "type": "object"
         }
       },
-      "type": "object"
-    },
-    "services": {
-      "additionalProperties": {
-        "$ref": "#/$defs/Service"
-      },
-      "description": "the service catalog: the named external services this deployment may use; mcp.servers entries reference entries via `service:` and may only narrow them",
       "type": "object"
     },
     "skills": {

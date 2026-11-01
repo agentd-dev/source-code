@@ -480,9 +480,38 @@ fn capture_to_tap(event: &str, line: &Value, ctx: &LogCtx) {
     let stream = t.stream.clone();
     // Metadata, not payloads: the emitted line already excludes conversation
     // content unless `log_content` is on, and this carries it as-is so a
-    // consumer reads the same fields an operator would see in the log.
-    push_bounded(t, stream, event.to_string(), line.clone(), ctx.trace());
+    // consumer reads the same fields an operator would see in the log —
+    // except a sign-in code, which completes a sign-in as whoever holds it:
+    // the operator's log may show it, a stream a workflow reads may not.
+    push_bounded(
+        t,
+        stream,
+        event.to_string(),
+        tapped(event, line),
+        ctx.trace(),
+    );
 }
+
+/// What of the line `event` the tap carries into a stream: all of it but
+/// the [`UNTAPPED`] fields.
+fn tapped(event: &str, line: &Value) -> Value {
+    let mut data = line.clone();
+    for (ev, field) in UNTAPPED {
+        if *ev == event
+            && let Some(o) = data.as_object_mut()
+        {
+            o.remove(*field);
+        }
+    }
+    data
+}
+
+/// The fields of a line the tap never carries into a stream: the codes a
+/// person signs in with.
+const UNTAPPED: &[(&str, &str)] = &[
+    ("mcp.sign_in.required", "code"),
+    ("delegation.step_up", "user_code"),
+];
 
 /// Take everything queued since the last drain, plus how many were dropped.
 /// The reactor calls this once per tick and appends each to its stream.
@@ -791,6 +820,25 @@ pub fn rfc3339_ms(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sign-in code the operator's log shows never reaches a stream a
+    /// workflow reads; everything else of the line does.
+    #[test]
+    fn the_tap_carries_no_sign_in_code() {
+        let line = serde_json::json!({"event": "mcp.sign_in.required", "server": "kb",
+                                      "url": "https://idp.example/device", "code": "WDJB-MJHT"});
+        let t = tapped("mcp.sign_in.required", &line);
+        assert!(t.get("code").is_none(), "{t}");
+        assert_eq!(t["server"], "kb");
+        let t = tapped(
+            "delegation.step_up",
+            &serde_json::json!({"gate": "g", "user_code": "WDJB-MJHT"}),
+        );
+        assert!(!t.to_string().contains("WDJB-MJHT"), "{t}");
+        // Another event's `code` is its own business.
+        let other = serde_json::json!({"code": 7});
+        assert_eq!(tapped("http.done", &other), other);
+    }
     use std::time::Duration;
 
     /// An RFC 3339 time reads back as the instant `rfc3339_millis` writes,

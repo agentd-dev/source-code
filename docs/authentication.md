@@ -520,11 +520,17 @@ the token in the same cache under `mcp:<name>`:
   own origin, or HTTPS through the SSRF guard (and in `http.endpoints` under
   `security.egress: closed`).
 
-Where to sign in is logged (`mcp.sign_in.required {server, url, method,
-code}`) and shown on the A2A interface as a **sign-in gate**, the same
-surface a human approval uses: the run's task goes `input-required`, badged
-as a gate agentd raised itself, with the verification URL and the code in
-its question and in `mcpSignIn` on the task. The TUI and the web UI show it
+Where to sign in is logged (`mcp.sign_in.required {server, url, method}`,
+with the `code` only where there is no A2A listener to show it on) and
+shown on the A2A interface as a **sign-in gate**, the same surface a human
+approval uses: the run's task goes `input-required`, badged as a gate agentd
+raised itself, with the verification URL and the code in its question and
+in `mcpSignIn` on the task. Whoever holds the code can complete the sign-in
+as themselves, so it goes to the gate's person and nowhere a model or a
+workflow reads: the question is the task's status while the gate is open
+and never enters the task's history, the gate's close replaces it, no turn
+or run output carries it, and a `stream`'s runtime-event tap drops it from
+the line. The TUI and the web UI show it
 as they show any gate. When no step waits — an instruction declared the
 server — the gate is a task of its own. The person signs in at the
 authorization server, not at the gate; the gate closes by itself once they

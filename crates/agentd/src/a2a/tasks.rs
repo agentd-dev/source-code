@@ -421,6 +421,26 @@ impl Task {
         self.dirty = true;
     }
 
+    /// [`Self::transition`] to `state` with a status text shown while it is
+    /// current and never entered into the conversation: a secret a gate
+    /// shows its person — a sign-in code, which whoever holds it can complete
+    /// as themselves — that the next status supersedes and no history keeps,
+    /// so nothing that replays the task reads it.
+    pub fn transition_unrecorded(&mut self, state: State, text: String) {
+        self.state = state;
+        // Its own id on the wire, so it is never taken for the status it
+        // replaced, nor that one for it.
+        self.status_seq += 1;
+        self.message = Some(text);
+        self.updated = now_ms();
+        self.history
+            .push(json!({"state": state.wire(), "ts": self.updated}));
+        if self.history.len() > 64 {
+            self.history.remove(0);
+        }
+        self.dirty = true;
+    }
+
     /// Enter a caller's `Message` into the conversation.
     ///
     /// Stored as the caller sent it, with three fields set to this task's: its
@@ -521,6 +541,38 @@ mod tests {
         assert_eq!(back.state, t.state);
         assert_eq!(back.history.len(), t.history.len());
         assert!(!back.dirty);
+    }
+
+    /// A status said unrecorded — a gate's sign-in code — is the task's
+    /// status while current, under an id of its own, and never in its
+    /// history: superseded, it is gone.
+    #[test]
+    fn an_unrecorded_status_is_shown_and_never_kept() {
+        let mut t = Task::new("t", "c", Some("user:a"), Link::Run { id: "r".into() });
+        t.transition(State::Working, Some("working on it".into()));
+        t.transition_unrecorded(State::InputRequired, "enter the code WDJB-MJHT".into());
+        assert_eq!(t.state, State::InputRequired);
+        assert_eq!(t.message.as_deref(), Some("enter the code WDJB-MJHT"));
+        let statuses = |t: &Task| -> Vec<(u64, String)> {
+            t.messages
+                .iter()
+                .filter_map(|m| match m {
+                    TaskMessage::Status { seq, text } => Some((*seq, text.clone())),
+                    TaskMessage::Inbound { .. } => None,
+                })
+                .collect()
+        };
+        assert_eq!(statuses(&t), [(1, "working on it".to_string())]);
+        assert_eq!(t.status_seq, 2, "the code's status has an id of its own");
+        t.transition(State::Working, Some("signed in".into()));
+        assert_eq!(
+            statuses(&t),
+            [
+                (1, "working on it".to_string()),
+                (3, "signed in".to_string())
+            ]
+        );
+        assert!(!format!("{t:?}").contains("WDJB-MJHT"));
     }
 
     /// The conversation stays within both bounds by dropping its oldest

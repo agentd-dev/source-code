@@ -110,7 +110,9 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   sign in is a sign-in gate on the A2A interface — the waiting run's task
   goes `input-required`, badged, with the URL and the code (`mcpSignIn`),
   and its one answer is `cancel` — and is logged
-  (`mcp.sign_in.required {server, url, method}`; the code is logged only where there is no A2A listener to show it on). The step waits
+  (`mcp.sign_in.required {server, url, method}`; the code is logged only where there is no A2A listener to show it on, and a runtime-event tap never carries it into a stream). The code is the task's status while
+  the gate is open and never enters its history, a turn or a run's output.
+  The step waits
   durably; a restart starts a new sign-in. Once signed in
   (`mcp.sign_in.done`) the token is cached under `mcp:<name>` as a login
   is, the server is dialed and the step goes on; past the step's

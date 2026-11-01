@@ -27,7 +27,11 @@
 //! whose step waits for the server — the run's own, or one made for it when
 //! that already holds a gate — or, when no step waits, on a task of its own.
 //! The person signs in at the authorization server, not at the gate; the
-//! one answer it takes is `cancel`. A gate's task outlives no process: a
+//! one answer it takes is `cancel`. The code is for the gate's person
+//! alone, since whoever holds it can complete the sign-in as themselves: it
+//! is the task's status while the gate is open, never entered into the
+//! task's history (a later status supersedes it), never in a turn, a run's
+//! output or a stream the log is tapped into. A gate's task outlives no process: a
 //! restart closes it, and the step waiting for the server starts a new
 //! sign-in when it looks again.
 //!
@@ -641,7 +645,10 @@ impl Runtime {
                 url: p.complete.clone().unwrap_or_else(|| p.url.clone()),
                 code: p.code.clone(),
             });
-            t.transition(State::InputRequired, Some(question(server, &p)));
+            // The code is shown on the task's status while the gate is open
+            // and kept out of its history: a turn, a run and a client that
+            // replays the task later read no code.
+            t.transition_unrecorded(State::InputRequired, question(server, &p));
         }
         self.task_persist(&task);
         self.task_sync(&task);
@@ -662,14 +669,20 @@ impl Runtime {
         let Some(t) = self.tasks.get_mut(&g.task) else {
             return;
         };
-        if t.mcp_sign_in.is_none() {
+        let Some(gate) = t.mcp_sign_in.take() else {
             return;
-        }
-        t.mcp_sign_in = None;
+        };
         t.ask_schema = None;
         t.security_gate = false;
         if t.state.is_terminal() {
-            // Its work ended first: nothing to move on.
+            // Its work ended first: nothing to move on — but its status is
+            // not left saying the code.
+            if let (Some(code), Some(m)) = (&gate.code, &t.message)
+                && m.contains(code.as_str())
+            {
+                t.message = None;
+                t.dirty = true;
+            }
         } else if g.standalone {
             t.transition(end, Some(said.to_string()));
         } else {

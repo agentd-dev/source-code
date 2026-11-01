@@ -188,7 +188,14 @@ impl Drop for MockLlm {
 }
 fn spawn_mock_llm() -> (MockLlm, String) {
     let pb = common::unique_path("signin-playbook", "json");
-    std::fs::write(&pb, json!({"turns": [{"content": "unused"}]}).to_string()).unwrap();
+    // A model that is shown the sign-in code says so.
+    std::fs::write(
+        &pb,
+        json!({"turns": [{"content": "clean"}],
+               "match": [{"when_contains": USER_CODE, "content": "LEAKED"}]})
+        .to_string(),
+    )
+    .unwrap();
     let addr_file = common::unique_path("signin-mock-llm", "addr");
     let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
         .args(["--internal-mock-llm", &addr_file, &format!("file:{pb}")])
@@ -390,6 +397,46 @@ fn a_step_signs_in_at_a_gate_and_completes() {
         .unwrap()
         .count();
     assert!(cached >= 1, "nothing cached");
+}
+
+/// The code reaches the gate's person — the task's status (and its
+/// `mcpSignIn`) while the gate is open — and nothing read later: not the
+/// task's history, not the run, not a turn in the run's conversation.
+#[test]
+fn the_sign_in_code_is_shown_at_the_gate_and_kept_from_history_and_turns() {
+    let case = Case::new();
+    let (_d, addr) = case.start("");
+    let task = run_fetch(&addr);
+    let gated = wait_task(&addr, &task, 20, "the sign-in gate", |t| {
+        state(t) == "TASK_STATE_INPUT_REQUIRED"
+    });
+    assert!(text(&gated).contains(USER_CODE), "{gated}");
+    case.idp.set(APPROVED);
+    wait_task(&addr, &task, 30, "the run's end", |t| {
+        state(t) == "TASK_STATE_COMPLETED"
+    });
+    let done = rpc(
+        &addr,
+        903,
+        "GetTask",
+        json!({"id": task, "historyLength": 100}),
+    );
+    assert!(
+        done["history"].as_array().is_some_and(|h| !h.is_empty()),
+        "the task has a history: {done}"
+    );
+    assert!(!done.to_string().contains(USER_CODE), "{done}");
+    assert!(!call_step(&addr).to_string().contains(USER_CODE));
+    // A turn in the run's conversation reads no code.
+    let ctx = done["contextId"].as_str().expect("a context").to_string();
+    let reply = SendMessage::text("what did the gate say?")
+        .context(&ctx)
+        .result(&addr);
+    let said = reply.to_string();
+    assert!(
+        said.contains("clean") && !said.contains("LEAKED"),
+        "{reply}"
+    );
 }
 
 /// A gate nobody answers within the step's timeout fails the step

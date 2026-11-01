@@ -592,3 +592,60 @@ fn a_reload_that_moves_a_humans_channel_moves_the_next_gate() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A model's `ask_human` addressed to a person the instruction declares
+/// (`::person`) is answered by the operators, as the document's own `human`
+/// steps are: the gate opens, and the log says whom it was addressed to. A
+/// bare name the document does not declare is still refused, with its reason
+/// on the `tool.result` line.
+#[cfg(feature = "a2a")]
+#[test]
+fn ask_human_to_a_documents_person_is_answered_by_the_operators() {
+    let play = r#"{"turns": [
+         {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Sam, ship it?", "to": "sam", "timeout": "1s"}}]},
+         {"tool_calls": [{"name": "ask_human", "arguments": {"question": "Priya, ship it?", "to": "priya", "timeout": "1s"}}]},
+         {"echo_tool_result": true}]}"#;
+    let cfg = "\
+         agent:\n  name: gates\n  prompt: go\n  ask_human_unowned: gate\n\
+         \x20 instruction: |\n    ::person{id=priya title=\"Priya\"}\n\n    Ship carefully.\n\
+         store: { kind: memory }\n\
+         observability: { log_level: info, log_content: true }\n\
+         intelligence: { endpoints: \"mock:file:__DIR__/play.json\", model: mock }\n\
+         lifecycle: { run_until: idle, idle_grace: 3s }\n\
+         a2a: { listen: \"unix://__DIR__/a2a.sock\" }\n";
+    let dir = common::unique_path("gate-addressee-person", "d");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(format!("{dir}/play.json"), play).unwrap();
+    std::fs::write(format!("{dir}/c.yaml"), cfg.replace("__DIR__", &dir)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &format!("{dir}/c.yaml")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .expect("run agentd");
+    let _ = std::fs::remove_dir_all(&dir);
+    let log = String::from_utf8_lossy(&out.stderr).to_string();
+    let events: Vec<serde_json::Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    assert!(
+        events.iter().any(|e| e["event"] == "tool.result"
+            && e["tool"] == "ask_human"
+            && e["is_error"] == true
+            && e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("sam") && m.contains("::person"))),
+        "a name the document does not declare is refused, its reason on tool.result\n{log}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| e["event"] == "human.addressed" && e["person"] == "priya"),
+        "the person's ask is addressed to the operators\n{log}"
+    );
+    assert!(
+        events.iter().any(|e| e["event"] == "human.ask"),
+        "and its gate opens\n{log}"
+    );
+}

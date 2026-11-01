@@ -248,7 +248,27 @@ impl Runtime {
         // Nor may it name someone who could never see the gate's task: the
         // load holds a declared `to` to this, and this holds the one a model
         // or a rendered template supplies.
-        let addressee = match args.get("to").filter(|v| !v.is_null()) {
+        // A person or role the instruction declares is answered by the
+        // operators, exactly as the document's own `human` steps addressed
+        // to one are (`config::humans`): the name stays in the question, and
+        // the gate waits for an operator.
+        let to = args.get("to").filter(|v| !v.is_null()).map(|v| match v {
+            Value::String(s)
+                if self
+                    .settings
+                    .agent
+                    .document_people
+                    .contains(s.trim().strip_prefix('#').unwrap_or(s.trim())) =>
+            {
+                hlog.info(
+                    "human.addressed",
+                    json!({"person": s.trim(), "answered_by": "operator"}),
+                );
+                Value::String("operator".into())
+            }
+            other => other.clone(),
+        });
+        let addressee = match to.as_ref() {
             None => None,
             Some(v) => match crate::a2a::principals::Addressee::parse(v)
                 .and_then(|a| a.check_gate().map(|()| a))

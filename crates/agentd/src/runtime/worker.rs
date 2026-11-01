@@ -569,9 +569,11 @@ pub fn run_turn(
                 // capture (it can quote the arguments).
                 if let Some(why) = refused {
                     fields["refused"] = json!(why);
-                    if log.content_capture() {
-                        fields["error"] = content.clone();
-                    }
+                }
+                // What a failed call told the model, refused or not — only with
+                // content capture, since it can quote the arguments.
+                if is_error && log.content_capture() {
+                    fields["error"] = content.clone();
                 }
                 log.info("tool.result", fields);
                 let msg = Msg::tool(tc.id.clone(), tc.name.clone(), content, is_error);

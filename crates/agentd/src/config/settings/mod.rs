@@ -360,6 +360,12 @@ pub struct Agent {
     /// reached for.
     #[serde(skip)]
     pub document_declarations: std::collections::BTreeMap<String, Vec<Value>>,
+    /// The people and roles the instruction document declares (`::person`,
+    /// `::role`), by id — DERIVED, never a config key. An `ask_human` the
+    /// model addresses to one is answered by the operators, as the
+    /// document's own `human` steps are (`config::humans`).
+    #[serde(skip)]
+    pub document_people: std::collections::BTreeSet<String>,
     /// The channel each gate is announced on, per workflow and step —
     /// DERIVED from the operator's `gate_channels`, never a config key
     /// (`config::humans`). Out of the definition on purpose: a `to` stays
@@ -6081,6 +6087,7 @@ impl Settings {
         // family declarations across.
         if let Some(ex) = idoc_extraction {
             settings.agent.inline_skills = ex.skills;
+            settings.agent.document_people = ex.people.clone();
             settings.agent.document_declarations = ex.declarations;
             settings.agent.document_config = ex.config;
         }

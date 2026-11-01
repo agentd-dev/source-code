@@ -468,6 +468,7 @@ its `jti`.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
+| `human.addressed` | info | `answered_by`, `person` | A model's `ask_human` named a person or role the instruction declares; the operators answer it, as the document's own gates. |
 | `human.answer.not_addressed` | info | `addressee`, `from`, `link`, `task` |  |
 | `human.answer.override` | warn | `addressee`, `by`, `link`, `sid`, `task` | An operator answered a gate addressed to someone else. |
 | `human.answer.rejected` | info | `errors`, `link`, `task`, `via` |  |

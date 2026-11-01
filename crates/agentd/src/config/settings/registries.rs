@@ -193,15 +193,18 @@ pub fn implicit_server(
     let version = version.filter(|v| !v.is_empty()).map(str::to_string);
     let same_version =
         |v: &Option<String>| v.as_deref().unwrap_or(LATEST) == version.as_deref().unwrap_or(LATEST);
+    // The operator's entry for this server at this version, else at any:
+    // its credential and headers are for the server, whichever version.
+    let theirs = |o: &&McpServer| {
+        o.registry.as_deref() == Some(registry_name) && o.server.as_deref() == Some(server)
+    };
     let mut srv = s
         .mcp
         .servers
         .iter()
-        .find(|o| {
-            o.registry.as_deref() == Some(registry_name)
-                && o.server.as_deref() == Some(server)
-                && same_version(&o.version)
-        })
+        .filter(theirs)
+        .find(|o| same_version(&o.version))
+        .or_else(|| s.mcp.servers.iter().filter(theirs).find(|o| o.name != name))
         .cloned()
         .unwrap_or_else(|| McpServer::from_registry(name, registry_name, server, version.clone()));
     srv.name = name.to_string();
@@ -583,6 +586,34 @@ mod tests {
             implicit_name("official", "io.a/b", Some("1.2.0")),
             "official/io.a/b@1.2.0"
         );
+    }
+
+    /// A server a step or a run's pin makes takes the operator's entry for
+    /// the same server — its credential and headers — whatever the version.
+    #[test]
+    fn a_made_server_takes_the_operators_entry_for_it() {
+        let s = Settings::from_document(
+            serde_json::json!({"store": {"kind": "memory"}, "mcp": {
+                "registries": [{"name": "official", "url": "https://registry.example", "servers": ["io.acme/*"]}],
+                "servers": [{"name": "kb", "registry": "official", "server": "io.acme/kb",
+                             "headers": {"Authorization": "Bearer {{secret:KB}}"}}]}}),
+            "t",
+        )
+        .unwrap();
+        for (name, version) in [
+            ("official/io.acme/kb", None),
+            ("official/io.acme/kb@1.0.0", Some("1.0.0")),
+        ] {
+            let m = implicit_server(&s, name, "official", "io.acme/kb", version).unwrap();
+            assert_eq!(m.name, name);
+            assert_eq!(m.version.as_deref(), version);
+            assert_eq!(m.headers["Authorization"], "Bearer {{secret:KB}}");
+            assert!(m.on_use());
+        }
+        let e = implicit_server(&s, "x", "official", "io.other/kb", None).unwrap_err();
+        assert!(e.contains("not approved"), "{e}");
+        let e = implicit_server(&s, "x", "nowhere", "io.acme/kb", None).unwrap_err();
+        assert!(e.contains("not declared"), "{e}");
     }
 
     #[test]

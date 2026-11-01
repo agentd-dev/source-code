@@ -3024,6 +3024,11 @@ impl Runtime {
         if self.settings.mcp.on_use(name) && !self.mcp.contains_key(name) {
             return None;
         }
+        // Nor for a registry server not resolved yet: its endpoint is its
+        // record's.
+        if spec.registry.is_some() {
+            return None;
+        }
         spec.first_request = self.mcp.get(name).and_then(|c| c.first_request());
         Some(spec)
     }

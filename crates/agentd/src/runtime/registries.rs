@@ -263,8 +263,29 @@ impl Runtime {
         run_id: &str,
         spec: &Map<String, Value>,
     ) -> Result<Option<String>, String> {
-        let Some(named) = StepServer::of(spec) else {
-            return Ok(None);
+        // A step naming a registry server by registry and name, or naming a
+        // configured registry server (the operator's, a document's) by its
+        // name.
+        let named = match StepServer::of(spec) {
+            Some(n) => n,
+            None => {
+                let Some(srv) = spec
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .and_then(|n| self.settings.mcp.servers.iter().find(|s| s.name == n))
+                else {
+                    return Ok(None);
+                };
+                let (Some(registry), Some(server)) = (&srv.registry, &srv.server) else {
+                    return Ok(None);
+                };
+                StepServer {
+                    name: srv.name.clone(),
+                    registry: registry.clone(),
+                    server: server.clone(),
+                    version: srv.version.clone(),
+                }
+            }
         };
         self.ensure_registry_server(&named)?;
         // An exact version is its own pin.

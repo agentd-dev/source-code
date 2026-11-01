@@ -726,13 +726,9 @@ run looked like on the builds here:
 | (d) coder | `main` built with `exec` | 17 passed |
 | (e) home | the instruction/1 build | 20 passed |
 
-The latest runs on the instruction/1 build, of (a), (b), (c) and (e),
-needed no flag: the turn stays gpt-6.1-sol, as live, and agentd's built-in
-mock answers it on the Responses API. `MOCK_CHAT_ONLY=1`
-is for an older build whose mock predates that: the flag gives the mock's
-turn (the AP agent's, the recon agent's, the coding agent's) to a model
-named `mock`. The close agent, (c) and (e) use the scripted model and need
-it on none.
+On both builds the turn stays gpt-6.1-sol, as live: the built-in mock
+answers the Responses API that model is asked on. (c) and (e) use the
+scripted model.
 
 `rehearse.sh` starts the stand-ins and the agents on each demo's own
 loopback ports — (a) 8701, 8703, 8420; (b) 8702, 8713, 8719, 8421, 8422; (c) 8723,

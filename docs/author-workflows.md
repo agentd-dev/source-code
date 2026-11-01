@@ -776,6 +776,7 @@ records which capability got a node or a field, which got nothing, and why.
 | Skills | `skills:` on `agent`, `think`, `classify`, `extract`, `summarize`, `judge`, `route` and `subagent`, by `<name>`, `<origin>/<name>`, `local/<name>` or `<origin>/<path>` |
 | Acting at a Company for its User | `company.*` and a Company's operation tools as `tool` steps, `http` with `auth: {kind: company}`, and the stream `company.<name>` through a `stream` start or `wait {on: event}` |
 | Acting for an enrolled person | `mcp.tool` and `tool` steps on a delegated server, in the person's own runs; the person's consent gate is the step's |
+| A server from an MCP registry | `registry` + `server` (+ `version`) on `mcp.tool`, `mcp.resource` and `wait {on: resource}`, in place of a configured server name; dialed when the step first runs, the run pinned to the version it first called. No search node: a workflow names its servers |
 | AGENTS.md, the Client ID Metadata Document | nothing in a workflow: AGENTS.md is in every turn's prompt, an `agent` step's included, and the metadata document is how agentd names itself at a login |
 
 ### Start a long MCP call and collect it later
@@ -859,6 +860,37 @@ workflows:
   and the question with it.
 - The task is durable: after a restart agentd polls it again and resolves
   the wait when it ends.
+
+### Call a server from an MCP registry
+
+A step names a server by an `mcp.registries` entry and the server's name
+there, with no `mcp.servers` entry:
+
+```yaml
+# fragment: under workflows:
+- name: lookup
+  steps:
+    start: {kind: manual}
+    page:
+      kind: mcp.tool
+      registry: official
+      server: com.deepwiki/mcp
+      tool: read_wiki_structure
+      args: {repoName: "{{inputs.repo}}"}
+      depends_on: [start]
+    done: {kind: finish, depends_on: [page]}
+```
+
+- The registry's `servers` globs must approve the name, or the workflow is
+  refused at load; `registry`, `server` and `version` are written out, never
+  templated.
+- The server is dialed when the step first runs, and the step waits for it
+  durably. Every step naming the same server shares the connection.
+- A run keeps calling the version it first called, after a restart and
+  whatever the registry publishes meanwhile.
+
+[Use servers from an MCP registry](mcp-registries.md) covers approval and
+how a record is resolved.
 
 ### Name a skill exactly
 

@@ -242,6 +242,14 @@ export const DOCS = [
     "hint": "Declare, authenticate, verify"
   },
   {
+    "slug": "mcp-registries",
+    "file": "docs/mcp-registries.md",
+    "title": "Use servers from an MCP registry",
+    "group": "guides",
+    "section": "tools",
+    "blurb": "Approve servers from an MCP registry, call them from workflows and documents by name, and pin each run's version."
+  },
+  {
     "slug": "react-to-events",
     "file": "docs/react-to-events.md",
     "title": "React to changes and events",

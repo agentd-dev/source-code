@@ -384,6 +384,29 @@ document's `:::mcp` that matches none of your servers is held as text with a
 without it. Under `egress: open` it is a server of its own, counted
 `untrusted_input`. [Harden a deployment](harden.md) covers closed egress.
 
+## Use a server from a registry
+
+An `mcp.servers` entry can name a server by an MCP registry and the server's
+name there instead of an endpoint, and a workflow step can name one without
+an entry at all. You approve names per registry with `mcp.registries`:
+
+```yaml
+# fragment: under mcp:
+registries:
+  - name: official
+    url: https://registry.modelcontextprotocol.io
+    servers: ["io.github.github/*"]
+servers:
+  - name: github
+    registry: official
+    server: io.github.github/github-mcp-server
+    headers: {Authorization: "Bearer {{secret:GITHUB_TOKEN}}"}
+```
+
+The server is resolved through its registry record and dialed on first use.
+[Use servers from an MCP registry](mcp-registries.md) covers approval,
+workflow steps, instruction documents and version pinning.
+
 ## Set timeouts
 
 A timeout bounds silence, not work. A call that streams progress, or waits

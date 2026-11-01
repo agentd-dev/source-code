@@ -130,7 +130,11 @@ operator decision, never a default.
 
 **Endpoints live in the section that uses them** — MCP servers in
 `mcp.servers` (endpoint, credential, trifecta tags, `allow`/`exclude`
-ceiling, `rate`, `breaker`, `connect: boot | on_use`), models in
+ceiling, `rate`, `breaker`, `connect: boot | on_use`; or `registry` +
+`server` from an `mcp.registries` entry, whose `servers` globs approve the
+names — a workflow step and a document's `:::mcp{registry server}` name
+them too, dialed on use, each run pinned to the version it first called),
+models in
 `intelligence` (+ `providers`, each with `rate`), peers in `a2a.peers`
 (`rate`, `timeout`), plain HTTP in `http.endpoints` (`methods`, `rate`;
 an `http` step names one with `endpoint:`), Companies in `companies`. An

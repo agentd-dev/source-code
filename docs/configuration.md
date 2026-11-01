@@ -548,7 +548,10 @@ live · doc, except where a row says op.
 |---|---|---|---|
 | `mcp.default_timeout` | duration | `60s` | Per-call timeout for a server that sets none. |
 | `mcp.servers[].name` | string | required | Unique; `code` is reserved for code-registered tools. |
-| `mcp.servers[].endpoint` | URL | required | `https://host[:port][/path]`, or a loopback `http://`. Reached over Streamable HTTP; agentd spawns no process. Also the match base for an instruction document's servers ([Servers a document declares](#servers-a-document-declares)). |
+| `mcp.servers[].endpoint` | URL | required, unless `registry` | `https://host[:port][/path]`, or a loopback `http://`. Reached over Streamable HTTP; agentd spawns no process. Also the match base for an instruction document's servers ([Servers a document declares](#servers-a-document-declares)). |
+| `mcp.servers[].registry` | string | — | An `mcp.registries` entry, in place of `endpoint`: the server's record there names its endpoint when it is dialed. See [MCP registries](#mcp-registries). |
+| `mcp.servers[].server` | string | with `registry` | The server's name in that registry (`io.github.github/github-mcp-server`). The registry's `servers` must approve it. |
+| `mcp.servers[].version` | string | `latest` | The version a registry server resolves to: `latest` or an exact one. |
 | `mcp.servers[].headers` | map | `{}` | Extra headers. A credential-shaped one needs a reference. Headers the MCP client sets itself (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`, `Mcp-Session-Id`, `Last-Event-ID`) are refused. |
 | `mcp.servers[].tags` | map: glob → list of `untrusted_input \| sensitive \| egress \| trusted` | `{}` | Capability tags for the Rule of Two. The union applies to every tool of the server. An untagged server counts as `untrusted_input`, in the check and at runtime: its results taint the work that reads them. `trusted` is no leg: it marks a server whose results are not outside text, and changes nothing beside `untrusted_input`. Refused on a delegated server (`auth.trusted_output` says it there) and in an instruction document, whose servers count as `untrusted_input` unless they are an operator server ([Servers a document declares](#servers-a-document-declares)), whose tags they carry. |
 | `mcp.servers[].ns` | string | — | A namespace prefix: tools register as `<ns>.<tool>`. |
@@ -557,7 +560,7 @@ live · doc, except where a row says op.
 | `mcp.servers[].timeout` | duration | `mcp.default_timeout` | Per-call timeout for this server; for a `connect: on_use` server, also how long a step waits for it to connect. |
 | `mcp.servers[].rate` | rate | — | Pacing of calls to this server, per process. A call that finds the bucket dry fails; a workflow step's `retry:` can absorb it. |
 | `mcp.servers[].breaker` | `{failures, cooldown}` | — | The default breaker for `mcp.tool` steps naming this server. A step's own `breaker` wins. |
-| `mcp.servers[].connect` | `boot \| on_use` | `boot` | When the server is dialed. `boot` dials it at startup. `on_use` dials it the first time something needs it: a workflow step naming it (`mcp.tool`, `mcp.resource`), a resource wait or `subscribe` start on it, or an instruction document that declares it. Once connected it stays connected. See [Connecting on use](#connecting-on-use). |
+| `mcp.servers[].connect` | `boot \| on_use` | `boot`; `on_use` for a registry server | When the server is dialed. `boot` dials it at startup. `on_use` dials it the first time something needs it: a workflow step naming it (`mcp.tool`, `mcp.resource`), a resource wait or `subscribe` start on it, or an instruction document that declares it. Once connected it stays connected. See [Connecting on use](#connecting-on-use). |
 | `mcp.servers[].tasks` | `auto \| off` | `auto` | Whether the server may answer a long tool call with an MCP task (SEP-2663). `auto` declares the extension on 2026-07-28 connections, on the calls that have a time limit (a turn's, a workflow step's, a store adapter's); `off` never does, so the server answers every call inline. See [Long-running tool calls](connect-mcp.md#long-running-tool-calls). |
 | `mcp.servers[].auth` | object | — | A credential provider; see [Credentials](#credentials). With `grant: id_jag` — or `grant: token_exchange`, for a server behind the person's own IdP — the server is reached with an enrolled person's grant or a caller's own token, by the supervisor alone; its fields are under [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization), restart · op, and a served document may set none of them. Needs `xaa`. |
 | `mcp.servers[].oauth` | `{client_id, client_secret, token_url, scope}` | — | An OAuth client-credentials shortcut. Needs `oauth`. |
@@ -634,6 +637,55 @@ A document server that matches no operator server is held as text with a
 refused. Under `egress: open` it is a server of its own, counted
 `untrusted_input`. A document's `:::agent`, or an `a2a.peers` entry in its
 `:::config`, follows the same rule against the operator's `a2a.peers`.
+
+### MCP registries
+
+`mcp.registries[]` names the MCP registries the operator trusts as
+directories of servers, and the names it approves from each. All
+`mcp.registries.*` paths are live · op. The guide is
+[Use servers from an MCP registry](mcp-registries.md).
+
+| Path | Type | Default | What it does |
+|---|---|---|---|
+| `mcp.registries[].name` | string | required | Unique, `[a-zA-Z0-9_-]+`. What `mcp.servers[].registry` and a step's `registry` name. |
+| `mcp.registries[].url` | URL | required | The registry API's base (`https://registry.modelcontextprotocol.io`), or a loopback `http://`; agentd reads its `v0.1` paths. An instruction's `:::mcp{registry=…}` must equal it. |
+| `mcp.registries[].servers` | list of globs | `[]` | The approval: the registry names that may be resolved. `*` matches within a `/`-separated segment; `*` alone matches every name. Missing or empty approves nothing (a warning says so). |
+| `mcp.registries[].tags` | map: glob → list of `untrusted_input \| sensitive \| egress` | `{"*": [untrusted_input]}` | The legs every server from the registry counts as. `trusted` is refused. Counted in the lethal-trifecta check at load when `servers` approves anything, whether or not a server is connected. |
+| `mcp.registries[].allow` | list of globs | all | The widest tool surface of a server from it; a server's own `allow` narrows it, a pattern outside it is dropped. |
+| `mcp.registries[].exclude` | list of globs | `[]` | Tools no server from it offers; added to each server's `exclude`. |
+| `mcp.registries[].auth` | object | — | The credential the registry's API is reached with ([Credentials](#credentials)). Never sent to a server. |
+| `mcp.registries[].headers` | map | `{}` | Extra headers on the registry's API requests. |
+| `mcp.registries[].rate` | rate | — | The default `rate` of each server from it. |
+| `mcp.registries[].timeout` | duration | `30s` | The registry request's timeout, and the default `timeout` of each server from it. |
+| `mcp.registries[].refresh` | duration | `1h` | How long a record read is reused, in the store, across restarts. A refused record is read again after it. |
+| `mcp.registries[].allow_private` | bool | `false` | Admit remotes on loopback, private and link-local addresses, and loopback `http://`: an internal registry's servers. |
+| `mcp.registries[].discover` | bool | `false` | Give the model `mcp.registry.search` and `mcp.registry.connect` over the approved names. |
+
+A registry server is used in three places: an `mcp.servers` entry with
+`registry` + `server`; a workflow step `{kind: mcp.tool | mcp.resource,
+registry, server, version?}` or `wait {on: resource, registry, server}`,
+which needs no `mcp.servers` entry; and an instruction document's
+`:::mcp{id registry=<url> server=<name>}`. Each is dialed on first use. A run
+keeps calling the version it first called.
+
+```yaml
+# fragment: under mcp:
+registries:
+  - name: official
+    url: https://registry.modelcontextprotocol.io
+    servers: ["io.github.github/*", "com.deepwiki/*"]
+  - name: acme
+    url: https://mcp-registry.acme.internal
+    auth: {kind: static, token: "{{secret:ACME_REGISTRY_TOKEN}}"}
+    servers: ["*"]
+    tags: {"*": [sensitive]}
+    allow_private: true
+servers:
+  - name: github
+    registry: official
+    server: io.github.github/github-mcp-server
+    headers: {Authorization: "Bearer {{secret:GITHUB_TOKEN}}"}
+```
 
 ### MCP Events
 
@@ -1807,6 +1859,7 @@ Every other path is applied live, as follows:
 | `intelligence.routes` | Read as each turn is launched; a turn routed to a model the reload removed runs on `roles.turn`. |
 | `agent.instruction` | Re-read, through the servers the reload would run on, and its machinery folded again. A resource that cannot be read refuses the reload. |
 | `agent.workspace` | Its AGENTS.md files read again; the next turn's prompt carries them. A file the load cannot take refuses the reload. |
+| `mcp.registries` | Read live: a step, a document or the model naming a registry server is judged against the registries as they are now. A registry server made at run time stays while its registry still approves it. A registry server whose registry entry changed is resolved and dialed again on its next use. |
 | `mcp.servers` | Added or changed servers are dialed beside the running set; unchanged ones keep their connection; removed ones disconnect when the reload applies. A server is unchanged only when everything its dial reads is (endpoint, headers, `auth`, `oauth`, `aauth`, `rate`, `timeout`), so a rotated credential re-dials it and a tags-only change does not. An added or changed `connect: on_use` server nothing has needed yet is not dialed by the reload. |
 | `tools`, `knowledge`, `search`, `skills` | The tool registry is rebuilt; the skills sources are listed again and both skills folders read again. A context keeps the skill bodies it loaded of the skills the new catalogue holds; a server's skill whose source was removed, or no longer admits it, is unloaded (`skills.unloaded`). |
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |

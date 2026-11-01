@@ -223,6 +223,7 @@ ends on a segment boundary:
 | Surface | Must match | Checked |
 |---|---|---|
 | MCP servers, a document's or a subagent template's servers | an `mcp.servers` endpoint | at load, and again before each dial |
+| a registry server's endpoint, and the registry's API | an `mcp.registries` entry whose `servers` approve the name | at load for the name; the endpoint when the record is resolved |
 | model endpoints, every `intelligence.providers` entry | an `intelligence` endpoint or provider | at load |
 | A2A peers | an `a2a.peers` endpoint | at load |
 | A2A push targets a caller registers | an `a2a.peers` endpoint or an `a2a.push.allow` entry | at registration |
@@ -249,6 +250,40 @@ What closed egress does not bind:
 - Anything a compromised MCP server, or a command the `exec` runner starts,
   reaches on its own. Network policy at the host or cluster stays
   complementary; the operator's sections are what make those rules derivable.
+
+## MCP registries
+
+An MCP registry is a directory, not an authority. A record it serves is
+untrusted input about where to connect, and agentd holds it to the
+operator's configuration rather than the other way round
+([Use servers from an MCP registry](mcp-registries.md)):
+
+- **The approval is the operator's.** A name resolves only when an
+  `mcp.registries` entry's `servers` globs match it, exactly: `*` matches
+  within a segment, never across the `/` of `namespace/server`. A missing or
+  empty list approves nothing. A document, a workflow step and the model
+  name servers; none of them adds a registry or widens a glob.
+- **The trust is the operator's.** A registry server counts at the
+  registry's `tags`, `untrusted_input` by default. `trusted` is refused on a
+  registry: the operator vouches for one server with an `mcp.servers` entry
+  of its own.
+- **Judged at load.** The lethal-trifecta check counts every approved name
+  at the registry's tags whether or not any is connected, so approving a
+  registry next to a `sensitive` + `egress` server is refused at load, not at
+  first use. `discover: true`, which lets the model search and connect, adds
+  no reach the approval did not.
+- **The record is checked.** A record whose name differs from the name
+  asked for, a deleted one, one with only local packages, and a remote that
+  is not `https://` to a public address (unless the registry entry sets
+  `allow_private`) are refused. A registry never supplies a credential: a
+  remote header's `{variable}` is filled from the operator's headers, and a
+  fixed value marked secret is not sent.
+- **A run's version is pinned.** A run keeps calling the version it first
+  called, so a publish under it does not change the server it talks to.
+
+The remote's address is checked when the record is resolved; the dial that
+follows resolves the host again. Network policy at the host or cluster
+closes the gap a rebinding DNS answer would leave.
 
 ## Outside input that arrives through streams
 

@@ -615,11 +615,14 @@ saved: {kind: checkpoint, depends_on: [transform], name: after-transform}
 Suspends until something happens. The wait is durable: a restart resumes it
 with its deadline intact.
 
-- **Fields:** **`on`**, `server`, `uri`, `condition`, `signal`, `run`,
+- **Fields:** **`on`**, `server`, `registry`, `version`, `uri`,
+  `condition`, `signal`, `run`,
   `subagent`, `conversation`, `from`, `webhook`, `stream`, `subject`,
   `subscribe`, `match`, `task`, `timeout`, `on_timeout`.
 - `on` is written out, never templated: what a wait listens on decides what
-  it opens, which load checks. An `on` that is none of the forms below is
+  it opens, which load checks. `wait {on: resource}` takes `registry` and
+  `version` beside `server` for a registry server, as
+  [`mcp.tool`](#mcptool) does. An `on` that is none of the forms below is
   refused at load.
 - `timeout` ends the wait with status `timeout`. `on_timeout: <step>` makes
   that an expected branch: the named step runs, and the wait's dependents do
@@ -939,8 +942,8 @@ page:   {kind: search.fetch, depends_on: [web], url: "{{ steps.web.output.result
 Calls a tool on a declared MCP server: the main way a workflow reaches the
 outside world.
 
-- **Fields:** **`server`**, **`tool`**, `args`, `idempotency`, `breaker`,
-  `rate`, `detach`, `input`, `payment`.
+- **Fields:** **`server`**, **`tool`**, `registry`, `version`, `args`,
+  `idempotency`, `breaker`, `rate`, `detach`, `input`, `payment`.
 - **Output:** the tool's result. A result the server marks as an error
   fails the step. With `detach: true` and a call the server makes a task
   of, `{task: {server, id, status}}`. With `payment`, `{result, payment}`.
@@ -955,6 +958,14 @@ outside world.
   fails if it has not connected by then. The server's `rate` paces calls
   (a dry bucket fails the call, which the step's `retry` can absorb), and
   its `breaker` is the step's default breaker.
+- With `registry`, `server` is a server's name in that `mcp.registries`
+  entry (`registry: official, server: io.github.github/github-mcp-server`,
+  `version` `latest` or exact), and needs no `mcp.servers` entry: the
+  registry's `servers` must approve it, at load. It is resolved through its
+  record and dialed when the step first runs, and the run keeps calling the
+  version it first called. `registry`, `server` and `version` are not
+  templated. `mcp.resource` and `wait {on: resource}` take the same fields.
+  See [Use servers from an MCP registry](mcp-registries.md).
 - A call the server makes an MCP task of is waited for durably, bounded by
   the step's `timeout` (default `limits.step_timeout`), which cancels the
   task when it passes, and with it any question the task asks.
@@ -1026,8 +1037,9 @@ built:
 
 Reads MCP resources and prompts.
 
-- **Fields:** **`server`**, **`op`**, `uri`, `name`, `arguments`,
-  `reference`, `argument`.
+- **Fields:** **`server`**, **`op`**, `registry`, `version`, `uri`,
+  `name`, `arguments`, `reference`, `argument`. With `registry`, `server`
+  is a registry server's name, as on [`mcp.tool`](#mcptool).
 - **Output** by `op`:
 
 | `op` | Uses | Output |

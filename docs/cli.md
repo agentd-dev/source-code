@@ -13,6 +13,7 @@ agentd --config <settings.yaml> [--config <overlay.yaml> …] [--<path> <value> 
 agentd --prompt <TEXT> --intelligence <URL> --model <NAME>
 agentd --instruction <TEXT> --intelligence <URL> --model <NAME> [--mcp name=<endpoint> …]
 agentd tui|ui [launcher flags] --config <settings.yaml> [--<path> <value> …]
+agentd mcp registry search <term> [--registry <url-or-name>] [-c <settings.yaml>] [--limit <n>] [--json]
 agentd <ask>
 ```
 
@@ -29,7 +30,8 @@ agentd <ask>
   listener, or `lifecycle.run_until: drained`) gets no such workflow: there
   the instruction is the policy for the messages it takes, and it runs
   nothing at startup unless it has `--prompt` or a `once` start.
-- `tui` and `ui` run the daemon plus a display client. See
+- `tui` and `ui` run the daemon plus a display client, and
+  `mcp registry search` lists what an MCP registry serves. See
   [Subcommands](#subcommands).
 - An *ask* prints something and exits without starting the runtime. See
   [Asks](#asks).
@@ -59,6 +61,21 @@ anything else before it spawns a process (exit 2). The client binary is
 `agentd-tui` or `agentd-ui` on `PATH`, or the path in `AGENTD_TUI_BIN` /
 `AGENTD_UI_BIN`. A build without the `a2a` feature has no launcher and exits 2.
 [Use the terminal and web UI](interface.md) covers the clients.
+
+`agentd mcp registry search <term>` lists the servers an MCP registry serves
+whose names match `term` (at least 3 characters), one per line: name,
+latest version, status when not `active`, and remotes. It starts no runtime.
+
+| Flag | Meaning |
+|---|---|
+| `--registry <url-or-name>` | The registry: a URL, or the name of an `mcp.registries` entry in `-c`'s configuration. Default: every registry the configuration declares, else `https://registry.modelcontextprotocol.io`. |
+| `-c`, `--config <PATH>` | Read `mcp.registries` from this configuration, and add `approved` or `not approved` to each line by the entry's `servers` globs. |
+| `--limit <n>` | At most `n` records per registry. Default `30`. |
+| `--json` | Print the records as a JSON array instead. |
+
+It exits `0`, `1` when a registry did not answer, and `2` on a usage error.
+A registry entry's `auth` is not presented. See
+[Use servers from an MCP registry](mcp-registries.md).
 
 ## Asks
 

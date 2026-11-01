@@ -110,7 +110,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   sign in is a sign-in gate on the A2A interface — the waiting run's task
   goes `input-required`, badged, with the URL and the code (`mcpSignIn`),
   and its one answer is `cancel` — and is logged
-  (`mcp.sign_in.required {server, url, method, code}`). The step waits
+  (`mcp.sign_in.required {server, url, method}`; the code is logged only where there is no A2A listener to show it on). The step waits
   durably; a restart starts a new sign-in. Once signed in
   (`mcp.sign_in.done`) the token is cached under `mcp:<name>` as a login
   is, the server is dialed and the step goes on; past the step's
@@ -120,6 +120,32 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   are being signed in to (the prompt's `signing_in`). The internal mock MCP
   server takes `--bearer <token>`.
 
+- MCP registries (RFC 0055 §3.1, §4, phase 3). `mcp.registries[]` names
+  the registries the operator trusts as directories of MCP servers — `name`,
+  `url`, `auth`, `headers`, `servers` (globs over `namespace/server` names,
+  the approval: missing or empty approves nothing), `tags` (default
+  `{"*": [untrusted_input]}`, `trusted` refused), `allow`/`exclude`,
+  `rate`, `timeout`, `refresh` (default `1h`), `allow_private`, `discover`.
+  A registry server is named three ways, each dialed on first use: an
+  `mcp.servers` entry with `registry` + `server` (+ `version`) in place of
+  `endpoint`; an `mcp.tool`, `mcp.resource` or `wait {on: resource}` step
+  with `registry` + `server`, which needs no `mcp.servers` entry; and an
+  instruction's `:::mcp{id registry=<url> server=<name>}`, held as text with
+  a `host-policy` warning unless the URL is an `mcp.registries` entry's and
+  the name passes its globs (`account` and `resolver` are warnings too).
+  Its record (`GET {url}/v0.1/servers/{name}/versions/{version}`) is held
+  to what agentd dials — the name asked for, not `deleted` (`deprecated`
+  connects and warns), a Streamable HTTP remote (`sse` skipped, said;
+  packages only refused), `https://` to a public address unless
+  `allow_private`, remote header `{variable}`s filled from the operator's
+  headers, a document's `src` one of its remotes — kept in the store for
+  `refresh`, and a run keeps calling the version it first called. The
+  lethal-trifecta check counts every approved name at the registry's tags at
+  load. `discover: true` gives the model `mcp.registry.search` and
+  `mcp.registry.connect` over the approved names. `agentd mcp registry
+  search <term>` lists what a registry serves. Events:
+  `mcp.registry.resolved`, `.deprecated`, `.refused`, `.unreachable`,
+  `.pinned`, `.server`, `.server.dropped`, `.search`.
 - `agent.on_instruction_updated: note | think`. Under `think`, with
   `instruction_updated` in `agent.wake_on`, a released change to the
   instruction starts a turn of the root conversation by itself: the agent

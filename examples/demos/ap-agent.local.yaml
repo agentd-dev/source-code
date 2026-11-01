@@ -29,4 +29,6 @@ mcp:
           rate: 120/1m
     - name: instruction-md
       endpoint: "${REGISTRY_MCP_URL:-http://127.0.0.1:8703/mcp}"
+      # agentd's, not the model's: none of its tools is offered (ap-agent.yaml).
+      allow: []
       tags: {"*": [trusted]}

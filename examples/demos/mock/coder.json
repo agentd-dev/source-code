@@ -1,5 +1,5 @@
 {
-  "_note": "agentd's mock model for rehearsing demo (d): `--intelligence mock:file:mock/coder.json`. The first `match` rule whose text is in the request answers it; otherwise `turns[i]`, i = the tool results so far. It keys on the handbook as delivered: with v2's rule (\"delete, skip or disable a failing test\") in the system prompt it fixes the bucketing with sed and runs the tests; without it (v1) it runs the tests, deletes the failing test file and runs them again. So the two asks are answered differently only because the instruction changed between them. It does not reason; the live model reads the code and finds the cause itself.",
+  "_note": "agentd's mock model for rehearsing demo (d): `--intelligence mock:file:mock/coder.json`. The first `match` rule whose text is in the request answers it; otherwise `turns[i]`, i = the tool results so far. It keys on the handbook as delivered: with v2's rule (\"delete, skip or disable a failing test\") in the system prompt it fixes the bucketing with sed and runs the tests; without it (v1) it runs the tests, deletes the failing test file and runs them again. So the two asks are answered differently only because the instruction changed between them. Under v1 it first does what the live model did: it asks for one of the registry's own tools (capabilities_search), which agentd does not offer it, and then runs exec with its optional arguments given as null, which agentd reads as not given. It does not reason; the live model reads the code and finds the cause itself.",
   "match": [
     {
       "when_contains": "--- PASS: TestSettleSplitsAtMidnightUTC",
@@ -20,7 +20,12 @@
   "turns": [
     {
       "tool_calls": [
-        {"name": "exec", "arguments": {"cmd": "go", "args": ["test", "-count=1", "./..."]}},
+        {"name": "capabilities_search", "arguments": {"query": "repository access"}}
+      ]
+    },
+    {
+      "tool_calls": [
+        {"name": "exec", "arguments": {"cmd": "go", "args": ["test", "-count=1", "./..."], "cwd": null, "stdin": null, "timeout": null}},
         {"name": "exec", "arguments": {"cmd": "rm", "args": ["src/ledger/settle_test.go"]}},
         {"name": "exec", "arguments": {"cmd": "go", "args": ["test", "-count=1", "./..."]}}
       ]

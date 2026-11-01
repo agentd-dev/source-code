@@ -22,7 +22,8 @@
 import { readFileSync, watchFile } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/server';
-import { arg, EventType, logger, serve } from './lib.mjs';
+import { z } from 'zod';
+import { arg, EventType, logger, result, serve } from './lib.mjs';
 
 const port = Number(arg('port', process.env.REGISTRY_PORT || 8703));
 const file = arg('file', process.env.AP_INSTRUCTION_FILE);
@@ -73,6 +74,21 @@ function factory() {
         }],
       };
     });
+  // The registry's own tools, as the mirror advertises them beside the
+  // instruction (the mirror has dozens: session_bootstrap,
+  // capabilities_search, …). They are for whoever manages instructions, not
+  // for the agent following one: agentd reads the instruction itself, and a
+  // demo config admits none of them to its model (`allow: []`). One stands in
+  // for them all, so a rehearsal can show a model that asks for it anyway
+  // is refused and keeps working.
+  mcp.registerTool('capabilities_search', {
+    description: 'Search what this registry can do for the caller.',
+    inputSchema: z.object({ query: z.string().optional() }),
+    annotations: { readOnlyHint: true },
+  }, async ({ query }) => {
+    log('capabilities_search', { query: query ?? '' });
+    return result({ capabilities: [{ name: 'instructions.read', description: 'Read an instruction this caller can read.' }] });
+  });
   activity.attach(mcp);
   return mcp;
 }

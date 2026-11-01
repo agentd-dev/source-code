@@ -84,6 +84,12 @@ mcp:
         client_id: "${HOME_CLIENT_ID:-home-climate}"
         client_secret: "{{secret:HOME_CLIENT_SECRET}}"
         token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
+      # The registry is agentd's, not the model's: agentd reads the
+      # instruction and its versions from it, and none of the dozens of
+      # tools it advertises (session_bootstrap, capabilities_search, …) is
+      # offered to the model. `trusted` vouches for what is left, the
+      # instruction itself — the rules the operator chose to follow.
+      allow: []
       tags: {"*": [trusted]}
     # The document's two connected objects, under its names. Device readings
     # and acknowledgements, not outside text: trusted.

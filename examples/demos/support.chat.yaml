@@ -24,6 +24,8 @@ mcp:
         client_id: "${CHAT_AGENT_CLIENT_ID:-chat-agent}"
         client_secret: "{{secret:CHAT_AGENT_CLIENT_SECRET}}"
         token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
+      # agentd's, not the model's: none of its tools is offered (support.yaml).
+      allow: []
       tags: {"*": [trusted]}
 
 a2a:

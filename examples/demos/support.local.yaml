@@ -24,4 +24,6 @@ mcp:
   servers:
     - name: instruction-md
       endpoint: "${REGISTRY_MCP_URL:-http://127.0.0.1:8723/mcp}"
+      # agentd's, not the model's: none of its tools is offered (support.yaml).
+      allow: []
       tags: {"*": [trusted]}

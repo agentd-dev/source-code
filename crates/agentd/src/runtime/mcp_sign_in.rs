@@ -523,9 +523,10 @@ impl Runtime {
                     }
                 }
                 // A little past the code's life: the grant says it first.
-                t.until
-                    .is_some_and(|u| now >= u.saturating_add(5_000))
-                    .then(|| (server.clone(), "the device code expired".to_string()))
+                if t.until.is_some_and(|u| now >= u.saturating_add(5_000)) {
+                    return Some((server.clone(), "the device code expired".to_string()));
+                }
+                None
             })
             .collect();
         for (server, why) in ends {

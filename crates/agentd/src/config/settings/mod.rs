@@ -5710,7 +5710,11 @@ impl Settings {
                 if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                     a.insert("instruction".into(), Value::String(text));
                 }
-                instruction_signature = pulled.signature;
+                // Only a build that verifies signatures reads it.
+                #[cfg(feature = "sign")]
+                {
+                    instruction_signature = pulled.signature;
+                }
                 instruction_origin = Some(InstructionOrigin {
                     uri,
                     manifest_digest: pulled.manifest_digest,

@@ -31,6 +31,18 @@ agent:
     machinery: live
 
 security:
+  # The release completes the lethal trifecta, and agentd says so: DeepWiki's
+  # answers are text generated from public repositories (untrusted input: a
+  # document's server is untrusted, and this one should be), while `exec`
+  # writes the repository (sensitive) and runs `git`, which can push (egress).
+  # Without this the v2 reload is refused (`config.reload.invalid`,
+  # "lethal-trifecta refused") and the agent keeps v1's servers. Saying yes
+  # is the operator's decision, made here at start: `security` is
+  # restart-only, so no release can widen it. What still holds: no shell, an
+  # exact allow-list with no network tool, the repository as the only working
+  # directory, an environment without the model key or the registry secret,
+  # and closed egress for agentd's own connections.
+  allow_trifecta: true
   exec:
     # coder.yaml's list (a list replaces, it does not append), plus what
     # writing a page needs: `mkdir -p docs/deps`, and `tee <file>` with the

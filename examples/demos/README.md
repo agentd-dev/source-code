@@ -597,7 +597,9 @@ agentd -c examples/demos/coder.yaml -c examples/demos/coder-e.yaml 2> >(tee "$AG
 
 `coder-e.yaml` adds DeepWiki and `raw.githubusercontent.com` to the services
 catalogue (egress stays closed), and `mkdir` and `tee` to the commands `exec`
-may run. A server the catalogue does not name refuses the release's reload
+may run, and sets `security.allow_trifecta: true`: DeepWiki's answers are
+untrusted text and `exec` writes the repository and runs `git`, so without it
+agentd refuses the release as a lethal trifecta. A server the catalogue does not name refuses the release's reload
 whole, and the running agent keeps what it had; a skill on an uncatalogued
 host is left out with a warning.
 

@@ -213,6 +213,10 @@ pub struct Resolution {
     pub status: String,
     /// Remotes passed over, each said (`sse https://…: …`).
     pub skipped: Vec<String>,
+    /// The document's `src`, beside the operator's own entry, that the
+    /// record's remotes do not hold: the document's declaration is refused,
+    /// with this; the operator's server is not.
+    pub document_refused: Option<String>,
 }
 
 impl Resolution {
@@ -280,7 +284,9 @@ pub fn validate_record(
             other => skipped.push(format!("{other} {url}: not a transport agentd speaks")),
         }
     }
-    if let Some(src) = &dial.document_src {
+    let mut document_refused = None;
+    if let Some(doc) = &dial.document_src {
+        let src = &doc.src;
         let norm = |u: &str| u.trim().trim_end_matches('/').to_string();
         let all: Vec<&str> = server
             .get("remotes")
@@ -289,16 +295,25 @@ pub fn validate_record(
             .flatten()
             .filter_map(|r| r.get("url").and_then(Value::as_str))
             .collect();
-        if !all.iter().any(|u| norm(u) == norm(src)) {
-            return Err(format!(
+        let held = all.iter().any(|u| norm(u) == norm(src));
+        if !held {
+            let why = format!(
                 "{at}: the document's src {src:?} is none of the record's remotes {all:?} — the document and the registry disagree, refused"
-            ));
+            );
+            // The operator's own entry is not the document's to refuse:
+            // only the document's block is (RFC 0055 §4.2).
+            if !doc.operator {
+                return Err(why);
+            }
+            document_refused = Some(why);
+        } else if !doc.operator {
+            // The document's own server dials the remote it named.
+            candidates.retain(|r| {
+                r.get("url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|u| norm(u) == norm(src))
+            });
         }
-        candidates.retain(|r| {
-            r.get("url")
-                .and_then(Value::as_str)
-                .is_some_and(|u| norm(u) == norm(src))
-        });
     }
     let Some(remote) = candidates.first() else {
         let packages = server
@@ -334,6 +349,7 @@ pub fn validate_record(
         headers,
         status,
         skipped,
+        document_refused,
     })
 }
 
@@ -634,13 +650,23 @@ mod tests {
             &[],
         )
         .unwrap_err();
-        assert!(e.contains("\"1.1.0\" was asked for") && e.contains("\"1.2.0\""), "{e}");
+        assert!(
+            e.contains("\"1.1.0\" was asked for") && e.contains("\"1.2.0\""),
+            "{e}"
+        );
+    }
+
+    fn src(src: &str, operator: bool) -> Option<crate::config::DocumentSrc> {
+        Some(crate::config::DocumentSrc {
+            src: src.into(),
+            operator,
+        })
     }
 
     #[test]
     fn a_document_src_must_be_one_of_the_records_remotes() {
         let mut d = dial();
-        d.document_src = Some("https://kb.acme.example/mcp/".into());
+        d.document_src = src("https://kb.acme.example/mcp/", false);
         let r = validate_record(
             "io.acme/kb",
             &record(remote("https://kb.acme.example/mcp"), "active"),
@@ -649,7 +675,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.url, "https://kb.acme.example/mcp");
-        d.document_src = Some("https://evil.example/mcp".into());
+        assert!(r.document_refused.is_none());
+        d.document_src = src("https://evil.example/mcp", false);
         let e = validate_record(
             "io.acme/kb",
             &record(remote("https://kb.acme.example/mcp"), "active"),
@@ -658,6 +685,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("disagree"), "{e}");
+    }
+
+    /// A document's `src` beside the operator's own entry that the record
+    /// does not hold refuses the document's block, not the operator's
+    /// server: it resolves as it would without the document.
+    #[test]
+    fn a_wrong_document_src_on_the_operators_entry_refuses_only_the_document() {
+        let mut d = dial();
+        d.document_src = src("https://evil.example/mcp", true);
+        let r = validate_record(
+            "io.acme/kb",
+            &record(remote("https://kb.acme.example/mcp"), "active"),
+            &d,
+            &[],
+        )
+        .expect("the operator's server resolves");
+        assert_eq!(r.url, "https://kb.acme.example/mcp");
+        assert!(
+            r.document_refused
+                .as_deref()
+                .is_some_and(|e| e.contains("disagree")),
+            "{r:?}"
+        );
+        // One the record holds is no refusal, and does not choose the
+        // operator's remote.
+        d.document_src = src("https://kb.acme.example/sse", true);
+        let r = validate_record(
+            "io.acme/kb",
+            &record(remote("https://kb.acme.example/mcp"), "active"),
+            &d,
+            &[],
+        )
+        .unwrap();
+        assert!(r.document_refused.is_none());
+        assert_eq!(r.url, "https://kb.acme.example/mcp");
     }
 
     #[test]

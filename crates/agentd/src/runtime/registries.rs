@@ -35,6 +35,10 @@ pub(crate) struct State {
     /// The servers whose record was refused, and why: a step naming one
     /// fails with the reason instead of waiting for it.
     pub refused: BTreeMap<String, String>,
+    /// The operator's servers whose record disagrees with the `src` an
+    /// instruction's block named beside it, and why: the document's steps
+    /// naming one fail with the reason; everything else calls it.
+    pub document_refused: BTreeMap<String, String>,
 }
 
 /// A connected registry server.
@@ -183,6 +187,21 @@ impl Runtime {
         match &r.resolution {
             Ok(res) => {
                 self.registries.refused.remove(server);
+                match &res.document_refused {
+                    Some(e) => {
+                        self.log.warn(
+                            "mcp.registry.refused",
+                            json!({"registry": r.registry, "server": r.server, "name": server,
+                                   "err": e, "document": true}),
+                        );
+                        self.registries
+                            .document_refused
+                            .insert(server.to_string(), e.clone());
+                    }
+                    None => {
+                        self.registries.document_refused.remove(server);
+                    }
+                }
                 self.log.info(
                     "mcp.registry.resolved",
                     json!({"registry": r.registry, "server": r.server, "name": server,
@@ -351,6 +370,18 @@ impl Runtime {
             }
         };
         self.ensure_registry_server(&named)?;
+        // The document's block for the operator's server named a `src` its
+        // record does not hold: the document's steps are refused, not the
+        // operator's server (RFC 0055 §4.2).
+        if let Some(why) = self.registries.document_refused.get(&named.name)
+            && self
+                .runs
+                .get(run_id)
+                .and_then(|r| self.workflows.get(&r.workflow))
+                .is_some_and(|w| w.document)
+        {
+            return Err(why.clone());
+        }
         // An exact version is its own pin.
         let exact = named
             .version
@@ -604,6 +635,7 @@ mod tests {
                 headers: Vec::new(),
                 status: "active".into(),
                 skipped: Vec::new(),
+                document_refused: None,
             }),
             spec: Some(
                 McpServerSpec {

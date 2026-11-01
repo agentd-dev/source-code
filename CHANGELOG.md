@@ -139,7 +139,9 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   connects and warns), a Streamable HTTP remote (`sse` skipped, said;
   packages only refused), `https://` to a public address unless
   `allow_private`, remote header `{variable}`s filled from the operator's
-  headers, a document's `src` one of its remotes — kept in the store for
+  headers, a document's `src` one of its remotes (else the document's block
+  is refused: its steps fail, and the operator's own entry it folded into
+  connects as without it) — kept in the store for
   `refresh` and read again on any re-dial once stale (a moved remote is
   followed, a record since `deleted` refused), and a run keeps calling the
   version it first called. The

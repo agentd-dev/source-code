@@ -149,8 +149,12 @@ GitHub, for issue lookups.
   one, or a server of its own under the registry's tags and ceiling. Its
   `tools=` only narrows the tool list.
 - A `src` beside `registry` and `server` must be one of the record's
-  remotes, or the server is refused when it is resolved: the document and the
-  registry disagree.
+  remotes, or the document's block is refused when the server is resolved:
+  the document and the registry disagree (`mcp.registry.refused`). When the
+  block became your own entry, only the document's steps that named it fail;
+  your entry resolves and connects as it would without the document, and a
+  `src` the record holds does not choose its remote. A server the document
+  alone declared is refused.
 - The document's workflow steps that name its `id` call that server. It is
   dialed right after the load.
 - `account` and `resolver` are not taken from a document; each is a

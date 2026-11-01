@@ -439,6 +439,20 @@ pub struct McpServerSpec {
     pub registry: Option<RegistryDial>,
 }
 
+/// The `src` an instruction's `:::mcp{registry server src}` named beside the
+/// registry (RFC 0055 §4.2): the record's remotes must hold it, or the
+/// document's block is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentSrc {
+    pub src: String,
+    /// The block folded into the operator's own entry for the server: a
+    /// record that disagrees refuses the document's declaration — its steps
+    /// that named the server — and the operator's server resolves and
+    /// connects as it would without the document. Otherwise the server is
+    /// the document's own, and is refused.
+    pub operator: bool,
+}
+
 /// How a registry server is resolved: the registry's API and the name and
 /// version asked for, with what the operator set on it (RFC 0055 §4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -460,7 +474,7 @@ pub struct RegistryDial {
     pub refresh: Duration,
     /// A document's `src` beside the registry name: the record's remotes must
     /// hold it.
-    pub document_src: Option<String>,
+    pub document_src: Option<DocumentSrc>,
     /// The server's own `auth` names its RFC 8707 resource `auto`: the
     /// resolved endpoint, in canonical form.
     pub resource_auto: bool,

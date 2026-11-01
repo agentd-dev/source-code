@@ -2951,7 +2951,8 @@ pub struct FoldedServers {
     pub warnings: Vec<String>,
     /// The `src` a document named beside a registry server, by the server
     /// it folded into: the record's remotes must hold it (RFC 0055 §4.2).
-    pub registry_src: BTreeMap<String, String>,
+    /// `operator` where that server is the operator's own entry.
+    pub registry_src: BTreeMap<String, crate::config::DocumentSrc>,
 }
 
 /// Fold a document's `mcp.servers` and `a2a.peers` into the operator's
@@ -2974,6 +2975,9 @@ pub fn fold_document_servers(
 ) -> FoldedServers {
     let mut out = FoldedServers::default();
     let mut renames: BTreeMap<String, String> = BTreeMap::new();
+    // The registry servers this fold made: the document's own, not the
+    // operator's.
+    let mut made_here: BTreeSet<String> = BTreeSet::new();
     let doc_servers = fragment
         .get_mut("mcp")
         .and_then(|m| m.get_mut("servers"))
@@ -2996,11 +3000,22 @@ pub fn fold_document_servers(
         // the operator trusts and the name one it approves, whatever the
         // egress policy — otherwise the block stays text.
         if let Some(registry) = srv.get("registry").and_then(Value::as_str) {
-            if let Some(target) =
-                fold_registry_server(operator, &srv, &name, registry, &mut out.warnings)
-            {
+            if let Some((target, made)) = fold_registry_server(
+                operator,
+                &srv,
+                &name,
+                registry,
+                &mut made_here,
+                &mut out.warnings,
+            ) {
                 if !endpoint.is_empty() {
-                    out.registry_src.insert(target.clone(), endpoint.clone());
+                    out.registry_src.insert(
+                        target.clone(),
+                        crate::config::DocumentSrc {
+                            src: endpoint.clone(),
+                            operator: !made,
+                        },
+                    );
                 }
                 if name != target {
                     renames.insert(name.clone(), target.clone());
@@ -3143,8 +3158,9 @@ fn fold_registry_server(
     doc: &Value,
     name: &str,
     registry: &str,
+    made_here: &mut BTreeSet<String>,
     warnings: &mut Vec<String>,
-) -> Option<String> {
+) -> Option<(String, bool)> {
     let server = doc
         .get("server")
         .and_then(Value::as_str)
@@ -3203,6 +3219,7 @@ fn fold_registry_server(
                     if let Some(v) = version {
                         made["version"] = json!(v);
                     }
+                    made_here.insert(implicit);
                     servers.push(made);
                     servers.len() - 1
                 }
@@ -3211,7 +3228,9 @@ fn fold_registry_server(
     };
     let op = &mut servers[at];
     narrow_operator_server(op, doc, name, warnings);
-    op.get("name").and_then(Value::as_str).map(str::to_string)
+    let target = op.get("name").and_then(Value::as_str).map(str::to_string)?;
+    let made = made_here.contains(&target);
+    Some((target, made))
 }
 
 /// Narrow the operator's server `op` by the document's `doc` entry: `allow`
@@ -3698,9 +3717,10 @@ pub struct McpServer {
     pub company: Option<companies::CompanyServer>,
     /// NOT a config key: the `src` an instruction's `:::mcp{registry server
     /// src}` named beside the registry — the record's remotes must hold it,
-    /// or the server is refused when it is resolved (RFC 0055 §4.2).
+    /// or the document's block is refused when it is resolved (RFC 0055
+    /// §4.2).
     #[serde(skip)]
-    pub document_src: Option<String>,
+    pub document_src: Option<crate::config::DocumentSrc>,
 }
 
 impl McpServer {
@@ -17225,8 +17245,10 @@ mod tests {
         assert!(s.on_use() && l.settings.mcp.document_matched.contains(&s.name));
         assert_eq!(s.allow.as_deref(), Some(&["get_doc".to_string()][..]));
         assert_eq!(
-            s.document_src.as_deref(),
-            Some("https://kb.acme.example/mcp")
+            s.document_src
+                .as_ref()
+                .map(|d| (d.src.as_str(), d.operator)),
+            Some(("https://kb.acme.example/mcp", false))
         );
         assert!(
             l.warnings

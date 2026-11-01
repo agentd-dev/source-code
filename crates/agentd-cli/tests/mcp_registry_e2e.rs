@@ -410,6 +410,64 @@ fn an_instructions_registry_server_is_dialed_after_the_load() {
     let _ = std::fs::remove_file(&cfg);
 }
 
+/// A document's block naming the operator's registry server with a `src`
+/// the record does not hold refuses the document's block — its workflow's
+/// step fails with the reason — and not the operator's server, which the
+/// operator's workflow calls as before.
+#[test]
+fn a_documents_wrong_src_refuses_only_the_documents_block() {
+    let mock = common::spawn_mock_mcp("mock://unused", false);
+    let reg = Registry::start();
+    let url = format!("{}/mcp", mock.uri());
+    reg.publish(record("io.acme/kb", "1.0.0", &url), "active");
+    let dir = tempfile::tempdir().unwrap();
+    let instr = dir.path().join("agent.md");
+    std::fs::write(
+        &instr,
+        format!(
+            "---\nspec: \"1\"\n---\n# Desk\n\nUse the knowledge base.\n\n\
+             :::mcp{{id=kbdoc registry=\"{}\" server=io.acme/kb src=\"https://evil.example/mcp\"}}\nThe knowledge base.\n:::\n\n\
+             :::workflow{{id=ask dialect=\"instruction/workflow\"}}\nname: ask\nsteps:\n  s: {{kind: once}}\n  c: {{kind: mcp.tool, depends_on: [s], server: kbdoc, tool: mock.ops}}\n  f: {{kind: finish, depends_on: [c], status: completed}}\n:::\n",
+            reg.base
+        ),
+    )
+    .unwrap();
+    let cfg = write_cfg(&format!(
+        "agent: {{name: reg, preflight: never, instruction: {{file: {}}}}}\n{}mcp:\n{}  servers:\n    - {{name: kb, registry: official, server: io.acme/kb}}\nworkflows:\n  - name: call\n    steps:\n      s: {{kind: once}}\n      w: {{kind: wait, depends_on: [s], on: signal, signal: never, timeout: 2s, on_timeout: c}}\n      c: {{kind: mcp.tool, server: kb, tool: mock.ops}}\n      f: {{kind: finish, depends_on: [c], status: completed}}\nlifecycle: {{run_until: drained}}\nobservability: {{log_level: info}}\n",
+        instr.display(),
+        store(&dir),
+        registries(&reg, "")
+    ));
+    let d = Daemon::start(&cfg);
+    let log = d.wait_for("both runs", |l| {
+        run_done(l, "ask").is_some() && run_done(l, "call").is_some()
+    });
+    assert_eq!(
+        run_done(&log, "call").unwrap()["status"],
+        "completed",
+        "the operator's server is not refused:\n{log}"
+    );
+    assert_ne!(
+        run_done(&log, "ask").unwrap()["status"],
+        "completed",
+        "the document's block is refused:\n{log}"
+    );
+    assert!(
+        events(&log, "step.done").iter().any(|e| e["step"] == "c"
+            && e["status"] == "failed"
+            && e["err"].as_str().is_some_and(|m| m.contains("disagree"))),
+        "{log}"
+    );
+    assert!(
+        events(&log, "mcp.registry.refused")
+            .iter()
+            .any(|e| e["name"] == "kb" && e["document"] == true),
+        "{log}"
+    );
+    assert_eq!(calls(&mock), 1, "only the operator's workflow called it");
+    let _ = std::fs::remove_file(&cfg);
+}
+
 /// What agentd must not dial is refused, said, and fails the step that
 /// names it; a deprecated record connects and warns.
 #[test]
@@ -521,7 +579,11 @@ fn a_stale_record_is_read_again_on_a_re_dial_and_a_moved_remote_followed() {
             .any(|e| e["name"] == "kb" && e["url"] == format!("{}/mcp", two.uri())),
         "the record was read again:\n{log}"
     );
-    assert_eq!(calls(&one), 1, "the second call did not go to the old remote");
+    assert_eq!(
+        calls(&one),
+        1,
+        "the second call did not go to the old remote"
+    );
     assert_eq!(calls(&two), 1, "the second call went where the record says");
 }
 
@@ -541,8 +603,7 @@ fn a_stale_record_deleted_meanwhile_refuses_the_re_dial() {
     assert!(
         events(&log, "mcp.registry.refused")
             .iter()
-            .any(|e| e["name"] == "kb"
-                && e["err"].as_str().is_some_and(|m| m.contains("deleted"))),
+            .any(|e| e["name"] == "kb" && e["err"].as_str().is_some_and(|m| m.contains("deleted"))),
         "{log}"
     );
     assert_eq!(calls(&one), 1, "the deleted server was not called again");

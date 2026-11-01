@@ -850,6 +850,7 @@ impl Runtime {
             let live = &self.mcp;
             self.registries.live.retain(|n, _| live.contains_key(n));
             self.registries.refused.clear();
+            self.registries.document_refused.clear();
             // A replaced or dropped connection's webhook subscriptions are
             // let go on that connection (RFC 0045 §5.6.3).
             #[cfg(feature = "mcp-events")]

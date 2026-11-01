@@ -191,6 +191,10 @@ struct State {
     /// Bumped by `mock.publish`: the publisher's edit `mock://instruction`
     /// reads with, made while the server stays up.
     edition: AtomicU64,
+    /// The document `mock.serve_document` last set, and how many times it was
+    /// set: what `instruction://ins_live…` reads as, raw and unsigned, under
+    /// the versionId `ver_live_<n>`.
+    served: Mutex<Option<(u64, String)>>,
     /// The server-to-client streams open now, which `mock.tools_changed`
     /// writes to.
     open: Mutex<Vec<Open>>,
@@ -295,6 +299,7 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
         pending_emit: AtomicBool::new(false),
         generation: AtomicU64::new(0),
         edition: AtomicU64::new(0),
+        served: Mutex::new(None),
         open: Mutex::new(Vec::new()),
         next_open: AtomicU64::new(0),
         store: Mutex::new(std::collections::BTreeMap::new()),
@@ -707,6 +712,7 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
                         {"name": "mock.job", "description": "a job that becomes an MCP task where the call declares the extension", "inputSchema": {"type": "object"}},
                         {"name": "mock.restart", "description": "forget every session, as a restarted server does", "inputSchema": {"type": "object"}},
                         {"name": "mock.publish", "description": "edit mock://instruction, pushing nothing", "inputSchema": {"type": "object"}},
+                        {"name": "mock.serve_document", "description": "replace the document instruction://ins_live reads as, pushing nothing", "inputSchema": {"type": "object"}},
                         {"name": "mock.narrow", "description": "leave `uri` out of every later listen acknowledgment", "inputSchema": {"type": "object"}},
                         {"name": "mock.refuse_subscribe", "description": "refuse the next `count` subscribes", "inputSchema": {"type": "object"}},
                         {"name": "mock.tools_changed", "description": "send notifications/tools/list_changed down every open stream that takes it", "inputSchema": {"type": "object"}},
@@ -750,6 +756,11 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
             // (RFC-0028 §3.3), signed with a FIXED test seed when the `sign`
             // feature is built, so the consumer's §7.6 verification — and its
             // fail-closed refusals — have coverage with no live gateway.
+            if asked.starts_with(LIVE_DOCUMENT)
+                && let Some((n, text)) = lock(&state.served).clone()
+            {
+                return (Response::ok(req.id, live_read(&asked, n, &text)), false);
+            }
             if asked.starts_with("instruction://") {
                 return (Response::ok(req.id, registry_read(&asked)), false);
             }
@@ -1009,6 +1020,20 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
         // subscribes again on a new session.
         // The publisher edits the instruction; nothing is pushed — a test
         // says how the consumer hears of it.
+        // The publisher replaces the whole document `instruction://ins_live…`
+        // reads as; nothing is pushed.
+        Some("mock.serve_document") => {
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut served = lock(&state.served);
+            let n = served.as_ref().map_or(0, |(n, _)| *n) + 1;
+            *served = Some((n, text));
+            eprintln!("MOCK_SERVE_DOCUMENT {n}");
+            tool_ok(req.id, json!({"ok": true, "version": n}))
+        }
         Some("mock.publish") => {
             let edition = state.edition.fetch_add(1, Ordering::SeqCst) + 1;
             eprintln!("MOCK_PUBLISH {edition}");
@@ -1693,6 +1718,25 @@ fn write_json(stream: &mut TcpStream, status: u16, payload: &Value, session: Opt
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&body);
     let _ = stream.flush();
+}
+
+/// The resource a test's own document is served at (`mock.serve_document`).
+const LIVE_DOCUMENT: &str = "instruction://ins_live";
+
+/// `resources/read` for the document a test serves: raw, unsigned, with the
+/// alignment metadata a registry stamps.
+fn live_read(uri: &str, n: u64, text: &str) -> Value {
+    let digest = instruction_md::digest(text.as_bytes());
+    json!({"contents": [{"uri": uri, "mimeType": "text/markdown; variant=instruction", "text": text,
+    "_meta": {
+        "md.instruction/canonical": LIVE_DOCUMENT,
+        "md.instruction/versionId": format!("ver_live_{n}"),
+        "md.instruction/revision": n,
+        "md.instruction/spec": "1",
+        "md.instruction/resolution": "raw",
+        "md.instruction/digest": digest,
+        "md.instruction/deliveredDigest": digest,
+    }}]})
 }
 
 /// The document this mock's registry serves. `REGISTRY_VERSION` moves when the

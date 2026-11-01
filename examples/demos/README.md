@@ -47,7 +47,7 @@ the limit is released by a person's answer and nothing else.
 | "Can it post?" | no | the ERP has `journal.post`, as real ERPs do; `close-agent.yaml`'s server `allow` list never names it, so the tool does not exist for this agent. A model that tries is refused inside agentd and the ERP never sees the call (the rehearsal's mock tries, on purpose) |
 | Review | the question in the controller's TUI: review and post in the ERP | a `human` gate addressed to the controller; posting stays a person's act |
 | The team releases v2: "MUST: tag every draft entry with the closing period, e.g. 2026-10." | `instruction.applied v1 → v2`, within a second | the resource's subscription and the `md.instruction.activity` MCP Events type; agentd re-reads, verifies the signature, and applies from the next turn, without a restart |
-| Two more bank lines land | two drafts, both `tags=2026-10`; the review question says so | the same workflow, the same step text: nothing in `close-agent.yaml` mentions a tag or a period. The difference is the rule, which reaches the drafting step through the instruction alone |
+| Two more bank lines land | two drafts, both `tags=["2026-10"]`; the review question says so | the same workflow, the same step text: nothing in `close-agent.yaml` mentions a tag or a period. The difference is the rule, which reaches the drafting step through the instruction alone |
 | Review again | the controller reviews; nothing is posted | the gate, as before |
 
 ## Prerequisites
@@ -320,11 +320,34 @@ runnable on a feed change instead of a monthly schedule.
 6. The team adds the rule and releases v2: `instruction.applied` with
    `old_version_id` → `new_version_id`, within a second. No restart.
 7. Two more lines land: the recon agent is asked again; the ERP terminal
-   shows `JE-DRAFT-005` and `006`, each `tags=2026-10`, and the earlier four
+   shows `JE-DRAFT-005` and `006`, each `tags=["2026-10"]`, and the earlier four
    are not drafted again. The review question ends "Each is tagged with the
    closing period, 2026-10."; answer it.
 8. `control.mjs state erp`: six drafts, nothing posted. Posting is the
    controller's, in the ERP.
+
+**The lines, and what the model can find for each.** Every scripted line is
+an adjustment a careful accountant drafts without asking, with its support
+in what the read tools return (`bank.read` carries the bank's advice for
+each line and the period, open; `accounts.read` the open payables;
+`journal.read` the posted purchase invoices), and one is deliberately
+doubtful:
+
+| Line | Amount | What it is | Its draft |
+|---|---|---|---|
+| BL-0904 | −38.50 | Albion bank charges, advice CA-1031 | Dr 6810 bank charges / Cr 1010 |
+| BL-0905 | +1,212.40 | credit interest, advice IA-1031 | Dr 1010 / Cr 4900 interest income |
+| BL-0906 | −4,180.00 | pays Fastclean Services' invoice FC-7721, an open payable (JE-0871) | Dr 2100 trade creditors / Cr 1010 |
+| BL-0907 | +5,000.00 | a receipt from Oakridge Garden Centres with no reference: **the doubtful one** | Dr 1010 / Cr 1190 suspense, the doubt in its memo and in the review summary |
+| BL-0908 | −12.00 | card terminal rental, advice CS-1031 (after the release) | Dr 6810 / Cr 1010 |
+| BL-0909 | −1,265.00 | pays Harbourline Logistics' invoice HL-2026-1244, an open payable (JE-0874) (after the release) | Dr 2100 / Cr 1010 |
+
+The lines already in the feed (BL-0901 to 0903) each match a cash-book entry
+by amount and reference. The drafting step tells the model to draft every
+line it can, to draft a doubtful one to its likeliest account or to
+suspense with the doubt in that draft's memo, never to hold back the other
+drafts for it, and to keep its open questions for the summary the
+controller reads at the review. It says nothing about tags or periods.
 
 **Why this beat.** The team offered two: raising `tolerance` from $50 to
 $1,000, or adding the tagging rule. The tolerance only decides whether the
@@ -653,7 +676,27 @@ examples/demos/rehearse.sh ap close            # or name them: ap close support 
 AGENTD_BIN=/path/to/agentd examples/demos/rehearse.sh support home
 ```
 
-The binary is `AGENTD_BIN`, else `AGENTD`, else `agentd` on `PATH`. Run
+The binary is `AGENTD_BIN`, else `AGENTD`, else `agentd` on `PATH`.
+
+**(b) on the real model.** `REHEARSE_LIVE=1` runs demo (b) with the configs'
+own model, gpt-6.1-sol, and `OPENAI_API_KEY` from the environment (the
+script never reads or prints it; it spends tokens). The registry is still
+the local stand-in, so the script releases v2 itself, between the two
+bursts:
+
+```sh
+export OPENAI_API_KEY=…            # however you keep it; the script reads only the variable
+REHEARSE_LIVE=1 AGENTD_BIN=/path/to/agentd-instruction1 examples/demos/rehearse.sh close
+```
+
+Its checks allow for the model's wording and judgement (what it writes in a
+memo, whether it drafts the doubtful line, what it asks the controller) and
+hold it to the beat: the three clear lines of the first burst are drafted;
+before the release, no draft carries a period tag; after it, BL-0908 and
+BL-0909 are drafted and every new draft is tagged with the closing period,
+`2026-10`; the review gate is raised and answered twice; nothing is ever
+posted. It prints each draft (line, amount, tags, support, memo) for you to
+read. The other demos are skipped in live mode. Run
 (b) and (e) with the instruction/1 build (their local copies are the
 instruction team's documents, `:::mcp` blocks and all) and (d) with a build
 that has `exec`; a demo the binary cannot run is reported as skipped, with
@@ -663,7 +706,7 @@ run looked like on the builds here:
 | Demo | Binary | Result |
 |---|---|---|
 | (a) accounts payable | the instruction/1 build, and `main` | 20 passed |
-| (b) month-end close | the instruction/1 build | 32 passed |
+| (b) month-end close | the instruction/1 build | 34 passed |
 | (c) support | the instruction/1 build, and `main` | 27 passed |
 | (d) coder | `main` built with `exec` | 17 passed |
 | (e) home | the instruction/1 build | 20 passed |

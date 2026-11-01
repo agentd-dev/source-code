@@ -14,6 +14,17 @@
 #
 #   AGENTD_BIN=/path/to/agentd examples/demos/rehearse.sh support home
 #
+#   REHEARSE_LIVE=1 examples/demos/rehearse.sh close   # (b) on the real model
+#
+# REHEARSE_LIVE=1 runs demo (b) on the configs' own model, gpt-6.1-sol, with
+# OPENAI_API_KEY from the environment (this script never reads or prints it,
+# and reads no key file; it spends tokens). The registry is still the local
+# stand-in, so the script releases v2 itself. Its checks allow for the
+# model's own wording and judgement, and hold it to the beat: before the
+# release, no draft carries a period tag; after it, every new draft is
+# tagged with the closing period, 2026-10; nothing is ever posted. The other
+# demos are skipped in live mode.
+#
 # The binary: AGENTD_BIN, else AGENTD, else `agentd` on PATH. Demos (a)–(c)
 # need the release features (mcp-events, a2a, cel, mock-models). Demo (d)
 # needs a build with `exec`, which no release binary has (README.md, "A
@@ -108,6 +119,11 @@ latency_ms() {
     const t0 = rel ? Date.parse(rel.split(" ")[0]) : NaN, t1 = app ? Date.parse(app.ts) : NaN;
     console.log(Number.isFinite(t0) && Number.isFinite(t1) ? t1 - t0 : -1);' "$1" "$2" "$3"
 }
+# report_drafts <file of ERP journal.draft lines>: show them (a live run's
+# record of what the model drafted; not a check).
+report_drafts() {
+  sed -E 's/.*journal\.draft journalId=([^ ]+) sourceBankLine=([^ ]+) tags=([^ ]+) support=([^ ]+) total=GBP ([^ ]+) memo=(.*)/        \1 \2 GBP \5  tags=\3  support=\4  memo: \6/' "$1"
+}
 # start <name> <command…>: run in the background, its output in $WORK/<name>.log.
 start() {
   local name="$1"; shift
@@ -200,6 +216,10 @@ mock() {
   fi
 }
 FEATURES="$(features)"
+LIVE="${REHEARSE_LIVE:-0}"
+if [ "$LIVE" = 1 ] && [ -z "${OPENAI_API_KEY:-}" ]; then
+  echo "REHEARSE_LIVE=1 asks the real model: export OPENAI_API_KEY first" >&2; exit 2
+fi
 echo "agentd: $("$AGENTD" --version)   ($AGENTD)   work: $WORK"
 
 # ---- demo (a): accounts payable --------------------------------------------
@@ -269,7 +289,7 @@ demo_ap() {
 
 # ---- demo (b): month-end close ---------------------------------------------
 demo_close() {
-  say "demo (b): month-end close — drafts under \"Month-end close\", never a post"
+  say "demo (b): month-end close — drafts under \"Month-end close\", never a post$([ "$LIVE" = 1 ] && echo ' (live: gpt-6.1-sol)')"
   if ! "$AGENTD" --validate-config --instruction "$HERE/instruction/close-v1.md" --intelligence mock:final >/dev/null 2>&1; then
     skip close "this agentd does not read instruction/1 (the document's :::mcp blocks): rehearse with the build that does"
     return 0
@@ -278,20 +298,33 @@ demo_close() {
   local erp="$WORK/erp.log" reg="$WORK/close-registry.log" model="$WORK/close-model.log"
   local recon="$WORK/recon-agent.log" close="$WORK/close-agent.log"
   local uri='instruction://lumen-foods/month-end-close@latest'
+  # How long a step that asks the model may take: the mock answers at once.
+  local t=30; [ "$LIVE" = 1 ] && t=600
   export CLOSE_INSTRUCTION_URI="$uri"
   cp "$HERE/instruction/close-v1.md" "$WORK/close.md"
   start erp node "$HERE/standins/erp.mjs"
   start close-registry node "$HERE/standins/registry.mjs" --file "$WORK/close.md" --port 8713 --uri "$uri" --title 'Month-end close'
-  start close-model node "$HERE/standins/model.mjs" --port 8719 --playbook "$HERE/mock/close.model.json"
-  if ! { until_has 10 "$erp" listening && until_has 10 "$reg" serving && until_has 10 "$model" listening; }; then
-    bad "the ERP, registry and model stand-ins start"; return 0
+  if ! { until_has 10 "$erp" listening && until_has 10 "$reg" serving; }; then
+    bad "the ERP and registry stand-ins start"; return 0
   fi
-  check "the scripted model's rules name no period or date of their own" rules_lack "$HERE/mock/close.model.json" '20[0-9]{2}-[0-9]{2}|2026'
   check "v1 and v2 differ in one line, the rule" \
     test "$(diff "$HERE/instruction/close-v1.md" "$HERE/instruction/close-v2.md" | grep -c '^[<>] .')" = 1
-  mock recon-agent
-  start recon-agent "$AGENTD" -c "$HERE/recon-agent.yaml" "${MOCK[@]}"
-  start close-agent "$AGENTD" -c "$HERE/close-agent.yaml" -c "$HERE/close-agent.local.yaml" -c "$HERE/close-agent.mock.yaml"
+  local recon_model=() close_model=()
+  if [ "$LIVE" = 1 ]; then
+    # The configs' own model block: gpt-6.1-sol, {{secret:OPENAI_API_KEY}}
+    # from this environment. The registry is still the local stand-in, so
+    # this script decides when v2 is released.
+    :
+  else
+    start close-model node "$HERE/standins/model.mjs" --port 8719 --playbook "$HERE/mock/close.model.json"
+    until_has 10 "$model" listening || { bad "the scripted model starts"; return 0; }
+    check "the scripted model's rules name no period or date of their own" \
+      rules_lack "$HERE/mock/close.model.json" '\b20[0-9]{2}-(0[1-9]|1[0-2])\b'
+    mock recon-agent; recon_model=("${MOCK[@]}")
+    close_model=(-c "$HERE/close-agent.mock.yaml")
+  fi
+  start recon-agent "$AGENTD" -c "$HERE/recon-agent.yaml" "${recon_model[@]}"
+  start close-agent "$AGENTD" -c "$HERE/close-agent.yaml" -c "$HERE/close-agent.local.yaml" "${close_model[@]}"
 
   check "the close agent follows Month-end close over MCP: v1 loaded" \
     until_has 20 "$close" '"event":"instruction.loaded"' '"version_id":"ver_local_1_'
@@ -309,17 +342,24 @@ demo_close() {
   check "the close agent delegates to the recon agent over A2A" \
     until_has 30 "$recon" '"event":"run.start"' '"workflow":"unmatched-lines"'
   check "the recon agent reads the ERP and answers" \
-    until_has 30 "$recon" '"event":"run.done"' '"workflow":"unmatched-lines"' '"status":"completed"'
+    until_has "$t" "$recon" '"event":"run.done"' '"workflow":"unmatched-lines"' '"status":"completed"'
   check "the A2A step completes in the close agent" \
-    until_has 30 "$close" '"event":"step.done"' '"step":"unmatched"' '"status":"done"'
-  check "journal.draft is called, one per unmatched line" until_has 30 "$erp" 'journal.draft journalId=JE-DRAFT-004'
-  check "four drafts in the ERP" test "$(count "$erp" 'journal.draft journalId=')" = 4
-  check "none tagged with a period: v1 has no such rule" test "$(nlines "$erp" 'journal.draft journalId=' ' tags=- ')" = 4
-  check "the model's journal.post attempt is refused inside agentd" \
-    until_has 20 "$close" '"event":"tool.result"' '"is_error":true' '"tool":"erp.journal.post"'
-  check "the ERP never received journal.post" bash -c "! grep -qF 'journal.post' '$erp'"
+    until_has "$t" "$close" '"event":"step.done"' '"step":"unmatched"' '"status":"done"'
   check "the review gate is raised for the controller (human.ask)" \
-    until_has 20 "$close" '"event":"human.ask"' 'Month-end close'
+    until_has "$t" "$close" '"event":"human.ask"' 'Month-end close'
+  if [ "$LIVE" = 1 ]; then
+    check "drafted: bank charges BL-0904, interest BL-0905, the Fastclean payment BL-0906" \
+      bash -c "for l in BL-0904 BL-0905 BL-0906; do grep -F 'journal.draft journalId=' '$erp' | grep -qF \"sourceBankLine=\$l \" || exit 1; done"
+    report_drafts <(grep -F 'journal.draft journalId=' "$erp")
+  else
+    check "four drafts in the ERP, one per unmatched line" test "$(count "$erp" 'journal.draft journalId=')" = 4
+    check "every draft names its support" bash -c "! grep -F 'journal.draft journalId=' '$erp' | grep -qF ' support=0 '"
+    check "the model's journal.post attempt is refused inside agentd" \
+      until_has 20 "$close" '"event":"tool.result"' '"is_error":true' '"tool":"erp.journal.post"'
+  fi
+  check "v1: no draft carries a period tag (v1 has no such rule)" \
+    bash -c "grep -qF 'journal.draft journalId=' '$erp' && ! grep -F 'journal.draft journalId=' '$erp' | grep -qE 'tags=\\[[^]]*20[0-9]{2}-(0[1-9]|1[0-2])([^0-9]|$)'"
+  check "the ERP never received journal.post" bash -c "! grep -qF 'journal.post' '$erp'"
   local gate; gate="$(task_of "$close" 1)"
   answer http://127.0.0.1:8421 "$CONTROLLER_TOKEN" "$gate" reviewed >"$WORK/answer-close-1.json"
   check "the controller's review is taken, as the addressee (human.answered)" \
@@ -329,6 +369,7 @@ demo_close() {
   local first_done; first_done="$(line_of "$close" '"event":"run.done"' '"workflow":"month-end-close"')"
 
   say "beat 2: the team releases v2 (MUST: tag every draft entry with the closing period)"
+  local erp_at_release; erp_at_release="$(wc -l <"$erp")"
   cp "$HERE/instruction/close-v2.md" "$WORK/close.md"
   check "the registry stand-in releases version 2" until_has 10 "$reg" 'released' 'ver_local_2_'
   check "agentd applies v2: instruction.applied, v1 → v2" \
@@ -345,15 +386,26 @@ demo_close() {
   check "v2 was applied between the two bursts (line ${first_done:-?} < ${applied:-?} < ${second:-?})" \
     test -n "$first_done" -a -n "$applied" -a -n "$second" -a "${first_done:-0}" -lt "${applied:-0}" -a "${applied:-0}" -lt "${second:-0}"
   check "the recon agent is asked again, over A2A, and answers" \
-    until_n 30 2 "$recon" '"event":"run.done"' '"workflow":"unmatched-lines"' '"status":"completed"'
-  check "two new drafts, JE-DRAFT-005 and 006" until_has 30 "$erp" 'journal.draft journalId=JE-DRAFT-006'
-  check "both tagged with the closing period, 2026-10, as the new rule asks" \
-    test "$(nlines "$erp" 'journal.draft journalId=JE-DRAFT-00' ' tags=2026-10 ')" = 2
-  check "six drafts in all: lines drafted before were not drafted again" test "$(count "$erp" 'journal.draft journalId=')" = 6
-  check "the model tagged because the delivered instruction said so (v1 untagged, v2 tagged)" \
-    test "$(count "$model" 'answered rule=draft-first ')" = 1 -a "$(count "$model" 'answered rule=draft-second-tagged ')" = 1
-  check "the review gate is raised again, its summary naming the period" \
-    until_has 20 "$close" '"event":"human.ask"' 'closing period, 2026-10'
+    until_n "$t" 2 "$recon" '"event":"run.done"' '"workflow":"unmatched-lines"' '"status":"completed"'
+  check "the review gate is raised again" until_n "$t" 2 "$close" '"event":"human.ask"' 'Month-end close'
+  # The drafts made after the release: the ERP's lines past where it stood then.
+  local v1d="$WORK/drafts-v1.log" v2d="$WORK/drafts-v2.log"
+  head -n "$erp_at_release" "$erp" | grep -F 'journal.draft journalId=' >"$v1d" || true
+  tail -n +"$((erp_at_release + 1))" "$erp" | grep -F 'journal.draft journalId=' >"$v2d" || true
+  check "the new lines are drafted (BL-0908, BL-0909)" \
+    bash -c "grep -qF 'sourceBankLine=BL-0908 ' '$v2d' && grep -qF 'sourceBankLine=BL-0909 ' '$v2d'"
+  check "v2: every draft made after the release is tagged with the closing period, 2026-10" \
+    bash -c "[ -s '$v2d' ] && ! grep -vE 'tags=\\[[^]]*2026-10([^0-9]|$)' '$v2d' | grep -q ."
+  check "the drafts from before the release carry no period tag" \
+    bash -c "[ -s '$v1d' ] && ! grep -qE 'tags=\\[[^]]*20[0-9]{2}-(0[1-9]|1[0-2])([^0-9]|$)' '$v1d'"
+  if [ "$LIVE" = 1 ]; then
+    report_drafts "$v2d"
+  else
+    check "six drafts in all: lines drafted before were not drafted again" test "$(count "$erp" 'journal.draft journalId=')" = 6
+    check "the model tagged because the delivered instruction said so (v1 untagged, v2 tagged)" \
+      test "$(count "$model" 'answered rule=draft-first ')" = 1 -a "$(count "$model" 'answered rule=draft-second-tagged ')" = 1
+    check "the second review question names the period" has "$close" '"event":"human.ask"' 'closing period, 2026-10'
+  fi
   gate="$(task_of "$close" 2)"
   answer http://127.0.0.1:8421 "$CONTROLLER_TOKEN" "$gate" reviewed >"$WORK/answer-close-2.json"
   check "the second run completes after the controller's review" \
@@ -561,6 +613,7 @@ demo_home() {
 
 for d in "${DEMOS[@]}"; do
   before_pass=$PASS before_fail=$FAIL
+  if [ "$LIVE" = 1 ] && [ "$d" != close ]; then skip "$d" "REHEARSE_LIVE=1 runs demo (b) only"; continue; fi
   case "$d" in
     ap) demo_ap ;;
     close) demo_close ;;

@@ -33,9 +33,9 @@ const FEED = 'erp://bank-feed/today';
 const lines = [...data.bankLines];
 const script = [...data.nextBankLines];
 const accounts = new Map(data.accounts.map((a) => [a.code, a]));
-const journals = [];
+const journals = []; // the drafts made here; data.postedJournals came before
 
-const feed = () => ({ account: data.bankAccount, date: data.feedDate, lines });
+const feed = () => ({ account: data.bankAccount, date: data.feedDate, period: data.period, lines });
 const money = (s) => Math.round(Number(s) * 100);
 
 function factory() {
@@ -50,7 +50,7 @@ function factory() {
   }, async () => ({ contents: [{ uri: FEED, mimeType: 'application/json', text: JSON.stringify(feed(), null, 2) }] }));
 
   mcp.registerTool('bank.read', {
-    description: "Today's bank statement lines for the operating account (the same as erp://bank-feed/today). Amounts are signed: money in is positive.",
+    description: "Today's bank statement lines for the operating account (the same as erp://bank-feed/today), each with the bank's advice for it, and the accounting period they fall in. Amounts are signed: money in is positive.",
     inputSchema: z.object({}),
     annotations: { readOnlyHint: true },
   }, async () => result(feed()));
@@ -62,10 +62,10 @@ function factory() {
   }, async ({ date }) => result({ entries: data.cashBook.filter((e) => !date || e.date === date) }));
 
   mcp.registerTool('accounts.read', {
-    description: 'The chart of accounts: code, name and type.',
+    description: 'The chart of accounts (code, name and type), the open accounting period, and the open payables: supplier invoices posted to trade creditors and not yet paid.',
     inputSchema: z.object({}),
     annotations: { readOnlyHint: true },
-  }, async () => result({ accounts: [...accounts.values()] }));
+  }, async () => result({ period: data.period, accounts: [...accounts.values()], openPayables: data.openPayables }));
 
   mcp.registerTool('journal.draft', {
     description: 'Draft a journal entry for review. A draft changes no balance until a person posts it in the ERP. Lines must balance: total debits equal total credits.',
@@ -73,11 +73,12 @@ function factory() {
       date: z.string(),
       memo: z.string(),
       sourceBankLine: z.string().optional(),
+      support: z.array(z.string()).optional().describe('The documents behind the entry: statement lines, advices, invoices.'),
       tags: z.array(z.string()).optional().describe('Labels on the entry.'),
       lines: z.array(z.object({ account: z.string(), debit: z.string().optional(), credit: z.string().optional() })).min(2),
     }),
     annotations: { idempotentHint: false },
-  }, async ({ date, memo, sourceBankLine, tags, lines: jl }) => {
+  }, async ({ date, memo, sourceBankLine, support, tags, lines: jl }) => {
     const unknown = jl.filter((l) => !accounts.has(l.account)).map((l) => l.account);
     if (unknown.length) return refusal(`unknown account(s): ${unknown.join(', ')} — see accounts.read`);
     const dr = jl.reduce((s, l) => s + money(l.debit ?? 0), 0);
@@ -87,17 +88,17 @@ function factory() {
       const j = journals.find((x) => x.sourceBankLine === sourceBankLine);
       return result({ journalId: j.journalId, status: j.status, message: `${sourceBankLine} already has draft ${j.journalId}` });
     }
-    const j = { journalId: `JE-DRAFT-${String(journals.length + 1).padStart(3, '0')}`, status: 'draft', date, memo, sourceBankLine, tags: tags ?? [], lines: jl, total: (dr / 100).toFixed(2) };
+    const j = { journalId: `JE-DRAFT-${String(journals.length + 1).padStart(3, '0')}`, status: 'draft', date, memo, sourceBankLine, support: support ?? [], tags: tags ?? [], lines: jl, total: (dr / 100).toFixed(2) };
     journals.push(j);
-    log('journal.draft', { journalId: j.journalId, sourceBankLine: sourceBankLine ?? '-', tags: tags?.length ? tags.join(',') : '-', total: `GBP ${j.total}`, memo });
+    log('journal.draft', { journalId: j.journalId, sourceBankLine: sourceBankLine ?? '-', tags: tags?.length ? tags : '-', support: support?.length ?? 0, total: `GBP ${j.total}`, memo });
     return result({ journalId: j.journalId, status: 'draft', message: `draft ${j.journalId} saved for review; nothing is posted` });
   });
 
   mcp.registerTool('journal.read', {
-    description: 'Journal entries, optionally only drafts or only posted ones.',
+    description: 'Journal entries, posted (such as the purchase invoices behind the open payables) and drafted; optionally only drafts or only posted ones.',
     inputSchema: z.object({ status: z.enum(['draft', 'posted']).optional() }),
     annotations: { readOnlyHint: true },
-  }, async ({ status }) => result({ journals: journals.filter((j) => !status || j.status === status) }));
+  }, async ({ status }) => result({ journals: [...data.postedJournals, ...journals].filter((j) => !status || j.status === status) }));
 
   mcp.registerTool('journal.post', {
     description: 'Post a drafted journal entry to the general ledger. Posting changes balances and closes the period entry.',
@@ -138,6 +139,6 @@ function land(spec) {
   factory,
   control: {
     bankline: async (spec) => { try { return land(spec); } catch (e) { return { error: e.message }; } },
-    state: async () => ({ feed: feed(), cashBook: data.cashBook, journals, nextScripted: script.map((l) => l.id) }),
+    state: async () => ({ feed: feed(), cashBook: data.cashBook, openPayables: data.openPayables, journals, nextScripted: script.map((l) => l.id) }),
   },
 }));

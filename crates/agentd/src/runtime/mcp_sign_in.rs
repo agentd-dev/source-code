@@ -403,11 +403,20 @@ impl Runtime {
                     complete,
                     code: code.clone(),
                 });
-                self.log.info(
-                    "mcp.sign_in.required",
-                    json!({"server": server, "url": url, "method": method, "code": code,
-                           "expires_in_s": for_ms / 1000}),
-                );
+                // The code is a sign-in anyone holding it can complete as
+                // themselves: it goes to the gate, where operators see it, and
+                // into the log only where there is no gate to show it on (a
+                // build or a configuration without the A2A listener).
+                #[cfg(feature = "a2a")]
+                let gated = self.settings.a2a.listen.is_some();
+                #[cfg(not(feature = "a2a"))]
+                let gated = false;
+                let mut line = json!({"server": server, "url": url, "method": method,
+                                      "expires_in_s": for_ms / 1000});
+                if !gated {
+                    line["code"] = json!(code);
+                }
+                self.log.info("mcp.sign_in.required", line);
                 #[cfg(feature = "a2a")]
                 {
                     let waiting = self.runs_waiting_for(server);

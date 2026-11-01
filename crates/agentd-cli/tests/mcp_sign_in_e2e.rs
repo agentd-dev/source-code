@@ -300,8 +300,10 @@ fn a_step_signs_in_at_a_gate_and_completes() {
     let (d, addr) = case.start("");
     let task = run_fetch(&addr);
     let log = d.wait_log("\"mcp.sign_in.required\"", 1, 20);
+    // The listener shows the code on the gate, so the log does not carry it:
+    // whoever holds it can complete the sign-in as themselves.
     assert!(
-        log.contains(USER_CODE) && log.contains("\"method\":\"device\""),
+        !log.contains(USER_CODE) && log.contains("\"method\":\"device\""),
         "{log}"
     );
     let gated = wait_task(&addr, &task, 10, "the sign-in gate", |t| {

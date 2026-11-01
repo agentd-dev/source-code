@@ -426,6 +426,13 @@ mod tests {
         // Asking did not take it: the holder still has it.
         assert!(FileStore::open(&root).is_err());
         drop(store);
+        // Released at once, unless a child another test thread is forking
+        // holds a copy of the descriptor until it execs (close-on-exec): a
+        // moment, not a holder.
+        let released = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lock_holder(&root).is_some() && std::time::Instant::now() < released {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert_eq!(lock_holder(&root), None);
         assert!(FileStore::open(&root).is_ok());
         let _ = fs::remove_dir_all(&root);

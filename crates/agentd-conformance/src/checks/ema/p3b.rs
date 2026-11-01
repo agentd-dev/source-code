@@ -372,6 +372,25 @@ impl Setup {
             .collect()
     }
 
+    /// Whether the store holds a run whose step `w` is suspended — the
+    /// [`TWICE`] run waiting on `go`, durably.
+    fn held_on_go(&self) -> bool {
+        fn suspended_w(v: &Value) -> bool {
+            if v.pointer("/steps/w/status").and_then(Value::as_str) == Some("suspended") {
+                return true;
+            }
+            match v {
+                Value::Object(m) => m.values().any(suspended_w),
+                Value::Array(a) => a.iter().any(suspended_w),
+                _ => false,
+            }
+        }
+        self.store_bytes()
+            .iter()
+            .filter_map(|(_, b)| serde_json::from_slice::<Value>(b).ok())
+            .any(|v| suspended_w(&v))
+    }
+
     /// Kill the daemon as a crash would: nothing it holds in memory is
     /// revoked or written.
     fn crash(&self) {
@@ -490,10 +509,14 @@ pub(super) fn a_ciba_firing_asks_once_more_after_a_restart(h: &Harness) -> Outco
     );
     let d = s.daemon(h);
     tryo!(s.login(h));
+    // Not only made: the store holds the run suspended on `go`. A crash
+    // before step `one` is written runs it again after the restart, and a
+    // `go` sent while it runs wakes no wait — it is dropped, and the run
+    // waits on `w` for ever.
     tryo!(s.until(
-        "the first call made",
+        "the first call made, and the run held on `go` in the store",
         Duration::from_secs(40),
-        &|| s.made("whoami") >= 1
+        &|| s.made("whoami") >= 1 && s.held_on_go()
     ));
     let binding = tryo!(s.first_binding());
     std::thread::sleep(Duration::from_millis(500));
@@ -583,10 +606,14 @@ pub(super) fn a_ciba_refresh_token_is_revoked_after_a_crash(h: &Harness) -> Outc
     );
     let d = s.daemon(h);
     tryo!(s.login(h));
+    // Not only made: the store holds the run suspended on `go`. A crash
+    // before step `one` is written runs it again after the restart, and a
+    // `go` sent while it runs wakes no wait — it is dropped, and the run
+    // waits on `w` for ever.
     tryo!(s.until(
-        "the first call made",
+        "the first call made, and the run held on `go` in the store",
         Duration::from_secs(40),
-        &|| s.made("whoami") >= 1
+        &|| s.made("whoami") >= 1 && s.held_on_go()
     ));
     let kept = s.approvals_kept();
     let clear = s
@@ -710,10 +737,14 @@ pub(super) fn a_ciba_refresh_token_is_revoked_once_the_signer_is_back(h: &Harnes
     );
     let d = s.daemon(h);
     tryo!(s.login(h));
+    // Not only made: the store holds the run suspended on `go`. A crash
+    // before step `one` is written runs it again after the restart, and a
+    // `go` sent while it runs wakes no wait — it is dropped, and the run
+    // waits on `w` for ever.
     tryo!(s.until(
-        "the first call made",
+        "the first call made, and the run held on `go` in the store",
         Duration::from_secs(40),
-        &|| s.made("whoami") >= 1
+        &|| s.made("whoami") >= 1 && s.held_on_go()
     ));
     let kept = s.approvals_kept().len();
     s.crash();

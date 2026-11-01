@@ -10,7 +10,8 @@
 //! nobody answers within the step's `timeout` fails the step
 //! `sign_in_timeout`; a denied grant fails it `sign_in_denied`; a restart in
 //! the middle of the wait closes the old gate, starts a new sign-in, and the
-//! step completes once the person signs in.
+//! step completes once the person signs in. A registry server (RFC 0055
+//! §4.1) signs in the same way, for the remote its record names.
 #![cfg(all(unix, feature = "a2a", feature = "oauth"))]
 
 mod common;
@@ -132,6 +133,50 @@ fn spawn_mcp() -> String {
     format!("{}/mcp", common::mock_in_thread(opts))
 }
 
+/// An MCP registry serving one server.json record — `io.acme/kb` at 1.0.0,
+/// its one Streamable HTTP remote `url` — at every version read of its name
+/// (`/v0.1/servers/io.acme%2Fkb/versions/…`); each read counted.
+fn spawn_registry(url: &str) -> (String, Arc<AtomicUsize>) {
+    let l = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://127.0.0.1:{}", l.local_addr().unwrap().port());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (url, counted) = (url.to_string(), Arc::clone(&reads));
+    std::thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let mut r = BufReader::new(c.try_clone().unwrap());
+            let mut line = String::new();
+            r.read_line(&mut line).ok();
+            loop {
+                let mut h = String::new();
+                if r.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                    break;
+                }
+            }
+            let path = line.split_whitespace().nth(1).unwrap_or("");
+            let (status, body) = if path.starts_with("/v0.1/servers/io.acme%2Fkb/versions/") {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let server = json!({"name": "io.acme/kb", "version": "1.0.0",
+                                    "description": "a test server",
+                                    "remotes": [{"type": "streamable-http", "url": url}]});
+                (
+                    200,
+                    json!({"server": server, "_meta": {"io.modelcontextprotocol.registry/official":
+                           {"status": "active", "isLatest": true}}})
+                    .to_string(),
+                )
+            } else {
+                (404, "{}".to_string())
+            };
+            let _ = write!(
+                c,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    (base, reads)
+}
+
 struct MockLlm {
     child: Child,
 }
@@ -212,6 +257,21 @@ impl Case {
     /// The daemon on a free port, its state and login cache under the
     /// case's directory, the step's `timeout` as `step_timeout`.
     fn start(&self, step_timeout: &str) -> (Daemon, String) {
+        let tail = format!(
+            "mcp:\n  servers:\n    - name: vault\n      endpoint: {mcp}\n      connect: on_use\n      \
+             auth: {{kind: oauth2, grant: device, issuer: \"{issuer}\", client_id: agentd-test}}\n\
+             workflows:\n  - name: fetch\n    steps:\n      s: {{kind: manual}}\n      \
+             call: {{kind: mcp.tool, server: vault, tool: state.put, args: {{key: k, value: v}}, depends_on: [s]{step_timeout}}}\n      \
+             f: {{kind: finish, depends_on: [call], output: done}}\n",
+            mcp = self.mcp,
+            issuer = self.idp.issuer,
+        );
+        self.start_with(&tail)
+    }
+
+    /// The daemon as [`Case::start`] makes it, with `tail` (its `mcp` and
+    /// `workflows`) in place of the on-use `vault` and its `fetch`.
+    fn start_with(&self, tail: &str) -> (Daemon, String) {
         let dir = self.dir.path().display().to_string();
         std::fs::create_dir_all(format!("{dir}/creds")).unwrap();
         for _ in 0..5 {
@@ -221,15 +281,8 @@ impl Case {
                  intelligence:\n  endpoints: {llm}\n  model: mock\n\
                  store:\n  kind: file\n  file:\n    path: {dir}/state\n  checkpoint:\n    debounce_ms: 0\n\
                  a2a:\n  listen: http://127.0.0.1:{port}\n  introspection:\n    enabled: true\n\
-                 observability:\n  log_level: info\n\
-                 mcp:\n  servers:\n    - name: vault\n      endpoint: {mcp}\n      connect: on_use\n      \
-                 auth: {{kind: oauth2, grant: device, issuer: \"{issuer}\", client_id: agentd-test}}\n\
-                 workflows:\n  - name: fetch\n    steps:\n      s: {{kind: manual}}\n      \
-                 call: {{kind: mcp.tool, server: vault, tool: state.put, args: {{key: k, value: v}}, depends_on: [s]{step_timeout}}}\n      \
-                 f: {{kind: finish, depends_on: [call], output: done}}\n",
+                 observability:\n  log_level: info\n{tail}",
                 llm = self.llm,
-                mcp = self.mcp,
-                issuer = self.idp.issuer,
             );
             let path = format!("{dir}/agentd-{port}.yaml");
             std::fs::write(&path, cfg).unwrap();
@@ -406,4 +459,80 @@ fn a_restart_mid_wait_signs_in_again_and_completes() {
         state(t) == "TASK_STATE_COMPLETED"
     });
     assert_eq!(call_step(&addr)["status"], "done");
+}
+
+/// A registry server that wants a sign-in (RFC 0055 §4.1 + §4.3): a step
+/// names it by registry and name; the operator's own entry for that name
+/// carries its credential, a device grant. The step's dial reads the record
+/// first, and its remote — an MCP server answering only the signed-in
+/// token — is signed in to at the gate on the run's task, then dialed with
+/// the token; the step completes.
+#[test]
+fn a_registry_server_signs_in_at_a_gate_and_completes() {
+    let case = Case::new();
+    let (registry, reads) = spawn_registry(&case.mcp);
+    let tail = format!(
+        "mcp:\n  registries:\n    - {{name: official, url: \"{registry}\", servers: [\"io.acme/*\"], allow_private: true}}\n  \
+         servers:\n    - name: kb\n      registry: official\n      server: io.acme/kb\n      \
+         auth: {{kind: oauth2, grant: device, issuer: \"{issuer}\", client_id: agentd-test}}\n\
+         workflows:\n  - name: fetch\n    steps:\n      s: {{kind: manual}}\n      \
+         call: {{kind: mcp.tool, registry: official, server: io.acme/kb, tool: state.put, args: {{key: k, value: v}}, depends_on: [s]}}\n      \
+         f: {{kind: finish, depends_on: [call], output: done}}\n",
+        issuer = case.idp.issuer,
+    );
+    let (d, addr) = case.start_with(&tail);
+    let task = run_fetch(&addr);
+    let name = "official/io.acme/kb";
+    let log = d.wait_log("\"mcp.sign_in.required\"", 1, 20);
+    let lines: Vec<Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    let at = |event: &str| {
+        lines
+            .iter()
+            .position(|v| v["event"] == event && v["server"] == name)
+    };
+    // Resolved through its record, to the remote it names — before the
+    // sign-in, which is for that remote.
+    let resolved = lines
+        .iter()
+        .position(|v| {
+            v["event"] == "mcp.registry.resolved"
+                && v["name"] == name
+                && v["server"] == "io.acme/kb"
+                && v["version"] == "1.0.0"
+                && v["url"] == case.mcp.as_str()
+        })
+        .unwrap_or_else(|| panic!("no resolution:\n{log}"));
+    let required = at("mcp.sign_in.required").expect("the sign-in is the step's server's");
+    assert!(resolved < required, "{log}");
+    assert!(
+        !log.contains(USER_CODE) && !log.contains(TOKEN),
+        "a code or a token in the log:\n{log}"
+    );
+    let gated = wait_task(&addr, &task, 10, "the sign-in gate", |t| {
+        state(t) == "TASK_STATE_INPUT_REQUIRED"
+    });
+    let q = text(&gated);
+    assert!(
+        q.contains(USER_CODE) && q.contains(name),
+        "the gate names the server and the code: {gated}"
+    );
+    assert_eq!(case.idp.devices.load(Ordering::SeqCst), 1);
+
+    case.idp.set(APPROVED);
+    wait_task(&addr, &task, 30, "the run's end", |t| {
+        state(t) == "TASK_STATE_COMPLETED"
+    });
+    let log = d.log();
+    assert!(log.contains("\"mcp.sign_in.done\""), "{log}");
+    assert_eq!(call_step(&addr)["status"], "done", "{log}");
+    assert!(
+        !log.contains(USER_CODE) && !log.contains(TOKEN),
+        "a code or a token in the log:\n{log}"
+    );
+    // The dial after the sign-in reused the record it had read.
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "{log}");
+    assert_eq!(case.idp.devices.load(Ordering::SeqCst), 1, "one sign-in");
 }

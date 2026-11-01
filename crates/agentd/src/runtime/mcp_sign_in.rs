@@ -273,12 +273,17 @@ impl Runtime {
 
     /// Start signing in to `server` by `spec`, unless that is under way: the
     /// grant on a thread of its own, its prompt and its end sent back as
-    /// [`Step`]s. The server is dialed with `spec` from now on.
+    /// [`Step`]s. A server with no `auth` of its own (one discovery found the
+    /// grant for) is dialed with `spec` from now on; one with its own keeps
+    /// it as configured — a registry server's is bound to its record's
+    /// endpoint at each dial, and a reload compares it as written.
     pub(crate) fn start_mcp_sign_in(&mut self, server: &str, spec: AuthSpec) {
         if self.mcp_sign_ins.contains_key(server) {
             return;
         }
-        if let Some(s) = self.mcp_specs.get_mut(server) {
+        if let Some(s) = self.mcp_specs.get_mut(server)
+            && s.auth.is_none()
+        {
             s.auth = Some(spec.clone());
         }
         let method = if spec.grant.as_deref() == Some("authorization_code") {

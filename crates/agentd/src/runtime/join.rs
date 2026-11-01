@@ -349,9 +349,10 @@ impl Runtime {
                                     auth = dialed.auth;
                                     (dialed.found.map(|(c, t)| Found::Mcp(Box::new(c), t)), None)
                                 }
-                                Some(t) => {
-                                    (dial(&t).map(|(c, tools)| Found::Mcp(Box::new(c), tools)), None)
-                                }
+                                Some(t) => (
+                                    dial(&t).map(|(c, tools)| Found::Mcp(Box::new(c), tools)),
+                                    None,
+                                ),
                             }
                         }
                     };
@@ -563,10 +564,10 @@ impl Runtime {
         }
         // Found by discovery: the connection's credential is the server's
         // from now on, for every client built for it.
-        if let Some(a) = auth
+        if let Some(a) = &auth
             && let Some(s) = self.mcp_specs.get_mut(&server)
         {
-            s.auth = Some(a);
+            s.auth = Some(a.clone());
         }
         // A server that refused this agent outright is not dialled again in
         // this life.
@@ -581,11 +582,10 @@ impl Runtime {
         let adopted = match found {
             Some(Found::Mcp(client, tools)) => {
                 // A registry server runs on the spec it was resolved to: what
-                // a child is handed, and what a reload compares.
-                if let Some(r) = registry
-                    && let (Some(spec), Ok(res)) = (r.spec, r.resolution)
-                {
-                    self.registry_adopted(&server, spec, res.version);
+                // a child is handed, and what a reload compares — with the
+                // credential discovery found, which it was resolved without.
+                if let Some((spec, version)) = registry.and_then(|r| r.adopted(auth)) {
+                    self.registry_adopted(&server, spec, version);
                 }
                 self.join_adopt(&server, *client, tools)
             }

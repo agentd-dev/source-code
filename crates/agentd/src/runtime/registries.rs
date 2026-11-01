@@ -19,7 +19,7 @@
 
 use super::reactor::Runtime;
 use crate::config::settings::registries::{self, StepServer};
-use crate::config::{McpServerSpec, RegistryDial};
+use crate::config::{AuthSpec, McpServerSpec, RegistryDial};
 use crate::mcp::registry::{Api, Resolution};
 use crate::state::{Kind, now_ms};
 use serde_json::{Map, Value, json};
@@ -60,6 +60,20 @@ pub(crate) struct Resolved {
     /// The spec to dial: the record's endpoint and headers.
     pub spec: Option<McpServerSpec>,
     pub refresh_ms: u64,
+}
+
+impl Resolved {
+    /// The spec a connection made on this resolution runs on, and the
+    /// version it is: the record's endpoint and headers, and — where the
+    /// entry has no `auth` and discovery found one (`found`) — that
+    /// credential, which the resolution was made without.
+    pub(crate) fn adopted(self, found: Option<AuthSpec>) -> Option<(McpServerSpec, String)> {
+        let (mut spec, res) = (self.spec?, self.resolution.ok()?);
+        if spec.auth.is_none() {
+            spec.auth = found;
+        }
+        Some((spec, res.version))
+    }
 }
 
 /// The store key a registry's record of `server` at `version` is kept
@@ -510,6 +524,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A connection made on a resolution runs on the record's endpoint with
+    /// the credential discovery found for it, where the entry has none of
+    /// its own — so a child handed the spec, and a reload comparing it, see
+    /// the credential the connection was made with.
+    #[test]
+    fn a_registry_server_runs_on_the_credential_discovery_found() {
+        let dial = RegistryDial {
+            registry: "official".into(),
+            server: "io.acme/kb".into(),
+            ..Default::default()
+        };
+        let unresolved = McpServerSpec {
+            name: "kb".into(),
+            registry: Some(dial),
+            ..Default::default()
+        };
+        let resolved = |own: Option<AuthSpec>| Resolved {
+            registry: "official".into(),
+            server: "io.acme/kb".into(),
+            asked: "latest".into(),
+            record: None,
+            fetched: false,
+            resolution: Ok(Resolution {
+                name: "io.acme/kb".into(),
+                version: "1.0.0".into(),
+                url: "https://kb.example/mcp".into(),
+                headers: Vec::new(),
+                status: "active".into(),
+                skipped: Vec::new(),
+            }),
+            spec: Some(
+                McpServerSpec {
+                    auth: own,
+                    ..unresolved.clone()
+                }
+                .resolved("https://kb.example/mcp", Vec::new()),
+            ),
+            refresh_ms: 1000,
+        };
+        let auth = |grant: &str| AuthSpec {
+            kind: "oauth2".into(),
+            grant: Some(grant.into()),
+            ..Default::default()
+        };
+        let (spec, version) = resolved(None).adopted(Some(auth("device"))).unwrap();
+        assert_eq!(
+            (spec.endpoint.as_str(), version.as_str()),
+            ("https://kb.example/mcp", "1.0.0")
+        );
+        assert_eq!(spec.auth, Some(auth("device")));
+        let (spec, _) = resolved(Some(auth("client_credentials")))
+            .adopted(Some(auth("device")))
+            .unwrap();
+        assert_eq!(spec.auth, Some(auth("client_credentials")));
+        let refused = Resolved {
+            resolution: Err("refused".into()),
+            spec: None,
+            ..resolved(None)
+        };
+        assert!(refused.adopted(None).is_none());
     }
 
     /// A search lists only the names the registry's globs approve, once.

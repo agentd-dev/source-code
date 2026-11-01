@@ -416,6 +416,17 @@ impl Runtime {
         // Every spec first: one that cannot be built refuses the reload
         // before any server is dialed, as it refuses a start.
         let mut specs = dial_specs(new)?;
+        // A credential found at run time — a server with no `auth` whose
+        // RFC 9728 metadata named its authorization server (RFC 0055 §4.3)
+        // — is the server's still, while its entry is unchanged.
+        carry_found_auth(old, new, &mut specs, |n| {
+            self.registries
+                .live
+                .get(n)
+                .map(|l| &l.unresolved)
+                .or_else(|| self.mcp_specs.get(n))
+                .and_then(|s| s.auth.clone())
+        });
         let mut set = std::collections::BTreeMap::new();
         let mut fresh = Vec::new();
         let mut resolved = Vec::new();
@@ -1394,6 +1405,40 @@ enum ReloadRefused {
     RestartRequired(Vec<String>),
 }
 
+/// Carry into `specs` (the new settings' dial specs) the credential each
+/// server with no `auth` found at run time (`found`: the running spec's), for
+/// a server whose entry names no credential in `old` nor in `new` and is the
+/// same server in both — its endpoint, or its registry, name and version.
+/// Without it a reload of anything at all took the credential away: the
+/// server, compared unchanged no more, was dialed again without it.
+fn carry_found_auth(
+    old: &cfg::Settings,
+    new: &cfg::Settings,
+    specs: &mut std::collections::BTreeMap<String, crate::config::McpServerSpec>,
+    found: impl Fn(&str) -> Option<crate::config::AuthSpec>,
+) {
+    let uncredentialed = |s: &cfg::McpServer| s.auth.is_none() && s.oauth.is_none();
+    for s in new.mcp.servers.iter().filter(|s| uncredentialed(s)) {
+        let same = old.mcp.servers.iter().any(|o| {
+            o.name == s.name
+                && uncredentialed(o)
+                && o.endpoint == s.endpoint
+                && o.registry == s.registry
+                && o.server == s.server
+                && o.version == s.version
+        });
+        if !same {
+            continue;
+        }
+        if let Some(spec) = specs.get_mut(&s.name)
+            && spec.auth.is_none()
+            && let Some(a) = found(&s.name)
+        {
+            spec.auth = Some(a);
+        }
+    }
+}
+
 /// The spec `srv` is dialed with: its own, its credential bound to its
 /// endpoint, and for a registry server how it is resolved.
 pub(crate) fn dial_spec(
@@ -1500,6 +1545,47 @@ mod dial_tests {
         let errs = dial_specs(&s).unwrap_err();
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].contains("crm"), "{errs:?}");
+    }
+
+    /// A credential a server with no `auth` found at run time survives a
+    /// reload that leaves the server's entry as it was, and only that one.
+    #[test]
+    fn a_found_credential_is_kept_by_a_reload_that_leaves_its_server_alone() {
+        let settings = |servers: &str| {
+            cfg::Settings::from_document(
+                crate::config::yaml::parse(&format!(
+                    "mcp:\n  registries:\n    - {{name: official, url: \"https://registry.example\", servers: [\"io.acme/*\"]}}\n  servers:\n{servers}"
+                ))
+                .unwrap(),
+                "t",
+            )
+            .unwrap()
+        };
+        let base = "    - {name: wiki, endpoint: \"https://wiki.example/mcp\", connect: on_use}\n    - {name: kb, registry: official, server: io.acme/kb}\n";
+        let found = crate::config::AuthSpec {
+            kind: "oauth2".into(),
+            grant: Some("device".into()),
+            ..Default::default()
+        };
+        let carried = |old: &cfg::Settings, new: &cfg::Settings| {
+            let mut specs = dial_specs(new).unwrap();
+            carry_found_auth(old, new, &mut specs, |_| Some(found.clone()));
+            ["wiki", "kb"].map(|n| specs[n].auth.is_some())
+        };
+        let old = settings(base);
+        assert_eq!(carried(&old, &settings(base)), [true, true]);
+        // The server moved: what it found was for the old one.
+        let moved = settings(
+            "    - {name: wiki, endpoint: \"https://wiki2.example/mcp\", connect: on_use}\n    - {name: kb, registry: official, server: io.acme/kb, version: \"2.0.0\"}\n",
+        );
+        assert_eq!(carried(&old, &moved), [false, false]);
+        // The operator gave it a credential: that one is dialed.
+        let own = settings(
+            "    - {name: wiki, endpoint: \"https://wiki.example/mcp\", connect: on_use, auth: {kind: static, token: \"{{secret:T}}\"}}\n    - {name: kb, registry: official, server: io.acme/kb}\n",
+        );
+        let mut specs = dial_specs(&own).unwrap();
+        carry_found_auth(&old, &own, &mut specs, |_| Some(found.clone()));
+        assert_ne!(specs["wiki"].auth.as_ref(), Some(&found));
     }
 
     /// A reload that adds, removes or changes a company entry is a restart:

@@ -25,7 +25,7 @@ use super::paths::{self, Binding};
 use super::{ConfigError, usage};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -140,13 +140,13 @@ pub struct Settings {
     /// silently creating a stream nothing retains.
     #[serde(default)]
     pub streams: BTreeMap<String, StreamCfg>,
-    /// The **service catalog**: the named external services this deployment may
-    /// use. Entries carry connection settings, one shared credential,
-    /// authoritative trifecta tags and a tool-surface ceiling; `mcp.servers`
-    /// entries reference them via `service:`. An absent catalog imposes no
-    /// constraints at all.
+    /// The plain-HTTP endpoints this deployment reaches (RFC 0055 §3.2).
     #[serde(default)]
-    pub services: BTreeMap<String, Service>,
+    pub http: Http,
+    /// The Companies agentd acts at for its User (RFC 0047; the `companies`
+    /// feature), by name.
+    #[serde(default)]
+    pub companies: BTreeMap<String, Company>,
     /// Operator-defined constants, referenced anywhere in this document and in
     /// workflow definitions as `{{config.NAME}}` (dotted paths reach into
     /// nested values). The template prefix is `config.` and NOT `vars.`
@@ -1040,15 +1040,15 @@ pub fn resolve_document_source(
     }
     if value.starts_with("https://") || value.starts_with("http://") {
         policy
-            .allows(ServiceKind::Http, &value)
+            .allows(EndpointKind::Http, &value)
             .map_err(|e| format!("{at}: {e}"))?;
-        let text = crate::config::http_get(&value, &|u| policy.allows(ServiceKind::Http, u))
+        let text = crate::config::http_get(&value, &|u| policy.allows(EndpointKind::Http, u))
             .map_err(|e| format!("{at} {value}: {e}"))?;
         return Ok(wire(text));
     }
     if value.starts_with("oci://") {
         policy
-            .allows(ServiceKind::Http, &value)
+            .allows(EndpointKind::Http, &value)
             .map_err(|e| format!("{at}: {e}"))?;
         #[cfg(feature = "oci")]
         {
@@ -1170,7 +1170,7 @@ pub const DOCUMENT_MAY_WRITE: &[&str] = &[
     "agent.wake_on",
     // Another agent this one collaborates with — an OUTBOUND dial, exactly
     // like `mcp.servers`, and covered by the same closed-egress sweep
-    // (`ServiceKind::Peer`). `:::peer` is the `identity`-family block that
+    // (`EndpointKind::Peer`). `:::peer` is the `identity`-family block that
     // declares one. The rest of `a2a` is the listener, and is the operator's.
     "a2a.peers",
     // `tools.narrow` only ADDS trifecta tags and descriptions: a document can
@@ -1246,10 +1246,13 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "tools.overrides",
     // The gates: trifecta, egress, exec, policies, TLS trust, AAuth.
     "security",
-    // The allow-list `security.egress: closed` is CHECKED AGAINST. A gate
-    // whose catalogue the gated party writes is not a gate — the document
-    // simply catalogues its own destination and the sweep passes.
-    "services",
+    // Plain-HTTP endpoints and the Companies agentd acts at: part of the
+    // allow-list `security.egress: closed` is CHECKED AGAINST. A gate whose
+    // list the gated party writes is not a gate. (A document's `mcp.servers`
+    // and `a2a.peers` fold into the operator's under `closed` instead,
+    // `fold_document_servers`.)
+    "http",
+    "companies",
     // Who work is done on behalf of.
     "identity",
     // The pins and the client authentication a delegated server is reached
@@ -1272,6 +1275,9 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "mcp.servers[].auth.trusted_output",
     "mcp.servers[].auth.subject",
     "mcp.servers[].auth.dpop",
+    // When a server is dialed is the operator's (RFC 0055 §4.4): a document
+    // declares the servers it needs, and the load dials an on-use one.
+    "mcp.servers[].connect",
     // Who may talk to THIS agent and as what, over which socket, with which
     // credential. Enumerated rather than taken as a section, because
     // `a2a.peers` — an outbound dial — is the document's and sits inside it;
@@ -1314,6 +1320,9 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "intelligence.token_file",
     "intelligence.headers",
     "intelligence.auth",
+    // How hard the operator's endpoint is pressed: the operator's terms with
+    // the vendor, not the document's.
+    "intelligence.rate",
     // Further destinations for the agent's content, with their credentials
     // (RFC 0046 §5.2) — and the model that answers asks on the operator's
     // behalf, which a document must not choose for its own gates.
@@ -1476,6 +1485,8 @@ struct DocumentFold {
     workflows: std::collections::BTreeSet<usize>,
     /// One `skills.fetched` record per remote skill fetched.
     skill_fetches: Vec<Value>,
+    /// What became of the document's servers and peers.
+    servers: FoldedServers,
 }
 
 /// The document a load folds, and how it came ([`fold_instruction_document`]).
@@ -1624,7 +1635,7 @@ fn fold_instruction_document(
     let vouched = document_vouched(&ex.config);
     if !vouched.is_empty() {
         return Err(format!(
-            "{source}: the instruction declares {} — vouching for a server is the operator's: what a server a document declares answers is outside text unless the operator's service catalog vouches for it",
+            "{source}: the instruction declares {} — vouching for a server is the operator's: what a server a document declares answers is outside text unless it is the operator's own server (an mcp.servers endpoint its src falls under)",
             vouched.join(", ")
         ));
     }
@@ -1671,14 +1682,17 @@ fn fold_instruction_document(
     let mut operator_intelligence = None;
     let mut workflows = std::collections::BTreeSet::new();
     let mut fragment = ex.config.clone();
-    // The document's servers are untrusted unless the
-    // operator's catalog vouches for them; a catalog that
-    // will not parse vouches for none.
-    let catalog: BTreeMap<String, Service> = doc
-        .get("services")
-        .and_then(|v| serde_json::from_value(v.clone()).ok())
-        .unwrap_or_default();
-    untrust_document_servers(&mut fragment, &catalog);
+    let mut ex = ex;
+    // A document's server that matches an operator's IS that server; one
+    // that matches none is its own, untrusted — or, under closed egress,
+    // text (RFC 0055 §3.1).
+    let servers = fold_document_servers(&mut fragment, &mut ex.workflows, doc, egress.closed());
+    warnings.extend(
+        servers
+            .warnings
+            .iter()
+            .map(|w| format!("agent.instruction: {w}")),
+    );
     if let Some(o) = doc.as_object_mut() {
         if fragment.contains_key("intelligence") {
             let operator = o.get("intelligence").cloned().unwrap_or(json!({}));
@@ -1706,7 +1720,6 @@ fn fold_instruction_document(
             w.extend(ex.workflows.clone());
         }
     }
-    let mut ex = ex;
     let skill_fetches = if source == MERGED_DOCUMENT {
         fetch_remote_skills(&mut ex, doc, egress, warnings)
     } else {
@@ -1719,6 +1732,7 @@ fn fold_instruction_document(
         operator_intelligence,
         workflows,
         skill_fetches,
+        servers,
     })
 }
 
@@ -1726,8 +1740,8 @@ fn fold_instruction_document(
 /// (`idoc::skill_url`) and add each to its skills, marked as fetched text —
 /// which reaches the model as untrusted input, inside a block that names the
 /// URL. A fetch is a URL read like a `url:` document's: through the egress
-/// policy (under `security.egress: closed` its host is in the services
-/// catalogue), on `https://`, to a public address, and no larger than
+/// policy (under `security.egress: closed` its host is in `http.endpoints`),
+/// on `https://`, to a public address, and no larger than
 /// `skills.max_bytes`. One that fails is a warning and that skill is left
 /// out; the document and the reload stand. Returns the `skills.fetched`
 /// records.
@@ -1781,7 +1795,7 @@ fn fetch_remote_skills(
 /// policy and, on `https://`, must reach a public address.
 fn fetch_skill_md(url: &str, egress: &EgressPolicy, cap: usize) -> Result<String, String> {
     let admit = |u: &str| -> Result<(), String> {
-        egress.allows(ServiceKind::Http, u)?;
+        egress.allows(EndpointKind::Http, u)?;
         let parsed = crate::net::http::Url::parse(u).map_err(|e| format!("url {u}: {e}"))?;
         if parsed.is_tls() {
             crate::net::ssrf::guard_host(&parsed.host, false).map_err(|e| e.to_string())?;
@@ -2157,6 +2171,9 @@ pub struct Intelligence {
     /// The ceiling on one model call on this connection. Default 120 s; the
     /// run's deadline is the real bound.
     pub timeout: Option<Dur>,
+    /// Per-process pacing of model calls on this connection (`<burst>/<per>`):
+    /// a call waits for a token.
+    pub rate: Option<String>,
     /// Further connections, by name — a second vendor, a gateway, a decisions
     /// endpoint. Each is everything the top-level connection is and nothing
     /// more: `endpoints`, `dialect`, `token`/`token_file`, `headers`, `auth`,
@@ -2206,6 +2223,7 @@ pub struct Provider {
     pub headers: BTreeMap<String, String>,
     pub auth: Option<Auth>,
     pub timeout: Option<Dur>,
+    pub rate: Option<String>,
     pub structured_output: StructuredOutput,
 }
 
@@ -2222,6 +2240,7 @@ pub struct Connection<'a> {
     pub headers: &'a BTreeMap<String, String>,
     pub auth: Option<&'a Auth>,
     pub timeout: Option<Duration>,
+    pub rate: Option<&'a str>,
     pub structured_output: StructuredOutput,
 }
 
@@ -2548,6 +2567,7 @@ impl Intelligence {
                 headers: &p.headers,
                 auth: p.auth.as_ref(),
                 timeout: p.timeout.map(|d| d.0),
+                rate: p.rate.as_deref(),
                 structured_output: p.structured_output,
             }),
         }
@@ -2564,6 +2584,7 @@ impl Intelligence {
             headers: &self.headers,
             auth: self.auth.as_ref(),
             timeout: self.timeout.map(|d| d.0),
+            rate: self.rate.as_deref(),
             structured_output: self.structured_output,
         }
     }
@@ -2718,126 +2739,172 @@ pub struct Degrade {
 pub struct Mcp {
     pub servers: Vec<McpServer>,
     pub default_timeout: Option<Dur>,
+    /// NOT a config key: the operator's servers the instruction declared
+    /// (RFC 0055 §3.1) — a `connect: on_use` one among them is dialed right
+    /// after the load.
+    #[serde(skip)]
+    pub document_matched: BTreeSet<String>,
+    /// NOT a config key: the instruction's own servers, kept under
+    /// `security.egress: open` and counted `untrusted_input`.
+    #[serde(skip)]
+    pub document_servers: BTreeSet<String>,
 }
 
-/// A **service catalog entry**: a named external service this deployment may
-/// use — connection settings, one shared credential, authoritative trifecta
-/// tags (a floor for any matching endpoint, not just referencing ones), and a
-/// tool-surface ceiling consumers can only narrow. The catalog itself dials
-/// nothing; `mcp.servers` entries reference it.
+impl Mcp {
+    /// Whether `server` is a `connect: on_use` server.
+    pub fn on_use(&self, server: &str) -> bool {
+        self.servers
+            .iter()
+            .any(|s| s.name == server && s.connect == Connect::OnUse)
+    }
+}
+
+/// `mcp.servers[].connect`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Connect {
+    #[default]
+    Boot,
+    OnUse,
+}
+
+/// A Company agentd acts at for its User (RFC 0047): `companies.<name>`. The
+/// domain whose discovery document names every endpoint, bounded by `hosts`;
+/// its MCP servers are made from it at load ([`companies::synthesize`]).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Service {
-    #[serde(default)]
-    pub kind: ServiceKind,
+pub struct Company {
+    /// `https://<host>`: the domain whose discovery document is read.
     pub endpoint: String,
-    #[serde(default)]
-    pub headers: BTreeMap<String, String>,
-    /// Authoritative trifecta tags: unioned into any consumer whose endpoint
-    /// matches this entry — referencing or inline, `open` or `closed` mode.
+    /// Trifecta tags its MCP servers count as.
     #[serde(default)]
     pub tags: BTreeMap<String, Vec<String>>,
-    /// The CEILING: the widest advertised-tool surface any consumer may get.
-    /// A consumer `allow` pattern not subsumed by this list is refused.
+    /// The widest tool surface its MCP servers offer.
     #[serde(default)]
     pub allow: Option<Vec<String>>,
     #[serde(default)]
     pub exclude: Vec<String>,
-    #[serde(default)]
-    pub auth: Option<Auth>,
-    /// Per-instance pacing toward the service (`<burst>/<per>`, e.g. `60/1m`),
-    /// shared by every consumer of the entry in this process.
+    /// Per-instance pacing of calls to its MCP servers (`<burst>/<per>`).
     #[serde(default)]
     pub rate: Option<String>,
     #[serde(default)]
     pub timeout: Option<Dur>,
-    /// `kind: http` only — the METHOD ceiling for `http` steps against this
-    /// entry (`[GET, POST]`); absent = any method.
-    #[serde(default)]
-    pub methods: Option<Vec<String>>,
-    /// `kind: mcp` only — a default `breaker:` policy for `mcp.tool` steps
-    /// against this entry (same shape as the step field); a step's own
-    /// `breaker:` wins.
-    #[serde(default)]
-    pub breaker: Option<Value>,
-    /// `kind: company` only — the host globs every endpoint the Company's
-    /// documents name must match (RFC 0047 §5.5.1). Absent: the endpoint's
-    /// host, the document's `organization.domain`, the subdomains of both,
-    /// and the issuer's host.
+    /// The host globs every endpoint the Company's documents name must match
+    /// (RFC 0047 §5.5.1). Absent: the endpoint's host, the document's
+    /// `organization.domain`, the subdomains of both, and the issuer's host.
     #[serde(default)]
     pub hosts: Option<Vec<String>>,
-    /// `kind: company` only — admit loopback, private and link-local
-    /// addresses: an on-premises Company, or a fake one in a test.
+    /// Admit loopback, private and link-local addresses: an on-premises
+    /// Company, or a fake one in a test.
     #[serde(default)]
     pub allow_private: Option<bool>,
-    /// `kind: company` only — which of the Company's interfaces are used.
+    /// Which of the Company's interfaces are used.
     #[serde(default)]
     pub interfaces: Option<Vec<companies::Interface>>,
-    /// `kind: company` only — a server name for each MCP API `url`, when the
-    /// Company lists more than one.
+    /// A server name for each MCP API `url`, when the Company lists more than
+    /// one.
     #[serde(default)]
     pub mcp_names: BTreeMap<String, String>,
-    /// `kind: company` only — a server name for each OpenAPI API `url`, under
-    /// which the tools of the operations `api_allow` lists are named, when
-    /// the Company lists more than one or the entry's name is taken.
+    /// A server name for each OpenAPI API `url`, under which the tools of the
+    /// operations `api_allow` lists are named, when the Company lists more
+    /// than one or the entry's name is taken.
     #[serde(default)]
     pub api_names: BTreeMap<String, String>,
-    /// `kind: company` only — what agentd's own correlators a Company sees.
+    /// What agentd's own correlators a Company sees.
     #[serde(default)]
     pub privacy: Option<companies::Privacy>,
-    /// `kind: company` only — the sign-in types agentd may start with the
-    /// User there, in the order it tries them: `device`, `direct`.
+    /// The sign-in types agentd may start with the User there, in the order
+    /// it tries them: `device`, `direct`.
     #[serde(default)]
     pub sign_in: Option<Vec<companies::SignIn>>,
-    /// `kind: company` only — the most account scopes agentd ever asks the
-    /// User for there.
+    /// The most account scopes agentd ever asks the User for there.
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
-    /// `kind: company` only — the OpenAPI operations agentd may call there,
-    /// each `METHOD /path-template`; one outside them is refused unsent.
+    /// The OpenAPI operations agentd may call there, each `METHOD
+    /// /path-template`; one outside them is refused unsent.
     #[serde(default)]
     pub api_allow: Option<Vec<String>>,
-    /// `kind: company` only — what its conversations' messages share of the
-    /// User's situation, over `security.companies.context`.
+    /// What its conversations' messages share of the User's situation, over
+    /// `security.companies.context`.
     #[serde(default)]
     pub context: Option<companies::Context>,
 }
 
-/// Which outbound surface a catalog entry describes. Matching is
-/// KIND-FILTERED: an MCP dial only matches `mcp` entries, an `http` step only
-/// `http` entries, and so on, because one host may legitimately serve several
-/// kinds under different trust budgets.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ServiceKind {
-    #[default]
-    Mcp,
-    Intelligence,
-    Peer,
-    Http,
-    /// A Company agentd acts at for its User (RFC 0047): the domain whose
-    /// discovery document names every endpoint, bounded by the entry's
-    /// `hosts`. Its MCP servers are made from it at load.
-    Company,
+/// `http:` — the plain-HTTP endpoints this deployment reaches (RFC 0055
+/// §3.2): what an `http` step, a document fetched by `url:` and a skill
+/// fetched by `src` are held to under `security.egress: closed`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Http {
+    pub endpoints: BTreeMap<String, HttpEndpoint>,
 }
 
-impl ServiceKind {
-    pub fn as_str(self) -> &'static str {
+/// One `http.endpoints.<name>`: a URL prefix and how it is reached. An
+/// `http` step whose URL it matches (or that names it with `endpoint:`)
+/// sends with its headers under the step's own, its credential, its timeout
+/// and its pacing, and only a method `methods` lists.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HttpEndpoint {
+    pub endpoint: String,
+    #[serde(default)]
+    pub auth: Option<Auth>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// The METHOD ceiling (`[GET, POST]`); absent = any method.
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
+    /// Per-instance pacing toward the endpoint (`<burst>/<per>`, e.g. `60/1m`).
+    #[serde(default)]
+    pub rate: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<Dur>,
+}
+
+impl Http {
+    /// The entry `url` falls under, by [`endpoint_matches`] — the longest
+    /// endpoint wins, so a narrower entry is never shadowed by a wider one.
+    pub fn matching(&self, url: &str) -> Option<(&String, &HttpEndpoint)> {
+        self.endpoints
+            .iter()
+            .filter(|(_, e)| endpoint_matches(&e.endpoint, url))
+            .max_by_key(|(_, e)| e.endpoint.len())
+    }
+}
+
+/// Which section an outbound dial is judged against under
+/// `security.egress: closed` (RFC 0055 §3.2): each kind only against its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointKind {
+    /// `mcp.servers`.
+    Mcp,
+    /// `intelligence.endpoints` and `intelligence.providers`.
+    Intelligence,
+    /// `a2a.peers`.
+    Peer,
+    /// An A2A push target: `a2a.peers` or `a2a.push.allow`.
+    Push,
+    /// `http.endpoints`.
+    Http,
+}
+
+impl EndpointKind {
+    /// Where the operator declares an endpoint of this kind.
+    pub fn section(self) -> &'static str {
         match self {
-            ServiceKind::Mcp => "mcp",
-            ServiceKind::Intelligence => "intelligence",
-            ServiceKind::Peer => "peer",
-            ServiceKind::Http => "http",
-            ServiceKind::Company => "company",
+            EndpointKind::Mcp => "mcp.servers endpoint",
+            EndpointKind::Intelligence => "intelligence endpoint or provider",
+            EndpointKind::Peer => "a2a.peers endpoint",
+            EndpointKind::Push => "a2a.peers endpoint or a2a.push.allow entry",
+            EndpointKind::Http => "http.endpoints entry",
         }
     }
 }
 
 /// What a document's configuration `fragment` vouches for, which only the
 /// operator may: a server it declares tagged `trusted`, named as the
-/// document wrote it. What a document's server answers is outside text
-/// unless the operator's catalog vouches for it
-/// ([`untrust_document_servers`]).
+/// document wrote it. What a document's own server answers is outside text
+/// ([`fold_document_servers`]).
 pub fn document_vouched(fragment: &Map<String, Value>) -> Vec<String> {
     let trusted = crate::sec::scope::TRUSTED;
     let mut out = Vec::new();
@@ -2866,17 +2933,308 @@ pub fn document_vouched(fragment: &Map<String, Value>) -> Vec<String> {
     out
 }
 
-/// Count every server a document's configuration `fragment` declares as
-/// `untrusted_input`, whatever legs it declares, by adding the tag: a
-/// document can make a server look more dangerous than the operator did,
-/// never less. Not one the operator's catalog `services` vouches for — the
-/// `kind: mcp` entry it names with `service:`, or whose endpoint its own
-/// matches, declares tags, which the server takes ([`resolve_services`]).
-pub fn untrust_document_servers(
+/// What [`fold_document_servers`] did with a document's servers and peers.
+#[derive(Debug, Default)]
+pub struct FoldedServers {
+    /// The operator's servers a document declared: dialed right after the
+    /// load when they are `connect: on_use`.
+    pub matched: BTreeSet<String>,
+    /// The document's own servers, kept under `egress: open`.
+    pub own: BTreeSet<String>,
+    /// Host-policy diagnostics: what was narrowed, what was held as text.
+    pub warnings: Vec<String>,
+}
+
+/// Fold a document's `mcp.servers` and `a2a.peers` into the operator's
+/// (RFC 0055 §3.1), before the fragment merges.
+///
+/// A document server whose endpoint matches an operator server's
+/// ([`endpoint_matches`]) IS that server: its entry leaves the fragment, the
+/// operator's name, credential, headers, tags and ceiling stand, its `allow`
+/// only narrows the server's (a pattern outside the operator's ceiling is
+/// dropped, said), its `exclude` adds, and the document's workflow steps that
+/// named it name the operator's server. One that matches none is held as text
+/// under `security.egress: closed` — a host-policy warning, not a refusal —
+/// and under `open` is its own server, counted `untrusted_input` whatever it
+/// declares. A peer folds the same way against `a2a.peers`.
+pub fn fold_document_servers(
     fragment: &mut Map<String, Value>,
-    services: &BTreeMap<String, Service>,
-) {
+    document_workflows: &mut [Value],
+    operator: &mut Value,
+    closed: bool,
+) -> FoldedServers {
+    let mut out = FoldedServers::default();
+    let mut renames: BTreeMap<String, String> = BTreeMap::new();
+    let doc_servers = fragment
+        .get_mut("mcp")
+        .and_then(|m| m.get_mut("servers"))
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let mut kept = Vec::new();
+    for mut srv in doc_servers {
+        let name = srv
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let endpoint = srv
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let target = operator
+            .pointer_mut("/mcp/servers")
+            .and_then(Value::as_array_mut)
+            .and_then(|ops| {
+                ops.iter_mut()
+                    .filter(|o| {
+                        o.get("endpoint")
+                            .and_then(Value::as_str)
+                            .is_some_and(|e| endpoint_matches(e, &endpoint))
+                    })
+                    .max_by_key(|o| {
+                        o.get("endpoint")
+                            .and_then(Value::as_str)
+                            .map_or(0, str::len)
+                    })
+            });
+        match target {
+            Some(op) => {
+                let op_name = op
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                narrow_operator_server(op, &srv, &name, &mut out.warnings);
+                if name != op_name {
+                    renames.insert(name.clone(), op_name.clone());
+                }
+                out.matched.insert(op_name);
+            }
+            None if closed => out.warnings.push(format!(
+                "mcp server {name:?} ({endpoint}) is not activated: security.egress is closed and it matches no mcp.servers endpoint of the operator's — the document's block stays text (host-policy)"
+            )),
+            None => {
+                untrust(&mut srv);
+                out.own.insert(name);
+                kept.push(srv);
+            }
+        }
+    }
+    if let Some(m) = fragment.get_mut("mcp").and_then(Value::as_object_mut) {
+        if kept.is_empty() {
+            m.remove("servers");
+        } else {
+            m.insert("servers".into(), Value::Array(kept));
+        }
+        if m.is_empty() {
+            fragment.remove("mcp");
+        }
+    }
+    // Peers: the same rule against the operator's `a2a.peers`.
+    let doc_peers = fragment
+        .get_mut("a2a")
+        .and_then(|m| m.get_mut("peers"))
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let mut kept = Vec::new();
+    let mut peer_renames: BTreeMap<String, String> = BTreeMap::new();
+    for peer in doc_peers {
+        let name = peer
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let endpoint = peer
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let target = operator
+            .pointer("/a2a/peers")
+            .and_then(Value::as_array)
+            .and_then(|ops| {
+                ops.iter()
+                    .filter(|o| {
+                        o.get("endpoint")
+                            .and_then(Value::as_str)
+                            .is_some_and(|e| endpoint_matches(e, &endpoint))
+                    })
+                    .max_by_key(|o| {
+                        o.get("endpoint")
+                            .and_then(Value::as_str)
+                            .map_or(0, str::len)
+                    })
+                    .and_then(|o| o.get("name").and_then(Value::as_str))
+                    .map(str::to_string)
+            });
+        match target {
+            Some(op_name) => {
+                if name != op_name {
+                    peer_renames.insert(name, op_name);
+                }
+            }
+            None if closed => out.warnings.push(format!(
+                "a2a peer {name:?} ({endpoint}) is not activated: security.egress is closed and it matches no a2a.peers endpoint of the operator's — the document's block stays text (host-policy)"
+            )),
+            None => kept.push(peer),
+        }
+    }
+    if let Some(m) = fragment.get_mut("a2a").and_then(Value::as_object_mut) {
+        if kept.is_empty() {
+            m.remove("peers");
+        } else {
+            m.insert("peers".into(), Value::Array(kept));
+        }
+        if m.is_empty() {
+            fragment.remove("a2a");
+        }
+    }
+    if !renames.is_empty() || !peer_renames.is_empty() {
+        let fragment_workflows = fragment
+            .get_mut("workflows")
+            .and_then(Value::as_array_mut)
+            .map(|a| a.iter_mut())
+            .into_iter()
+            .flatten();
+        for w in fragment_workflows.chain(document_workflows.iter_mut()) {
+            rename_step_targets(w, &renames, &peer_renames);
+        }
+    }
+    out
+}
+
+/// Narrow the operator's server `op` by the document's `doc` entry: `allow`
+/// patterns the operator's ceiling covers replace the server's list, `exclude`
+/// adds.
+fn narrow_operator_server(op: &mut Value, doc: &Value, name: &str, warnings: &mut Vec<String>) {
+    let Some(op) = op.as_object_mut() else { return };
+    let op_name = op
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let list = |v: Option<&Value>| -> Option<Vec<String>> {
+        v.and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+    };
+    if let Some(mine) = list(doc.get("allow")) {
+        let ceiling = list(op.get("allow"));
+        let mut narrowed = Vec::new();
+        for p in mine {
+            if ceiling
+                .as_ref()
+                .is_none_or(|c| c.iter().any(|c| pattern_subsumes(&p, c)))
+            {
+                narrowed.push(Value::String(p));
+            } else {
+                warnings.push(format!(
+                    "mcp server {name:?} is the operator's {op_name:?}: its tool {p:?} is outside the operator's allow list and is left out — a document narrows a server's tools, never widens them"
+                ));
+            }
+        }
+        op.insert("allow".into(), Value::Array(narrowed));
+    }
+    if let Some(more) = list(doc.get("exclude")) {
+        let ex = op
+            .entry("exclude")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(ex) = ex.as_array_mut() {
+            for e in more {
+                if !ex.iter().any(|x| x == e.as_str()) {
+                    ex.push(Value::String(e));
+                }
+            }
+        }
+    }
+}
+
+/// Count a document's own server as `untrusted_input`, whatever legs it
+/// declares: a document can make a server look more dangerous than the
+/// operator did, never less.
+fn untrust(srv: &mut Value) {
     let untrusted = "untrusted_input";
+    // A shape that is not a map of lists is the typed parse's to refuse.
+    if let Some(all) = srv
+        .as_object_mut()
+        .map(|s| s.entry("tags").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut)
+        .map(|t| t.entry("*").or_insert_with(|| json!([])))
+        .and_then(Value::as_array_mut)
+        && !all.iter().any(|t| t == untrusted)
+    {
+        all.push(json!(untrusted));
+    }
+}
+
+/// Compose an instance child's `servers` as the operator's in `operator` (the
+/// parent's raw document): each one whose endpoint matches an operator
+/// server's becomes that server's entry under the child's name — endpoint,
+/// credential, headers, tags, ceiling — narrowed by the child's `allow` and
+/// `exclude`. A Company's servers and MCP Events bindings stay the parent's.
+pub fn adopt_operator_servers(servers: &mut [Value], operator: &Value) {
+    let Some(ops) = operator.pointer("/mcp/servers").and_then(Value::as_array) else {
+        return;
+    };
+    for srv in servers.iter_mut() {
+        let endpoint = srv
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let Some(op) = ops
+            .iter()
+            .filter(|o| {
+                o.get("endpoint")
+                    .and_then(Value::as_str)
+                    .is_some_and(|e| endpoint_matches(e, &endpoint))
+            })
+            .max_by_key(|o| {
+                o.get("endpoint")
+                    .and_then(Value::as_str)
+                    .map_or(0, str::len)
+            })
+        else {
+            continue;
+        };
+        let mut adopted = op.clone();
+        let name = srv.get("name").cloned().unwrap_or(Value::Null);
+        let mut warnings = Vec::new();
+        narrow_operator_server(
+            &mut adopted,
+            srv,
+            name.as_str().unwrap_or_default(),
+            &mut warnings,
+        );
+        if let Some(o) = adopted.as_object_mut() {
+            o.insert("name".into(), name);
+            o.remove("events");
+            o.remove("event_grants");
+            for k in ["ns", "connect", "timeout", "tasks"] {
+                match srv.get(k) {
+                    Some(v) => {
+                        o.insert(k.into(), v.clone());
+                    }
+                    None => {
+                        o.remove(k);
+                    }
+                }
+            }
+        }
+        *srv = adopted;
+    }
+}
+
+/// A subagent template's servers, judged as the child will hold them: one
+/// whose endpoint matches an operator server of `operator` counts at that
+/// server's tags; any other counts `untrusted_input`, whatever it declares.
+pub fn untrust_template_servers(fragment: &mut Map<String, Value>, operator: &[McpServer]) {
     let Some(servers) = fragment
         .get_mut("mcp")
         .and_then(|m| m.get_mut("servers"))
@@ -2884,174 +3242,76 @@ pub fn untrust_document_servers(
     else {
         return;
     };
-    for srv in servers.iter_mut().filter_map(Value::as_object_mut) {
-        let entry = match srv.get("service").and_then(Value::as_str) {
-            Some(name) => services.get(name),
-            None => srv
-                .get("endpoint")
-                .and_then(Value::as_str)
-                .and_then(|e| service_match(services, ServiceKind::Mcp, e))
-                .map(|(_, e)| e),
-        };
-        if entry.is_some_and(|e| e.kind == ServiceKind::Mcp && !e.tags.values().all(Vec::is_empty))
-        {
-            continue;
-        }
-        // A shape that is not a map of lists is the typed parse's to refuse.
-        if let Some(all) = srv
-            .entry("tags")
-            .or_insert_with(|| json!({}))
-            .as_object_mut()
-            .map(|t| t.entry("*").or_insert_with(|| json!([])))
-            .and_then(Value::as_array_mut)
-            && !all.iter().any(|t| t == untrusted)
-        {
-            all.push(json!(untrusted));
-        }
-    }
-}
-
-/// Resolve `service:` references against the catalog and apply the
-/// unconditional tag floor. Mutates `mcp.servers` in place — after this, every
-/// server carries its effective endpoint, auth, headers, admission lists and
-/// tag set, so validation, the trifecta gate and the runtime all judge the
-/// *outcome* rather than each re-deriving it. Must therefore run BEFORE
-/// validation. Returns the resolution errors, for aggregation with
-/// validation's.
-pub fn resolve_services(s: &mut Settings) -> Vec<String> {
-    let services = s.services.clone();
-    let mut errs = Vec::new();
-    for srv in &mut s.mcp.servers {
-        let Some(name) = srv.service.clone() else {
-            continue;
-        };
-        let Some(entry) = services.get(&name) else {
-            errs.push(format!(
-                "mcp server '{}' references unknown service '{name}' (services.{name} is not declared)",
-                srv.name
-            ));
-            continue;
-        };
-        if entry.kind == ServiceKind::Company {
-            errs.push(format!(
-                "mcp server '{}' references service '{name}', which is `kind: company`: a Company's MCP servers are made from its discovery document, under their own names",
-                srv.name
-            ));
-            continue;
-        }
-        // Consumers reference, never restate: connection settings live in the
-        // catalog only, so there is exactly one place to rotate a credential
-        // or repoint a host.
-        for (restated, what) in [
-            (!srv.endpoint.is_empty(), "endpoint"),
-            (srv.auth.is_some(), "auth"),
-            (srv.oauth.is_some(), "oauth"),
-            (!srv.headers.is_empty(), "headers"),
-        ] {
-            if restated {
-                errs.push(format!(
-                    "mcp server '{}' references service '{name}' and restates `{what}` — a referencing consumer inherits connection settings from the catalog",
-                    srv.name
-                ));
-            }
-        }
-        srv.endpoint = entry.endpoint.clone();
-        srv.auth = entry.auth.clone();
-        srv.headers = entry.headers.clone();
-        if srv.timeout.is_none() {
-            srv.timeout = entry.timeout;
-        }
-        // The ceiling: consumer `allow` may only narrow (every consumer
-        // pattern must be subsumed by some catalog pattern); absent consumer
-        // `allow` inherits the ceiling itself. `exclude` unions.
-        match (&entry.allow, &mut srv.allow) {
-            (Some(ceil), Some(mine)) => {
-                for p in mine.iter() {
-                    if !ceil.iter().any(|c| pattern_subsumes(p, c)) {
-                        errs.push(format!(
-                            "mcp server '{}': allow pattern '{p}' widens the ceiling of service '{name}' (catalog allow: {ceil:?})",
-                            srv.name
-                        ));
+    for srv in servers.iter_mut() {
+        let endpoint = srv
+            .get("endpoint")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let op = operator
+            .iter()
+            .filter(|o| !o.endpoint.is_empty() && endpoint_matches(&o.endpoint, &endpoint))
+            .max_by_key(|o| o.endpoint.len());
+        match op.filter(|o| !o.untagged()) {
+            Some(op) => {
+                if let Some(tags) = srv
+                    .as_object_mut()
+                    .map(|s| s.entry("tags").or_insert_with(|| json!({})))
+                    .and_then(Value::as_object_mut)
+                {
+                    for (k, list) in &op.tags {
+                        let slot = tags.entry(k.clone()).or_insert_with(|| json!([]));
+                        if let Some(slot) = slot.as_array_mut() {
+                            for t in list {
+                                if !slot.iter().any(|x| x == t.as_str()) {
+                                    slot.push(json!(t));
+                                }
+                            }
+                        }
                     }
                 }
             }
-            (Some(ceil), mine @ None) => *mine = Some(ceil.clone()),
-            _ => {}
-        }
-        for e in &entry.exclude {
-            if !srv.exclude.contains(e) {
-                srv.exclude.push(e.clone());
-            }
-        }
-        union_tags(&mut srv.tags, &entry.tags);
-        srv.service_rate = entry.rate.clone();
-    }
-    // The unconditional tag floor: ANY server whose endpoint matches a catalog
-    // entry gets that entry's tags unioned in — whether it referenced the entry
-    // or spelled the URL out inline, and in either egress mode. Without this,
-    // restating a catalogued endpoint inline with weaker tags would launder
-    // away the trifecta tags the catalog declares. (The entry's pacing applies
-    // to matched inline consumers too, for the same reason.)
-    for srv in &mut s.mcp.servers {
-        if srv.endpoint.is_empty() {
-            continue;
-        }
-        if let Some((name, entry)) = service_match(&services, ServiceKind::Mcp, &srv.endpoint) {
-            union_tags(&mut srv.tags, &entry.tags);
-            if srv.service.is_none() {
-                srv.service = Some(name.clone());
-                srv.service_rate = entry.rate.clone();
-            }
+            None => untrust(srv),
         }
     }
-    // `a2a.peers[].service` references resolve the same way against
-    // `kind: peer` entries — inherit, never restate.
-    for peer in &mut s.a2a.peers {
-        let Some(name) = peer.service.clone() else {
-            continue;
-        };
-        let entry = match services.get(&name) {
-            Some(e) if e.kind == ServiceKind::Peer => e,
-            Some(e) => {
-                errs.push(format!(
-                    "a2a peer '{}' references service '{name}', which is `kind: {}` (a peer reference needs `kind: peer`)",
-                    peer.name,
-                    e.kind.as_str()
-                ));
-                continue;
-            }
-            None => {
-                errs.push(format!(
-                    "a2a peer '{}' references unknown service '{name}' (services.{name} is not declared)",
-                    peer.name
-                ));
-                continue;
-            }
-        };
-        for (restated, what) in [
-            (!peer.endpoint.is_empty(), "endpoint"),
-            (peer.auth.is_some(), "auth"),
-            (!peer.headers.is_empty(), "headers"),
-        ] {
-            if restated {
-                errs.push(format!(
-                    "a2a peer '{}' references service '{name}' and restates `{what}` — a referencing consumer inherits connection settings from the catalog",
-                    peer.name
-                ));
-            }
-        }
-        peer.endpoint = entry.endpoint.clone();
-        peer.auth = entry.auth.clone();
-        peer.headers = entry.headers.clone();
-    }
-    // Last, so no loop above takes a Company's server for a consumer.
-    companies::synthesize(s, &mut errs);
-    errs
 }
 
-/// Does catalog pattern `ceiling` cover consumer pattern `p`? Patterns are the
-/// registry's trailing-`*` globs. A literal ceiling covers only itself; a
-/// glob ceiling covers any pattern whose fixed prefix extends the ceiling's.
+/// Point a document workflow's steps that named a document server or peer at
+/// the operator's entry it folded into.
+fn rename_step_targets(
+    w: &mut Value,
+    servers: &BTreeMap<String, String>,
+    peers: &BTreeMap<String, String>,
+) {
+    let Some(steps) = w.get_mut("steps").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for st in steps.values_mut() {
+        let Some(st) = st.as_object_mut() else {
+            continue;
+        };
+        for (field, map) in [("server", servers), ("peer", peers), ("to", peers)] {
+            if let Some(Value::String(v)) = st.get_mut(field)
+                && let Some(n) = map.get(v.as_str())
+            {
+                *v = n.clone();
+            }
+        }
+        if let Some(Value::Array(list)) = st.get_mut("servers") {
+            for v in list.iter_mut() {
+                if let Value::String(s) = v
+                    && let Some(n) = servers.get(s.as_str())
+                {
+                    *s = n.clone();
+                }
+            }
+        }
+    }
+}
+
+/// Does pattern `ceiling` cover pattern `p`? Patterns are the registry's
+/// trailing-`*` globs. A literal ceiling covers only itself; a glob ceiling
+/// covers any pattern whose fixed prefix extends the ceiling's.
 fn pattern_subsumes(p: &str, ceiling: &str) -> bool {
     match ceiling.strip_suffix('*') {
         Some(prefix) => p.strip_suffix('*').unwrap_or(p).starts_with(prefix),
@@ -3059,44 +3319,43 @@ fn pattern_subsumes(p: &str, ceiling: &str) -> bool {
     }
 }
 
-/// Union `from` into `into` (per tool-pattern key; tag lists dedup).
-fn union_tags(into: &mut BTreeMap<String, Vec<String>>, from: &BTreeMap<String, Vec<String>>) {
-    for (k, list) in from {
-        let slot = into.entry(k.clone()).or_default();
-        for t in list {
-            if !slot.contains(t) {
-                slot.push(t.clone());
-            }
-        }
+/// Make the MCP servers each company entry stands for (RFC 0047), returning
+/// what refuses. Runs BEFORE validation, so validation, the trifecta gate and
+/// the runtime judge the servers as they are.
+pub fn resolve_companies(s: &mut Settings) -> Vec<String> {
+    let mut errs = Vec::new();
+    companies::synthesize(s, &mut errs);
+    errs
+}
+
+impl Settings {
+    /// The egress policy these settings hold ([`EgressPolicy::of`]).
+    pub fn egress_policy(&self) -> EgressPolicy {
+        EgressPolicy::of(self)
+    }
+
+    /// `Ok` when `url` may be dialed as a `kind` endpoint.
+    pub fn egress_allows(&self, kind: EndpointKind, url: &str) -> Result<(), String> {
+        EgressPolicy::of(self).allows(kind, url)
     }
 }
 
-/// Match a URL against the catalog's entries OF ONE KIND: scheme and authority
-/// must be equal (host case-insensitively), and the URL's path must extend the
-/// entry's path on a segment boundary — so `/v1` never matches `/v1betaX`.
-/// Returns the matching entry and refuses nothing; the caller decides what a
-/// non-match means (`Egress::Closed` refuses it).
-pub fn service_match<'a>(
-    services: &'a BTreeMap<String, Service>,
-    kind: ServiceKind,
-    url: &str,
-) -> Option<(&'a String, &'a Service)> {
-    let (scheme, authority, path) = split_url(url)?;
-    services.iter().find(|(_, e)| {
-        if e.kind != kind {
-            return false;
-        }
-        let Some((es, ea, ep)) = split_url(&e.endpoint) else {
-            return false;
-        };
-        scheme == es
-            && authority.eq_ignore_ascii_case(&ea)
-            && (ep.is_empty()
-                || ep == "/"
-                || path == ep
-                || (path.starts_with(&ep)
-                    && (ep.ends_with('/') || path.as_bytes().get(ep.len()) == Some(&b'/'))))
-    })
+/// Whether `url` falls under the declared `endpoint`: scheme and authority
+/// equal (host case-insensitively), and the URL's path extends the
+/// endpoint's on a segment boundary — so `/v1` never matches `/v1betaX`.
+pub fn endpoint_matches(endpoint: &str, url: &str) -> bool {
+    let (Some((scheme, authority, path)), Some((es, ea, ep))) =
+        (split_url(url), split_url(endpoint))
+    else {
+        return false;
+    };
+    scheme == es
+        && authority.eq_ignore_ascii_case(&ea)
+        && (ep.is_empty()
+            || ep == "/"
+            || path == ep
+            || (path.starts_with(&ep)
+                && (ep.ends_with('/') || path.as_bytes().get(ep.len()) == Some(&b'/'))))
 }
 
 /// `scheme://authority/path` → (scheme, authority, path). `unix:` sockets
@@ -3116,61 +3375,140 @@ fn split_url(url: &str) -> Option<(String, String, String)> {
     Some((scheme.to_string(), authority.to_string(), path))
 }
 
-/// The dial-time egress check. `Open` always passes; `Closed` requires the URL
-/// to match a catalog entry of the surface's kind, so an uncatalogued host
-/// cannot be reached even if some other config path names it.
-pub fn egress_allows(
-    services: &BTreeMap<String, Service>,
-    egress: Egress,
-    kind: ServiceKind,
-    url: &str,
-) -> Result<(), String> {
-    if egress == Egress::Open || service_match(services, kind, url).is_some() {
-        return Ok(());
-    }
-    Err(format!(
-        "security.egress is `closed` and {url} matches no `kind: {}` services: catalog entry — catalog the endpoint to allow it",
-        kind.as_str()
-    ))
-}
-
-/// [`egress_allows`], answered from the RAW document instead of parsed
-/// [`Settings`], for the dials that happen before the parse.
+/// The egress policy (RFC 0055 §3.2): under `security.egress: closed` a dial
+/// must match an endpoint the operator declared in the section of its kind.
+/// `Open` admits everything.
 ///
-/// The instruction fetch is the one dial that PRECEDES the parse: an `url:` or
-/// `oci:` document has to be in hand before typed deserialization, because its
-/// machinery folds into the configuration being built. So the boot sweep in
-/// `validate()` — which walks MCP, intelligence, peers, the store and workflow
-/// refs — structurally cannot see it, and `security.egress: closed` did not
-/// cover the document that becomes the agent's own standing policy.
-///
-/// Reading the two fields it needs straight off the document is what closes
-/// that. It fails CLOSED on anything it cannot understand: an unparseable
-/// `security.egress` is treated as `closed`, and an unparseable `services:` map
-/// as empty, so a malformed catalog refuses the dial rather than waving it
-/// through. The typed parse reports the real error a moment later.
+/// Built from parsed [`Settings`] ([`Settings::egress_policy`]) or from the
+/// RAW document ([`EgressPolicy::read`]) for the dials that precede the
+/// parse: an `url:` or `oci:` instruction has to be in hand before typed
+/// deserialization, because its machinery folds into the configuration being
+/// built. Read raw, it fails CLOSED on anything it cannot understand: an
+/// unparseable `security.egress` is `closed`, and a section that does not
+/// parse declares nothing, so a malformed section refuses the dial rather
+/// than waving it through. The typed parse reports the real error a moment
+/// later.
+#[derive(Debug, Clone, Default)]
 pub struct EgressPolicy {
     egress: Egress,
-    services: BTreeMap<String, Service>,
+    mcp: Vec<String>,
+    intelligence: Vec<String>,
+    peers: Vec<String>,
+    push: Vec<String>,
+    http: Vec<String>,
 }
 
 impl EgressPolicy {
     /// Read the policy off the raw document, once, before anything dials.
     pub fn read(doc: &Value) -> EgressPolicy {
+        let strings = |ptr: &str, field: &str| -> Vec<String> {
+            match doc.pointer(ptr) {
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(|e| e.get(field).and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect(),
+                Some(Value::Object(o)) => o
+                    .values()
+                    .filter_map(|e| e.get(field).and_then(Value::as_str))
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let endpoints = |v: Option<&Value>| -> Vec<String> {
+            match v {
+                Some(Value::String(s)) => s.split(',').map(|e| e.trim().to_string()).collect(),
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        let mut intelligence = endpoints(doc.pointer("/intelligence/endpoints"));
+        if let Some(Value::Object(p)) = doc.pointer("/intelligence/providers") {
+            for v in p.values() {
+                intelligence.extend(endpoints(v.get("endpoints")));
+            }
+        }
+        let peers = strings("/a2a/peers", "endpoint");
+        let mut push = peers.clone();
+        push.extend(endpoints(doc.pointer("/a2a/push/allow")));
         EgressPolicy {
             egress: match doc.get("security").and_then(|s| s.get("egress")) {
                 None => Egress::default(),
                 Some(v) => serde_json::from_value(v.clone()).unwrap_or(Egress::Closed),
             },
-            services: doc
-                .get("services")
-                .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_default(),
+            mcp: strings("/mcp/servers", "endpoint"),
+            intelligence,
+            peers,
+            push,
+            http: strings("/http/endpoints", "endpoint"),
         }
     }
 
-    pub fn allows(&self, kind: ServiceKind, url: &str) -> Result<(), String> {
-        egress_allows(&self.services, self.egress, kind, url)
+    /// The policy parsed settings hold.
+    pub fn of(s: &Settings) -> EgressPolicy {
+        let peers: Vec<String> = s.a2a.peers.iter().map(|p| p.endpoint.clone()).collect();
+        let mut push = peers.clone();
+        push.extend(s.a2a.push.allow.iter().cloned());
+        EgressPolicy {
+            egress: s.security.egress,
+            mcp: s
+                .mcp
+                .servers
+                .iter()
+                .filter(|m| !s.mcp.document_servers.contains(&m.name))
+                .map(|m| m.endpoint.clone())
+                .collect(),
+            intelligence: s
+                .intelligence
+                .connections()
+                .flat_map(|c| c.endpoints.iter().cloned())
+                .collect(),
+            peers,
+            push,
+            http: s
+                .http
+                .endpoints
+                .values()
+                .map(|e| e.endpoint.clone())
+                .collect(),
+        }
+    }
+
+    /// Whether egress is closed.
+    pub fn closed(&self) -> bool {
+        self.egress == Egress::Closed
+    }
+
+    /// Every endpoint declared for `kind`.
+    pub fn declared(&self, kind: EndpointKind) -> &[String] {
+        match kind {
+            EndpointKind::Mcp => &self.mcp,
+            EndpointKind::Intelligence => &self.intelligence,
+            EndpointKind::Peer => &self.peers,
+            EndpointKind::Push => &self.push,
+            EndpointKind::Http => &self.http,
+        }
+    }
+
+    /// `Ok` when `url` may be dialed as a `kind` endpoint.
+    pub fn allows(&self, kind: EndpointKind, url: &str) -> Result<(), String> {
+        if self.egress == Egress::Open
+            || self
+                .declared(kind)
+                .iter()
+                .any(|e| !e.is_empty() && endpoint_matches(e, url))
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "security.egress is `closed` and {url} matches no {} — declare it there to allow it",
+            kind.section()
+        ))
     }
 }
 
@@ -3178,19 +3516,9 @@ impl EgressPolicy {
 #[serde(deny_unknown_fields)]
 pub struct McpServer {
     pub name: String,
-    /// Either a literal URL, or empty when `service:` references a catalog
-    /// entry — resolution fills it in before anything dials.
-    #[serde(default)]
+    /// The server's URL. A Company's servers are made with an empty one,
+    /// filled at discovery.
     pub endpoint: String,
-    /// Reference a `services:` catalog entry: inherit its connection settings
-    /// (restating `endpoint`/`auth`/`headers` here is refused) and narrow its
-    /// tool ceiling.
-    #[serde(default)]
-    pub service: Option<String>,
-    /// NOT a config key: the referenced entry's `rate:`, stamped by
-    /// resolution so `to_spec` can carry it to every process's pace registry.
-    #[serde(skip)]
-    pub service_rate: Option<String>,
     #[serde(default)]
     pub ns: Option<String>,
     #[serde(default)]
@@ -3218,6 +3546,18 @@ pub struct McpServer {
     pub auth: Option<Auth>,
     #[serde(default)]
     pub timeout: Option<Dur>,
+    /// Per-instance pacing of calls to this server (`<burst>/<per>`, e.g.
+    /// `60/1m`): a dry bucket fails the call, which a step's `retry:` absorbs.
+    #[serde(default)]
+    pub rate: Option<String>,
+    /// The default `breaker:` of the `mcp.tool` steps that name this server
+    /// (the step field's shape); a step's own `breaker:` wins.
+    #[serde(default)]
+    pub breaker: Option<Value>,
+    /// When the server is dialed: at `boot` (the default), or `on_use` — on
+    /// the first call that needs it (RFC 0055 §4.3). Once connected it stays.
+    #[serde(default)]
+    pub connect: Connect,
     /// Whether this server may answer a call with an MCP task (RFC 0050):
     /// `auto` declares the Tasks extension where the revision defines it,
     /// `off` never does. Part of the dial spec: a change re-dials.
@@ -3296,8 +3636,7 @@ impl McpServer {
                 resource: canonical_resource(&self.endpoint),
             }),
             auth: self.auth.as_ref().map(|a| a.to_spec()),
-            service: self.service.clone(),
-            rate: self.service_rate.clone(),
+            rate: self.rate.clone(),
             first_request: None,
             company: self.company.as_ref().map(|c| c.entry.clone()),
             delegated: delegation::is_delegated(self),
@@ -4558,6 +4897,9 @@ pub struct A2aPush {
     pub enabled: bool,
     /// Permit webhook targets on private / loopback addresses.
     pub allow_private: bool,
+    /// Under `security.egress: closed`, the push targets admitted beside the
+    /// peers' endpoints: URL prefixes, matched as every endpoint is.
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -4769,16 +5111,15 @@ pub struct Quotas {
 #[serde(deny_unknown_fields)]
 pub struct A2aPeer {
     pub name: String,
-    /// Either a literal URL, or empty when `service:` references a
-    /// `kind: peer` catalog entry — resolution fills it in before any dial.
-    #[serde(default)]
     pub endpoint: String,
-    /// Reference a `services:` entry of `kind: peer`: inherit its connection
-    /// settings (restating `endpoint`/`auth`/`headers` here is refused).
-    #[serde(default)]
-    pub service: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Per-instance pacing of sends to this peer (`<burst>/<per>`).
+    #[serde(default)]
+    pub rate: Option<String>,
+    /// The per-request timeout toward this peer.
+    #[serde(default)]
+    pub timeout: Option<Dur>,
     #[serde(default)]
     pub client_cert: Option<String>,
     #[serde(default)]
@@ -4914,10 +5255,10 @@ pub struct Security {
     pub cgroup: Cgroup,
     pub exec: Exec,
     pub workflows: WorkflowSecurity,
-    /// `closed` ⇒ an outbound MCP dial whose URL matches no `services:`
-    /// catalog entry is refused: at boot for configured servers, and at dial
-    /// time for everything else, so a URL assembled at runtime is caught too.
-    /// Default `open`.
+    /// `closed` ⇒ agentd dials only what the operator declared, each kind
+    /// against its own section (RFC 0055 §3.2): at load for configured
+    /// endpoints, and at dial time for everything else, so a URL assembled
+    /// at runtime is caught too. Default `open`.
     pub egress: Egress,
     /// Ordered verdicts on the tool CALL — by name, tag, caller, principal or
     /// arguments. First match wins; no match is allow.
@@ -5701,7 +6042,7 @@ impl Settings {
             .map(str::to_string)
         {
             egress_policy
-                .allows(ServiceKind::Http, &uri)
+                .allows(EndpointKind::Http, &uri)
                 .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
             #[cfg(feature = "oci")]
             {
@@ -5772,10 +6113,10 @@ impl Settings {
             .map(str::to_string)
         {
             egress_policy
-                .allows(ServiceKind::Http, &url)
+                .allows(EndpointKind::Http, &url)
                 .map_err(|e| format!("{source}: agent.instruction: {e}"))?;
             let text =
-                crate::config::http_get(&url, &|u| egress_policy.allows(ServiceKind::Http, u))
+                crate::config::http_get(&url, &|u| egress_policy.allows(EndpointKind::Http, u))
                     .map_err(|e| format!("{source}: agent.instruction {url}: {e}"))?;
             if let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
                 a.insert("instruction".into(), Value::String(text));
@@ -5949,6 +6290,7 @@ impl Settings {
         let mut document_workflows = std::collections::BTreeSet::new();
         let mut document_grants = std::collections::BTreeSet::new();
         let mut skill_fetches = Vec::new();
+        let mut folded_servers = FoldedServers::default();
         // The document whose machinery folds: the instruction itself — an
         // instruction/1 document, read by the instruction.md SDK, the ONLY
         // surface extraction runs on (conversation text is never parsed) —
@@ -6003,6 +6345,7 @@ impl Settings {
             operator_intelligence = f.operator_intelligence;
             document_workflows = f.workflows;
             skill_fetches = f.skill_fetches;
+            folded_servers = f.servers;
             idoc_extraction = Some(f.extraction);
         }
         // `agent.prompt` is a document too — a one-shot task is as likely to
@@ -6134,6 +6477,8 @@ impl Settings {
         settings.agent.instruction_warnings = instruction_warnings;
         settings.agent.instruction_read = instruction_read;
         settings.agent.skill_fetches = skill_fetches;
+        settings.mcp.document_matched = folded_servers.matched;
+        settings.mcp.document_servers = folded_servers.own;
         Ok(settings)
     }
 
@@ -7123,10 +7468,9 @@ pub fn load_with(
     if !store_stated && settings.is_long_lived() {
         settings.store.kind = StoreKind::File;
     }
-    // Resolve `service:` references and apply the tag floor BEFORE validation
-    // and the trifecta gate, so both judge the effective servers rather than
-    // the pre-resolution shorthand.
-    let service_errors = resolve_services(&mut settings);
+    // A Company's servers are made BEFORE validation and the trifecta gate,
+    // so both judge them as the servers they are.
+    let service_errors = resolve_companies(&mut settings);
     let mut loaded = Loaded {
         settings,
         doc,
@@ -9096,18 +9440,13 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     .into(),
             );
         }
-        if srv.endpoint.is_empty() {
-            // A `service:` reference is filled by resolution (an unknown name
-            // already errored there); a server with NEITHER is malformed.
-            if srv.service.is_none() {
-                err(
-                    &mut d,
-                    format!(
-                        "mcp server '{}' needs an `endpoint` or a `service:` catalog reference",
-                        srv.name
-                    ),
-                );
-            }
+        // A Company's servers have no endpoint until discovery.
+        if srv.company.is_some() {
+        } else if srv.endpoint.is_empty() {
+            err(
+                &mut d,
+                format!("mcp server '{}' needs an `endpoint`", srv.name),
+            );
         } else if let Err(e) = super::mcp_endpoint_scheme_ok(&srv.endpoint) {
             err(&mut d, format!("mcp server '{}': {e}", srv.name));
         }
@@ -9160,8 +9499,47 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
-    // services catalog
-    for (name, svc) in &s.services {
+    // The rest of each server's own settings: its pacing, its breaker.
+    for srv in &s.mcp.servers {
+        if let Some(r) = &srv.rate
+            && let Err(e) = crate::supervisor::tree::parse_rate(r)
+        {
+            err(&mut d, format!("mcp server '{}' rate: {e}", srv.name));
+        }
+        if let Some(b) = &srv.breaker
+            && crate::runtime::breaker::Config::of(Some(b)).is_none()
+        {
+            err(
+                &mut d,
+                format!(
+                    "mcp server '{}' breaker: want {{failures: N>=1, cooldown: \"60s\"}} — both fields required",
+                    srv.name
+                ),
+            );
+        }
+    }
+    for p in &s.a2a.peers {
+        if let Some(r) = &p.rate
+            && let Err(e) = crate::supervisor::tree::parse_rate(r)
+        {
+            err(&mut d, format!("a2a peer '{}' rate: {e}", p.name));
+        }
+    }
+    for c in s.intelligence.connections() {
+        if let Some(r) = c.rate
+            && let Err(e) = crate::supervisor::tree::parse_rate(r)
+        {
+            err(&mut d, format!("{}.rate: {e}", c.at()));
+        }
+    }
+    for u in &s.a2a.push.allow {
+        if let Err(e) = super::mcp_endpoint_scheme_ok(u) {
+            err(&mut d, format!("a2a.push.allow: {u:?}: {e}"));
+        }
+    }
+    // http.endpoints
+    for (name, ep) in &s.http.endpoints {
+        let at = format!("http.endpoints.{name}");
         if name.is_empty()
             || !name
                 .chars()
@@ -9169,209 +9547,97 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         {
             err(
                 &mut d,
-                format!("services: entry name '{name}' must be [a-zA-Z0-9_-]+"),
+                format!("http.endpoints: entry name '{name}' must be [a-zA-Z0-9_-]+"),
             );
         }
-        // The endpoint scheme is judged by the entry's KIND: a peer speaks
-        // A2A (https / loopback http / unix), everything else HTTPS-or-loopback.
-        match svc.kind {
-            ServiceKind::Peer => {
-                if let Err(e) = crate::config::A2aEndpoint::parse(&svc.endpoint) {
-                    err(&mut d, format!("services.{name}: {e}"));
-                }
-            }
-            _ => {
-                if let Err(e) = super::mcp_endpoint_scheme_ok(&svc.endpoint) {
-                    err(&mut d, format!("services.{name}: {e}"));
-                }
-            }
+        if let Err(e) = super::mcp_endpoint_scheme_ok(&ep.endpoint) {
+            err(&mut d, format!("{at}: {e}"));
         }
-        // Kind-specific fields: the tool surface (allow/exclude/tags/breaker)
-        // is `kind: mcp` vocabulary; `methods` is `kind: http` vocabulary.
-        if !matches!(svc.kind, ServiceKind::Mcp | ServiceKind::Company) {
-            for (set, what) in [
-                (svc.allow.is_some(), "allow"),
-                (!svc.exclude.is_empty(), "exclude"),
-                (!svc.tags.is_empty(), "tags"),
-                (svc.breaker.is_some(), "breaker"),
-            ] {
-                if set {
-                    err(
-                        &mut d,
-                        format!(
-                            "services.{name}: `{what}` applies to `kind: mcp` entries only (this entry is `kind: {}`)",
-                            svc.kind.as_str()
-                        ),
-                    );
-                }
-            }
-        }
-        if svc.methods.is_some() && svc.kind != ServiceKind::Http {
-            err(
-                &mut d,
-                format!(
-                    "services.{name}: `methods` applies to `kind: http` entries only (this entry is `kind: {}`)",
-                    svc.kind.as_str()
-                ),
-            );
-        }
-        if let Some(ms) = &svc.methods {
-            for m in ms {
-                if !matches!(
-                    m.as_str(),
-                    "GET" | "PUT" | "POST" | "DELETE" | "PATCH" | "HEAD"
-                ) {
-                    err(
-                        &mut d,
-                        format!(
-                            "services.{name}.methods: unknown method '{m}' (want GET|PUT|POST|DELETE|PATCH|HEAD, uppercase)"
-                        ),
-                    );
-                }
-            }
-        }
-        if let Some(b) = &svc.breaker
-            && crate::runtime::breaker::Config::of(Some(b)).is_none()
-        {
-            err(
-                &mut d,
-                format!(
-                    "services.{name}.breaker: want {{failures: N>=1, cooldown: \"60s\"}} — both fields required"
-                ),
-            );
-        }
-        for list in svc.tags.values() {
-            for t in list {
-                if t == crate::sec::scope::TRUSTED {
-                    // What a Company says is its text, whatever its entry
-                    // is tagged (RFC 0047 §6.3).
-                    if svc.kind == ServiceKind::Company {
-                        err(
-                            &mut d,
-                            format!(
-                                "services.{name}: `trusted` marks an MCP server's results; a Company's content is outside text whatever its entry says"
-                            ),
-                        );
-                    }
-                } else if crate::sec::scope::TrifectaTag::parse(t).is_none() {
-                    err(
-                        &mut d,
-                        format!("services.{name} has unknown trifecta tag '{t}'"),
-                    );
-                }
-            }
-        }
-        for (h, v) in &svc.headers {
-            // Only an MCP service's headers reach the MCP client; a peer's or
-            // an intelligence endpoint's are theirs to set.
-            if svc.kind == ServiceKind::Mcp && ::mcp::wire::is_protocol_header(h) {
+        for m in ep.methods.iter().flatten() {
+            if !matches!(
+                m.as_str(),
+                "GET" | "PUT" | "POST" | "DELETE" | "PATCH" | "HEAD"
+            ) {
                 err(
                     &mut d,
                     format!(
-                        "services.{name} header '{h}' is set by the MCP client itself (the protocol owns it); remove it"
+                        "{at}.methods: unknown method '{m}' (want GET|PUT|POST|DELETE|PATCH|HEAD, uppercase)"
                     ),
                 );
-            } else if super::is_secret_shaped_key(h) && !crate::sec::secret::has_secret_ref(v) {
+            }
+        }
+        for (h, v) in &ep.headers {
+            if super::is_secret_shaped_key(h) && !crate::sec::secret::has_secret_ref(v) {
                 err(
                     &mut d,
                     format!(
-                        "services.{name} header '{h}' looks like a credential but has an inline value; use a {{{{secret:…}}}} reference"
+                        "{at} header '{h}' looks like a credential but has an inline value; use a {{{{secret:…}}}} reference"
                     ),
                 );
             } else if let Some(e) = unresolved_secret_ref(v) {
-                err(&mut d, format!("services.{name} header '{h}': {e}"));
+                err(&mut d, format!("{at} header '{h}': {e}"));
             }
         }
-        if let Some(auth) = &svc.auth {
-            for e in validate_auth_block(
-                auth,
-                s.security.client.as_ref(),
-                &format!("services.{name}"),
-                svc.kind == ServiceKind::Mcp,
-            ) {
+        if let Some(auth) = &ep.auth {
+            for e in validate_auth_block(auth, s.security.client.as_ref(), &at, false) {
                 err(&mut d, e);
             }
+            if auth.kind == AuthKind::Spiffe && auth.svid.as_deref() == Some("x509") {
+                err(
+                    &mut d,
+                    format!(
+                        "{at}.auth: an X.509-SVID is a TLS client identity, which an http step does not present — use svid: jwt"
+                    ),
+                );
+            }
         }
-        if let Some(r) = &svc.rate
+        if let Some(r) = &ep.rate
             && let Err(e) = crate::supervisor::tree::parse_rate(r)
         {
-            err(&mut d, format!("services.{name}.rate: {e}"));
+            err(&mut d, format!("{at}.rate: {e}"));
         }
     }
-    // Matching must be unambiguous PER KIND: no entry's endpoint may itself
-    // match another entry of the same kind (identical or prefix-comparable).
-    // Different kinds on one host are legal — matching is kind-filtered.
-    {
-        let entries: Vec<(&String, &Service)> = s.services.iter().collect();
-        for i in 0..entries.len() {
-            for j in (i + 1)..entries.len() {
-                if entries[i].1.kind != entries[j].1.kind {
-                    continue;
-                }
-                let kind = entries[i].1.kind;
-                let one = BTreeMap::from([(entries[i].0.clone(), entries[i].1.clone())]);
-                let other = BTreeMap::from([(entries[j].0.clone(), entries[j].1.clone())]);
-                if service_match(&one, kind, &entries[j].1.endpoint).is_some()
-                    || service_match(&other, kind, &entries[i].1.endpoint).is_some()
-                {
-                    err(
-                        &mut d,
-                        format!(
-                            "services.{} and services.{} have prefix-comparable endpoints of the same kind — URL matching must be unambiguous",
-                            entries[i].0, entries[j].0
-                        ),
-                    );
-                }
+    // An `http` step that names an endpoint names a declared one.
+    for w in &s.workflows {
+        for (sid, st) in w
+            .get("steps")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+        {
+            if st.get("kind").and_then(Value::as_str) == Some("http")
+                && let Some(n) = st.get("endpoint").and_then(Value::as_str)
+                && !n.contains("{{")
+                && !s.http.endpoints.contains_key(n)
+            {
+                err(
+                    &mut d,
+                    format!("http step '{sid}': endpoint {n:?} is not an http.endpoints entry"),
+                );
             }
         }
     }
-    // Egress policy, over all four outbound surfaces: closed ⇒ every
-    // configured dial must match a catalog entry of its own kind.
+    // Egress policy: closed ⇒ every dial matches an endpoint the operator
+    // declared in the section of its kind. MCP servers, intelligence
+    // connections and peers ARE such declarations (a document's fold into
+    // the operator's, `fold_document_servers`); what is left to judge is
+    // every other HTTP request against `http.endpoints`.
     if s.security.egress == Egress::Closed {
-        let closed = |d: &mut Diagnostics, kind: ServiceKind, what: &str, url: &str| {
-            if service_match(&s.services, kind, url).is_none() {
+        let policy = s.egress_policy();
+        let closed = |d: &mut Diagnostics, kind: EndpointKind, what: &str, url: &str| {
+            if policy.allows(kind, url).is_err() {
                 d.errors.push(format!(
-                    "security.egress is closed and {what} ({url}) matches no `kind: {}` services: catalog entry — catalog the endpoint to allow it",
-                    kind.as_str()
+                    "security.egress is closed and {what} ({url}) matches no {} — declare it there to allow it",
+                    kind.section()
                 ));
             }
         };
-        for srv in &s.mcp.servers {
-            if !srv.endpoint.is_empty() {
-                closed(
-                    &mut d,
-                    ServiceKind::Mcp,
-                    &format!("mcp server '{}'", srv.name),
-                    &srv.endpoint,
-                );
-            }
-        }
-        for c in s.intelligence.connections() {
-            let what = match c.name {
-                Some(n) => format!("intelligence provider '{n}' endpoint"),
-                None => "intelligence endpoint".into(),
-            };
-            // `mock:` is the in-process test endpoint — no socket, no egress.
-            for e in c.endpoints.iter().filter(|e| !e.starts_with("mock:")) {
-                closed(&mut d, ServiceKind::Intelligence, &what, e);
-            }
-        }
-        for p in &s.a2a.peers {
-            if !p.endpoint.is_empty() {
-                closed(
-                    &mut d,
-                    ServiceKind::Peer,
-                    &format!("a2a peer '{}'", p.name),
-                    &p.endpoint,
-                );
-            }
-        }
         if s.store.kind == StoreKind::Http
             && let Some(h) = &s.store.http
         {
             closed(
                 &mut d,
-                ServiceKind::Http,
+                EndpointKind::Http,
                 "store.http.base_url",
                 &h.base_url,
             );
@@ -9388,7 +9654,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 {
                     closed(
                         &mut d,
-                        ServiceKind::Http,
+                        EndpointKind::Http,
                         &format!("store.http.{opname}.url"),
                         &op.url,
                     );
@@ -9397,7 +9663,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
         for w in &s.workflows {
             if let Some(u) = w.get("url").and_then(Value::as_str) {
-                closed(&mut d, ServiceKind::Http, "workflow reference url", u);
+                closed(&mut d, EndpointKind::Http, "workflow reference url", u);
             }
             // Literal `http` step URLs are judged here; templated ones are
             // checked at execution (`step_http`'s runtime gate).
@@ -9408,10 +9674,11 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     // dial to the Company.
                     if st.get("kind").and_then(Value::as_str) == Some("http")
                         && st.pointer("/auth/kind").and_then(Value::as_str) != Some("company")
+                        && st.get("endpoint").is_none()
                         && let Some(u) = st.get("url").and_then(Value::as_str)
                         && !u.contains("{{")
                     {
-                        closed(&mut d, ServiceKind::Http, &format!("http step '{sid}'"), u);
+                        closed(&mut d, EndpointKind::Http, &format!("http step '{sid}'"), u);
                     }
                 }
             }
@@ -9433,7 +9700,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             "extra",
             "tools",
             "workflows",
-            "services",
+            "endpoints",
             "egress_closed",
             "streams",
             "templates",
@@ -10253,21 +10520,6 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     &mut d,
                     format!(
                         "a2a peer '{}': auth kind `aws` is not accepted for peers — use static, oauth2 or spiffe",
-                        p.name
-                    ),
-                );
-            }
-            // A device or authorization-code grant waits for a login, and
-            // `agentd --login` makes one for a peer only through the service
-            // catalog: a peer's own block would never have a credential.
-            if auth.kind == AuthKind::Oauth2
-                && p.service.is_none()
-                && auth.grant.unwrap_or(OAuthGrant::Device) != OAuthGrant::ClientCredentials
-            {
-                err(
-                    &mut d,
-                    format!(
-                        "a2a peer '{}': an oauth2 device or authorization_code grant needs a login, which `agentd --login` makes for a peer only through the service catalog — move the `auth:` to a `kind: peer` entry under `services:`, reference it with `service:` and run `agentd --login service:<entry>`",
                         p.name
                     ),
                 );
@@ -11389,6 +11641,9 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     // Read again by every reload's load, and rendered from the live
     // settings at each turn.
     "agent.workspace",
+    // Staged by the reload, which refuses with a restart when a company
+    // entry was added, removed or changed (`company_entries_moved`).
+    "companies",
     "context.compact_at",
     "context.keep_last",
     "context.model_window",
@@ -11400,6 +11655,8 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "goal.on_achieved",
     "goal.on_stuck",
     "goal.statement",
+    // Read at every http step and every URL fetch a load makes.
+    "http.endpoints",
     "goal.stuck_after",
     "identity.autonomous_as",
     // Read at each consent gate and each answer.
@@ -11421,6 +11678,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "intelligence.model",
     "intelligence.models",
     "intelligence.providers",
+    "intelligence.rate",
     "intelligence.roles",
     // Read when a turn is launched: a route a reload removed leaves the turn
     // a preflight routed to it on `roles.turn`.
@@ -11456,7 +11714,6 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     // that raised it, and a first use approved under a rule stands while
     // the rule's content does.
     "security.policies",
-    "services",
     "skills.dir",
     "skills.max_bytes",
     "skills.max_loaded",
@@ -11747,16 +12004,17 @@ mod tests {
     }
 
     /// The same agreement check for types that live INSIDE a collection —
-    /// a map value (`services.<name>` → `Service`) and an array item
-    /// (`a2a.peers[]` → `A2aPeer`).
+    /// a map value (`http.endpoints.<name>` → `HttpEndpoint`, `companies.<name>`
+    /// → `Company`) and an array item (`a2a.peers[]` → `A2aPeer`,
+    /// `mcp.servers[]` → `McpServer`).
     ///
     /// `schema_matches_struct_at_every_object` walks `properties` segment by
     /// segment, so it cannot reach through `additionalProperties` or `items`
     /// and never covered these two. That gap is exactly where the published
-    /// schema drifted: `Service.kind` still said mcp-only against four kinds in
-    /// the loader, `Service.methods` and `A2aPeer.service` were absent, and
-    /// with `additionalProperties: false` that made our OWN shipped
-    /// examples/voice/hands.yaml red in any editor honouring the schema.
+    /// schema drifted once: an enum still offered one value against four in
+    /// the loader, two fields were absent, and with `additionalProperties:
+    /// false` that made our OWN shipped examples red in any editor honouring
+    /// the schema.
     ///
     /// Note what this could NOT have caught: CI regenerates the published files
     /// from the binary and diffs, which proves the file matches the generator
@@ -11790,8 +12048,16 @@ mod tests {
         let schema = schema::schema();
         for (def, probe) in [
             (
-                "Service",
-                json!({"services": {"p": {"endpoint": "https://x", "__probe__": 1}}}),
+                "HttpEndpoint",
+                json!({"http": {"endpoints": {"p": {"endpoint": "https://x", "__probe__": 1}}}}),
+            ),
+            (
+                "Company",
+                json!({"companies": {"p": {"endpoint": "https://x", "__probe__": 1}}}),
+            ),
+            (
+                "McpServer",
+                json!({"mcp": {"servers": [{"name": "p", "endpoint": "https://x", "__probe__": 1}]}}),
             ),
             (
                 "A2aPeer",
@@ -11810,11 +12076,11 @@ mod tests {
         }
 
         // And the enum, which a field-name comparison cannot see: every
-        // ServiceKind variant must be offered, or a valid config reads as
+        // `connect` variant must be offered, or a valid config reads as
         // invalid in an editor.
         assert_eq!(
-            schema["$defs"]["Service"]["properties"]["kind"]["enum"],
-            json!(["mcp", "intelligence", "peer", "http", "company"]),
+            schema["$defs"]["McpServer"]["properties"]["connect"]["enum"],
+            json!(["boot", "on_use"]),
         );
     }
 
@@ -11944,7 +12210,8 @@ mod tests {
                     }
                     "store.mcp" => json!({"server": "s"}),
                     "streams" => json!({"orders": {"retention": {"max_events": 1}}}),
-                    "services" => json!({"billing": {"endpoint": "https://b.example/mcp"}}),
+                    "companies" => json!({"shop": {"endpoint": "https://shop.example"}}),
+                    "http.endpoints" => json!({"gh": {"endpoint": "https://gh.example"}}),
                     "subagents.templates" => json!({"t": {"instruction": "do the thing"}}),
                     "subagents.defaults.limits" => json!({"max_tokens": 1000}),
                     "store.http" => json!({"base_url": "https://s"}),
@@ -12289,27 +12556,23 @@ mod tests {
         validate("      tags: {\"*\": [trusted]}\n").expect("`trusted` is no leg");
     }
 
-    /// `trusted` is an MCP server's tag: a `kind: mcp` catalog entry may
-    /// carry it, a Company entry may not — what a Company says is its text.
+    /// `trusted` is an MCP server's tag: an operator's server may carry it, a
+    /// Company entry may not — what a Company says is its text.
     #[test]
     fn trusted_is_refused_on_a_company_entry() {
-        let validate = |kind: &str| {
-            let f = write_tmp(
-                &format!(
-                    "store: {{kind: memory}}\n\
-                     services:\n  calc:\n    kind: {kind}\n    endpoint: https://calc.example\n    tags: {{\"*\": [trusted]}}\n"
-                ),
-                "yaml",
-            );
+        let validate = |section: &str| {
+            let f = write_tmp(&format!("store: {{kind: memory}}\n{section}"), "yaml");
             load(
                 &args(&["--config", f.path().to_str().unwrap(), "--validate-config"]),
                 &base_env(),
             )
         };
-        validate("mcp").expect("an MCP service may be vouched for");
-        let e = validate("company").unwrap_err();
+        validate("mcp:\n  servers:\n    - {name: calc, endpoint: \"https://calc.example\", tags: {\"*\": [trusted]}}\n")
+            .expect("an MCP server may be vouched for");
+        let e = validate("companies:\n  calc:\n    endpoint: https://calc.example\n    tags: {\"*\": [trusted]}\n")
+            .unwrap_err();
         assert!(
-            format!("{e}").contains("services.calc: `trusted` marks an MCP server's results"),
+            format!("{e}").contains("companies.calc: `trusted` marks an MCP server's results"),
             "{e}"
         );
     }
@@ -13201,8 +13464,9 @@ mod tests {
         let s = McpServer {
             name: "gh".into(),
             endpoint: "https://mcp.example".into(),
-            service: None,
-            service_rate: None,
+            rate: None,
+            breaker: None,
+            connect: Connect::Boot,
             ns: None,
             headers: BTreeMap::new(),
             tags: BTreeMap::new(),
@@ -13919,7 +14183,7 @@ mod tests {
     /// The allow-list fails CLOSED: a fragment key in neither list is refused,
     /// not admitted. That is the whole reason for the polarity — a deny-list
     /// can only ever refuse what somebody already thought of, which is how
-    /// `services`, `agent.tools`, the principal table and the intelligence
+    /// the egress allow-list, `agent.tools`, the principal table and the intelligence
     /// endpoints all came to be writable by a served document.
     #[test]
     fn a_fragment_key_nobody_classified_is_refused() {
@@ -14001,13 +14265,13 @@ mod tests {
                 "instruction_sources:\n  - uri: \"instruction://self\"\n    publisher: \"https://evil.example\"",
                 "instruction_sources",
             ),
-            // It catalogued its own destination, which is the list
-            // `security.egress: closed` is checked against — the gate stays,
-            // and the thing it reads becomes the document's to write.
+            // It declared its own destination in a list `security.egress:
+            // closed` is checked against — the gate stays, and the thing it
+            // reads becomes the document's to write.
             (
                 "catalog.md",
-                "services:\n  exfil:\n    kind: mcp\n    endpoint: \"https://evil.example/mcp\"",
-                "services",
+                "http:\n  endpoints:\n    exfil:\n      endpoint: \"https://evil.example/\"",
+                "http",
             ),
             // It widened its own tool grant. Arrays CONCATENATE, so an
             // operator who narrowed `internal:` to two names got the
@@ -14191,11 +14455,11 @@ mod tests {
     /// decides what the agent will do.
     #[test]
     fn a_closed_egress_covers_the_document_the_agent_takes_its_policy_from() {
-        let load = |instruction: Value, services: Value| {
+        let load = |instruction: Value, endpoints: Value| {
             Settings::from_document(
                 json!({"agent": {"name": "a", "instruction": instruction, "preflight": "never"},
                     "security": {"egress": "closed"},
-                    "services": services,
+                    "http": {"endpoints": endpoints},
                     "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
                     "store": {"kind": "memory"}}),
                 MERGED_DOCUMENT,
@@ -14217,7 +14481,7 @@ mod tests {
         // which is the proof that the gate is the only thing that stopped it.
         let e = load(
             json!({"url": "https://127.0.0.1:1/policy.md"}),
-            json!({"docs": {"kind": "http", "endpoint": "https://127.0.0.1:1/"}}),
+            json!({"docs": {"endpoint": "https://127.0.0.1:1/"}}),
         )
         .unwrap_err();
         assert!(
@@ -14242,7 +14506,7 @@ mod tests {
 
     /// The pre-parse gate fails CLOSED on a config it cannot understand.
     ///
-    /// It reads `security.egress` and `services:` off the raw document, ahead
+    /// It reads `security.egress` and the declared endpoints off the raw document, ahead
     /// of the typed parse that would reject a malformed one. If a typo in
     /// either let the dial through, the control would be defeated by the very
     /// mistakes it most needs to survive.
@@ -14251,22 +14515,22 @@ mod tests {
         // A misspelled policy value.
         let p = EgressPolicy::read(&json!({"security": {"egress": "clsoed"}}));
         assert!(
-            p.allows(ServiceKind::Http, "https://evil.example/x")
+            p.allows(EndpointKind::Http, "https://evil.example/x")
                 .is_err()
         );
-        // A `services:` map that does not deserialize is an EMPTY catalog, so
-        // nothing matches.
+        // An `http.endpoints` map that does not deserialize declares
+        // nothing, so nothing matches.
         let p = EgressPolicy::read(
-            &json!({"security": {"egress": "closed"}, "services": ["not", "a", "map"]}),
+            &json!({"security": {"egress": "closed"}, "http": {"endpoints": ["https://evil.example/x"]}}),
         );
         assert!(
-            p.allows(ServiceKind::Http, "https://evil.example/x")
+            p.allows(EndpointKind::Http, "https://evil.example/x")
                 .is_err()
         );
         // Absent policy is `open`, the documented default.
         let p = EgressPolicy::read(&json!({}));
         assert!(
-            p.allows(ServiceKind::Http, "https://anywhere.example/x")
+            p.allows(EndpointKind::Http, "https://anywhere.example/x")
                 .is_ok()
         );
     }
@@ -16458,21 +16722,14 @@ mod tests {
             "Mcp-Name",
             "Mcp-Param-Region",
         ] {
-            for doc in [
-                format!(
-                    "mcp:\n  servers:\n    - {{name: m, endpoint: https://m/mcp, headers: {{\"{h}\": x}}}}\n"
-                ),
-                format!(
-                    "services:\n  m:\n    endpoint: https://m/mcp\n    headers: {{\"{h}\": x}}\n"
-                ),
-            ] {
-                let errs = errors(&doc);
-                assert!(
-                    errs.iter()
-                        .any(|e| e.contains("set by the MCP client itself")),
-                    "{h}: {errs:?}"
-                );
-            }
+            let errs = errors(&format!(
+                "mcp:\n  servers:\n    - {{name: m, endpoint: https://m/mcp, headers: {{\"{h}\": x}}}}\n"
+            ));
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("set by the MCP client itself")),
+                "{h}: {errs:?}"
+            );
         }
         let errs = errors(
             "mcp:\n  servers:\n    - {name: m, endpoint: https://m/mcp, headers: {X-Env: prod}}\n",
@@ -16485,7 +16742,7 @@ mod tests {
         );
         // A peer's headers are not the MCP client's.
         let errs = errors(
-            "services:\n  p:\n    kind: peer\n    endpoint: https://p/a2a\n    headers: {\"Mcp-Method\": x}\n",
+            "a2a:\n  peers:\n    - {name: p, endpoint: \"https://p/a2a\", headers: {\"Mcp-Method\": x}}\n",
         );
         assert!(
             !errs
@@ -16590,283 +16847,269 @@ mod tests {
         assert!(help_section().contains("intelligence.model"));
     }
 
-    // ---- service catalog & egress policy -----------------------------------
+    // ---- each section owns its endpoints; the egress policy -----------------
 
-    const CATALOG: &str = "store: {kind: memory}\nservices:\n  billing:\n    endpoint: https://billing.example/mcp\n    headers: {X-Env: prod}\n    tags: {\"*\": [sensitive]}\n    allow: [charge_lookup, invoice_*]\n    exclude: [invoice_purge]\n  brain:\n    kind: intelligence\n    endpoint: https://intel.example/v1\n";
-
-    #[test]
-    fn service_reference_inherits_and_narrows() {
-        // The entry's credential, where the build can send one (`auth` on an
-        // MCP server needs `oauth`).
-        let catalog = if cfg!(feature = "oauth") {
-            CATALOG.replace(
-                "    headers: {X-Env: prod}\n",
-                "    auth: {kind: static, token: \"{{secret:BILLING}}\"}\n    headers: {X-Env: prod}\n",
-            )
-        } else {
-            CATALOG.to_string()
-        };
-        let f = write_tmp(
-            &format!(
-                "{catalog}mcp:\n  servers:\n    - {{name: money, service: billing, allow: [charge_lookup], ns: fin}}\n"
-            ),
-            "yaml",
-        );
-        let (loaded, _) = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap();
-        let s = &loaded.settings.mcp.servers[0];
-        assert_eq!(s.endpoint, "https://billing.example/mcp", "inherited");
-        assert_eq!(s.auth.is_some(), cfg!(feature = "oauth"), "inherited auth");
-        assert_eq!(s.headers["X-Env"], "prod", "inherited headers");
-        assert_eq!(s.allow.as_deref(), Some(&["charge_lookup".to_string()][..]));
-        assert_eq!(
-            s.exclude,
-            vec!["invoice_purge".to_string()],
-            "exclude unions"
-        );
-        assert_eq!(s.tags["*"], vec!["sensitive"], "tag floor applied");
-        assert_eq!(s.ns.as_deref(), Some("fin"), "consumer-local ns kept");
-    }
-
-    #[test]
-    fn service_reference_without_allow_inherits_the_ceiling() {
-        let f = write_tmp(
-            &format!("{CATALOG}mcp:\n  servers:\n    - {{name: money, service: billing}}\n"),
-            "yaml",
-        );
-        let (loaded, _) = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap();
-        let s = &loaded.settings.mcp.servers[0];
-        assert_eq!(
-            s.allow.as_deref(),
-            Some(&["charge_lookup".to_string(), "invoice_*".to_string()][..]),
-            "absent consumer allow inherits the catalog ceiling"
-        );
-    }
-
-    #[test]
-    fn service_reference_refuses_restated_connection_settings() {
-        let f = write_tmp(
-            &format!(
-                "{CATALOG}mcp:\n  servers:\n    - {{name: money, service: billing, endpoint: \"https://other.example\"}}\n"
-            ),
-            "yaml",
-        );
-        let e = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap_err();
-        let msg = format!("{e}");
-        assert!(msg.contains("restates `endpoint`"), "{msg}");
-    }
-
-    #[test]
-    fn service_allow_widening_is_refused() {
-        let f = write_tmp(
-            &format!(
-                "{CATALOG}mcp:\n  servers:\n    - {{name: money, service: billing, allow: [refund_all]}}\n"
-            ),
-            "yaml",
-        );
-        let e = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap_err();
-        let msg = format!("{e}");
-        assert!(msg.contains("widens the ceiling"), "{msg}");
-    }
-
-    #[test]
-    fn unknown_service_reference_is_refused() {
-        let f = write_tmp(
-            "store: {kind: memory}\nmcp:\n  servers:\n    - {name: x, service: nope}\n",
-            "yaml",
-        );
-        let e = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap_err();
-        assert!(format!("{e}").contains("unknown service 'nope'"), "{e}");
-    }
-
-    #[test]
-    fn tag_floor_applies_to_inline_matching_servers() {
-        // An INLINE server pointing under a catalogued endpoint gets the
-        // entry's tags unioned in — under-tagging cannot launder a sensitive
-        // endpoint past the trifecta gate.
-        let f = write_tmp(
-            &format!(
-                "{CATALOG}mcp:\n  servers:\n    - {{name: sneaky, endpoint: \"https://billing.example/mcp/sub\"}}\n"
-            ),
-            "yaml",
-        );
-        let (loaded, _) = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap();
-        assert_eq!(
-            loaded.settings.mcp.servers[0].tags["*"],
-            vec!["sensitive"],
-            "the catalog's tags are a floor for any matching endpoint"
-        );
-    }
-
-    #[test]
-    fn egress_closed_refuses_uncatalogued_and_admits_catalogued() {
-        let f = write_tmp(
-            &format!(
-                "{CATALOG}security: {{egress: closed}}\nmcp:\n  servers:\n    - {{name: rogue, endpoint: \"https://rogue.example/mcp\"}}\n"
-            ),
-            "yaml",
-        );
-        let e = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap_err();
-        let msg = format!("{e}");
-        assert!(
-            msg.contains("matches no `kind: mcp` services: catalog entry"),
-            "{msg}"
-        );
-
-        let ok = write_tmp(
-            &format!(
-                "{CATALOG}security: {{egress: closed}}\nmcp:\n  servers:\n    - {{name: money, service: billing}}\n"
-            ),
-            "yaml",
-        );
+    fn load_yaml(doc: &str) -> Result<Loaded, String> {
+        let f = write_tmp(doc, "yaml");
         load(
-            &args(&["--config", ok.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .expect("a catalogued reference passes closed egress");
-    }
-
-    #[test]
-    fn ambiguous_catalog_endpoints_are_refused() {
-        let f = write_tmp(
-            "store: {kind: memory}\nservices:\n  a: {endpoint: \"https://s.example/mcp\"}\n  b: {endpoint: \"https://s.example/mcp/deeper\"}\n",
-            "yaml",
-        );
-        let e = load(
             &args(&["--config", f.path().to_str().unwrap()]),
             &base_env(),
         )
+        .map(|(l, _)| l)
+        .map_err(|e| e.to_string())
+    }
+
+    /// A server's pacing, breaker and `connect` are its own settings, read
+    /// and checked where the server is declared.
+    #[test]
+    fn a_servers_rate_breaker_and_connect_are_its_own() {
+        let l = load_yaml(
+            "store: {kind: memory}\nmcp:\n  servers:\n    - {name: billing, endpoint: \"https://billing.example/mcp\", rate: 60/1m, breaker: {failures: 3, cooldown: 30s}, connect: on_use}\n",
+        )
+        .unwrap();
+        let s = &l.settings.mcp.servers[0];
+        assert_eq!(s.connect, Connect::OnUse);
+        assert!(l.settings.mcp.on_use("billing"));
+        assert_eq!(s.to_spec().unwrap().rate.as_deref(), Some("60/1m"));
+        let e = load_yaml(
+            "store: {kind: memory}\nmcp:\n  servers:\n    - {name: billing, endpoint: \"https://billing.example/mcp\", rate: often, breaker: {failures: 3}}\n",
+        )
         .unwrap_err();
-        assert!(format!("{e}").contains("prefix-comparable"), "{e}");
+        assert!(e.contains("mcp server 'billing' rate"), "{e}");
+        assert!(e.contains("mcp server 'billing' breaker"), "{e}");
+        let e = load_yaml(
+            "store: {kind: memory}\nmcp:\n  servers:\n    - {name: billing, endpoint: \"https://billing.example/mcp\", connect: lazily}\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("lazily"), "{e}");
+    }
+
+    /// An `http.endpoints` entry's fields are checked where it is declared;
+    /// an `http` step that names one names a declared one.
+    #[test]
+    fn http_endpoints_are_validated_and_named_by_steps() {
+        let e = load_yaml(
+            "store: {kind: memory}\nhttp:\n  endpoints:\n    gh: {endpoint: \"ftp://gh.example\", methods: [get], rate: often, headers: {Authorization: \"Bearer x\"}}\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("http.endpoints.gh"), "{e}");
+        assert!(e.contains("unknown method 'get'"), "{e}");
+        assert!(e.contains("http.endpoints.gh.rate"), "{e}");
+        assert!(e.contains("looks like a credential"), "{e}");
+        let e = load_yaml(
+            "store: {kind: memory}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], endpoint: nope, url: /x}\n      f: {kind: finish, depends_on: [h], status: completed}\n",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("endpoint \"nope\" is not an http.endpoints entry"),
+            "{e}"
+        );
+        load_yaml(
+            "store: {kind: memory}\nhttp:\n  endpoints:\n    gh: {endpoint: \"https://gh.example\", methods: [GET]}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], endpoint: gh, url: /x}\n      f: {kind: finish, depends_on: [h], status: completed}\n",
+        )
+        .expect("a step naming a declared endpoint");
+    }
+
+    /// Under `security.egress: closed` every other HTTP request matches an
+    /// `http.endpoints` entry: a literal `http` step URL is judged at load.
+    #[test]
+    fn closed_egress_judges_http_against_http_endpoints() {
+        let doc = |endpoints: &str| {
+            format!(
+                "store: {{kind: memory}}\nsecurity: {{egress: closed}}\n{endpoints}workflows:\n  - name: w\n    steps:\n      s: {{kind: once}}\n      h: {{kind: http, depends_on: [s], method: POST, url: \"https://hooks.example/x\"}}\n      f: {{kind: finish, depends_on: [h], status: completed}}\n"
+            )
+        };
+        let e = load_yaml(&doc("")).unwrap_err();
+        assert!(
+            e.contains("http step 'h'") && e.contains("matches no http.endpoints entry"),
+            "{e}"
+        );
+        load_yaml(&doc(
+            "http:\n  endpoints:\n    hooks: {endpoint: \"https://hooks.example\"}\n",
+        ))
+        .expect("a declared endpoint passes closed egress");
+        // An MCP server, a peer and an intelligence endpoint are declarations
+        // themselves.
+        load_yaml(
+            "store: {kind: memory}\nsecurity: {egress: closed}\nintelligence: {endpoints: \"https://intel.example/v1\"}\nmcp:\n  servers:\n    - {name: m, endpoint: \"https://m.example/mcp\"}\na2a:\n  peers:\n    - {name: pal, endpoint: \"https://peer.example\"}\n",
+        )
+        .expect("the sections are the allow-list");
     }
 
     #[test]
-    fn service_match_respects_segment_boundaries() {
-        let mut services = BTreeMap::new();
-        services.insert(
-            "a".to_string(),
-            Service {
-                kind: ServiceKind::Mcp,
-                endpoint: "https://s.example/api".into(),
-                headers: BTreeMap::new(),
-                tags: BTreeMap::new(),
-                allow: None,
-                exclude: Vec::new(),
-                auth: None,
-                rate: None,
-                timeout: None,
-                methods: None,
-                breaker: None,
-                hosts: None,
-                allow_private: None,
-                interfaces: None,
-                mcp_names: BTreeMap::new(),
-                api_names: BTreeMap::new(),
-                privacy: None,
-                sign_in: None,
-                scopes: None,
-                api_allow: None,
-                context: None,
-            },
-        );
-        let m = ServiceKind::Mcp;
-        assert!(service_match(&services, m, "https://s.example/api").is_some());
-        assert!(service_match(&services, m, "https://s.example/api/v2").is_some());
+    fn endpoint_matching_respects_segment_boundaries() {
+        let e = "https://s.example/api";
+        assert!(endpoint_matches(e, "https://s.example/api"));
+        assert!(endpoint_matches(e, "https://s.example/api/v2"));
         assert!(
-            service_match(&services, m, "https://s.example/apiary").is_none(),
+            !endpoint_matches(e, "https://s.example/apiary"),
             "prefix match is on segment boundaries, not string prefixes"
         );
-        assert!(service_match(&services, m, "https://other.example/api").is_none());
+        assert!(!endpoint_matches(e, "https://other.example/api"));
         assert!(
-            service_match(&services, m, "http://s.example/api").is_none(),
+            !endpoint_matches(e, "http://s.example/api"),
             "scheme must match"
         );
+        assert!(endpoint_matches("https://S.example", "https://s.example/x"));
+    }
+
+    /// The policy is per kind: an endpoint declared in one section admits
+    /// nothing of another kind, and a push target is a peer's endpoint or an
+    /// `a2a.push.allow` entry.
+    #[test]
+    fn the_egress_policy_judges_each_kind_against_its_own_section() {
+        let p = EgressPolicy::read(&json!({
+            "security": {"egress": "closed"},
+            "mcp": {"servers": [{"name": "m", "endpoint": "https://m.example/mcp"}]},
+            "intelligence": {"endpoints": "https://i.example/v1",
+                             "providers": {"p": {"endpoints": ["https://p.example/v1"]}}},
+            "a2a": {"peers": [{"name": "pal", "endpoint": "https://peer.example"}],
+                    "push": {"allow": ["https://hooks.example/a2a"]}},
+            "http": {"endpoints": {"gh": {"endpoint": "https://gh.example"}}}}));
+        assert!(p.allows(EndpointKind::Mcp, "https://m.example/mcp").is_ok());
         assert!(
-            service_match(&services, ServiceKind::Http, "https://s.example/api").is_none(),
-            "matching is kind-filtered"
+            p.allows(EndpointKind::Http, "https://m.example/mcp")
+                .is_err()
+        );
+        assert!(
+            p.allows(EndpointKind::Intelligence, "https://p.example/v1/chat")
+                .is_ok()
+        );
+        assert!(p.allows(EndpointKind::Peer, "https://peer.example").is_ok());
+        assert!(
+            p.allows(EndpointKind::Push, "https://peer.example/hook")
+                .is_ok()
+        );
+        assert!(
+            p.allows(EndpointKind::Push, "https://hooks.example/a2a/1")
+                .is_ok()
+        );
+        assert!(
+            p.allows(EndpointKind::Push, "https://evil.example/")
+                .is_err()
+        );
+        assert!(p.allows(EndpointKind::Http, "https://gh.example/x").is_ok());
+        let e = p
+            .allows(EndpointKind::Http, "https://evil.example/")
+            .unwrap_err();
+        assert!(e.contains("matches no http.endpoints entry"), "{e}");
+    }
+
+    /// A peer logs in under its own name now: an interactive grant on a
+    /// peer's own block loads (`agentd --login a2a:<peer>`).
+    #[cfg(all(feature = "a2a", feature = "oauth"))]
+    #[test]
+    fn a_peers_own_oauth2_login_loads() {
+        load_yaml(
+            "store: {kind: memory}\na2a:\n  peers:\n    - {name: pal, endpoint: \"https://peer.example\", rate: 10/1m, timeout: 20s, auth: {kind: oauth2, grant: device, client_id: c, issuer: \"https://id.example\"}}\n",
+        )
+        .expect("a device grant on a peer");
+        let e = load_yaml(
+            "store: {kind: memory}\na2a:\n  peers:\n    - {name: pal, endpoint: \"https://peer.example\", rate: soon}\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("a2a peer 'pal' rate"), "{e}");
+    }
+
+    /// A document's server is the operator's when its endpoint falls under
+    /// one: one entry, the operator's name and settings, the document's
+    /// tools narrowing only — and its workflow steps name the operator's
+    /// server. Under closed egress one that matches nothing is held as text,
+    /// said; under open it is its own, untrusted.
+    #[test]
+    fn a_documents_server_folds_into_the_operators() {
+        let dir = tempfile::tempdir().unwrap();
+        let instr = dir.path().join("desk.md");
+        let load = |src: &str, egress: &str| {
+            std::fs::write(
+                &instr,
+                format!(
+                    "You are the desk.\n\n:::mcp{{id=gh src=\"{src}\" tools=\"get_issue,delete_repo\"}}\n:::\n\n:::workflow{{id=triage dialect=instruction/workflow}}\nname: triage\nsteps:\n  s: {{kind: once}}\n  t: {{kind: mcp.tool, depends_on: [s], server: gh, tool: get_issue}}\n  f: {{kind: finish, depends_on: [t], status: completed}}\n:::\n"
+                ),
+            )
+            .unwrap();
+            Settings::from_document(
+                json!({"agent": {"name": "a", "preflight": "never",
+                              "instruction": {"file": instr.to_str().unwrap()},
+                              "document_capabilities": ["workflows", "mcp"]},
+                       "security": {"egress": egress},
+                       "store": {"kind": "memory"},
+                       "mcp": {"servers": [{"name": "github", "endpoint": "https://mcp.example/mcp",
+                                            "allow": ["get_*", "list_*"], "connect": "on_use",
+                                            "tags": {"*": ["sensitive"]}}]}}),
+                "t",
+            )
+        };
+        let s = load("https://mcp.example/mcp/v1", "closed").unwrap();
+        assert_eq!(s.mcp.servers.len(), 1, "{:?}", s.mcp.servers);
+        let srv = &s.mcp.servers[0];
+        assert_eq!(srv.name, "github");
+        assert_eq!(srv.allow.as_deref(), Some(&["get_issue".to_string()][..]));
+        assert_eq!(srv.tags["*"], ["sensitive"]);
+        assert!(s.mcp.document_matched.contains("github"));
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("delete_repo") && w.contains("never widens")),
+            "{:?}",
+            s.agent.instruction_warnings
+        );
+        let triage = s
+            .workflows
+            .iter()
+            .find(|w| w["name"] == "triage")
+            .expect("the document's workflow");
+        assert_eq!(triage["steps"]["t"]["server"], "github");
+
+        // Closed, matching nothing: text, said, no refusal.
+        let s = load("https://elsewhere.example/mcp", "closed");
+        let s = match s {
+            Ok(s) => s,
+            // The workflow names a server that is not there now: the load's
+            // own refusal of an undeclared server, not the fold's.
+            Err(e) => {
+                assert!(e.contains("gh"), "{e}");
+                return;
+            }
+        };
+        assert!(s.mcp.servers.iter().all(|m| m.name != "gh"));
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("host-policy") && w.contains("gh")),
+            "{:?}",
+            s.agent.instruction_warnings
         );
     }
 
-    #[cfg(feature = "a2a")]
+    /// Open egress: a document's server that matches nothing is its own,
+    /// counted `untrusted_input`.
     #[test]
-    fn peer_references_resolve_and_all_four_kinds_gate_closed_egress() {
-        // A `kind: peer` entry feeds a2a.peers[].service, and closed mode
-        // covers intelligence endpoints, peers and http-step literals too.
-        // A peer's `auth` needs the oauth build feature and is refused
-        // without it, so there the entry has none to inherit.
-        let auth = if cfg!(feature = "oauth") {
-            ", auth: {kind: static, token: \"{{secret:PEER}}\"}"
-        } else {
-            ""
-        };
-        let f = write_tmp(
-            &"store: {kind: memory}\nsecurity: {egress: closed}\nservices:\n  brain: {kind: intelligence, endpoint: \"https://intel.example/v1\"}\n  buddy: {kind: peer, endpoint: \"https://peer.example\"AUTH}\n  hooks: {kind: http, endpoint: \"https://hooks.example\", methods: [POST]}\na2a:\n  peers:\n    - {name: pal, service: buddy}\nworkflows:\n  - name: w\n    steps:\n      s: {kind: once}\n      h: {kind: http, depends_on: [s], method: POST, url: \"https://hooks.example/x\"}\n      f: {kind: finish, depends_on: [h], status: completed}\n"
-                .replace("AUTH", auth),
-            "yaml",
-        );
-        let (loaded, _) = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
+    fn under_open_egress_a_documents_own_server_is_untrusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let instr = dir.path().join("desk.md");
+        std::fs::write(
+            &instr,
+            ":::mcp{id=gh src=\"https://elsewhere.example/mcp\"}\n:::\n\nYou are the desk.\n",
         )
-        .expect("all surfaces catalogued ⇒ closed mode admits the config");
-        let p = &loaded.settings.a2a.peers[0];
-        assert_eq!(p.endpoint, "https://peer.example", "peer inherited");
+        .unwrap();
+        let s = Settings::from_document(
+            json!({"agent": {"name": "a", "preflight": "never",
+                          "instruction": {"file": instr.to_str().unwrap()},
+                          "document_capabilities": ["mcp"]},
+                   "store": {"kind": "memory"}}),
+            "t",
+        )
+        .unwrap();
+        let srv = s.mcp.servers.iter().find(|m| m.name == "gh").unwrap();
         assert_eq!(
-            p.auth.is_some(),
-            cfg!(feature = "oauth"),
-            "peer inherited auth"
+            srv.counted_tags(),
+            [crate::sec::scope::TrifectaTag::UntrustedInput]
         );
-
-        let bad = write_tmp(
-            "store: {kind: memory}\nsecurity: {egress: closed}\na2a:\n  peers:\n    - {name: rogue, endpoint: \"https://rogue.example\"}\n",
-            "yaml",
-        );
-        let e = load(
-            &args(&["--config", bad.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{e}").contains("kind: peer"),
-            "an uncatalogued peer is refused naming the kind: {e}"
-        );
-
-        let badi = write_tmp(
-            "store: {kind: memory}\nsecurity: {egress: closed}\nintelligence: {endpoints: \"https://rogue-intel.example/v1\"}\n",
-            "yaml",
-        );
-        let e = load(&args(&["--config", badi.path().to_str().unwrap()]), &[]).unwrap_err();
-        assert!(
-            format!("{e}").contains("kind: intelligence"),
-            "an uncatalogued intelligence endpoint is refused: {e}"
-        );
+        assert!(s.mcp.document_servers.contains("gh"));
+        assert!(EgressPolicy::of(&s).declared(EndpointKind::Mcp).is_empty());
     }
 
     /// RFC 8707: an MCP server's block sends the server as its `resource`
@@ -17016,81 +17259,6 @@ mod tests {
             errs.iter().any(|e| e.contains("is for auth.kind oauth2")),
             "{errs:?}"
         );
-    }
-
-    /// A peer's own oauth2 block with a grant that takes a login could never
-    /// have a credential — `agentd --login` takes no `a2a:<peer>` target — so
-    /// it is refused at load, naming the way that works. The same block on a
-    /// `kind: peer` entry loads, and so does a client-credentials grant on
-    /// the peer itself.
-    #[cfg(all(feature = "a2a", feature = "oauth"))]
-    #[test]
-    fn a_peers_own_oauth2_login_is_refused_at_load() {
-        let peer = |auth: &str, services: &str| {
-            let f = write_tmp(
-                &format!(
-                    "store: {{kind: memory}}\n{services}a2a:\n  peers:\n    - {{name: pal, {auth}}}\n"
-                ),
-                "yaml",
-            );
-            load(
-                &args(&["--config", f.path().to_str().unwrap()]),
-                &base_env(),
-            )
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-        };
-        let oauth2 = |grant: &str| {
-            format!(
-                "{{kind: oauth2, {grant}client_id: c, issuer: \"https://id.example\", client_secret: \"{{{{secret:PEER}}}}\"}}"
-            )
-        };
-        for grant in ["grant: device, ", "grant: authorization_code, ", ""] {
-            let e = peer(
-                &format!(
-                    "endpoint: \"https://peer.example\", auth: {}",
-                    oauth2(grant)
-                ),
-                "",
-            )
-            .expect_err(grant);
-            assert!(
-                e.contains("a2a peer 'pal'") && e.contains("`agentd --login service:<entry>`"),
-                "{grant}: {e}"
-            );
-        }
-        peer(
-            &format!(
-                "endpoint: \"https://peer.example\", auth: {}",
-                oauth2("grant: client_credentials, ")
-            ),
-            "",
-        )
-        .expect("a client-credentials grant needs no login");
-        peer(
-            "service: buddy",
-            &format!(
-                "services:\n  buddy: {{kind: peer, endpoint: \"https://peer.example\", auth: {}}}\n",
-                oauth2("grant: device, ")
-            ),
-        )
-        .expect("a login through the service entry");
-    }
-
-    #[test]
-    fn kind_specific_entry_fields_are_validated() {
-        let f = write_tmp(
-            "store: {kind: memory}\nservices:\n  x: {kind: http, endpoint: \"https://x.example\", tags: {\"*\": [egress]}}\n  y: {kind: mcp, endpoint: \"https://y.example\", methods: [GET]}\n",
-            "yaml",
-        );
-        let e = load(
-            &args(&["--config", f.path().to_str().unwrap()]),
-            &base_env(),
-        )
-        .unwrap_err();
-        let msg = format!("{e}");
-        assert!(msg.contains("`tags` applies to `kind: mcp`"), "{msg}");
-        assert!(msg.contains("`methods` applies to `kind: http`"), "{msg}");
     }
 
     /// The message hop cap is a fail-closed gate, so it has to bind on a
@@ -17572,16 +17740,9 @@ mod tests {
             e.contains("intelligence.providers.p.token carries an inline credential"),
             "{e}"
         );
-        // Under `egress: closed`, a provider is a destination like any other.
+        // Under `egress: closed`, a provider is a declaration of its own.
         let e = errors(
             "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p: {endpoints: \"https://p.example/v1\"}\nsecurity: {egress: closed}\n",
-        );
-        assert!(
-            e.contains("intelligence provider 'p' endpoint (https://p.example/v1) matches no `kind: intelligence`"),
-            "{e}"
-        );
-        let e = errors(
-            "intelligence:\n  endpoints: \"mock:json\"\n  providers:\n    p: {endpoints: \"https://p.example/v1\"}\nsecurity: {egress: closed}\nservices:\n  p: {kind: intelligence, endpoint: \"https://p.example/v1\"}\n",
         );
         assert!(!e.contains("intelligence provider"), "{e}");
     }
@@ -17966,10 +18127,10 @@ mod tests {
 
     /// A document vouches for none of its servers: `trusted` on one is
     /// refused, and each it declares counts `untrusted_input` beside the
-    /// legs it names — unless the operator's catalog entry it names, or
-    /// whose endpoint it restates, declares tags.
+    /// legs it names — unless its endpoint is an operator server's, which it
+    /// then is (RFC 0055 §3.1).
     #[test]
-    fn a_documents_servers_are_untrusted_unless_the_operators_catalog_vouches() {
+    fn a_documents_servers_are_untrusted_unless_they_are_the_operators() {
         use crate::sec::scope::TrifectaTag as T;
         let frag = json!({"mcp": {"servers": [
             {"name": "a", "endpoint": "https://a", "tags": {"*": ["trusted"]}},
@@ -17985,7 +18146,7 @@ mod tests {
         // Through the instruction's own fold.
         let dir = tempfile::tempdir().unwrap();
         let instr = dir.path().join("servers.md");
-        let load = |block: &str, services: Value| {
+        let load = |block: &str, operator: Value| {
             std::fs::write(
                 &instr,
                 format!(
@@ -17997,13 +18158,13 @@ mod tests {
             Settings::from_document(
                 json!({"agent": {"name": "a", "preflight": "never",
                               "instruction": {"file": instr.to_str().unwrap()}},
-                    "store": {"kind": "memory"}, "services": services}),
+                    "store": {"kind": "memory"}, "mcp": {"servers": operator}}),
                 "t",
             )
         };
         let e = load(
             "endpoint: https://mcp.example/mcp\ntags: {\"*\": [trusted]}\n",
-            json!({}),
+            json!([]),
         )
         .unwrap_err();
         assert!(
@@ -18011,37 +18172,33 @@ mod tests {
                 && e.contains("vouching for a server is the operator's"),
             "{e}"
         );
-        // The server as it resolves against the catalog.
-        let declared = |block: &str, services: Value| {
-            let mut s = load(block, services).unwrap();
-            assert!(resolve_services(&mut s).is_empty());
-            s.mcp.servers.into_iter().find(|m| m.name == "gh").unwrap()
+        // The server as the fold leaves it.
+        let declared = |block: &str, operator: Value| {
+            let s = load(block, operator).unwrap();
+            s.mcp
+                .servers
+                .into_iter()
+                .find(|m| m.name == "gh" || m.name == "github")
         };
         // Untagged, or tagged with legs alone: untrusted all the same.
-        let srv = declared("endpoint: https://mcp.example/mcp\n", json!({}));
+        let srv = declared("endpoint: https://mcp.example/mcp\n", json!([])).unwrap();
         assert_eq!(srv.counted_tags(), [T::UntrustedInput]);
         let srv = declared(
             "endpoint: https://mcp.example/mcp\ntags: {\"*\": [sensitive]}\n",
-            json!({}),
-        );
+            json!([]),
+        )
+        .unwrap();
         assert_eq!(srv.counted_tags(), [T::Sensitive, T::UntrustedInput]);
-        // The operator's catalog vouches: by `service:`, or by the endpoint
-        // its entry names.
-        let vouched = json!({"gh": {"kind": "mcp", "endpoint": "https://mcp.example/mcp",
-                                    "tags": {"*": ["trusted"]}}});
-        for block in ["service: gh\n", "endpoint: https://mcp.example/mcp/v1\n"] {
-            let srv = declared(block, vouched.clone());
-            assert!(
-                !srv.untagged() && srv.counted_tags().is_empty(),
-                "{block}: {:?}",
-                srv.tags
-            );
-        }
-        // An entry that declares no tags vouches for nothing.
-        let bare = json!({"gh": {"kind": "mcp", "endpoint": "https://mcp.example/mcp"}});
-        assert_eq!(
-            declared("service: gh\n", bare).counted_tags(),
-            [T::UntrustedInput]
+        // A server the operator declared at that endpoint is the operator's:
+        // its tags stand, whatever the document's entry said.
+        let operator = json!([{"name": "github", "endpoint": "https://mcp.example/mcp",
+                               "tags": {"*": ["trusted"]}}]);
+        let srv = declared("endpoint: https://mcp.example/mcp/v1\n", operator).unwrap();
+        assert_eq!(srv.name, "github");
+        assert!(
+            !srv.untagged() && srv.counted_tags().is_empty(),
+            "{:?}",
+            srv.tags
         );
     }
 
@@ -18128,7 +18285,7 @@ mod registry_document_tests {
             two.tags
                 .get("*")
                 .is_some_and(|t| t.iter().any(|x| x == "untrusted_input")),
-            "a document's server is untrusted unless the catalog vouches: {:?}",
+            "a document's own server is untrusted: {:?}",
             two.tags
         );
         assert!(s.mcp.servers.iter().any(|m| m.name == "registry"));
@@ -18199,7 +18356,7 @@ mod registry_document_tests {
     }
 
     /// A skill named by `src` is fetched through the egress policy: under
-    /// `security.egress: closed` a host the catalogue lacks is refused, said,
+    /// `security.egress: closed` a host no `http.endpoints` entry covers is refused, said,
     /// and the skill left out — the document still loads.
     #[test]
     fn a_skill_fetch_closed_egress_refuses_is_left_out_not_fatal() {
@@ -18208,8 +18365,8 @@ mod registry_document_tests {
             :::skill{id=tone title=\"Tone\"}\nBe brief.\n:::\n";
         let mut doc = operator();
         doc["security"] = json!({"egress": "closed"});
-        doc["services"] =
-            json!({"registry": {"kind": "mcp", "endpoint": "http://127.0.0.1:9/mcp"}});
+        doc["http"] =
+            json!({"endpoints": {"elsewhere": {"endpoint": "https://elsewhere.example"}}});
         let s = load(doc, raw).unwrap();
         let names: Vec<&str> = s
             .agent

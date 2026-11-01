@@ -153,7 +153,7 @@ impl Runtime {
         let entry = args["company"].as_str().unwrap_or_default().to_string();
         let Some(company) = sup.company(&entry) else {
             return refuse(format!(
-                "{entry:?} is not a company entry (services.<name>.kind: company)"
+                "{entry:?} is not a company entry (companies.<name>)"
             ));
         };
         let id = args["operation_id"]

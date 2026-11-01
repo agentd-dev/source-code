@@ -132,7 +132,7 @@ fn holds_both(s: &Settings, held: &[Held]) -> bool {
 /// here, so a new input is added to both at once.
 pub fn inputs_moved(old: &Settings, new: &Settings) -> bool {
     old.mcp != new.mcp
-        || old.services != new.services
+        || old.companies != new.companies
         || old.subagents != new.subagents
         || old.streams != new.streams
         || old.tools != new.tools
@@ -732,10 +732,9 @@ fn propagate<'w>(ctx: &Reach, workflows: &[&'w Workflow]) -> Propagation<'w> {
     // A Company's conversation events and its operations' final states,
     // appended to `company.<name>`, carry the entry's tags, as its MCP
     // servers do (RFC 0047 §6.3).
-    for (name, svc) in &ctx.s.services {
+    for (name, svc) in &ctx.s.companies {
         use crate::config::settings::companies as co;
-        if svc.kind != crate::config::settings::ServiceKind::Company || !co::has_stream(ctx.s, svc)
-        {
+        if !co::has_stream(ctx.s, svc) {
             continue;
         }
         let producer = format!("the conversations and operations of company entry {name:?}");
@@ -1053,23 +1052,13 @@ impl<'a> Reach<'a> {
             }
             let reach = match compiled.get(name) {
                 // An instance child dials the servers its own machinery
-                // declares, resolved against the parent's catalog — the same
-                // resolution `compile_templates` checks them under.
+                // declares, at the tags `compile_templates` judged them by.
                 Some(c) if c.tier == crate::config::templates::Tier::Instance => c
                     .fragment
                     .pointer("/mcp/servers")
                     .and_then(|v| serde_json::from_value::<Vec<McpServer>>(v.clone()).ok())
                     .map(|list| {
-                        let mut probe = Settings {
-                            services: s.services.clone(),
-                            ..Default::default()
-                        };
-                        probe.mcp.servers = list;
-                        let _ = crate::config::settings::resolve_services(&mut probe);
-                        probe
-                            .mcp
-                            .servers
-                            .iter()
+                        list.iter()
                             .filter_map(|srv| {
                                 held(
                                     srv,
@@ -2490,7 +2479,7 @@ mod tests {
         assert!(!inputs_moved(&base, &base.clone()));
         for change in [
             json!({"mcp": {"servers": []}}),
-            json!({"services": {"m": {"kind": "mcp", "endpoint": "https://m.invalid/mcp"}}}),
+            json!({"companies": {"m": {"endpoint": "https://m.invalid"}}}),
             json!({"subagents": {"allow_freeform": false}}),
             json!({"streams": {"inbox": {}}}),
             json!({"tools": {"disabled": ["exec"]}}),

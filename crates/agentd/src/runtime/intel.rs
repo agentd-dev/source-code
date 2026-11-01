@@ -41,6 +41,8 @@ pub(crate) struct Conn {
     aws: Option<crate::config::AuthSpec>,
     dialect: Option<String>,
     timeout_ms: Option<u64>,
+    /// `rate:`: every call on it waits for a token.
+    rate: Option<String>,
     /// `structured_output: prompt`: a schema-bearing call is sent no format.
     structured_prompt: bool,
     /// The login target its credential is reported under (`intelligence`,
@@ -128,6 +130,7 @@ impl Conn {
                 .map(|a| a.to_spec()),
             dialect: c.dialect.map(str::to_string),
             timeout_ms: c.timeout.map(|t| t.as_millis() as u64),
+            rate: c.rate.map(str::to_string),
             structured_prompt: c.structured_output == StructuredOutput::Prompt,
             target: c.login_target(),
         })
@@ -283,6 +286,7 @@ impl Runtime {
             dialect: conn.dialect.clone(),
             provider: provider.map(str::to_string),
             timeout_ms: conn.timeout_ms,
+            rate: conn.rate.clone(),
             reference: None,
             fallbacks: Vec::new(),
             reasoning,

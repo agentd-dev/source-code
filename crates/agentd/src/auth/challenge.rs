@@ -13,7 +13,7 @@
 //! chose, so it is held to [`reach`]: on the server's own origin it is as
 //! trusted as the server the operator configured; anywhere else it must be
 //! HTTPS, is dialled through the SSRF guard, and under `security.egress:
-//! closed` must be in the catalog. The endpoints that server's metadata
+//! closed` must be in `http.endpoints`. The endpoints that server's metadata
 //! names must be on its own origin ([`same_origin`]).
 
 use std::time::Duration;
@@ -117,7 +117,7 @@ pub fn resource_metadata(endpoint: &str, timeout: Duration) -> Result<ResourceMe
 /// `resource`'s own origin it is dialled as the server is; anywhere else
 /// only over HTTPS, through the SSRF guard (no loopback, private or
 /// link-local address), and — when `catalog` is given, under
-/// `security.egress: closed` — only when a catalog entry covers it.
+/// `security.egress: closed` — only when an `http.endpoints` entry covers it.
 pub fn reach(url: &str, resource: &str, catalog: Option<&[String]>) -> Result<Dial, String> {
     if same_origin(resource, url) {
         return Ok(Dial::Named);
@@ -132,7 +132,7 @@ pub fn reach(url: &str, resource: &str, catalog: Option<&[String]>) -> Result<Di
         && !entries.iter().any(|e| covers(e, url))
     {
         return Err(format!(
-            "oauth: security.egress is closed and the authorization server {url} that {resource} named matches no services: catalog entry — catalog it to allow it"
+            "oauth: security.egress is closed and the authorization server {url} that {resource} named matches no http.endpoints entry — declare it there to allow it"
         ));
     }
     Ok(Dial::Vetted {
@@ -140,7 +140,7 @@ pub fn reach(url: &str, resource: &str, catalog: Option<&[String]>) -> Result<Di
     })
 }
 
-/// Whether the catalog entry `entry` covers `url`: the same scheme and
+/// Whether the declared endpoint `entry` covers `url`: the same scheme and
 /// authority, and a path that extends the entry's on a segment boundary.
 fn covers(entry: &str, url: &str) -> bool {
     let (Some((eo, ep)), Some((uo, up))) = (http::split_origin(entry), http::split_origin(url))

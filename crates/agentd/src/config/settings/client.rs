@@ -244,8 +244,8 @@ impl Settings {
     /// ([`Auth::resource_for`]); for an MCP server's `oauth2` block that
     /// names no `issuer` and no `token_url`, the server whose RFC 9728
     /// metadata names its authorization server; and, under
-    /// `security.egress: closed`, the catalog a server-named authorization
-    /// server must be in.
+    /// `security.egress: closed`, the `http.endpoints` a server-named
+    /// authorization server must be in.
     pub fn auth_spec_at(&self, auth: &Auth, endpoint: &str, mcp: bool) -> crate::config::AuthSpec {
         let mut spec = self.auth_spec(auth);
         if auth.kind != AuthKind::Oauth2 {
@@ -257,7 +257,8 @@ impl Settings {
         }
         if self.security.egress == super::Egress::Closed {
             spec.catalog = Some(
-                self.services
+                self.http
+                    .endpoints
                     .values()
                     .map(|s| s.endpoint.clone())
                     .filter(|e| !e.is_empty())

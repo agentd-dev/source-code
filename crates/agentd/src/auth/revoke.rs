@@ -45,9 +45,8 @@ pub fn logout(
     dir: &Path,
     timeout: Duration,
 ) -> Result<String, String> {
-    let target = crate::auth::canonical_target(settings, target);
-    let remote = match cache::take_file(dir, &target, timeout)? {
-        Some(cred) => revoke_login(settings, &target, &cred, timeout),
+    let remote = match cache::take_file(dir, target, timeout)? {
+        Some(cred) => revoke_login(settings, target, &cred, timeout),
         None => Remote::Nothing,
     };
     match remote {

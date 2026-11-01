@@ -431,8 +431,7 @@ impl Runtime {
             }
             // Unchanged means everything the dial reads: the endpoint and
             // headers, and also the credential (`auth`, `oauth`, `aauth`),
-            // the `service` its cached login is keyed by, its `rate` and its
-            // timeout. Comparing a subset carried the old connection over when
+            // its `rate` and its timeout. Comparing a subset carried the old connection over when
             // a credential was rotated or revoked, while the reload reported
             // `mcp`. Only the tags need no dial: they feed the registry, which
             // is rebuilt from the new spec.
@@ -447,6 +446,15 @@ impl Runtime {
             });
             if same && let Some(live) = self.mcp.get(&s.name) {
                 set.insert(s.name.clone(), live.clone());
+                continue;
+            }
+            // An on-use server nothing has needed yet stays undialed: the
+            // join dials it on first use (RFC 0055 §4.3).
+            if s.connect == cfg::Connect::OnUse
+                && !self.mcp.contains_key(&s.name)
+                && !self.joining.wants(&s.name)
+                && !new.mcp.document_matched.contains(&s.name)
+            {
                 continue;
             }
             match crate::mcp::from_spec(spec, server_timeout(new, s))
@@ -1168,13 +1176,12 @@ struct StagedListener {
     routes: Option<super::webhooks::StagedRoutes>,
 }
 
-/// The `services.<name>` paths of the company entries a reload would add,
+/// The `companies.<name>` paths of the company entries a reload would add,
 /// remove or change.
 fn company_entries_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<String> {
-    let companies = |s: &cfg::Settings| -> Vec<(String, cfg::Service)> {
-        s.services
+    let companies = |s: &cfg::Settings| -> Vec<(String, cfg::Company)> {
+        s.companies
             .iter()
-            .filter(|(_, v)| v.kind == cfg::ServiceKind::Company)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     };
@@ -1183,7 +1190,7 @@ fn company_entries_moved(old: &cfg::Settings, new: &cfg::Settings) -> Vec<String
         .iter()
         .filter(|(k, v)| !b.iter().any(|(k2, v2)| k == k2 && v == v2))
         .chain(b.iter().filter(|(k, _)| !a.iter().any(|(k2, _)| k == k2)))
-        .map(|(k, _)| format!("services.{k}"))
+        .map(|(k, _)| format!("companies.{k}"))
         .collect();
     moved.dedup();
     moved
@@ -1366,17 +1373,14 @@ pub(crate) fn dial_specs(
     let mut specs = std::collections::BTreeMap::new();
     let mut errs = Vec::new();
     for srv in &s.mcp.servers {
-        // A Company's server has no endpoint until discovery, and every URL
-        // its documents name is held to the entry's `hosts` instead.
-        if srv.company.is_none()
-            && let Err(e) = cfg::egress_allows(
-                &s.services,
-                s.security.egress,
-                cfg::ServiceKind::Mcp,
-                &srv.endpoint,
-            )
-        {
-            errs.push(e);
+        // Under closed egress every server is the operator's: a document's
+        // own server never reached here (`fold_document_servers`), whatever
+        // assembled the settings.
+        if s.security.egress == cfg::Egress::Closed && s.mcp.document_servers.contains(&srv.name) {
+            errs.push(format!(
+                "security.egress is `closed` and mcp server {:?} is the instruction's own, not the operator's",
+                srv.name
+            ));
             continue;
         }
         match srv.to_spec() {
@@ -1404,30 +1408,24 @@ pub(crate) fn dial_specs(
 mod dial_tests {
     use super::*;
 
-    /// The dial-time egress backstop refuses an endpoint closed egress does
-    /// not admit, whatever assembled the settings — validation refuses the
-    /// same configuration first, so these are settings it never saw — and
-    /// admits one the service catalogue names.
+    /// The dial-time egress backstop refuses, under closed egress, a server
+    /// that is the instruction's own — whatever assembled the settings;
+    /// validation and the load never hand it one — and admits the operator's.
     #[test]
-    fn closed_egress_refuses_an_uncatalogued_endpoint_before_any_dial() {
-        let settings = |services: &str| {
-            cfg::Settings::from_document(
-                crate::config::yaml::parse(&format!(
-                    "security: {{egress: closed}}\n{services}mcp:\n  servers:\n    - {{name: crm, endpoint: \"https://crm.example/mcp\"}}\n"
-                ))
-                .unwrap(),
-                "t",
+    fn closed_egress_refuses_a_document_server_before_any_dial() {
+        let mut s = cfg::Settings::from_document(
+            crate::config::yaml::parse(
+                "security: {egress: closed}\nmcp:\n  servers:\n    - {name: crm, endpoint: \"https://crm.example/mcp\"}\n",
             )
-            .unwrap()
-        };
-        let errs = dial_specs(&settings("")).unwrap_err();
-        assert_eq!(errs.len(), 1, "{errs:?}");
-        assert!(errs[0].contains("crm.example"), "{errs:?}");
-        let specs = dial_specs(&settings(
-            "services:\n  crm: {kind: mcp, endpoint: \"https://crm.example/mcp\"}\n",
-        ))
+            .unwrap(),
+            "t",
+        )
         .unwrap();
-        assert!(specs.contains_key("crm"));
+        assert!(dial_specs(&s).unwrap().contains_key("crm"));
+        s.mcp.document_servers.insert("crm".into());
+        let errs = dial_specs(&s).unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("crm"), "{errs:?}");
     }
 
     /// A reload that adds, removes or changes a company entry is a restart:
@@ -1435,31 +1433,34 @@ mod dial_tests {
     /// it. Any other entry is the reload's to apply.
     #[test]
     fn a_company_entry_moved_by_a_reload_is_named_for_a_restart() {
-        let settings = |services: &str| {
+        let settings = |companies: &str| {
             cfg::Settings::from_document(
-                crate::config::yaml::parse(&format!("services:\n{services}")).unwrap(),
+                crate::config::yaml::parse(&format!(
+                    "{}http:\n  endpoints:\n{CRM}",
+                    if companies.is_empty() {
+                        String::new()
+                    } else {
+                        format!("companies:\n{companies}")
+                    }
+                ))
+                .unwrap(),
                 "t",
             )
             .unwrap()
         };
-        let shop = "  shop: {kind: company, endpoint: \"https://shop.example\"}\n";
-        let crm = "  crm: {kind: mcp, endpoint: \"https://crm.example/mcp\"}\n";
-        let base = settings(&format!("{shop}{crm}"));
+        const CRM: &str = "    crm: {endpoint: \"https://crm.example\"}\n";
+        let shop = "  shop: {endpoint: \"https://shop.example\"}\n";
+        let base = settings(shop);
         assert!(company_entries_moved(&base, &base).is_empty());
-        let crm_moved = settings(&format!(
-            "{shop}  crm: {{kind: mcp, endpoint: \"https://crm2.example/mcp\"}}\n"
-        ));
-        assert!(company_entries_moved(&base, &crm_moved).is_empty());
-        let changed = settings(&format!(
-            "  shop: {{kind: company, endpoint: \"https://shop.example\", hosts: [shop.example]}}\n{crm}"
-        ));
-        assert_eq!(company_entries_moved(&base, &changed), ["services.shop"]);
-        let removed = settings(crm);
-        assert_eq!(company_entries_moved(&base, &removed), ["services.shop"]);
+        let changed =
+            settings("  shop: {endpoint: \"https://shop.example\", hosts: [shop.example]}\n");
+        assert_eq!(company_entries_moved(&base, &changed), ["companies.shop"]);
+        let removed = settings("");
+        assert_eq!(company_entries_moved(&base, &removed), ["companies.shop"]);
         let added = settings(&format!(
-            "{shop}{crm}  mall: {{kind: company, endpoint: \"https://mall.example\"}}\n"
+            "{shop}  mall: {{endpoint: \"https://mall.example\"}}\n"
         ));
-        assert_eq!(company_entries_moved(&base, &added), ["services.mall"]);
+        assert_eq!(company_entries_moved(&base, &added), ["companies.mall"]);
     }
 
     /// A reload that changes a per-person operator's rule — its uid, its

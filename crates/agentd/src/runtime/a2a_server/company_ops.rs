@@ -68,7 +68,7 @@ pub(super) fn handle(
             };
             let Some(company) = sup.company(name) else {
                 return Err(bad(format!(
-                    "{op}: {name:?} is not a company entry (services.<name>.kind: company)"
+                    "{op}: {name:?} is not a company entry (companies.<name>)"
                 )));
             };
             // The old User's Account Tokens first — every account's: nothing

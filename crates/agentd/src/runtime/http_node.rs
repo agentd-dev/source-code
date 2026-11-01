@@ -24,7 +24,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 impl crate::runtime::reactor::Runtime {
     /// Execute an `http` step (fields already rendered by `render_spec`).
     pub(crate) fn step_http(&mut self, run_id: &str, step_id: &str, spec: &Map<String, Value>) {
-        let url = spec
+        let mut url = spec
             .get("url")
             .and_then(Value::as_str)
             .unwrap_or_default()
@@ -45,26 +45,66 @@ impl crate::runtime::reactor::Runtime {
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_ascii_uppercase();
+        // The `http.endpoints` entry the step names, or the one its URL
+        // falls under (RFC 0055 §3.2). With a name, `url` may be a path
+        // under the entry's endpoint.
+        let entry = match spec.get("endpoint").and_then(Value::as_str) {
+            Some(name) => match self.settings.http.endpoints.get_key_value(name) {
+                Some((n, e)) => {
+                    if !url.contains("://") {
+                        url = join_url(&e.endpoint, &url);
+                    }
+                    if !crate::config::settings::endpoint_matches(&e.endpoint, &url) {
+                        self.finish_step_pub(
+                            run_id,
+                            step_id,
+                            StepStatus::Failed,
+                            None,
+                            Some(format!(
+                                "http: {url} is not under http.endpoints.{n} ({})",
+                                e.endpoint
+                            )),
+                            0,
+                        );
+                        return;
+                    }
+                    Some((n.clone(), e.clone()))
+                }
+                None => {
+                    self.finish_step_pub(
+                        run_id,
+                        step_id,
+                        StepStatus::Failed,
+                        None,
+                        Some(format!(
+                            "http: endpoint {name:?} is not an http.endpoints entry"
+                        )),
+                        0,
+                    );
+                    return;
+                }
+            },
+            None => self
+                .settings
+                .http
+                .matching(&url)
+                .map(|(n, e)| (n.clone(), e.clone())),
+        };
         // The `http` step is a covered egress surface. In `closed` mode the URL
-        // must match a `kind: http` service-catalog entry; a literal URL is
-        // judged at config load, but a templated one only resolves here, so the
-        // check has to run again at dial time. A matching entry's `methods:`
-        // list is a ceiling in either mode — declaring an endpoint for reads
-        // must not silently authorize writes to it.
+        // must match an `http.endpoints` entry; a literal URL is judged at
+        // config load, but a templated one only resolves here, so the check
+        // has to run again at dial time. A matching entry's `methods:` list is
+        // a ceiling in either mode — declaring an endpoint for reads must not
+        // silently authorize writes to it.
+        if let Err(e) = self
+            .settings
+            .egress_allows(crate::config::settings::EndpointKind::Http, &url)
         {
-            use crate::config::settings;
-            if let Err(e) = settings::egress_allows(
-                &self.settings.services,
-                self.settings.security.egress,
-                settings::ServiceKind::Http,
-                &url,
-            ) {
-                self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
-                return;
-            }
-            if let Some((name, entry)) =
-                settings::service_match(&self.settings.services, settings::ServiceKind::Http, &url)
-                && let Some(methods) = &entry.methods
+            self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+            return;
+        }
+        if let Some((name, e)) = &entry {
+            if let Some(methods) = &e.methods
                 && !methods.iter().any(|m| m == &method)
             {
                 self.finish_step_pub(
@@ -73,7 +113,25 @@ impl crate::runtime::reactor::Runtime {
                     StepStatus::Failed,
                     None,
                     Some(format!(
-                        "http: {method} is outside services.{name}.methods ({methods:?}) — the catalog's method ceiling"
+                        "http: {method} is outside http.endpoints.{name}.methods ({methods:?})"
+                    )),
+                    0,
+                );
+                return;
+            }
+            // A rated endpoint is paced within this process: a dry bucket
+            // fails the step, which its `retry:` absorbs.
+            if let Some(r) = &e.rate
+                && let Err(retry) =
+                    crate::mcp::pace::take_rated(&format!("http:{name}"), "http endpoint rate", r)
+            {
+                self.finish_step_pub(
+                    run_id,
+                    step_id,
+                    StepStatus::Failed,
+                    None,
+                    Some(format!(
+                        "http: http.endpoints.{name} rate exceeded ({r} paces this process); retry in ~{retry}s"
                     )),
                     0,
                 );
@@ -89,6 +147,14 @@ impl crate::runtime::reactor::Runtime {
                     .collect()
             })
             .unwrap_or_default();
+        // The entry's headers, under the step's own.
+        if let Some((_, e)) = &entry {
+            for (k, v) in &e.headers {
+                if !headers.iter().any(|(h, _)| h.eq_ignore_ascii_case(k)) {
+                    headers.push((k.clone(), v.clone()));
+                }
+            }
+        }
         // Resolve `{{secret:NAME}}` / `{{secret-file:PATH}}` references through the
         // redacting resolver — so an `Authorization: Bearer {{secret:API_TOKEN}}`
         // header (or the `sign` secret below) carries a real credential without it
@@ -224,7 +290,19 @@ impl crate::runtime::reactor::Runtime {
             .get("timeout")
             .and_then(crate::engine::model::duration_ms_opt)
             .map(Duration::from_millis)
+            .or_else(|| entry.as_ref().and_then(|(_, e)| e.timeout).map(|d| d.0))
             .unwrap_or(DEFAULT_TIMEOUT);
+        // The entry's credential, made in the call's thread: a token fetch
+        // never holds the loop.
+        #[cfg(feature = "oauth")]
+        let credential = entry.as_ref().and_then(|(name, e)| {
+            e.auth.as_ref().map(|a| {
+                (
+                    format!("http:{name}"),
+                    self.settings.auth_spec_at(a, &e.endpoint, false),
+                )
+            })
+        });
         let allow_private = spec
             .get("allow_private")
             .and_then(Value::as_bool)
@@ -285,7 +363,28 @@ impl crate::runtime::reactor::Runtime {
             .name("step:http".into())
             .spawn(move || {
                 let start = crate::obs::otel::now_unix_nanos();
-                let answered = request.send(&[]);
+                #[cfg(feature = "oauth")]
+                let signed = match &credential {
+                    Some((target, aspec)) => request.credential(target, aspec),
+                    None => Ok(Vec::new()),
+                };
+                #[cfg(not(feature = "oauth"))]
+                let signed: Result<Vec<(String, String)>, String> = Ok(Vec::new());
+                let signed = match signed {
+                    Ok(h) => h,
+                    Err(e) => {
+                        let _ = tx.send(super::events::Event::StepDone {
+                            run: r,
+                            step: s,
+                            output: Value::Null,
+                            is_error: true,
+                            error: Some(format!("http: credential: {e}")),
+                            tokens: 0,
+                        });
+                        return;
+                    }
+                };
+                let answered = request.send(&signed);
                 // A 402 that asks for a payment: the step's to make when it
                 // may pay, else its error (RFC 0049 D2).
                 let asked = answered
@@ -362,7 +461,46 @@ pub(crate) struct Request {
     pub hop: Option<crate::obs::trace::TraceContext>,
 }
 
+/// `path` under `base`: one `/` between them.
+fn join_url(base: &str, path: &str) -> String {
+    if path.is_empty() {
+        return base.to_string();
+    }
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
 impl Request {
+    /// The headers an `http.endpoints` entry's `auth` adds to this request,
+    /// cached and refreshed under `target` (`http:<name>`).
+    #[cfg(feature = "oauth")]
+    fn credential(
+        &self,
+        target: &str,
+        aspec: &crate::config::AuthSpec,
+    ) -> Result<Vec<(String, String)>, String> {
+        let signer = if aspec.kind == "aws" {
+            Some(crate::auth::aws::SigV4Signer::from_spec(aspec, target)?
+                as std::sync::Arc<dyn ::mcp::http::RequestSigner>)
+        } else {
+            crate::auth::device::signer_for(aspec, target, self.timeout)?
+        };
+        let Some(signer) = signer else {
+            return Ok(Vec::new());
+        };
+        let parsed = crate::net::http::Url::parse(&self.url).map_err(|e| e.to_string())?;
+        let authority = ::mcp::http::authority_of(&self.url);
+        let mut path = parsed.path.clone();
+        if !self.query.is_empty() {
+            path.push(if path.contains('?') { '&' } else { '?' });
+            path.push_str(&self.query);
+        }
+        signer.sign(&self.method, &authority, &path, &self.body)
+    }
+
     /// The URL as sent, its `query` appended: what a server's
     /// `resource.url` is held to.
     #[cfg(feature = "x402")]

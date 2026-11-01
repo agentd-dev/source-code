@@ -530,13 +530,13 @@ fn a_reload_that_only_adds_a_mirror_rechecks_the_stored_definitions() {
     );
 }
 
-/// A reload that changes only the service catalog still re-checks the
-/// definitions: an instance template's servers resolve against it, so a
-/// catalog entry gaining `egress` hands a stored consumer that spawns the
-/// template the other leg — and that reload leaves it out.
+/// A reload that changes only an operator server's tags still re-checks the
+/// definitions: an instance template's server that is the operator's counts
+/// at its tags, so the server gaining `egress` hands a stored consumer that
+/// spawns the template the other leg — and that reload leaves it out.
 #[cfg(all(feature = "hot-reload", feature = "a2a"))]
 #[test]
-fn a_reload_that_only_retags_a_service_rechecks_the_stored_definitions() {
+fn a_reload_that_only_retags_a_server_rechecks_the_stored_definitions() {
     let t = tempfile::tempdir().unwrap();
     let play = t.path().join("play.json");
     std::fs::write(
@@ -561,10 +561,10 @@ fn a_reload_that_only_retags_a_service_rechecks_the_stored_definitions() {
              lifecycle: {{run_until: drained}}\n\
              observability:\n  log_level: info\n\
              a2a: {{ listen: \"http://127.0.0.1:{a2a}\" }}\n\
-             services:\n  crm: {{kind: mcp, endpoint: \"https://crm.invalid/mcp\", tags: {{\"*\": [{tags}]}}}}\n\
+             mcp:\n  servers:\n    - {{name: crm, endpoint: \"https://crm.invalid/mcp\", connect: on_use, tags: {{\"*\": [{tags}]}}}}\n\
              streams:\n  inbox: {{}}\n\
              subagents:\n  templates:\n    desk:\n      instruction: |\n        The desk.\n        \
-             :::config{{id=s dialect=agentd/config}}\n        streams: {{inbox: {{retention: {{ max_events: 10 }}}}}}\n        mcp: {{servers: [{{name: crm, service: crm}}]}}\n        :::\n      \
+             :::config{{id=s dialect=agentd/config}}\n        streams: {{inbox: {{retention: {{ max_events: 10 }}}}}}\n        mcp: {{servers: [{{name: crm, endpoint: \"https://crm.invalid/mcp\"}}]}}\n        :::\n      \
              mirror_streams: [inbox]\n\
              workflows:\n\
              \x20 - name: tick\n    steps:\n      s: {{kind: schedule, every: 1h}}\n      f: {{kind: finish, depends_on: [s], status: completed}}\n",
@@ -579,7 +579,7 @@ fn a_reload_that_only_retags_a_service_rechecks_the_stored_definitions() {
         d.events("workflow.defined")
             .iter()
             .any(|e| e["name"] == "reader"),
-        "a mirrored stream into a sensitive service is two legs:\n{}",
+        "a mirrored stream into a sensitive server is two legs:\n{}",
         d.log()
     );
 

@@ -14,7 +14,7 @@
 //! references multiply costs one operation's worth at a time.
 //!
 //! A call names a method and a path. Unless it is an operation of the
-//! description, and one `services.<name>.api_allow` lists as `METHOD
+//! description, and one `companies.<name>.api_allow` lists as `METHOD
 //! /path-template`, it is refused unsent. Each segment of its path is read
 //! percent-decoded, and one that is `.` or `..`, or holds `/` or `\` once
 //! decoded, is refused: a server or a proxy before it may resolve either to
@@ -856,7 +856,7 @@ impl Supervisor {
             .contains(&Interface::Openapi)
         {
             return Err(unsent(format!(
-                "company {} does not use the Company's OpenAPI APIs (services.{}.interfaces lists no openapi)",
+                "company {} does not use the Company's OpenAPI APIs (companies.{}.interfaces lists no openapi)",
                 company.name, company.name
             )));
         }
@@ -916,7 +916,7 @@ impl Supervisor {
             })?;
             if v.openapi.len() > 1 {
                 return Err(CallError::Unsent(format!(
-                    "company {} lists {} OpenAPI APIs ({}) — name the server each one's operation tools are named under with services.{}.api_names",
+                    "company {} lists {} OpenAPI APIs ({}) — name the server each one's operation tools are named under with companies.{}.api_names",
                     company.name,
                     v.openapi.len(),
                     v.openapi
@@ -1199,7 +1199,7 @@ impl Supervisor {
         });
         if !allowed {
             return Err(refused(format!(
-                "{} is not in services.{name}.api_allow",
+                "{} is not in companies.{name}.api_allow",
                 op.name()
             )));
         }

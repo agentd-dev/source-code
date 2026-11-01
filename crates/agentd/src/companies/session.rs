@@ -97,7 +97,7 @@ pub struct Env<'a> {
     /// to.
     pub accounts: Option<&'a Accounts>,
     pub principal: &'a str,
-    /// `services.<name>.scopes`: a held Account Token is used for no more,
+    /// `companies.<name>.scopes`: a held Account Token is used for no more,
     /// and not at all when they admit none of its scopes ([`narrowed`]).
     pub ceiling: &'a [String],
     pub log: &'a Logger,

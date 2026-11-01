@@ -306,14 +306,9 @@ fn check_webhook(s: &Settings, modes: &[(String, &super::McpServer)], d: &mut Di
             srv.auth.is_some() || srv.oauth.is_some() || srv.aauth == Some(true),
             &srv.headers,
         );
-        let catalogued = srv
-            .service
-            .as_ref()
-            .and_then(|n| s.services.get(n))
-            .is_some_and(|svc| has(svc.auth.is_some(), &svc.headers));
-        if !own && !catalogued {
+        if !own {
             d.errors.push(format!(
-                "{at}.delivery: `webhook` needs a credential on mcp server {:?} (auth, oauth, aauth, an Authorization header, or a catalogued service with one) — a webhook subscription is keyed by the authenticated principal",
+                "{at}.delivery: `webhook` needs a credential on mcp server {:?} (auth, oauth, aauth, or an Authorization header) — a webhook subscription is keyed by the authenticated principal",
                 srv.name
             ));
         }

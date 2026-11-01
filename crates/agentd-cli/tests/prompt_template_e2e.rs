@@ -77,15 +77,15 @@ fn a_template_does_loops_and_conditions_on_any_build() {
     // Bare paths only — the case that must work WITHOUT `--features cel`,
     // which is also why the built-in default is written this way.
     let (code, log) = run_cfg(&format!(
-        "{BASE}services:\n\
-        \x20 a: {{ endpoint: \"https://a.example/mcp\", tags: {{ \"*\": [sensitive] }} }}\n\
-        \x20 b: {{ endpoint: \"https://b.example/mcp\" }}\n\
+        "{BASE}mcp:\n  servers:\n\
+        \x20   - {{ name: a, endpoint: \"https://a.example/mcp\", connect: on_use, tags: {{ \"*\": [sensitive] }} }}\n\
+        \x20   - {{ name: b, endpoint: \"https://b.example/mcp\", connect: on_use }}\n\
          context:\n\
         \x20 template: |\n\
         \x20   AGENT {{{{instance}}}}\n\
         \x20   {{{{instruction}}}}\n\
-        \x20   {{{{#if services}}}}SERVICES:{{{{/if}}}}\n\
-        \x20   {{{{#each services}}}}<{{{{@index}}}}:{{{{this.name}}}}:{{{{this.tags_text}}}}>{{{{/each}}}}\n\
+        \x20   {{{{#if endpoints}}}}ENDPOINTS:{{{{/if}}}}\n\
+        \x20   {{{{#each endpoints}}}}<{{{{@index}}}}:{{{{this.name}}}}:{{{{this.tags_text}}}}>{{{{/each}}}}\n\
         \x20   {{{{#if egress_closed}}}}CLOSED{{{{else}}}}OPEN{{{{/if}}}}\n\
          workflows:\n  - name: w\n    steps:\n\
         \x20     s: {{ kind: once }}\n\
@@ -98,7 +98,7 @@ fn a_template_does_loops_and_conditions_on_any_build() {
         "interpolation reached the model:\n{log}"
     );
     assert!(
-        log.contains("SERVICES:"),
+        log.contains("ENDPOINTS:"),
         "#if fired on a non-empty list:\n{log}"
     );
     assert!(
@@ -118,14 +118,14 @@ fn a_template_does_loops_and_conditions_on_any_build() {
 #[test]
 fn a_template_limits_a_list_with_cel() {
     let (code, log) = run_cfg(&format!(
-        "{BASE}services:\n\
-        \x20 a: {{ endpoint: \"https://a.example/mcp\" }}\n\
-        \x20 b: {{ endpoint: \"https://b.example/mcp\" }}\n\
-        \x20 c: {{ endpoint: \"https://c.example/mcp\" }}\n\
+        "{BASE}http:\n  endpoints:\n\
+        \x20   a: {{ endpoint: \"https://a.example\" }}\n\
+        \x20   b: {{ endpoint: \"https://b.example\" }}\n\
+        \x20   c: {{ endpoint: \"https://c.example\" }}\n\
          context:\n\
         \x20 template: |\n\
         \x20   {{{{instruction}}}}\n\
-        \x20   {{{{#each take(services, 2)}}}}<{{{{this.name}}}}>{{{{/each}}}}\n\
+        \x20   {{{{#each take(endpoints, 2)}}}}<{{{{this.name}}}}>{{{{/each}}}}\n\
          workflows:\n  - name: w\n    steps:\n\
         \x20     s: {{ kind: once }}\n\
         \x20     a: {{ kind: agent, depends_on: [s], instruction: \"hi\" }}\n\
@@ -144,7 +144,7 @@ fn a_template_limits_a_list_with_cel() {
 #[test]
 fn a_cel_template_is_refused_at_load_without_the_feature() {
     let (code, log) = validate(&format!(
-        "{BASE}context:\n  template: \"{{{{#each take(services, 2)}}}}x{{{{/each}}}}{{{{instruction}}}}\"\n"
+        "{BASE}context:\n  template: \"{{{{#each take(endpoints, 2)}}}}x{{{{/each}}}}{{{{instruction}}}}\"\n"
     ));
     assert_eq!(code, Some(2), "{log}");
     assert!(log.contains("'cel' build feature"), "{log}");
@@ -176,7 +176,7 @@ fn a_node_selects_a_named_template() {
 #[test]
 fn malformed_templates_and_unknown_references_are_refused_at_load() {
     for (tpl, want) in [
-        ("{{#each services}}oops", "unclosed block"),
+        ("{{#each endpoints}}oops", "unclosed block"),
         ("{{#while x}}{{/while}}", "unknown block tag"),
         ("{{ghost}}", "unknown reference"),
     ] {
@@ -217,11 +217,11 @@ fn the_default_orders_stable_sections_before_volatile_ones() {
             .unwrap_or_else(|| panic!("missing {needle}: {t}"))
     };
     let instruction = at("## Instruction");
-    let services = at("## Services");
+    let endpoints = at("## Endpoints");
     let signals = at("## Signals");
     let memory = at("## Memory");
     assert!(
-        instruction < services && services < signals && signals < memory,
-        "stable → volatile ordering: instruction {instruction}, services {services}, signals {signals}, memory {memory}"
+        instruction < endpoints && endpoints < signals && signals < memory,
+        "stable → volatile ordering: instruction {instruction}, endpoints {endpoints}, signals {signals}, memory {memory}"
     );
 }

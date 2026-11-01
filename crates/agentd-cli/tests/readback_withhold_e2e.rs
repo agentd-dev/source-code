@@ -1480,7 +1480,7 @@ fn a_run_a_peer_signals_or_messages_carries_its_text() {
 /// The root is judged by what it can hand its text on to, as a run is. With
 /// its own `subagent.run` and `subagent.send` disabled and only `sensitive`
 /// in its own reach, a workflow's `subagent` step can still spawn the
-/// instance template whose service holds `egress` — so the root holds both,
+/// instance template whose server holds `egress` — so the root holds both,
 /// and is withheld from.
 #[cfg(feature = "a2a")]
 #[test]
@@ -1492,9 +1492,9 @@ fn the_root_is_judged_by_what_it_can_hand_on() {
          f: {{kind: finish, depends_on: [c], status: completed}}\n",
         hold(true)
     );
-    let top = "services:\n  web: {kind: mcp, endpoint: \"https://web.invalid/mcp\", tags: {\"*\": [egress]}}\n\
+    let top = "mcp:\n  servers:\n    - {name: web, endpoint: \"https://web.invalid/mcp\", connect: on_use, tags: {\"*\": [egress]}}\n\
                subagents:\n  templates:\n    desk:\n      instruction: |\n        The desk.\n        \
-               :::config{id=m dialect=agentd/config}\n        mcp: {servers: [{name: web, service: web}]}\n        :::\n\
+               :::config{id=m dialect=agentd/config}\n        mcp: {servers: [{name: web, endpoint: \"https://web.invalid/mcp\"}]}\n        :::\n\
                tools:\n  disabled: [subagent.run, subagent.send]\n";
     let turns = json!([
         call("workflow.run", json!({"name": "hold", "wait": true})),

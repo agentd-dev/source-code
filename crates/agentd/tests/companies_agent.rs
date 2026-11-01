@@ -214,7 +214,7 @@ fn config(host: &Host, fake: &Fake, dir: &Path, extra: &str) -> agentd::config::
     let yaml = format!(
         "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\"}}\n\
          store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
-         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true{extra}}}\n",
+         companies:\n  shop: {{endpoint: \"{o}\", allow_private: true{extra}}}\n",
         ca = fixture("ca.pem").display(),
         h = host.origin,
         d = dir.display(),
@@ -707,7 +707,7 @@ fn a_company_tool_never_takes_a_bare_name() {
     let yaml = format!(
         "security:\n  companies:\n    client: {{id: \"https://agent.example/c.json\", name: A, key_file: \"{d}/k\"}}\n\
          store: {{kind: file, file: {{path: \"{d}/s\"}}}}\n\
-         services:\n  shop: {{kind: company, endpoint: \"https://example.com\"}}\n\
+         companies:\n  shop: {{endpoint: \"https://example.com\"}}\n\
          mcp:\n  servers:\n    - {{name: mail, endpoint: \"https://mail.example/mcp\"}}\n",
         d = dir.path().display()
     );
@@ -962,7 +962,7 @@ fn sealed_agent(
     let yaml = format!(
         "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\"}}\n    seal_key: \"{{{{secret-file:{k}}}}}\"\n\
          store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
-         services:\n  shop: {{kind: company, endpoint: \"{s}\", allow_private: true}}\n  travel: {{kind: company, endpoint: \"{t}\", allow_private: true}}\n",
+         companies:\n  shop: {{endpoint: \"{s}\", allow_private: true}}\n  travel: {{endpoint: \"{t}\", allow_private: true}}\n",
         ca = fixture("ca.pem").display(),
         h = h.origin,
         d = dir.display(),
@@ -1072,7 +1072,7 @@ fn signing_config(
     let yaml = format!(
         "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\"{client}}}\n    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n\
          store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
-         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true{signs_in}}}\n{top}",
+         companies:\n  shop: {{endpoint: \"{o}\", allow_private: true{signs_in}}}\n{top}",
         ca = fixture("ca.pem").display(),
         h = host.origin,
         d = dir.display(),
@@ -2506,7 +2506,7 @@ fn an_operation_outside_the_description_or_api_allow_or_its_schema_is_refused_un
         .unwrap_err();
     assert!(
         e.to_string()
-            .contains("GET /session is not in services.shop.api_allow"),
+            .contains("GET /session is not in companies.shop.api_allow"),
         "{e}"
     );
     let e = a
@@ -3265,7 +3265,7 @@ fn operating_with(
     let yaml = format!(
         "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\", extensions: [operations]}}\n{standing}\
          store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
-         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true{fields}}}\n",
+         companies:\n  shop: {{endpoint: \"{o}\", allow_private: true{fields}}}\n",
         ca = fixture("ca.pem").display(),
         h = host.origin,
         d = dir.display(),
@@ -4737,7 +4737,7 @@ fn operating_signed_on(
     let yaml = format!(
         "security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\", extensions: [operations]}}\n    seal_key: \"{{{{secret-file:{d}/seal}}}}\"\n{standing}\
          store: {{kind: file, file: {{path: \"{d}/state\"}}}}\n\
-         services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true, sign_in: [device], scopes: {BOTH}{fields}}}\n",
+         companies:\n  shop: {{endpoint: \"{o}\", allow_private: true, sign_in: [device], scopes: {BOTH}{fields}}}\n",
         ca = fixture("ca.pem").display(),
         h = h.origin,
         d = dir.display(),

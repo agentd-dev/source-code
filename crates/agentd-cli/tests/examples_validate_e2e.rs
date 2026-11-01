@@ -115,10 +115,6 @@ fn every_shipped_example_config_validates() {
         {
             continue;
         }
-        // A `services.yaml` beside it is a shared catalog, not a config: the
-        // desks that use it are meant to be run as `-c services.yaml -c
-        // <desk>.yaml`, and validating a desk alone reports every service it
-        // references as undeclared. Layer it exactly as the README does.
         // An example for a build with `exec` — left out of the release
         // set — is checked by a build that has it: this one refuses it.
         if !cfg!(feature = "exec")
@@ -138,11 +134,6 @@ fn every_shipped_example_config_validates() {
             == Some(serde_json::Value::Bool(true))
         {
             continue;
-        }
-        let catalog = f.with_file_name("services.yaml");
-        let layered = catalog.exists() && catalog != *f;
-        if !layered && f.file_name().is_some_and(|n| n == "services.yaml") {
-            continue; // the catalog on its own declares no agent
         }
         // A `<name>.<layer>.yaml` beside `<name>.yaml` is a layer over it: the
         // demos run as `-c <name>.yaml -c <name>.local.yaml` (the rehearsal),
@@ -179,18 +170,11 @@ fn every_shipped_example_config_validates() {
         // The coding-agent demo names its repository by `${REPO}`, with no
         // default on purpose (exec is confined to it): any directory will do.
         cmd.env("REPO", std::env::temp_dir());
-        if layered {
-            cmd.arg("-c").arg(&catalog);
-        }
         if let Some(b) = &base {
             cmd.arg("-c").arg(b);
         }
         cmd.arg("-c").arg(f);
-        let under: Vec<&PathBuf> = layered
-            .then_some(&catalog)
-            .into_iter()
-            .chain(base.as_ref())
-            .collect();
+        let under: Vec<&PathBuf> = base.iter().collect();
         for name in secret_names(&text).into_iter().chain(
             under
                 .iter()
@@ -276,11 +260,7 @@ fn the_roots_beside_a_tainted_route_keep_their_read_backs() {
         "hiring/actions.yaml",
     ] {
         let f = examples_root().join(rel);
-        let catalog = f.with_file_name("services.yaml");
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"));
-        if catalog.exists() {
-            cmd.arg("-c").arg(&catalog);
-        }
         let out = cmd
             .arg("-c")
             .arg(&f)
@@ -312,11 +292,7 @@ fn the_roots_beside_a_tainted_route_keep_their_read_backs() {
         {
             let mut cmd = Command::new(env!("CARGO_BIN_EXE_agentd"));
             cmd.arg("--validate-config");
-            let mut text = std::fs::read_to_string(&f).unwrap();
-            if catalog.exists() {
-                cmd.arg("-c").arg(&catalog);
-                text.push_str(&std::fs::read_to_string(&catalog).unwrap());
-            }
+            let text = std::fs::read_to_string(&f).unwrap();
             for name in secret_names(&text) {
                 cmd.env(name, "test-value");
             }

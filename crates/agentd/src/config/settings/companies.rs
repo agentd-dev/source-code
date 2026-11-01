@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Acting at Companies for a person (RFC 0047 §5.3): `security.companies` —
 //! the one User this instance acts for, its client identity, the seal key —
-//! and the fields a `services` entry of `kind: company` adds, among them the
+//! and the `companies.<name>` entries, with among their fields the
 //! sign-in types agentd may start with the User and the scopes it may ask
 //! for. Both are parsed whatever the build; without the `companies` feature
 //! they are refused by name.
@@ -18,7 +18,7 @@
 //! where each one lives is learned at discovery, and only the supervisor
 //! ever dials one.
 
-use super::{Diagnostics, Dur, McpServer, Secret, ServiceKind, Settings, StoreKind};
+use super::{Diagnostics, Dur, McpServer, Secret, Settings, StoreKind};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 
@@ -200,7 +200,7 @@ pub fn lists_operations(s: &Settings) -> bool {
 /// Whether a company entry has the stream `company.<name>`: its
 /// conversations' events go there when it uses `agent`, and its operations'
 /// final states when the Operations extension is listed.
-pub fn has_stream(s: &Settings, svc: &super::Service) -> bool {
+pub fn has_stream(s: &Settings, svc: &super::Company) -> bool {
     interfaces_of(svc).contains(&Interface::Agent) || lists_operations(s)
 }
 
@@ -252,7 +252,7 @@ impl Context {
 
 /// The context a company entry's messages carry: its own, over
 /// `security.companies.context`.
-pub fn context_of(s: &Settings, svc: &super::Service) -> Context {
+pub fn context_of(s: &Settings, svc: &super::Company) -> Context {
     let base = s.security.companies.context.clone().unwrap_or_default();
     match &svc.context {
         Some(c) => c.over(&base),
@@ -332,7 +332,7 @@ pub struct Limits {
     pub conversations: Option<u32>,
 }
 
-/// `services.<name>.privacy`.
+/// `companies.<name>.privacy`.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Privacy {
@@ -341,7 +341,7 @@ pub enum Privacy {
     Standard,
 }
 
-/// A sign-in type (`services.<name>.sign_in`, draft §4.4).
+/// A sign-in type (`companies.<name>.sign_in`, draft §4.4).
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SignIn {
@@ -366,23 +366,21 @@ impl SignIn {
 }
 
 /// The sign-in types `svc` lets agentd start, in its order.
-pub fn sign_in_of(svc: &super::Service) -> Vec<SignIn> {
+pub fn sign_in_of(svc: &super::Company) -> Vec<SignIn> {
     svc.sign_in.clone().unwrap_or_default()
 }
 
 /// Whether any Company may be signed in to directly: the callback is then
 /// served, and listed in the client metadata document's `redirect_uris`.
 pub fn signs_in_directly(s: &Settings) -> bool {
-    s.services
+    s.companies
         .values()
-        .any(|v| v.kind == ServiceKind::Company && sign_in_of(v).contains(&SignIn::Direct))
+        .any(|v| sign_in_of(v).contains(&SignIn::Direct))
 }
 
 /// Whether any Company lets agentd sign the User in.
 pub fn signs_in(s: &Settings) -> bool {
-    s.services
-        .values()
-        .any(|v| v.kind == ServiceKind::Company && !sign_in_of(v).is_empty())
+    s.companies.values().any(|v| !sign_in_of(v).is_empty())
 }
 
 /// One interface a Company lists that agentd may use.
@@ -408,7 +406,7 @@ impl Interface {
 }
 
 /// The interfaces a company entry uses: its own, or `[mcp]`.
-pub fn interfaces_of(svc: &super::Service) -> Vec<Interface> {
+pub fn interfaces_of(svc: &super::Company) -> Vec<Interface> {
     svc.interfaces
         .clone()
         .unwrap_or_else(|| vec![Interface::Mcp])
@@ -416,9 +414,9 @@ pub fn interfaces_of(svc: &super::Service) -> Vec<Interface> {
 
 /// Whether some company entry uses `interface`.
 pub fn any_uses(s: &Settings, interface: Interface) -> bool {
-    s.services
+    s.companies
         .values()
-        .any(|v| v.kind == ServiceKind::Company && interfaces_of(v).contains(&interface))
+        .any(|v| interfaces_of(v).contains(&interface))
 }
 
 /// The `company.*` tools that reach a Company's agent in a conversation.
@@ -474,12 +472,11 @@ pub fn stream_of(entry: &str) -> String {
 pub fn interface_tags(s: &Settings) -> Vec<crate::sec::scope::TrifectaTag> {
     let mut out = Vec::new();
     let operations = lists_operations(s);
-    for svc in s.services.values().filter(|v| {
-        v.kind == ServiceKind::Company
-            && (operations
-                || interfaces_of(v)
-                    .iter()
-                    .any(|i| matches!(i, Interface::Agent | Interface::Openapi)))
+    for svc in s.companies.values().filter(|v| {
+        operations
+            || interfaces_of(v)
+                .iter()
+                .any(|i| matches!(i, Interface::Agent | Interface::Openapi))
     }) {
         for t in entry_tags(svc) {
             if !out.contains(&t) {
@@ -492,7 +489,7 @@ pub fn interface_tags(s: &Settings) -> Vec<crate::sec::scope::TrifectaTag> {
 
 /// The tags every channel to a company entry carries: its own, or
 /// [`default_tags`].
-pub fn entry_tags(svc: &super::Service) -> Vec<crate::sec::scope::TrifectaTag> {
+pub fn entry_tags(svc: &super::Company) -> Vec<crate::sec::scope::TrifectaTag> {
     let tags = if svc.tags.is_empty() {
         default_tags()
     } else {
@@ -598,7 +595,7 @@ pub fn host_matches(pattern: &str, host: &str) -> bool {
 
 /// The MCP servers a company entry stands for, by name, with the `url` each
 /// one is when `mcp_names` names them.
-pub fn server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<String>)> {
+pub fn server_names(name: &str, svc: &super::Company) -> Vec<(String, Option<String>)> {
     if !interfaces_of(svc).contains(&Interface::Mcp) {
         return Vec::new();
     }
@@ -616,7 +613,7 @@ pub fn server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<Str
 /// named after the entry — `<entry>_api` when the entry's own MCP server has
 /// that name — or one per `api_names` value; none unless the entry uses
 /// `openapi` and `api_allow` lists an operation.
-pub fn api_server_names(name: &str, svc: &super::Service) -> Vec<(String, Option<String>)> {
+pub fn api_server_names(name: &str, svc: &super::Company) -> Vec<(String, Option<String>)> {
     if !interfaces_of(svc).contains(&Interface::Openapi)
         || svc.api_allow.as_ref().is_none_or(Vec::is_empty)
     {
@@ -663,7 +660,7 @@ pub fn operation_name(op: &str) -> String {
 
 /// Each operation `svc`'s `api_allow` lists, as its tool's name within its
 /// server ([`operation_name`]) and the entry as written, in its order.
-pub fn operations_of(svc: &super::Service) -> Vec<(String, String)> {
+pub fn operations_of(svc: &super::Company) -> Vec<(String, String)> {
     svc.api_allow
         .iter()
         .flatten()
@@ -719,7 +716,7 @@ pub fn api_tool_names(s: &Settings, server: &str) -> Vec<String> {
         .find(|x| x.name == server)
         .and_then(|x| x.company.as_ref())
         .filter(|c| c.interface == Interface::Openapi)
-        .and_then(|c| s.services.get(&c.entry))
+        .and_then(|c| s.companies.get(&c.entry))
         .map(|svc| {
             operations_of(svc)
                 .into_iter()
@@ -745,18 +742,15 @@ pub fn api_tool_names(s: &Settings, server: &str) -> Vec<String> {
 pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
     let mut added: Vec<McpServer> = Vec::new();
     let mut streams = Vec::new();
-    for (entry, svc) in &s.services {
-        if svc.kind == ServiceKind::Company && has_stream(s, svc) {
+    for (entry, svc) in &s.companies {
+        if has_stream(s, svc) {
             streams.push(stream_of(entry));
         }
     }
     for stream in streams {
         s.streams.entry(stream).or_default();
     }
-    for (entry, svc) in &s.services {
-        if svc.kind != ServiceKind::Company {
-            continue;
-        }
+    for (entry, svc) in &s.companies {
         let servers = server_names(entry, svc)
             .into_iter()
             .map(|(n, u)| (n, u, Interface::Mcp));
@@ -782,14 +776,14 @@ pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
             if let Some(other) = taken {
                 errs.push(match &other.company {
                     Some(c) if c.entry == *entry => format!(
-                        "services.{entry}: {what} {server:?} has the name of another of its own servers — name them apart with api_names or mcp_names"
+                        "companies.{entry}: {what} {server:?} has the name of another of its own servers — name them apart with api_names or mcp_names"
                     ),
                     Some(c) => format!(
-                        "services.{entry}: {what} {server:?} has the name company entry '{}' gives one of its own — name them apart with {names}",
+                        "companies.{entry}: {what} {server:?} has the name company entry '{}' gives one of its own — name them apart with {names}",
                         c.entry
                     ),
                     None => format!(
-                        "services.{entry}: {what} {server:?} has the name of mcp server '{server}' — rename one ({names} names a Company's servers)"
+                        "companies.{entry}: {what} {server:?} has the name of mcp server '{server}' — rename one ({names} names a Company's servers)"
                     ),
                 });
                 continue;
@@ -802,8 +796,9 @@ pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
             added.push(McpServer {
                 name: server.clone(),
                 endpoint: String::new(),
-                service: Some(entry.clone()),
-                service_rate: svc.rate.clone().filter(|_| mcp),
+                rate: svc.rate.clone().filter(|_| mcp),
+                breaker: None,
+                connect: super::Connect::Boot,
                 ns: Some(server.clone()),
                 headers: BTreeMap::new(),
                 tags,
@@ -831,7 +826,7 @@ pub(super) fn synthesize(s: &mut Settings, errs: &mut Vec<String>) {
 
 /// Whether `s` declares any Company.
 pub fn any_company(s: &Settings) -> bool {
-    s.services.values().any(|v| v.kind == ServiceKind::Company)
+    !s.companies.is_empty()
 }
 
 /// The names of the MCP servers that are a Company's.
@@ -906,12 +901,13 @@ pub fn workflow_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Ve
                     .and_then(|a| a.get("company"))
                     .and_then(serde_json::Value::as_str)
                 && !name.contains("{{")
-                && !s.services.get(name).is_some_and(|v| {
-                    v.kind == ServiceKind::Company && interfaces_of(v).contains(&Interface::Openapi)
-                })
+                && !s
+                    .companies
+                    .get(name)
+                    .is_some_and(|v| interfaces_of(v).contains(&Interface::Openapi))
             {
                 out.push(format!(
-                    "workflow {wf:?} step {id:?}: auth.company {name:?} is not a company entry that uses `openapi` (services.<name>.interfaces)"
+                    "workflow {wf:?} step {id:?}: auth.company {name:?} is not a company entry that uses `openapi` (companies.<name>.interfaces)"
                 ));
             }
             // The User's account it acts with, by label; a templated one is
@@ -957,7 +953,7 @@ pub fn unknown_operation_tool(s: &Settings, pattern: &str) -> Option<String> {
             .any(|t| crate::registry::pattern_matches(pattern, t)))
         .then(|| {
             format!(
-                "{pattern:?} names no operation tool of company entry {}: each is named after an operation services.{}.api_allow lists ({})",
+                "{pattern:?} names no operation tool of company entry {}: each is named after an operation companies.{}.api_allow lists ({})",
                 c.entry,
                 c.entry,
                 tools.join(", ")
@@ -1020,44 +1016,14 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     let mut err = |m: String| d.errors.push(m);
     let c = &s.security.companies;
     let declared = c != &Companies::default();
-    let entries: Vec<(&String, &super::Service)> = s
-        .services
-        .iter()
-        .filter(|(_, v)| v.kind == ServiceKind::Company)
-        .collect();
-    // Every other kind keeps the vocabulary it had.
-    for (name, svc) in s
-        .services
-        .iter()
-        .filter(|(_, v)| v.kind != ServiceKind::Company)
-    {
-        for (set, what) in [
-            (svc.hosts.is_some(), "hosts"),
-            (svc.allow_private.is_some(), "allow_private"),
-            (svc.interfaces.is_some(), "interfaces"),
-            (!svc.mcp_names.is_empty(), "mcp_names"),
-            (!svc.api_names.is_empty(), "api_names"),
-            (svc.privacy.is_some(), "privacy"),
-            (svc.sign_in.is_some(), "sign_in"),
-            (svc.scopes.is_some(), "scopes"),
-            (svc.api_allow.is_some(), "api_allow"),
-            (svc.context.is_some(), "context"),
-        ] {
-            if set {
-                err(format!(
-                    "services.{name}: `{what}` applies to `kind: company` entries only (this entry is `kind: {}`)",
-                    svc.kind.as_str()
-                ));
-            }
-        }
-    }
+    let entries: Vec<(&String, &super::Company)> = s.companies.iter().collect();
     if !cfg!(feature = "companies") {
         if declared {
             err("security.companies needs the `companies` feature (build with --features companies)".into());
         }
         for (name, _) in &entries {
             err(format!(
-                "services.{name}: `kind: company` needs the `companies` feature (build with --features companies)"
+                "companies.{name}: a company entry needs the `companies` feature (build with --features companies)"
             ));
         }
         return;
@@ -1087,7 +1053,7 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     // The client identity.
     match &c.client {
         None if !entries.is_empty() => err(
-            "security.companies.client is required with a `kind: company` entry: it is who agentd is to every Company (id, name)".into(),
+            "security.companies.client is required with a company entry: it is who agentd is to every Company (id, name)".into(),
         ),
         None => {}
         Some(cl) => validate_client(s, cl, &mut err),
@@ -1112,7 +1078,7 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
         validate_context("security.companies.context", ctx, &mut err);
         if !any_uses(s, Interface::Agent) {
             err(
-                "security.companies.context: no company entry uses `agent` (services.<name>.interfaces), so no conversation would carry it".into(),
+                "security.companies.context: no company entry uses `agent` (companies.<name>.interfaces), so no conversation would carry it".into(),
             );
         }
     }
@@ -1152,7 +1118,7 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
             if s.store.kind == StoreKind::None { "none" } else { "memory" }
         )),
         StoreKind::Mcp | StoreKind::Http if !c.sealed() => err(
-            "a `kind: company` entry with a remote store (store.kind mcp or http) needs security.companies.seal_key (or key_custody: external), so the store holds the User IDs sealed".into(),
+            "a company entry with a remote store (store.kind mcp or http) needs security.companies.seal_key (or key_custody: external), so the store holds the User IDs sealed".into(),
         ),
         _ => {}
     }
@@ -1171,7 +1137,7 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
         && !c.sealed()
     {
         err(format!(
-            "services.{first}.sign_in needs security.companies.seal_key (or key_custody: external): the Account Token a sign-in gives agentd is kept only sealed with it"
+            "companies.{first}.sign_in needs security.companies.seal_key (or key_custody: external): the Account Token a sign-in gives agentd is kept only sealed with it"
         ));
     }
     let direct = entries
@@ -1181,7 +1147,7 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
         && !cl.serve
     {
         err(format!(
-            "services.{name}.sign_in: direct returns the User to the callback at security.companies.client.redirect_uri, which agentd serves only with client.serve: true"
+            "companies.{name}.sign_in: direct returns the User to the callback at security.companies.client.redirect_uri, which agentd serves only with client.serve: true"
         ));
     }
     // What else names a server must not name a Company's: its tools are
@@ -1341,20 +1307,23 @@ pub fn path_of(url: &str) -> String {
     }
 }
 
-fn validate_entry(name: &str, svc: &super::Service, err: &mut impl FnMut(String)) {
-    let at = format!("services.{name}");
-    // The protocol defines a Company's credential (§4.1–§4.3).
-    for (set, what) in [
-        (svc.auth.is_some(), "auth"),
-        (!svc.headers.is_empty(), "headers"),
-        (svc.methods.is_some(), "methods"),
-        (svc.breaker.is_some(), "breaker"),
-    ] {
-        if set {
+fn validate_entry(name: &str, svc: &super::Company, err: &mut impl FnMut(String)) {
+    let at = format!("companies.{name}");
+    for t in svc.tags.values().flatten() {
+        if t == crate::sec::scope::TRUSTED {
+            // What a Company says is its text, whatever its entry is tagged
+            // (§6.3).
             err(format!(
-                "{at}: `{what}` does not apply to a `kind: company` entry — the protocol defines how agentd authenticates there"
+                "{at}: `trusted` marks an MCP server's results; a Company's content is outside text whatever its entry says"
             ));
+        } else if crate::sec::scope::TrifectaTag::parse(t).is_none() {
+            err(format!("{at} has unknown trifecta tag '{t}'"));
         }
+    }
+    if let Some(r) = &svc.rate
+        && let Err(e) = crate::supervisor::tree::parse_rate(r)
+    {
+        err(format!("{at}.rate: {e}"));
     }
     // A domain, not a document: the discovery document's place is the
     // protocol's (§3).
@@ -1496,8 +1465,8 @@ fn validate_entry(name: &str, svc: &super::Service, err: &mut impl FnMut(String)
 /// `api_names` names them under: each operation listed once, no two named
 /// alike, every server name one, and no key of `tags` naming an operation
 /// tool the entry has not.
-fn validate_operations(name: &str, svc: &super::Service, err: &mut impl FnMut(String)) {
-    let at = format!("services.{name}");
+fn validate_operations(name: &str, svc: &super::Company, err: &mut impl FnMut(String)) {
+    let at = format!("companies.{name}");
     let ops: Vec<(String, String)> = operations_of(svc);
     for (i, (tool, op)) in ops.iter().enumerate() {
         let Ok((method, template)) = parse_operation(op) else {
@@ -1580,13 +1549,10 @@ fn validate_standing(s: &Settings, at: &str, st: &Standing, err: &mut impl FnMut
             "{at}: a standing permission confirms operations, which agentd recognises only once security.companies.client.extensions lists operations"
         ));
     }
-    let entry = s
-        .services
-        .get(&st.company)
-        .filter(|v| v.kind == ServiceKind::Company);
+    let entry = s.companies.get(&st.company);
     let Some(svc) = entry else {
         err(format!(
-            "{at}.company: {:?} is not a company entry (services.<name>.kind: company)",
+            "{at}.company: {:?} is not a company entry (companies.<name>)",
             st.company
         ));
         return;
@@ -1609,7 +1575,7 @@ fn validate_standing(s: &Settings, at: &str, st: &Standing, err: &mut impl FnMut
                 ));
             } else if servers.is_empty() {
                 err(format!(
-                    "{at}.via.tool: company {name} uses none of its MCP servers (services.{name}.interfaces lists no mcp)"
+                    "{at}.via.tool: company {name} uses none of its MCP servers (companies.{name}.interfaces lists no mcp)"
                 ));
             } else if !servers
                 .iter()
@@ -1634,7 +1600,7 @@ fn validate_standing(s: &Settings, at: &str, st: &Standing, err: &mut impl FnMut
                 });
                 if !allowed {
                     err(format!(
-                        "{at}.via.api: {api:?} is not in services.{name}.api_allow, so agentd never calls it"
+                        "{at}.via.api: {api:?} is not in companies.{name}.api_allow, so agentd never calls it"
                     ));
                 }
             }
@@ -1802,9 +1768,7 @@ mod tests {
     const STORE: &str = "store: {kind: file, file: {path: __DIR__}}\n";
 
     fn company(extra: &str) -> String {
-        format!(
-            "{CLIENT}{STORE}services:\n  shop: {{kind: company, endpoint: \"https://example.com\"{extra}}}\n"
-        )
+        format!("{CLIENT}{STORE}companies:\n  shop: {{endpoint: \"https://example.com\"{extra}}}\n")
     }
 
     /// A company entry stands for one MCP server named after it: `ns` its own
@@ -1901,14 +1865,9 @@ mod tests {
             &company("").replace("\"https://example.com\"", "\"https://example.com/shop\""),
             "a path is refused",
         );
+        refused(&company(", headers: {X-A: b}"), "unknown field `headers`");
         refused(
-            &company(", headers: {X-A: b}"),
-            "`headers` does not apply to a `kind: company` entry",
-        );
-        refused(
-            &format!(
-                "{STORE}services:\n  shop: {{kind: company, endpoint: \"https://example.com\"}}\n"
-            ),
+            &format!("{STORE}companies:\n  shop: {{endpoint: \"https://example.com\"}}\n"),
             "security.companies.client is required",
         );
         refused(
@@ -1948,19 +1907,6 @@ mod tests {
         refused(
             &company(", hosts: [\"https://example.com\"]"),
             "is not a host or a `*.<host>` glob",
-        );
-        refused(
-            &format!(
-                "{CLIENT}{STORE}services:\n  m: {{kind: mcp, endpoint: \"https://m.example/mcp\", hosts: [m.example]}}\n"
-            ),
-            "`hosts` applies to `kind: company` entries only",
-        );
-        refused(
-            &format!(
-                "{}mcp:\n  servers:\n    - {{name: x, service: shop}}\n",
-                company("")
-            ),
-            "which is `kind: company`",
         );
         refused(
             &format!("{}knowledge: {{server: shop}}\n", company("")),
@@ -2134,11 +2080,11 @@ mod tests {
         };
         refused(
             &sealed(", sign_in: [device, mediated]"),
-            "services.shop.sign_in: mediated is not supported — the User would hand agentd their password through a gate",
+            "companies.shop.sign_in: mediated is not supported — the User would hand agentd their password through a gate",
         );
         refused(
             &company(", sign_in: [device], scopes: [\"poppy:read\"]"),
-            "services.shop.sign_in needs security.companies.seal_key",
+            "companies.shop.sign_in needs security.companies.seal_key",
         );
         refused(
             &sealed(", sign_in: [direct], scopes: [\"poppy:read\"]"),
@@ -2158,7 +2104,7 @@ mod tests {
         );
         refused(
             &sealed(", sign_in: [device]"),
-            "services.shop.sign_in needs services.shop.scopes",
+            "companies.shop.sign_in needs companies.shop.scopes",
         );
         refused(
             &sealed(", sign_in: [device], scopes: [\"poppy:read\"]").replace(
@@ -2167,12 +2113,6 @@ mod tests {
             ),
             "client.redirect_uri: \"https://elsewhere.example/cb\" is not on the client_id's host",
         );
-        refused(
-            &format!(
-                "{CLIENT}{STORE}services:\n  m: {{kind: mcp, endpoint: \"https://m.example/mcp\", sign_in: [device]}}\n"
-            ),
-            "`sign_in` applies to `kind: company` entries only",
-        );
         let s = load_sealed(&sealed(", sign_in: [device], scopes: [\"poppy:read\"]")).unwrap();
         let cl = s.security.companies.client.as_ref().unwrap();
         assert_eq!(
@@ -2180,7 +2120,7 @@ mod tests {
             "https://agent.example/companies/callback"
         );
         assert!(signs_in(&s) && !signs_in_directly(&s));
-        assert_eq!(sign_in_of(&s.services["shop"]), [SignIn::Device]);
+        assert_eq!(sign_in_of(&s.companies["shop"]), [SignIn::Device]);
     }
 
     /// An entry that uses a Company's agent and its APIs: what load takes —
@@ -2205,7 +2145,7 @@ mod tests {
             "no MCP server without mcp; the server its operation tools are named under"
         );
         assert!(is_api_server(&s, "shop"));
-        let ctx = context_of(&s, &s.services["shop"]);
+        let ctx = context_of(&s, &s.companies["shop"]);
         assert_eq!(ctx.locale.as_deref(), Some("en-US"));
         assert_eq!(
             ctx.time_zone.as_deref(),
@@ -2229,7 +2169,7 @@ mod tests {
         };
         refused(
             &company(", api_allow: [\"GET /orders\"]"),
-            "services.shop.api_allow: the OpenAPI operations agentd may call apply when the entry uses `openapi`",
+            "companies.shop.api_allow: the OpenAPI operations agentd may call apply when the entry uses `openapi`",
         );
         refused(
             &company(", interfaces: [openapi], api_allow: [\"get /orders\"]"),
@@ -2245,22 +2185,22 @@ mod tests {
         );
         refused(
             &company(", context: {locale: en-US}"),
-            "services.shop.context: a conversation's context applies when the entry uses `agent`",
+            "companies.shop.context: a conversation's context applies when the entry uses `agent`",
         );
         // What shapes only the Company's MCP servers, without them.
         for (field, why) in [
             (
                 ", rate: \"30/60s\"",
-                "services.shop.rate: it shapes the Company's MCP servers",
+                "companies.shop.rate: it shapes the Company's MCP servers",
             ),
-            (", allow: [\"orders_*\"]", "services.shop.allow: it shapes"),
+            (", allow: [\"orders_*\"]", "companies.shop.allow: it shapes"),
             (
                 ", exclude: [\"cancel_*\"]",
-                "services.shop.exclude: it shapes",
+                "companies.shop.exclude: it shapes",
             ),
             (
                 ", mcp_names: {\"https://example.com/mcp\": search}",
-                "services.shop.mcp_names: it shapes",
+                "companies.shop.mcp_names: it shapes",
             ),
         ] {
             refused(
@@ -2288,12 +2228,6 @@ mod tests {
                 "name: Agent}\n    limits: {conversations: 0}",
             ),
             "limits.conversations: 0 would let no conversation open",
-        );
-        refused(
-            &format!(
-                "{CLIENT}{STORE}services:\n  m: {{kind: mcp, endpoint: \"https://m.example/mcp\", api_allow: [\"GET /x\"]}}\n"
-            ),
-            "`api_allow` applies to `kind: company` entries only",
         );
         // An `http` step reaches a Company's API only at an entry that uses
         // `openapi`, and names no credential, body or host rule of its own.
@@ -2429,7 +2363,7 @@ mod tests {
                 &rule(", via: {api: \"POST /orders/{id}/returns\"}"),
                 ", interfaces: [openapi], api_allow: [\"POST /orders/{order_id}/exchanges\"]",
             ),
-            "standing[0].via.api: \"POST /orders/{id}/returns\" is not in services.shop.api_allow",
+            "standing[0].via.api: \"POST /orders/{id}/returns\" is not in companies.shop.api_allow",
         );
         refused(
             &with(
@@ -2740,7 +2674,7 @@ mod tests {
             &company(
                 ", interfaces: [mcp, openapi], api_allow: [\"POST /notes\"], api_names: {\"https://example.com/openapi.json\": shop}",
             ),
-            "services.shop: the server its operation tools are named under \"shop\" has the name of another of its own servers — name them apart with api_names or mcp_names",
+            "companies.shop: the server its operation tools are named under \"shop\" has the name of another of its own servers — name them apart with api_names or mcp_names",
         );
         refused(
             &format!(
@@ -2751,11 +2685,11 @@ mod tests {
         );
         refused(
             &company(", interfaces: [mcp], api_names: {\"https://example.com/o.json\": o}"),
-            "services.shop.api_names: it names the servers the Company's OpenAPI operation tools are named under, and the entry does not use `openapi`",
+            "companies.shop.api_names: it names the servers the Company's OpenAPI operation tools are named under, and the entry does not use `openapi`",
         );
         refused(
             &company(", interfaces: [openapi], api_names: {\"https://example.com/o.json\": o}"),
-            "services.shop.api_names: services.shop.api_allow lists no operation",
+            "companies.shop.api_names: companies.shop.api_allow lists no operation",
         );
         refused(
             &ops(
@@ -2765,27 +2699,27 @@ mod tests {
         );
         refused(
             &ops(", api_names: {\"https://example.com/p.json\": code}"),
-            "services.shop.api_names: \"code\" is not a server name",
+            "companies.shop.api_names: \"code\" is not a server name",
         );
         refused(
             &ops(
                 ", api_names: {\"https://example.com/o.json\": o, \"https://example.com/p.json\": o}",
             ),
-            "services.shop.api_names: two OpenAPI APIs are both named \"o\"",
+            "companies.shop.api_names: two OpenAPI APIs are both named \"o\"",
         );
         refused(
             &company(
                 ", interfaces: [openapi], api_allow: [\"GET /orders/{order_id}\", \"GET /orders/{id}\"]",
             ),
-            "services.shop.api_allow: \"GET /orders/{order_id}\" and \"GET /orders/{id}\" name the same operation",
+            "companies.shop.api_allow: \"GET /orders/{order_id}\" and \"GET /orders/{id}\" name the same operation",
         );
         refused(
             &company(", interfaces: [openapi], api_allow: [\"GET /a-b\", \"GET /a_b\"]"),
-            "services.shop.api_allow: \"GET /a-b\" and \"GET /a_b\" both make the operation tool name \"get_a_b\"",
+            "companies.shop.api_allow: \"GET /a-b\" and \"GET /a_b\" both make the operation tool name \"get_a_b\"",
         );
         refused(
             &ops(", tags: {\"*\": [untrusted_input], \"shop.get_order\": [egress]}"),
-            "services.shop.tags: \"shop.get_order\" names no operation tool of \"shop\" — its tools are shop.get_orders_order_id, shop.post_notes",
+            "companies.shop.tags: \"shop.get_order\" names no operation tool of \"shop\" — its tools are shop.get_orders_order_id, shop.post_notes",
         );
         load(&ops(
             ", tags: {\"*\": [untrusted_input], \"shop.post_*\": [egress]}",
@@ -2825,7 +2759,7 @@ mod tests {
     fn a_company_needs_the_feature() {
         let e = load(&company("")).unwrap_err();
         assert!(
-            e.contains("`kind: company` needs the `companies` feature"),
+            e.contains("a company entry needs the `companies` feature"),
             "{e}"
         );
     }

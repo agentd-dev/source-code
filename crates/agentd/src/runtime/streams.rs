@@ -810,7 +810,7 @@ impl crate::runtime::reactor::Runtime {
             step_id,
             trace,
         } = *ev;
-        let timeout = std::time::Duration::from_secs(30);
+        let timeout = self.peer_timeout(peer, std::time::Duration::from_secs(30));
         let (endpoint, mut auth) = match self.a2a_peer_conn_pub(peer, timeout, "stream forward") {
             Ok(v) => v,
             Err(e) => {
@@ -896,12 +896,10 @@ impl crate::runtime::reactor::Runtime {
             trace,
         } = *ev;
         use crate::config::settings;
-        if let Err(e) = settings::egress_allows(
-            &self.settings.services,
-            self.settings.security.egress,
-            settings::ServiceKind::Http,
-            url,
-        ) {
+        if let Err(e) = self
+            .settings
+            .egress_allows(settings::EndpointKind::Http, url)
+        {
             self.run_log(run_id).warn(
                 "stream.forward.refused",
                 json!({"run": run_id, "step": step_id, "stream": stream, "err": e}),

@@ -548,6 +548,11 @@ impl Runtime {
                         }
                         self.suspend_wait(run_id, step_id, wait_record("resource", json!({"server": server, "uri": uri}), timeout));
                     }
+                    // An on-use server is dialed now; its join subscribes
+                    // the waits on it, this one among them.
+                    None if self.want_server(&server) => {
+                        self.suspend_wait(run_id, step_id, wait_record("resource", json!({"server": server, "uri": uri}), timeout));
+                    }
                     None => self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(format!("wait resource: server {server:?} is not connected")), 0),
                 }
             }
@@ -1893,6 +1898,18 @@ impl Runtime {
     /// ~140 lines of credential plumbing that must not diverge between the two.
     /// [`Runtime::a2a_peer_conn`] for callers outside this module — a stream
     /// `forward: {peer:}` resolves a peer exactly as a delegate does.
+    /// A configured peer's `timeout`, else `default`.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn peer_timeout(&self, peer: &str, default: Duration) -> Duration {
+        self.settings
+            .a2a
+            .peers
+            .iter()
+            .find(|p| p.name == peer)
+            .and_then(|p| p.timeout)
+            .map_or(default, |d| d.0)
+    }
+
     #[cfg(feature = "a2a")]
     pub(crate) fn a2a_peer_conn_pub(
         &self,
@@ -1946,8 +1963,9 @@ impl Runtime {
                     crate::config::settings::A2aPeer {
                         name: peer_name.to_string(),
                         endpoint,
-                        service: None,
                         headers: std::collections::BTreeMap::new(),
+                        rate: None,
+                        timeout: None,
                         client_cert: None,
                         client_key: None,
                         auth: None,
@@ -1961,6 +1979,17 @@ impl Runtime {
                 }
             },
         };
+        // A rated peer is paced within this process: a dry bucket refuses the
+        // send, which a step's `retry:` absorbs.
+        if let Some(r) = &peer.rate
+            && let Err(retry) =
+                crate::mcp::pace::take_rated(&format!("a2a:{}", peer.name), "a2a peer rate", r)
+        {
+            return Err(format!(
+                "{what}: a2a peer '{}' rate exceeded ({r} paces this process); retry in ~{retry}s",
+                peer.name
+            ));
+        }
         let spec = crate::config::A2aPeerSpec {
             name: peer.name.clone(),
             endpoint: peer.endpoint.clone(),
@@ -1987,14 +2016,9 @@ impl Runtime {
         #[cfg(feature = "oauth")]
         if let Some(a) = &peer.auth {
             let aspec = self.settings.auth_spec_at(a, &peer.endpoint, false);
-            // A peer that names a catalog `service:` caches its credential
-            // under `service:<entry>`, shared with every other consumer of that
-            // entry, so one `agentd --login service:<entry>` serves them all.
-            // Without one the cache is private to this peer's name.
-            let target = match &peer.service {
-                Some(svc) => format!("service:{svc}"),
-                None => format!("a2a:{}", peer.name),
-            };
+            // A peer's credential is cached under `a2a:<name>`, the target
+            // `agentd --login a2a:<name>` writes.
+            let target = format!("a2a:{}", peer.name);
             if aspec.kind == "aws" {
                 let s = crate::auth::aws::SigV4Signer::from_spec(&aspec, &target)
                     .map_err(|e| format!("{what}: peer aws auth: {e}"))?;
@@ -2122,7 +2146,7 @@ impl Runtime {
             .get("timeout")
             .and_then(crate::engine::model::duration_ms_opt)
             .map(Duration::from_millis)
-            .unwrap_or(Duration::from_secs(30));
+            .unwrap_or_else(|| self.peer_timeout(&peer_name, Duration::from_secs(30)));
         let paying = spec.contains_key("payment");
         if self.a2a_payment_refused(paying, run_id, step_id, "a2a.send") {
             return;
@@ -2408,7 +2432,7 @@ impl Runtime {
             .get("timeout")
             .and_then(crate::engine::model::duration_ms_opt)
             .map(Duration::from_millis)
-            .unwrap_or(Duration::from_secs(120));
+            .unwrap_or_else(|| self.peer_timeout(&peer_name, Duration::from_secs(120)));
         let paying = spec.contains_key("payment");
         if self.a2a_payment_refused(paying, run_id, step_id, "a2a.delegate") {
             return;

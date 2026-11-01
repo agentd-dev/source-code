@@ -69,8 +69,8 @@ pub struct CompiledTemplate {
 /// template sets the child's model and token ceiling with its own `model:` and
 /// `budget:` fields, and its retirement with `until:` and `ttl:`.
 ///
-/// The other two the parent composes — `security` and `services` — are wholly
-/// `OPERATOR_ONLY`, so the shared check refuses them first.
+/// The other one the parent composes — `security` — is wholly
+/// `OPERATOR_ONLY`, so the shared check refuses it first.
 const CHILD_COMPOSED_SECTIONS: &[&str] = &["a2a", "intelligence", "store", "lifecycle"];
 
 /// Compile every declared template. Errors are aggregated (all problems, not
@@ -113,10 +113,10 @@ fn compile_one(
         }
     };
     let gate_channels = crate::config::humans::GateChannels::new();
-    // The servers the machinery declares are untrusted unless the catalog
-    // the child inherits vouches for them, as the agent's own document's
-    // are: judged so here, and by the child.
-    settings::untrust_document_servers(&mut ex.config, &s.services);
+    // The servers the machinery declares are untrusted unless they are the
+    // operator's, whose tags they then count at: judged so here, and by the
+    // child.
+    settings::untrust_template_servers(&mut ex.config, &s.mcp.servers);
     let has_config = !ex.config.is_empty();
     let tier = if has_config || !ex.workflows.is_empty() {
         Tier::Instance
@@ -475,27 +475,14 @@ fn validate_instance_machinery(name: &str, ex: &idoc::Extraction, s: &Settings) 
             )));
         }
     }
-    // The composed MCP set: catalog resolution (the child inherits the
-    // parent's catalog and cannot extend it), tag floor, trifecta, egress.
+    // The composed MCP set: trifecta, and egress — under `closed` each server
+    // is one of the operator's (RFC 0055 §3.2).
     if let Some(servers_v) = config.pointer("/mcp/servers") {
         match serde_json::from_value::<Vec<settings::McpServer>>(servers_v.clone()) {
             Ok(servers) => {
-                let mut probe = Settings {
-                    services: s.services.clone(),
-                    ..Default::default()
-                };
-                probe.mcp.servers = servers;
-                for e in settings::resolve_services(&mut probe) {
-                    errs.push(at(e));
-                }
                 let mut tags = Vec::new();
-                for srv in &probe.mcp.servers {
-                    if let Err(e) = settings::egress_allows(
-                        &s.services,
-                        s.security.egress,
-                        settings::ServiceKind::Mcp,
-                        &srv.endpoint,
-                    ) {
+                for srv in &servers {
+                    if let Err(e) = s.egress_allows(settings::EndpointKind::Mcp, &srv.endpoint) {
                         errs.push(at(format!("mcp server '{}': {e}", srv.name)));
                     }
                     match srv.tag_set() {
@@ -787,10 +774,10 @@ mod tests {
                 "        agent:\n          instruction:\n            trust:\n              - uri: \"instruction://self\"\n                publisher: \"https://evil.example\"",
                 "agent.instruction.trust",
             ),
-            // The catalogue the child's closed-egress sweep reads.
+            // An endpoint list the child's closed-egress sweep reads.
             (
-                "        services:\n          exfil:\n            kind: mcp\n            endpoint: \"https://evil.example/mcp\"",
-                "services.exfil",
+                "        http:\n          endpoints:\n            exfil:\n              endpoint: \"https://evil.example/\"",
+                "http.endpoints",
             ),
         ] {
             let s = settings_with(&format!(
@@ -830,14 +817,14 @@ mod tests {
     /// A template's machinery vouches for none of its servers either:
     /// `trusted` on one is refused, and the child gets each it declares
     /// counted `untrusted_input` beside its legs — so one the machinery tags
-    /// `sensitive` and `egress` composes the trifecta — unless the catalog
-    /// the child inherits vouches for it.
+    /// `sensitive` and `egress` composes the trifecta — unless it is one of
+    /// the operator's servers, whose tags it then counts at.
     #[cfg(feature = "a2a")]
     #[test]
-    fn a_templates_servers_are_untrusted_unless_the_catalog_vouches() {
+    fn a_templates_servers_are_untrusted_unless_they_are_the_operators() {
         let room = |server: &str| {
             let doc: Value = crate::config::yaml::parse(&format!(
-                "services:\n  crm: {{kind: mcp, endpoint: \"https://crm.example/mcp\", tags: {{\"*\": [sensitive, egress]}}}}\n\
+                "mcp:\n  servers:\n    - {{name: crm, endpoint: \"https://crm.example/mcp\", tags: {{\"*\": [sensitive]}}}}\n\
                  subagents:\n  templates:\n    room:\n      instruction: |\n        Be the room.\n        :::config{{id=c dialect=agentd/config}}\n        mcp: {{servers: [{{name: crm, {server}}}]}}\n        :::\n"
             ))
             .unwrap();
@@ -860,12 +847,11 @@ mod tests {
         let e = room("endpoint: \"https://other.example/mcp\", tags: {\"*\": [sensitive, egress]}")
             .unwrap_err();
         assert!(e.iter().any(|m| m.contains("lethal trifecta")), "{e:?}");
-        // The catalog's entry is the operator's word on the server.
-        let c = room("service: crm").unwrap();
-        assert!(
-            c["room"].fragment["mcp"]["servers"][0]
-                .get("tags")
-                .is_none(),
+        // The operator's server is the operator's word on it.
+        let c = room("endpoint: \"https://crm.example/mcp/v2\"").unwrap();
+        assert_eq!(
+            c["room"].fragment["mcp"]["servers"][0]["tags"]["*"],
+            json!(["sensitive"]),
             "{}",
             c["room"].fragment
         );
@@ -1071,8 +1057,8 @@ mod tests {
                 "security.allow_trifecta",
             ),
             (
-                "services: {s: {kind: mcp, endpoint: \"https://s.example\"}}",
-                "services.s",
+                "http: {endpoints: {s: {endpoint: \"https://s.example\"}}}",
+                "http.endpoints",
             ),
             // The parent composes these four even though a document at large
             // may write part of each: a child's are overwritten at spawn.

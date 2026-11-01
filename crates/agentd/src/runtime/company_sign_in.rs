@@ -110,7 +110,7 @@ impl Runtime {
             .ok_or("no Company is declared".to_string())?;
         if sup.company(name).is_none() {
             return Err(format!(
-                "{name:?} is not a company entry (services.<name>.kind: company)"
+                "{name:?} is not a company entry (companies.<name>)"
             ));
         }
         Ok(Ask {
@@ -800,9 +800,9 @@ impl Runtime {
             .companies
             .clone()
             .ok_or("no Company is declared".to_string())?;
-        let company = sup.company(&name).ok_or_else(|| {
-            format!("{name:?} is not a company entry (services.<name>.kind: company)")
-        })?;
+        let company = sup
+            .company(&name)
+            .ok_or_else(|| format!("{name:?} is not a company entry (companies.<name>)"))?;
         let tx = self.events_tx.clone();
         std::thread::Builder::new()
             .name(format!("company-sign-out:{name}"))

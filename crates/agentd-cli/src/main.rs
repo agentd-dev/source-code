@@ -408,18 +408,28 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
             for w in &loaded.warnings {
                 eprintln!("{}", json!({"event": "config.warning", "msg": w}));
             }
-            // Review reads the OUTCOME, not the input: report the effective
-            // tool surface and tag set per consumer AFTER catalog resolution,
-            // since that is what actually governs at run time.
-            for s in &loaded.settings.mcp.servers {
-                if s.service.is_some() || !loaded.settings.services.is_empty() {
-                    eprintln!(
-                        "{}",
-                        json!({"event": "config.effective_server", "server": s.name,
-                               "service": s.service, "endpoint": s.endpoint,
-                               "allow": s.allow, "exclude": s.exclude, "tags": s.tags})
-                    );
-                }
+            // Review reads the OUTCOME, not the input: report each server as
+            // it governs at run time — after a Company's servers are made and
+            // the instruction's servers folded into the operator's.
+            let mcp = &loaded.settings.mcp;
+            for s in &mcp.servers {
+                let document = if mcp.document_matched.contains(&s.name) {
+                    Some("declared")
+                } else if mcp.document_servers.contains(&s.name) {
+                    Some("own")
+                } else {
+                    None
+                };
+                eprintln!(
+                    "{}",
+                    json!({"event": "config.effective_server", "server": s.name,
+                           "endpoint": s.endpoint, "connect": match s.connect {
+                               agentd::config::settings::Connect::Boot => "boot",
+                               agentd::config::settings::Connect::OnUse => "on_use",
+                           },
+                           "document": document, "rate": s.rate,
+                           "allow": s.allow, "exclude": s.exclude, "tags": s.tags})
+                );
             }
             eprintln!(
                 "{}",
@@ -630,12 +640,8 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
                 &dir,
                 std::time::Duration::from_secs(30),
             );
-            // A server that references a catalog entry caches its credential
-            // under `service:<entry>`, not `mcp:<name>` — canonicalize first, or
-            // logout would report success while leaving the real key in place.
             #[cfg(not(feature = "oauth"))]
             let out = {
-                let target = agentd::auth::canonical_target(&loaded.settings, &target);
                 agentd::auth::cache::take_file(&dir, &target, std::time::Duration::from_secs(30))
                     .map(|_| format!("logged out of {target}"))
             };

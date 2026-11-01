@@ -120,14 +120,13 @@ impl Runtime {
             return None;
         }
         let server = step.field_str("server")?;
-        let svc = self
+        let srv = self
             .settings
             .mcp
             .servers
             .iter()
-            .find(|s| s.name == server)
-            .and_then(|s| s.service.as_ref())?;
-        super::breaker::Config::of(self.settings.services.get(svc)?.breaker.as_ref())
+            .find(|s| s.name == server)?;
+        super::breaker::Config::of(srv.breaker.as_ref())
     }
 
     /// Resolve a parsed definition's durability class against the store
@@ -1571,6 +1570,16 @@ impl Runtime {
                 }
             }
         }
+        // A `connect: on_use` server a step names is dialed now, and the
+        // step waits for it — like a rate wait, before `begin_step`, so the
+        // wait consumes no attempt (RFC 0055 §4.3).
+        if matches!(step.kind.as_str(), "mcp.tool" | "mcp.resource")
+            && let Some(server) = step.spec.get("server").and_then(Value::as_str)
+            && !server.contains("{{")
+            && self.connect_wait(run_id, step_id, server)
+        {
+            return;
+        }
         let attempt = self
             .runs
             .get_mut(run_id)
@@ -2322,14 +2331,16 @@ impl Runtime {
                     return;
                 }
                 let Some(client) = self.mcp.get(&server).cloned() else {
-                    self.finish_step(
-                        run_id,
-                        step_id,
-                        StepStatus::Failed,
-                        None,
-                        Some(format!("mcp server {server:?} is not connected")),
-                        0,
-                    );
+                    // A templated name the connect gate could not read: an
+                    // on-use server it names is dialed now, for a retry.
+                    let why = if self.want_server(&server) {
+                        format!(
+                            "mcp server {server:?} is not connected yet (connect: on_use; it is being dialed)"
+                        )
+                    } else {
+                        format!("mcp server {server:?} is not connected")
+                    };
+                    self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(why), 0);
                     return;
                 };
                 // The key must NOT vary by attempt: a retry that presents a

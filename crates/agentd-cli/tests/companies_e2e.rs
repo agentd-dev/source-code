@@ -246,12 +246,12 @@ fn setup(host: &Host, fake: &str, company: &str, top: &str) -> Setup {
 
 /// The company entry `shop` at `fake`, with `extra` fields.
 fn shop_entry(fake: &str, extra: &str) -> String {
-    format!("  shop: {{kind: company, endpoint: \"{fake}\", allow_private: true{extra}}}\n")
+    format!("  shop: {{endpoint: \"{fake}\", allow_private: true{extra}}}\n")
 }
 
-/// [`setup`] with `agent` lines under `agent:`, the `services` entries, and
+/// [`setup`] with `agent` lines under `agent:`, the `companies` entries, and
 /// `rest` — workflows, more servers — after them.
-fn setup_with(host: &Host, top: &str, agent: &str, services: &str, rest: &str) -> Setup {
+fn setup_with(host: &Host, top: &str, agent: &str, companies: &str, rest: &str) -> Setup {
     let dir = tempfile::tempdir().unwrap().keep();
     let cfg = dir.join("agent.yaml");
     std::fs::write(dir.join("play.json"), play().to_string()).unwrap();
@@ -273,7 +273,7 @@ fn setup_with(host: &Host, top: &str, agent: &str, services: &str, rest: &str) -
              lifecycle: {{run_until: drained}}\n\
              observability:\n  log_level: debug\n  log_content: true\n\
              security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"{h}/companies/client.json\", name: \"Test agent\", key_file: \"{d}/client-key\"}}\n{top}\
-             services:\n{services}{rest}",
+             companies:\n{companies}{rest}",
             d = dir.display(),
             ca = fixture("ca.pem").display(),
             h = host.origin,
@@ -1194,7 +1194,7 @@ mod over_a2a {
                      observability: {{log_level: info}}\n\
                      a2a:\n  listen: https://127.0.0.1:{port}\n  url: https://127.0.0.1:{port}\n  tls: {{cert: {cert}, key: {key}}}\n\
                      security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"https://127.0.0.1:{port}/companies/client.json\", name: \"Served agent\", key_file: \"{d}/client-key\", serve: true}}\n\
-                     services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true}}\n",
+                     companies:\n  shop: {{endpoint: \"{o}\", allow_private: true}}\n",
                     d = s.display(),
                     cert = fixture("server.pem").display(),
                     key = fixture("server.key").display(),
@@ -1800,7 +1800,7 @@ mod over_a2a {
     /// Two Companies, `shop` and `travel`, at two fakes.
     fn two(shop: &Fake, travel: &Fake, extra: &str) -> String {
         format!(
-            "{}  travel: {{kind: company, endpoint: \"{}\", allow_private: true{extra}}}\n",
+            "{}  travel: {{endpoint: \"{}\", allow_private: true{extra}}}\n",
             shop_entry(&shop.origin, extra),
             travel.origin
         )
@@ -3064,7 +3064,7 @@ mod over_a2a {
                      observability: {{log_level: info}}\n\
                      a2a:\n  listen: https://127.0.0.1:{port}\n  url: https://127.0.0.1:{port}\n  tls: {{cert: {cert}, key: {key}}}\n\
                      security:\n  tls_ca: {ca}\n  companies:\n    client: {{id: \"https://127.0.0.1:{port}/companies/client.json\", name: \"Served agent\", key_file: \"{d}/client-key\", serve: true}}\n    seal_key: \"{{{{secret-file:{seal}}}}}\"\n\
-                     services:\n  shop: {{kind: company, endpoint: \"{o}\", allow_private: true, sign_in: [direct], scopes: [\"poppy:read\"]}}\n",
+                     companies:\n  shop: {{endpoint: \"{o}\", allow_private: true, sign_in: [direct], scopes: [\"poppy:read\"]}}\n",
                     d = s.display(),
                     cert = fixture("server.pem").display(),
                     key = fixture("server.key").display(),
@@ -4298,7 +4298,7 @@ fn an_http_step_calls_a_company_api_under_the_tools_rules() {
     assert!(
         x["err"]
             .as_str()
-            .is_some_and(|e| e.contains("GET /session is not in services.shop.api_allow")),
+            .is_some_and(|e| e.contains("GET /session is not in companies.shop.api_allow")),
         "{x}"
     );
     let record = f.record();

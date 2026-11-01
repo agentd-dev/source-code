@@ -79,7 +79,7 @@ pub struct Entry {
 impl Entry {
     pub fn from_settings(
         name: &str,
-        svc: &crate::config::settings::Service,
+        svc: &crate::config::settings::Company,
         timeout: Duration,
     ) -> Entry {
         Entry {
@@ -332,7 +332,7 @@ fn verify(entry: &Entry) -> Verification {
             ..Refusal::new(
                 "endpoint",
                 format!(
-                    "company {company}: {field} {url} is on {host}, which is not one of the entry's hosts (services.{company}.hosts)"
+                    "company {company}: {field} {url} is on {host}, which is not one of the entry's hosts (companies.{company}.hosts)"
                 ),
             )
         }
@@ -562,7 +562,7 @@ fn name_servers(entry: &Entry, listed: &[String]) -> Result<BTreeMap<String, Str
             several => Err(Refusal::new(
                 "mcp_names",
                 format!(
-                    "company {company}: the discovery document lists {} MCP APIs ({}) — name each with services.{company}.mcp_names",
+                    "company {company}: the discovery document lists {} MCP APIs ({}) — name each with companies.{company}.mcp_names",
                     several.len(),
                     several.join(", ")
                 ),
@@ -582,7 +582,7 @@ fn name_servers(entry: &Entry, listed: &[String]) -> Result<BTreeMap<String, Str
         let mut why = Vec::new();
         if !unnamed.is_empty() {
             why.push(format!(
-                "services.{company}.mcp_names names no server for {}",
+                "companies.{company}.mcp_names names no server for {}",
                 unnamed
                     .iter()
                     .map(|s| s.as_str())

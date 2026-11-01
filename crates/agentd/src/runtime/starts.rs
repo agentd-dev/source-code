@@ -250,6 +250,10 @@ impl Runtime {
         let server = spec.get("server").and_then(Value::as_str).unwrap_or("");
         let uri = spec.get("uri").and_then(Value::as_str).unwrap_or("");
         let Some(c) = self.mcp.get(server).cloned() else {
+            // An on-use server is dialed now; its join arms the starts on it.
+            if self.want_server(server) {
+                return;
+            }
             self.log.warn(
                 "start.subscribe.no_server",
                 json!({"workflow": workflow, "node": node, "server": server}),

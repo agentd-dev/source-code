@@ -158,7 +158,7 @@ impl Runtime {
         let name = args["company"].as_str().unwrap_or_default().to_string();
         if sup.company(&name).is_none() {
             return refuse(format!(
-                "{name:?} is not a company entry (services.<name>.kind: company)"
+                "{name:?} is not a company entry (companies.<name>)"
             ));
         }
         let parent = args["conversation"]

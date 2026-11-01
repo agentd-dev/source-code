@@ -4,8 +4,8 @@
 //! short code, poll until the human authorizes), and writes the obtained token
 //! to the per-user file cache the daemon reads at startup.
 //!
-//! `<target>` is `mcp:<name>` (an MCP server), `service:<name>` (a catalog
-//! entry shared by several servers), `intelligence`, or
+//! `<target>` is `mcp:<name>` (an MCP server), `a2a:<name>` (a peer),
+//! `http:<name>` (an `http.endpoints` entry), `intelligence`, or
 //! `intelligence:<provider>` (a named intelligence connection). The flow is
 //! fail-closed: a token is cached only on success, and nothing is printed but
 //! the code and URL — never the token itself.
@@ -46,20 +46,31 @@ pub fn resolve_auth<'a>(settings: &'a Settings, target: &str) -> Result<&'a Auth
             .as_ref()
             .ok_or_else(|| format!("mcp server '{name}' has no `auth:` block to log in with"));
     }
-    // A service-catalog entry holds one credential shared by every server
-    // that references it, so it is logged into once under its own name.
-    if let Some(name) = target.strip_prefix("service:") {
+    if let Some(name) = target.strip_prefix("a2a:") {
+        let p = settings
+            .a2a
+            .peers
+            .iter()
+            .find(|p| p.name == name)
+            .ok_or_else(|| format!("no a2a peer named '{name}' in the config"))?;
+        return p
+            .auth
+            .as_ref()
+            .ok_or_else(|| format!("a2a peer '{name}' has no `auth:` block to log in with"));
+    }
+    if let Some(name) = target.strip_prefix("http:") {
         let e = settings
-            .services
+            .http
+            .endpoints
             .get(name)
-            .ok_or_else(|| format!("no service named '{name}' in the services: catalog"))?;
+            .ok_or_else(|| format!("no http.endpoints entry named '{name}' in the config"))?;
         return e
             .auth
             .as_ref()
-            .ok_or_else(|| format!("services.{name} has no `auth:` block to log in with"));
+            .ok_or_else(|| format!("http.endpoints.{name} has no `auth:` block to log in with"));
     }
     Err(format!(
-        "unknown login target '{target}' (expected `intelligence`, `intelligence:<provider>`, `mcp:<name>` or `service:<name>`)"
+        "unknown login target '{target}' (expected `intelligence`, `intelligence:<provider>`, `mcp:<name>`, `a2a:<name>` or `http:<name>`)"
     ))
 }
 
@@ -88,8 +99,6 @@ fn intelligence_connection<'a>(
             )
         })
 }
-
-pub use super::canonical_target;
 
 /// Build the OAuth2 request params of an interactive login from an `auth:`
 /// block's runtime spec ([`Settings::auth_spec_at`]), discovering whichever
@@ -277,7 +286,6 @@ pub fn tokens_to_cred(t: &oauth2::Tokens) -> CachedCred {
 /// with a stderr prompt + real sleep, and cache the token. Returns a one-line
 /// success message for stdout (never the token).
 pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<String, String> {
-    let target = &canonical_target(settings, target);
     let auth = resolve_auth(settings, target)?;
     // A delegated server holds no login of its own: it is reached with the
     // enrolled person's grant (RFC 0044), which the running daemon keeps.
@@ -386,12 +394,12 @@ pub fn spec_of(settings: &Settings, target: &str, auth: &Auth) -> Result<AuthSpe
     } else if let Some(name) = target.strip_prefix("mcp:") {
         let s = settings.mcp.servers.iter().find(|s| s.name == name);
         (s.map(|s| s.endpoint.clone()).unwrap_or_default(), true)
-    } else if let Some(name) = target.strip_prefix("service:") {
-        let e = settings.services.get(name);
-        (
-            e.map(|e| e.endpoint.clone()).unwrap_or_default(),
-            e.is_some_and(|e| e.kind == crate::config::settings::ServiceKind::Mcp),
-        )
+    } else if let Some(name) = target.strip_prefix("a2a:") {
+        let p = settings.a2a.peers.iter().find(|p| p.name == name);
+        (p.map(|p| p.endpoint.clone()).unwrap_or_default(), false)
+    } else if let Some(name) = target.strip_prefix("http:") {
+        let e = settings.http.endpoints.get(name);
+        (e.map(|e| e.endpoint.clone()).unwrap_or_default(), false)
     } else {
         (String::new(), false)
     };

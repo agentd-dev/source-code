@@ -582,6 +582,7 @@ pub const KINDS: &[KindInfo] = &[
         &[
             "method",
             "url",
+            "endpoint",
             "headers",
             "query",
             "body",

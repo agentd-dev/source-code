@@ -407,17 +407,16 @@ impl Runtime {
                 &format!("push url refused: {e}"),
             ));
         }
-        // In `closed` mode a caller-chosen push target must clear the service
-        // catalog as well as the SSRF check above. The two guards answer
-        // different questions — "is this address reachable from here?" and "is
-        // this endpoint one we declared?" — and a push URL comes from the
-        // caller, so both have to hold.
-        if let Err(e) = crate::config::settings::egress_allows(
-            &self.settings.services,
-            self.settings.security.egress,
-            crate::config::settings::ServiceKind::Http,
-            &target.url,
-        ) {
+        // In `closed` mode a caller-chosen push target must match a peer's
+        // endpoint or an `a2a.push.allow` entry as well as clear the SSRF
+        // check above. The two guards answer different questions — "is this
+        // address reachable from here?" and "is this endpoint one we
+        // declared?" — and a push URL comes from the caller, so both have to
+        // hold.
+        if let Err(e) = self
+            .settings
+            .egress_allows(crate::config::settings::EndpointKind::Push, &target.url)
+        {
             return Err(err_obj(
                 ::mcp::rpc::INVALID_PARAMS,
                 &format!("push url refused: {e}"),

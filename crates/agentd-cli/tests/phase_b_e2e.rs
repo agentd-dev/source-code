@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Instance children and the service catalog end to end: a sync-mode instance
+//! Instance children and endpoint settings end to end: a sync-mode instance
 //! child resolving the spawn with its declared workflow's first result; child
-//! streams mirrored into the parent's; the catalog's per-entry breaker default
-//! opening on an unreachable service; and the `http` step's method ceiling.
+//! streams mirrored into the parent's; a server's breaker default opening on a
+//! failing server; and an `http.endpoints` entry's method ceiling.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -242,20 +242,16 @@ fn an_instance_report_into_a_stream_its_template_does_not_mirror_is_refused() {
 }
 
 #[test]
-fn a_catalog_breaker_default_opens_for_a_failing_service() {
-    // The entry declares the breaker; the referencing server's steps inherit
-    // it with no per-step `breaker:` — first failure opens, second fast-fails.
+fn a_servers_breaker_default_opens_for_a_failing_server() {
+    // The server declares the breaker; the steps that name it inherit it
+    // with no per-step `breaker:` — first failure opens, second fast-fails.
     // The mock MCP connects fine; calling a tool it does not serve fails.
     let mock = common::spawn_mock_mcp("mock://r", false);
     let (code, log) = run_cfg(&format!(
         "agent: {{ name: b }}\nstore: {{ kind: memory }}\n\
          lifecycle: {{ run_until: idle, idle_grace: 700ms }}\n\
          observability: {{ log_level: info, log_content: true }}\n\
-         services:\n\
-        \x20 flaky:\n\
-        \x20   endpoint: \"{}\"\n\
-        \x20   breaker: {{ failures: 1, cooldown: 60s }}\n\
-         mcp:\n  servers:\n    - {{ name: fl, service: flaky }}\n\
+         mcp:\n  servers:\n    - {{ name: fl, endpoint: \"{}\", breaker: {{ failures: 1, cooldown: 60s }} }}\n\
          workflows:\n  - name: w\n    steps:\n\
         \x20     s:  {{ kind: once }}\n\
         \x20     c1: {{ kind: mcp.tool, depends_on: [s], server: fl, tool: no_such_tool, retry: {{ max: 1, backoff: 100ms }}, on_error: continue }}\n\
@@ -265,7 +261,7 @@ fn a_catalog_breaker_default_opens_for_a_failing_service() {
     assert_eq!(code, Some(0), "{log}");
     assert!(
         !events(&log, "breaker.open").is_empty(),
-        "the first failure opened the entry's default breaker:\n{log}"
+        "the first failure opened the server's default breaker:\n{log}"
     );
     let done = events(&log, "run.done");
     assert!(
@@ -273,7 +269,7 @@ fn a_catalog_breaker_default_opens_for_a_failing_service() {
             .as_str()
             .unwrap_or("")
             .contains("breaker open"),
-        "the retry attempt failed fast on the inherited breaker (per-step state, entry-supplied policy): {done:?}\n{log}"
+        "the retry attempt failed fast on the inherited breaker (per-step state, server-supplied policy): {done:?}\n{log}"
     );
     drop(mock);
 }
@@ -284,11 +280,11 @@ fn the_http_steps_method_ceiling_holds() {
         "agent: { name: h }\nstore: { kind: memory }\n\
          lifecycle: { run_until: idle, idle_grace: 500ms }\n\
          observability: { log_level: info, log_content: true }\n\
-         services:\n\
-        \x20 hooks:\n\
-        \x20   kind: http\n\
-        \x20   endpoint: \"http://127.0.0.1:1/hook\"\n\
-        \x20   methods: [GET]\n\
+         http:\n\
+        \x20 endpoints:\n\
+        \x20   hooks:\n\
+        \x20     endpoint: \"http://127.0.0.1:1/hook\"\n\
+        \x20     methods: [GET]\n\
          workflows:\n  - name: w\n    steps:\n\
         \x20     s: { kind: once }\n\
         \x20     p: { kind: http, depends_on: [s], method: POST, url: \"http://127.0.0.1:1/hook\", on_error: continue }\n\
@@ -300,7 +296,7 @@ fn the_http_steps_method_ceiling_holds() {
         done[0]["output"]
             .as_str()
             .unwrap_or("")
-            .contains("method ceiling"),
+            .contains("is outside http.endpoints.hooks.methods"),
         "POST was refused by the entry's methods ceiling before any dial: {done:?}\n{log}"
     );
 }

@@ -209,6 +209,9 @@ pub struct IntelClient {
     /// client was built: every call on it then fails with
     /// [`IntelError::Credential`], unsent.
     credential_error: Option<String>,
+    /// The connection's `rate:` and the bucket it is kept under
+    /// (`intelligence`, `intelligence:<name>`): every call waits for a token.
+    rate: Option<(String, String)>,
 }
 
 /// The next link of a fallback chain: its client and the wire model it sends.
@@ -293,7 +296,15 @@ impl IntelClient {
             reasoning: None,
             temperature: None,
             credential_error: None,
+            rate: None,
         }
+    }
+
+    /// Pace every call on this client by `rate` (`<burst>/<per>`), kept in
+    /// this process under `key`: a call waits for a token.
+    pub fn with_rate(mut self, key: &str, rate: Option<String>) -> IntelClient {
+        self.rate = rate.map(|r| (key.to_string(), r));
+        self
     }
 
     /// Fail every call on this client, unsent, with `cause`: the credential
@@ -604,6 +615,9 @@ impl IntelClient {
             let e = IntelError::Credential(cause.clone());
             crate::obs::metrics::record_intel_error(error_reason(&e));
             return Err(e);
+        }
+        if let Some((key, rate)) = &self.rate {
+            crate::mcp::pace::wait_rated(key, "intelligence rate", rate);
         }
 
         let mut attempt: u32 = 0;

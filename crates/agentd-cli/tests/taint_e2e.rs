@@ -504,16 +504,16 @@ fn a_subscribe_starts_run_carries_an_untagged_servers_resource() {
 
 /// A server an instruction document declares vouches for nothing: what it
 /// answers taints the run whatever legs the document names, `trusted` on
-/// it is refused at load, and only the operator's catalog entry it names
-/// vouches for it.
+/// it is refused at load, and only when its endpoint is the operator's
+/// server is it that server, with the operator's tags.
 #[test]
-fn a_documents_server_is_untrusted_unless_the_operators_catalog_vouches() {
+fn a_documents_server_is_untrusted_unless_it_is_the_operators() {
     let mock = common::spawn_mock_mcp("mock://res", false);
     let dir = common::unique_path("taint-document", "d");
     std::fs::create_dir_all(&dir).unwrap();
     let uri = mock.uri();
-    let catalog = format!(
-        "services:\n  docs: {{ kind: mcp, endpoint: \"{uri}\", tags: {{ \"*\": [trusted] }} }}\n"
+    let operator = format!(
+        "mcp:\n  servers:\n    - {{ name: docsrv, ns: docsrv, endpoint: \"{uri}\", tags: {{ \"*\": [trusted] }} }}\n"
     );
     for (i, (block, services, tainted)) in [
         (format!("endpoint: \"{uri}\"\n"), String::new(), true),
@@ -522,7 +522,7 @@ fn a_documents_server_is_untrusted_unless_the_operators_catalog_vouches() {
             String::new(),
             true,
         ),
-        ("service: docs\n".to_string(), catalog, false),
+        (format!("endpoint: \"{uri}\"\n"), operator, false),
     ]
     .into_iter()
     .enumerate()

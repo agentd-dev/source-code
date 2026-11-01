@@ -15,7 +15,7 @@
 //!
 //! 1. persona, instruction and the workspace's AGENTS.md — change only on
 //!    reload
-//! 2. workflows, services, streams, subagent templates — configuration
+//! 2. workflows, endpoints, streams, subagent templates — configuration
 //! 3. skills catalogue — configuration, plus per-context bodies
 //! 4. peers, signals, memory — live state, changing turn to turn
 //!
@@ -54,10 +54,10 @@ The workspace's notes for agents working in it, one file each, the workspace's r
 {{/if}}{{#if workflows}}
 ## Workflows
 {{#each workflows}}- {{this.name}}{{#if this.description}}: {{this.description}}{{/if}}
-{{/each}}{{/if}}{{#if services}}
-## Services (the external services this deployment may use)
-{{#each services}}- {{this.name}}{{#if this.tags_text}} [{{this.tags_text}}]{{/if}}{{#if this.tools_text}} — tools: {{this.tools_text}}{{/if}}{{#if this.rate}} (rate {{this.rate}}){{/if}}
-{{/each}}{{#if egress_closed}}Egress is CLOSED: only these services are reachable.
+{{/each}}{{/if}}{{#if endpoints}}
+## Endpoints (what this deployment may reach)
+{{#each endpoints}}- {{this.name}} ({{this.kind}}){{#if this.tags_text}} [{{this.tags_text}}]{{/if}}{{#if this.tools_text}} — tools: {{this.tools_text}}{{/if}}{{#if this.rate}} (rate {{this.rate}}){{/if}}
+{{/each}}{{#if egress_closed}}Egress is CLOSED: only these endpoints are reachable.
 {{/if}}{{/if}}{{#if streams}}
 ## Streams (durable events; publish with an emit step, consume with a stream start)
 {{#each streams}}- {{this}}
@@ -122,30 +122,39 @@ impl Runtime {
                     .collect(),
             ),
         );
+        // The operator's endpoints: its MCP servers (a document's own server
+        // is not one), its peers and its plain-HTTP endpoints.
+        let mcp = &self.settings.mcp;
+        let servers = mcp
+            .servers
+            .iter()
+            .filter(|s| !mcp.document_servers.contains(&s.name) && s.company.is_none())
+            .map(|s| {
+                let tags: Vec<&str> = s
+                    .tags
+                    .values()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                let tools: Vec<String> = s.allow.clone().unwrap_or_default();
+                json!({"name": s.name, "kind": "mcp",
+                       "tags": tags, "tags_text": tags.join(", "),
+                       "tools": tools, "tools_text": tools.join(", "),
+                       "rate": s.rate})
+            });
+        let peers = self.settings.a2a.peers.iter().map(|p| {
+            json!({"name": p.name, "kind": "peer", "tags": [], "tags_text": "",
+                   "tools": [], "tools_text": "", "rate": p.rate})
+        });
+        let http = self.settings.http.endpoints.iter().map(|(n, e)| {
+            json!({"name": n, "kind": "http", "tags": [], "tags_text": "",
+                   "tools": [], "tools_text": "", "rate": e.rate})
+        });
         d.insert(
-            "services".into(),
-            Value::Array(
-                self.settings
-                    .services
-                    .iter()
-                    .take(CAP_LIST)
-                    .map(|(name, e)| {
-                        let tags: Vec<&str> = e
-                            .tags
-                            .values()
-                            .flatten()
-                            .map(String::as_str)
-                            .collect::<std::collections::BTreeSet<_>>()
-                            .into_iter()
-                            .collect();
-                        let tools: Vec<String> = e.allow.clone().unwrap_or_default();
-                        json!({"name": name, "kind": e.kind.as_str(),
-                               "tags": tags, "tags_text": tags.join(", "),
-                               "tools": tools, "tools_text": tools.join(", "),
-                               "rate": e.rate})
-                    })
-                    .collect(),
-            ),
+            "endpoints".into(),
+            Value::Array(servers.chain(peers).chain(http).take(CAP_LIST).collect()),
         );
         d.insert(
             "egress_closed".into(),
@@ -342,8 +351,8 @@ mod tests {
             pos("## AGENTS.md") < pos("{{extra}}"),
             "the workspace's files are stable; a turn's extra is not"
         );
-        assert!(pos("## Instruction") < pos("## Services"));
-        assert!(pos("## Services") < pos("## Peers"));
+        assert!(pos("## Instruction") < pos("## Endpoints"));
+        assert!(pos("## Endpoints") < pos("## Peers"));
         assert!(pos("## Peers") < pos("## Signals"));
         assert!(pos("## Signals") < pos("## Memory"));
     }

@@ -68,23 +68,3 @@ pub mod idjag;
 /// OpenID CIBA in poll mode: how a firing asks its person (RFC 0044 M4).
 #[cfg(feature = "xaa")]
 pub mod ciba;
-
-/// Canonicalize a login/logout target: `mcp:<name>` on a server that references
-/// a service-catalog entry becomes `service:<entry>`, the key the daemon's
-/// connect path actually reads. Every server pointing at that entry shares one
-/// credential, so a login must land where all of them look and a logout must
-/// revoke it for all of them at once. Deliberately outside the `oauth` feature
-/// gate, so logout still resolves in a build without interactive login.
-pub fn canonical_target(settings: &crate::config::settings::Settings, target: &str) -> String {
-    if let Some(name) = target.strip_prefix("mcp:")
-        && let Some(svc) = settings
-            .mcp
-            .servers
-            .iter()
-            .find(|s| s.name == name)
-            .and_then(|s| s.service.clone())
-    {
-        return format!("service:{svc}");
-    }
-    target.to_string()
-}

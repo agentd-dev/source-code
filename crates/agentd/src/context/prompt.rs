@@ -13,9 +13,9 @@
 //!
 //! Everything hard about *expressions* — field access, comparisons, macros,
 //! functions — is delegated to CEL, which agentd already ships. Resolution is
-//! **path first, CEL second**: `{{instance}}` and `{{#each services}}` are bare
+//! **path first, CEL second**: `{{instance}}` and `{{#each endpoints}}` are bare
 //! lookups that work in any build, and only a real expression
-//! (`take(services, 16)`, `size(peers) > 0`) needs `--features cel`. That
+//! (`take(endpoints, 16)`, `size(peers) > 0`) needs `--features cel`. That
 //! keeps the default template — and most custom ones — working without the
 //! feature, and a CEL-needing template is refused at CONFIG LOAD with the
 //! feature message rather than mis-rendering at turn time.
@@ -27,7 +27,7 @@
 //! turns invalidates the cache for **everything after it**, so the default
 //! template is ordered from most stable to most volatile: persona and
 //! instruction (change only on reload), then configuration-derived sections
-//! (workflows, services, streams, templates), then live state (peers with
+//! (workflows, endpoints, streams, templates), then live state (peers with
 //! their instance children, parked signals, memory keys). Put volatile
 //! content last in a custom template for the same reason.
 
@@ -392,7 +392,7 @@ fn stringify(v: &Value) -> String {
     }
 }
 
-/// CEL-ish truthiness, extended so `{{#if services}}` means "non-empty".
+/// CEL-ish truthiness, extended so `{{#if endpoints}}` means "non-empty".
 fn truthy(v: &Value) -> bool {
     match v {
         Value::Null => false,
@@ -489,9 +489,9 @@ mod tests {
 
     #[test]
     fn expressions_are_flagged_as_needing_cel() {
-        let bare = Template::parse("{{#each services}}{{this.name}}{{/each}}").unwrap();
+        let bare = Template::parse("{{#each endpoints}}{{this.name}}{{/each}}").unwrap();
         assert!(!bare.needs_cel);
-        let expr = Template::parse("{{#each take(services, 3)}}x{{/each}}").unwrap();
+        let expr = Template::parse("{{#each take(endpoints, 3)}}x{{/each}}").unwrap();
         assert!(expr.needs_cel, "a call is not a bare path");
         assert!(
             Template::parse("{{#if size(peers) > 0}}y{{/if}}")

@@ -20,7 +20,7 @@
 //! the account's Session in with the `refresh_token` grant and its
 //! `session_id`, and no gate opens.
 //!
-//! **Otherwise a sign-in**, of the first type `services.<name>.sign_in` lists
+//! **Otherwise a sign-in**, of the first type `companies.<name>.sign_in` lists
 //! that the Company offers, asking for what is needed now and what the held
 //! token grants (§4.4: "requests all the scopes it needs"), within the
 //! entry's `scopes` and the type's `scopes`. An empty request is refused,
@@ -355,7 +355,7 @@ impl Supervisor {
         let entry = &company.discovery.entry;
         if entry.sign_in.is_empty() {
             return Err(format!(
-                "company {name} lets agentd sign nobody in (services.{name}.sign_in lists no sign-in type)"
+                "company {name} lets agentd sign nobody in (companies.{name}.sign_in lists no sign-in type)"
             ));
         }
         let wanted = if ask.scopes.is_empty() {
@@ -399,7 +399,7 @@ impl Supervisor {
                 .find_map(|k| offered(*k).map(|o| (*k, o)))
             else {
                 return Err(format!(
-                    "company {name} offers none of the sign-in types services.{name}.sign_in lists ({})",
+                    "company {name} offers none of the sign-in types companies.{name}.sign_in lists ({})",
                     entry
                         .sign_in
                         .iter()
@@ -416,7 +416,7 @@ impl Supervisor {
             let requested = requested(&wanted, &held_scopes, &entry.scopes, granted);
             if requested.is_empty() {
                 return Err(format!(
-                    "company {name}: none of {} can be asked for — services.{name}.scopes allows {}, and {} sign-in grants {}",
+                    "company {name}: none of {} can be asked for — companies.{name}.scopes allows {}, and {} sign-in grants {}",
                     list(&wanted),
                     list(&entry.scopes),
                     kind.as_str(),
@@ -480,7 +480,7 @@ impl Supervisor {
                                 json!({"company": name, "field": field, "host": host_of(url)}),
                             );
                             return Err(format!(
-                                "company {name}: the device authorization's {field} {why}, so it is not shown to the User; it must be an HTTPS URL on one of services.{name}.hosts"
+                                "company {name}: the device authorization's {field} {why}, so it is not shown to the User; it must be an HTTPS URL on one of companies.{name}.hosts"
                             ));
                         }
                     }

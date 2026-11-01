@@ -7,53 +7,84 @@ pub use ::mcp::client;
 // name the `RequestSigner` seam that credential providers plug into.
 pub use ::mcp::http;
 
-/// The **service pace registry** behind a catalog entry's `rate:`: one
-/// process-global map, seeded at the [`from_spec`] chokepoint — the ONLY place
-/// every process (reactor, turn worker, flat subagent) constructs its MCP
-/// clients — so a rated catalog entry paces its consumers wherever the call
-/// actually executes. Buckets are keyed by SERVICE name rather than by server,
-/// so every server referencing one entry shares a single bucket per process.
+/// The **pace registry** behind every `rate:` on an endpoint: one
+/// process-global set of token buckets. An MCP server's is seeded at the
+/// [`from_spec`] chokepoint — the ONLY place every process (reactor, turn
+/// worker, flat subagent) constructs its MCP clients — so a rated server is
+/// paced wherever the call actually executes; a model connection's, a peer's
+/// and an `http.endpoints` entry's are taken by key where they are dialed.
 pub mod pace {
     use crate::supervisor::tree::TokenBucket;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    type Reg = HashMap<String, (String, String)>; // server → (service, rate)
+    type Reg = HashMap<String, (String, String)>; // key → (where it is set, rate)
     static REG: Mutex<Option<Reg>> = Mutex::new(None);
-    static BUCKETS: Mutex<Option<HashMap<String, TokenBucket>>> = Mutex::new(None);
+    static BUCKETS: Mutex<Option<HashMap<String, (String, TokenBucket)>>> = Mutex::new(None);
 
-    /// Called from `from_spec` for a spec carrying a catalog rate.
-    pub fn register(server: &str, service: &str, rate: &str) {
+    /// Called from `from_spec` for a server carrying a `rate:`.
+    pub fn register(server: &str, rate: &str) {
         let mut g = REG.lock().unwrap_or_else(|e| e.into_inner());
-        g.get_or_insert_with(HashMap::new)
-            .insert(server.to_string(), (service.to_string(), rate.to_string()));
+        g.get_or_insert_with(HashMap::new).insert(
+            server.to_string(),
+            (format!("mcp server '{server}' rate"), rate.to_string()),
+        );
     }
 
-    /// Spend one token toward `server`'s service, if it is rated. `Ok(())`
+    /// Spend one token toward MCP server `server`, if it is rated. `Ok(())`
     /// when unrated or a token was available; `Err(msg)` (a refusal the
     /// caller reports as a tool error, never a crash) when the bucket is dry.
     pub fn take(server: &str) -> Result<(), String> {
-        let (service, rate) = {
+        let (at, rate) = {
             let g = REG.lock().unwrap_or_else(|e| e.into_inner());
             match g.as_ref().and_then(|m| m.get(server)) {
-                Some((s, r)) => (s.clone(), r.clone()),
+                Some((a, r)) => (a.clone(), r.clone()),
                 None => return Ok(()),
             }
         };
-        let (burst, per_s) = crate::supervisor::tree::parse_rate(&rate)
-            .map_err(|e| format!("services.{service}.rate: {e}"))?;
+        take_rated(&format!("mcp:{server}"), &at, &rate).map_err(|retry| {
+            format!("{at} exceeded ({rate} paces this process); retry in ~{retry}s")
+        })
+    }
+
+    /// Spend one token from the bucket `key`, made from `rate` (set at `at`)
+    /// on first use and remade when the rate changes. `Err` carries the
+    /// seconds until the next token.
+    pub fn take_rated(key: &str, at: &str, rate: &str) -> Result<(), u32> {
+        let Ok((burst, per_s)) = crate::supervisor::tree::parse_rate(rate) else {
+            // Validation refuses an unparseable rate; one that got past it
+            // paces nothing rather than stopping every call.
+            let _ = at;
+            return Ok(());
+        };
         let mut g = BUCKETS.lock().unwrap_or_else(|e| e.into_inner());
-        let b = g
-            .get_or_insert_with(HashMap::new)
-            .entry(service.clone())
-            .or_insert_with(|| TokenBucket::new(burst, f64::from(burst) / per_s));
-        if b.try_take() {
+        let m = g.get_or_insert_with(HashMap::new);
+        let slot = m.entry(key.to_string()).or_insert_with(|| {
+            (
+                rate.to_string(),
+                TokenBucket::new(burst, f64::from(burst) / per_s),
+            )
+        });
+        if slot.0 != rate {
+            *slot = (
+                rate.to_string(),
+                TokenBucket::new(burst, f64::from(burst) / per_s),
+            );
+        }
+        if slot.1.try_take() {
             Ok(())
         } else {
-            let retry = (per_s / f64::from(burst.max(1))).ceil().max(1.0) as u32;
-            Err(format!(
-                "service '{service}' rate exceeded (services.{service}.rate: {rate} paces this process); retry in ~{retry}s"
-            ))
+            Err((per_s / f64::from(burst.max(1))).ceil().max(1.0) as u32)
+        }
+    }
+
+    /// Wait for a token from the bucket `key` (see [`take_rated`]): for the
+    /// calls that are paced rather than refused — a model call.
+    pub fn wait_rated(key: &str, at: &str, rate: &str) {
+        while let Err(retry) = take_rated(key, at, rate) {
+            std::thread::sleep(std::time::Duration::from_millis(
+                (u64::from(retry) * 1000).min(250),
+            ));
         }
     }
 }
@@ -219,14 +250,8 @@ pub fn from_spec(
     #[cfg(feature = "oauth")]
     let signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>> = if let Some(a) = &spec.auth
     {
-        // A server that references a catalog entry caches its credential under
-        // `service:<entry>`, so every consumer of that entry shares one login
-        // instead of each provoking its own. A standalone server keys its cache
-        // per-server as `mcp:<name>`.
-        let target = match &spec.service {
-            Some(svc) => format!("service:{svc}"),
-            None => format!("mcp:{}", spec.name),
-        };
+        // A server keys its credential cache as `mcp:<name>`.
+        let target = format!("mcp:{}", spec.name);
         crate::auth::device::signer_for(a, &target, timeout).map_err(McpError::Transport)?
     } else if let Some(o) = &spec.oauth {
         Some(std::sync::Arc::new(oauth::OAuthBearerSigner::new(
@@ -239,10 +264,10 @@ pub fn from_spec(
     };
     #[cfg(not(feature = "oauth"))]
     let signer = aauth_signer;
-    // A rated catalog entry paces its consumers within THIS process; registered
-    // here because every process builds its clients through this one function.
-    if let (Some(service), Some(rate)) = (&spec.service, &spec.rate) {
-        pace::register(&spec.name, service, rate);
+    // A rated server is paced within THIS process; registered here because
+    // every process builds its clients through this one function.
+    if let Some(rate) = &spec.rate {
+        pace::register(&spec.name, rate);
     }
     let client = McpClient::connect_signed(&spec.name, &spec.endpoint, headers, timeout, signer)?
         .with_client_info(::mcp::wire::Implementation {

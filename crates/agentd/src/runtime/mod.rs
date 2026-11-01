@@ -497,6 +497,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             mcp_specs.insert(s.name.clone(), spec);
             continue;
         }
+        // A `connect: on_use` server is dialed when something first needs it
+        // (`join`), never at boot.
+        if s.connect == crate::config::settings::Connect::OnUse {
+            log.info("mcp.connect.deferred", json!({"server": s.name}));
+            mcp_specs.insert(s.name.clone(), spec);
+            continue;
+        }
         let per_timeout = s.timeout.map(|d| d.0).unwrap_or(mcp_timeout);
         match crate::mcp::from_spec(&spec, per_timeout)
             .map(supervisor_client)
@@ -2999,6 +3006,11 @@ impl Runtime {
         // Nor for a delegated server: only the supervisor's pool reaches it
         // (RFC 0044 §5.7).
         if spec.company.is_some() || spec.delegated {
+            return None;
+        }
+        // Nor for an on-use server not connected yet: its tools reach a turn
+        // once it has (RFC 0055 §4.3).
+        if self.settings.mcp.on_use(name) && !self.mcp.contains_key(name) {
             return None;
         }
         spec.first_request = self.mcp.get(name).and_then(|c| c.first_request());

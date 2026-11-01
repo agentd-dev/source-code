@@ -165,6 +165,7 @@ fn top_level_properties(
                             "headers": string_map,
                             "auth": { "$ref": "#/$defs/Auth" },
                             "timeout": duration,
+                            "rate": { "type": "string", "description": "per-process pacing of model calls on this connection (`<burst>/<per>`, e.g. `60/1m`): a call waits for a token" },
                             "structured_output": structured_output } } },
                     "models": { "type": "object", "description": "named models: cost/quality tiering inside one workflow without forking a process. A model names the connection it is reached on and cannot describe one", "additionalProperties": {
                         "type": "object", "additionalProperties": false, "required": ["model"], "properties": {
@@ -198,7 +199,8 @@ fn top_level_properties(
                     "swap_policy": { "enum": ["finish-on-old", "restart-turn"] },
                     "structured_output": structured_output,
                     "budget": budget,
-                    "timeout": duration
+                    "timeout": duration,
+                    "rate": { "type": "string", "description": "per-process pacing of model calls on this connection (`<burst>/<per>`, e.g. `60/1m`): a call waits for a token. Operator-only" }
                 }
             }));
     m.insert(
@@ -284,9 +286,17 @@ fn top_level_properties(
                 "max_age": { "type": "string" } } } } } }),
     );
     m.insert(
-        "services".to_string(),
-        json!({ "type": "object", "additionalProperties": { "$ref": "#/$defs/Service" },
-                "description": "the service catalog: the named external services this deployment may use; mcp.servers entries reference entries via `service:` and may only narrow them" }),
+        "http".to_string(),
+        json!({ "type": "object", "additionalProperties": false,
+                "description": "the plain-HTTP endpoints this deployment reaches: what an http step, a document fetched by url and a skill fetched by src are held to under security.egress: closed. Operator-only",
+                "properties": {
+                "endpoints": { "type": "object", "additionalProperties": { "$ref": "#/$defs/HttpEndpoint" },
+                               "description": "by name; an http step uses the entry its URL falls under, or names it with `endpoint:`" } } }),
+    );
+    m.insert(
+        "companies".to_string(),
+        json!({ "type": "object", "additionalProperties": { "$ref": "#/$defs/Company" },
+                "description": "the Companies agentd acts at for its User, by name (RFC 0047; needs the companies feature). Operator-only; a change is a restart" }),
     );
     m.insert("vars".to_string(), json!({ "type": "object", "additionalProperties": true,
                 "description": "operator-defined constants; reference anywhere (and in workflows) as {{config.NAME}} — dotted paths reach nested values, unresolved references refuse startup" }));
@@ -370,7 +380,8 @@ fn top_level_properties(
                     "description": "push notifications: a caller registers a webhook and agentd POSTs its task's updates there. Default-OFF — the URL comes from a peer, so making the request at all is the operator's decision.",
                     "properties": {
                     "enabled": { "type": "boolean", "description": "accept CreateTaskPushNotificationConfig and deliver on transitions" },
-                    "allow_private": { "type": "boolean", "description": "permit webhook targets on private / loopback addresses (a separate and larger decision — a peer could otherwise reach agentd's own surfaces or a cloud metadata endpoint)" } } } } }));
+                    "allow_private": { "type": "boolean", "description": "permit webhook targets on private / loopback addresses (a separate and larger decision — a peer could otherwise reach agentd's own surfaces or a cloud metadata endpoint)" },
+                    "allow": { "type": "array", "items": { "type": "string" }, "description": "under security.egress: closed, the push targets admitted beside the peers' endpoints: URL prefixes (scheme, authority, path on a segment boundary)" } } } } }));
     m.insert("webhooks".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "listen": { "type": "string", "description": "https://host:port (loopback http:// for dev) — the inbound webhook surface" },
                 "url": { "type": "string", "description": "the URL the listener is reached at from outside (https://host[:port][/prefix]); callback URLs are built on it" },
@@ -456,7 +467,7 @@ fn top_level_properties(
                     "workdir": { "type": "string" }, "timeout": duration,
                     "max_output": { "type": "integer" },
                     "env": { "type": "array", "items": { "type": "string" }, "description": "env var names passed through" } } },
-                "egress": { "enum": ["open", "closed"], "description": "closed = an outbound MCP dial whose URL matches no services: catalog entry is refused; default open" },
+                "egress": { "enum": ["open", "closed"], "description": "closed = agentd dials only what the operator declared, each kind against its own section: mcp.servers, intelligence endpoints and providers, a2a.peers (and a2a.push.allow for push targets), http.endpoints for every other HTTP request, companies; observability.otel.endpoint is the one exception. Default open" },
                 "client": client(),
                 "companies": companies(),
                 "payments": payments(),
@@ -750,12 +761,10 @@ fn defs_properties(
                 "tokens": { "type": "integer", "minimum": 1 },
                 "requests": { "type": "integer", "minimum": 1 },
                 "reset": { "type": "string", "pattern": "^[0-9]{2}:[0-9]{2}Z$", "description": "calendar-window reset time (UTC), e.g. 00:00Z" } } }));
-    m.insert("McpServer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name"],
-                "oneOf": [ { "required": ["endpoint"] }, { "required": ["service"] } ],
+    m.insert("McpServer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"],
                 "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
-                "endpoint": { "type": "string" },
-                "service": { "type": "string", "description": "reference a services: catalog entry — inherit its connection settings (restating endpoint/auth/headers is refused) and narrow its tool ceiling" },
+                "endpoint": { "type": "string", "description": "the server's URL; an instruction's :::mcp whose src falls under it (scheme, authority, path on a segment boundary) is this server" },
                 "ns": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$", "description": "tool namespace prefix (`ns.tool`)" },
                 "headers": string_map,
                 "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress", "trusted"] } },
@@ -767,6 +776,11 @@ fn defs_properties(
                     "token_url": { "type": "string" }, "client_id": { "type": "string" }, "client_secret": secret, "scope": { "type": "string" } } },
                 "auth": { "$ref": "#/$defs/Auth" },
                 "timeout": duration,
+                "rate": { "type": "string", "description": "per-process pacing of calls to this server (`<burst>/<per>`, e.g. `60/1m`); a dry bucket fails the call, which a step's retry absorbs" },
+                "breaker": { "type": "object", "additionalProperties": false,
+                             "properties": { "failures": { "type": "integer", "minimum": 1 }, "cooldown": duration },
+                             "description": "the default breaker of the mcp.tool steps that name this server; a step's own breaker wins" },
+                "connect": { "enum": ["boot", "on_use"], "description": "boot (default) dials the server at start; on_use dials it on the first call that needs it — a workflow step naming it, a wait or subscribe start on it, or the instruction declaring it — and it stays connected. Its tools reach a turn once it has connected. Operator-only" },
                 "tasks": { "enum": ["auto", "off"], "description": "whether the server may answer a tool call with an MCP task (the Tasks extension, SEP-2663): auto (default) declares the extension on 2026-07-28 connections, on the calls that have a bound (a turn's, a workflow step's, a store adapter's), off never does, so the server must answer every call inline (RFC 0050)" },
                 "events": { "type": "array", "items": { "$ref": "#/$defs/EventBinding" }, "description": "MCP Events bindings (RFC 0045): each event type subscribed with fixed arguments, every occurrence appended to a declared stream; requires the mcp-events build feature" },
                 "event_grants": { "type": "array", "items": { "$ref": "#/$defs/EventGrant" }, "description": "event types runtime subscriptions may be made for — by a wait that subscribes or the events.* tools — and what each of them gets fixed (RFC 0045 §5.15)" } } }));
@@ -960,43 +974,45 @@ fn defs_properties(
                 "enum": { "type": "array" },
                 "description": { "type": "string" } } }),
     );
-    m.insert("Service".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
-                "description": "a service-catalog entry: connection settings, one shared credential, authoritative trifecta tags (a floor for any matching endpoint), and a tool-surface ceiling consumers can only narrow",
+    m.insert("Company".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
+                "description": "a Company agentd acts at for its User (RFC 0047): its MCP servers are made from its discovery document at load",
                 "properties": {
-                "kind": { "enum": ["mcp", "intelligence", "peer", "http", "company"],
-                          "description": "which surface this entry serves; one host may appear under several kinds with different trust budgets. `company` (RFC 0047, the companies feature): a Company agentd acts at for its User — `endpoint` is the https://<host> whose discovery document is read" },
-                "endpoint": { "type": "string", "description": "the connection URL and the dial-time match base (scheme + authority + path prefix)" },
-                "headers": string_map,
-                "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress", "trusted"] } },
-                          "description": "authoritative — unioned into any consumer whose endpoint matches, referencing or inline, open or closed; `trusted` (kind: mcp only) marks the endpoint's results as not outside text" },
-                "allow": { "type": "array", "items": { "type": "string" }, "description": "the CEILING: the widest advertised-tool surface any consumer may get" },
-                "exclude": { "type": "array", "items": { "type": "string" }, "description": "never admitted, unioned into every consumer (beats allow)" },
-                "auth": { "$ref": "#/$defs/Auth" },
-                "rate": { "type": "string", "description": "per-instance pacing toward the service (`<burst>/<per>`, e.g. `60/1m`)" },
+                "endpoint": { "type": "string", "description": "https://<host>: the domain whose discovery document is read" },
+                "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] } },
+                          "description": "the Rule-of-Two legs its servers, APIs and operations carry; default untrusted_input" },
+                "allow": { "type": "array", "items": { "type": "string" }, "description": "the widest tool surface its MCP servers offer" },
+                "exclude": { "type": "array", "items": { "type": "string" }, "description": "never admitted (beats allow)" },
+                "rate": { "type": "string", "description": "per-instance pacing of calls to its MCP servers (`<burst>/<per>`, e.g. `60/1m`)" },
                 "timeout": duration,
-                "methods": { "type": "array", "items": { "type": "string" },
-                             "description": "`kind: http` only — the METHOD ceiling for `http` steps against this entry (e.g. [GET, POST]); absent = any method" },
-                "breaker": { "type": "object", "additionalProperties": false,
-                             "properties": { "failures": { "type": "integer", "minimum": 1 }, "cooldown": duration },
-                             "description": "`kind: mcp` only — a default breaker policy for `mcp.tool` steps against this entry; a step's own `breaker:` wins" },
                 "hosts": { "type": "array", "items": { "type": "string" },
-                           "description": "`kind: company` only — host globs (`example.com`, `*.example.com`) every endpoint the Company's documents name must match; default the endpoint's host, the document's organization.domain, their subdomains and the issuer's host" },
-                "allow_private": { "type": "boolean", "description": "`kind: company` only — admit loopback, private and link-local addresses (an on-premises Company); default false" },
-                "interfaces": { "type": "array", "items": { "enum": ["mcp", "agent", "openapi"] }, "description": "`kind: company` only — the Company's interfaces agentd uses: mcp (its MCP servers), agent (conversations with its Company Agent, through company.converse and the company.<name> stream), openapi (its OpenAPI APIs, through company.api); default [mcp]" },
-                "mcp_names": { "type": "object", "additionalProperties": { "type": "string" }, "description": "`kind: company` only — a server name for each MCP API url the Company lists, when it lists more than one; with one, the server is named after the entry" },
-                "privacy": { "enum": ["strict", "standard"], "description": "`kind: company` only — strict (default) or standard, which sends agentd's usual correlators and is logged at boot" },
+                           "description": "host globs (`example.com`, `*.example.com`) every endpoint the Company's documents name must match; default the endpoint's host, the document's organization.domain, their subdomains and the issuer's host" },
+                "allow_private": { "type": "boolean", "description": "admit loopback, private and link-local addresses (an on-premises Company); default false" },
+                "interfaces": { "type": "array", "items": { "enum": ["mcp", "agent", "openapi"] }, "description": "the Company's interfaces agentd uses: mcp (its MCP servers), agent (conversations with its Company Agent, through company.converse and the company.<name> stream), openapi (its OpenAPI APIs, through company.api); default [mcp]" },
+                "mcp_names": { "type": "object", "additionalProperties": { "type": "string" }, "description": "a server name for each MCP API url the Company lists, when it lists more than one; with one, the server is named after the entry" },
+                "privacy": { "enum": ["strict", "standard"], "description": "strict (default) or standard, which sends agentd's usual correlators and is logged at boot" },
                 "sign_in": { "type": "array", "items": { "enum": ["device", "direct", "mediated"] },
-                             "description": "`kind: company` only — the sign-in types agentd may start with the User, in the order it tries them: device (a link and a code) or direct (the Company's page, back to the served callback; needs client.serve). mediated is refused. Needs scopes and security.companies.seal_key" },
+                             "description": "the sign-in types agentd may start with the User, in the order it tries them: device (a link and a code) or direct (the Company's page, back to the served callback; needs client.serve). mediated is refused. Needs scopes and security.companies.seal_key" },
                 "scopes": { "type": "array", "items": { "type": "string" },
-                            "description": "`kind: company` only — the most account scopes agentd asks the User for there; a sign-in asks for what is needed within these and what the sign-in type grants" },
+                            "description": "the most account scopes agentd asks the User for there; a sign-in asks for what is needed within these and what the sign-in type grants" },
                 "api_allow": { "type": "array", "items": { "type": "string" },
-                               "description": "`kind: company` only — the OpenAPI operations agentd may call there, each `METHOD /path-template` as the description's paths name it (`GET /orders/{order_id}`); one outside them, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, `<server>.<method>_<path>` (`shop.get_orders_order_id`). Needs `openapi` in interfaces; default none" },
-                "api_names": { "type": "object", "additionalProperties": { "type": "string" }, "description": "`kind: company` only — a server name for each OpenAPI API url the Company lists, under which its operation tools are named, when it lists more than one or the entry's name is taken; with one, the server is named after the entry. Needs api_allow" },
-                "context": company_context("`kind: company` only — what this Company's conversations share of the User's situation, each field over security.companies.context. Needs `agent` in interfaces") } }));
+                               "description": "the OpenAPI operations agentd may call there, each `METHOD /path-template` as the description's paths name it (`GET /orders/{order_id}`); one outside them, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, `<server>.<method>_<path>` (`shop.get_orders_order_id`). Needs `openapi` in interfaces; default none" },
+                "api_names": { "type": "object", "additionalProperties": { "type": "string" }, "description": "a server name for each OpenAPI API url the Company lists, under which its operation tools are named, when it lists more than one or the entry's name is taken; with one, the server is named after the entry. Needs api_allow" },
+                "context": company_context("what this Company's conversations share of the User's situation, each field over security.companies.context. Needs `agent` in interfaces") } }));
+    m.insert("HttpEndpoint".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
+                "description": "a plain-HTTP endpoint: a URL prefix and how it is reached",
+                "properties": {
+                "endpoint": { "type": "string", "description": "the URL prefix an http step, a fetched document or skill is matched against (scheme, authority, path on a segment boundary)" },
+                "auth": { "$ref": "#/$defs/Auth" },
+                "headers": string_map,
+                "methods": { "type": "array", "items": { "enum": ["GET", "PUT", "POST", "DELETE", "PATCH", "HEAD"] },
+                             "description": "the METHOD ceiling for http steps against this entry; absent = any method" },
+                "rate": { "type": "string", "description": "per-instance pacing of http steps toward it (`<burst>/<per>`, e.g. `60/1m`); a dry bucket fails the step, which its retry absorbs" },
+                "timeout": duration } }));
     m.insert("A2aPeer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"], "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" }, "endpoint": { "type": "string" },
                 "headers": string_map, "client_cert": { "type": "string" }, "client_key": { "type": "string" },
-                "service": { "type": "string", "description": "a `services:` entry of `kind: peer` supplying the endpoint, auth and tags" },
+                "rate": { "type": "string", "description": "per-instance pacing of sends to this peer (`<burst>/<per>`); a dry bucket fails the send, which a step's retry absorbs" },
+                "timeout": duration,
                 "auth": { "$ref": "#/$defs/Auth" } } }));
     m.insert("AAuth".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["provider"], "properties": {
                 "provider": { "type": "string" }, "key_file": { "type": "string" }, "enroll_token": secret,

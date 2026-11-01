@@ -404,15 +404,9 @@ pub struct McpServerSpec {
     /// narrower `oauth` / `aauth` settings. Travels in the spawn payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<AuthSpec>,
-    /// The `services:` catalog entry this server references. The credential
-    /// cache key becomes `service:<name>`, so every consumer of the
-    /// entry shares one cached login, and the per-instance `rate:` bucket is
-    /// keyed by it. Travels in the spawn payload.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service: Option<String>,
-    /// The entry's `rate:` (resolved at config load) — seeds the per-process
-    /// pace registry at connect time, so worker and subagent processes pace
-    /// their own in-loop calls too. Travels in the spawn payload.
+    /// The server's `rate:` — seeds the per-process pace registry at connect
+    /// time, so worker and subagent processes pace their own in-loop calls
+    /// too. Travels in the spawn payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate: Option<String>,
     /// What reached this server on the supervisor's connection — the

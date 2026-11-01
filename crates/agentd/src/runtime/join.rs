@@ -39,6 +39,8 @@ use std::sync::Arc;
 
 const BACKOFF_MIN_MS: u64 = 1_000;
 const BACKOFF_MAX_MS: u64 = 60_000;
+/// How often a step waiting for an on-use server looks again.
+const CONNECT_POLL_MS: u64 = 500;
 
 /// The servers without a live connection, and where their dials are.
 #[derive(Default)]
@@ -52,6 +54,11 @@ pub(crate) struct Joining {
     /// The servers being dialled when a description changed: an API among
     /// them, whose listing may have read it before, is listed once more.
     again: std::collections::BTreeSet<String>,
+    /// The `connect: on_use` servers something has needed: dialed until they
+    /// connect (RFC 0055 §4.3).
+    wanted: std::collections::BTreeSet<String>,
+    /// When each step waiting for an on-use server (`run/step`) began to.
+    connect_waits: BTreeMap<String, u64>,
 }
 
 /// The tools of a Company OpenAPI API's operations (RFC 0047 §9, P5a): the
@@ -69,6 +76,11 @@ pub(crate) struct Operations {
 }
 
 impl Joining {
+    /// Whether something has needed the on-use server `server`.
+    pub(crate) fn wants(&self, server: &str) -> bool {
+        self.wanted.contains(server)
+    }
+
     /// Whether the Company OpenAPI API `server` offers its operation tools.
     pub(crate) fn offers(&self, server: &str) -> bool {
         self.offered.contains_key(server)
@@ -177,6 +189,13 @@ impl Runtime {
             // A delegated server is never dialled with agentd's own
             // credential: its connections are the supervisor's pool's.
             .filter(|n| !self.mcp_specs.get(n).is_some_and(|s| s.delegated))
+            // An on-use server is dialed once something needs it: a step, a
+            // wait, a start, or the instruction that declared it.
+            .filter(|n| {
+                !self.settings.mcp.on_use(n)
+                    || self.joining.wanted.contains(n)
+                    || self.settings.mcp.document_matched.contains(n)
+            })
             .collect();
         self.joining.probes.retain(|n, _| down.contains(n));
         for name in down {
@@ -263,6 +282,72 @@ impl Runtime {
             {
                 p.out = false;
             }
+        }
+    }
+
+    /// Ask for the `connect: on_use` server `server` to be dialed, if it is
+    /// one and not connected: `true` when it is (so the caller waits for it).
+    pub(crate) fn want_server(&mut self, server: &str) -> bool {
+        if !self.settings.mcp.on_use(server) || self.mcp.contains_key(server) {
+            return false;
+        }
+        if self.joining.wanted.insert(server.to_string()) {
+            self.log
+                .info("mcp.connect.on_use", json!({"server": server}));
+        }
+        true
+    }
+
+    /// Hold the step `run_id/step_id` until the on-use server `server` it
+    /// names connects: `true` when it is held — suspended on a durable timer
+    /// that puts it back to pending, as a rate wait does, so a restart keeps
+    /// it waiting. Once the server's `timeout` (else `mcp.default_timeout`,
+    /// else 60 s) has passed it is let go, and the call fails as one to a
+    /// server that is not connected does, for its `retry:` to take.
+    pub(crate) fn connect_wait(&mut self, run_id: &str, step_id: &str, server: &str) -> bool {
+        let key = format!("{run_id}/{step_id}");
+        if !self.want_server(server) {
+            self.joining.connect_waits.remove(&key);
+            return false;
+        }
+        let now = now_ms();
+        let started = *self.joining.connect_waits.entry(key.clone()).or_insert(now);
+        let limit = self
+            .settings
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .and_then(|s| s.timeout)
+            .or(self.settings.mcp.default_timeout)
+            .map_or(60_000, |d| d.0.as_millis() as u64);
+        if now.saturating_sub(started) > limit {
+            self.joining.connect_waits.remove(&key);
+            return false;
+        }
+        match self.timers.arm(
+            &self.durable,
+            now + CONNECT_POLL_MS,
+            json!({"kind": "step_budget", "run": run_id, "step": step_id}),
+            serde_json::Value::Null,
+        ) {
+            Ok(id) => {
+                if started == now {
+                    self.run_log(run_id).info(
+                        "step.connect_wait",
+                        json!({"run": run_id, "step": step_id, "server": server}),
+                    );
+                }
+                if let Some(r) = self.runs.get_mut(run_id) {
+                    r.suspend_step(
+                        step_id,
+                        json!({"kind": "connect_wait", "server": server, "timer": id}),
+                    );
+                }
+                self.checkpoint(false);
+                true
+            }
+            Err(_) => false,
         }
     }
 

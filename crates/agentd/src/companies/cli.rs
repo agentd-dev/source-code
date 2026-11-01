@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::config::A2aEndpoint;
-use crate::config::settings::{ServiceKind, Settings, companies::OPERATOR};
+use crate::config::settings::{Settings, companies::OPERATOR};
 use crate::mcp::a2a_client::{self, PeerAuth};
 
 /// Why a login or logout did not end as asked.
@@ -53,13 +53,9 @@ fn daemon(settings: &Settings, name: &str, what: &str) -> Result<A2aEndpoint, St
             "{what} company:{name} signs in the operator, and security.companies.user is {user}: they sign in by asking the agent (its company.sign_in tool), or, when they are an operator principal, by sending the company.sign_in op from their own A2A client"
         ));
     }
-    if settings
-        .services
-        .get(name)
-        .is_none_or(|s| s.kind != ServiceKind::Company)
-    {
+    if !settings.companies.contains_key(name) {
         return Err(format!(
-            "{name:?} is not a company entry (services.<name>.kind: company)"
+            "{name:?} is not a company entry (companies.<name>)"
         ));
     }
     let listen = settings.a2a.listen.as_deref().unwrap_or_default();
@@ -208,7 +204,7 @@ mod tests {
             .settings
     }
 
-    const BASE: &str = "security:\n  companies:\n    client: {id: \"https://agent.example/c.json\", name: A, key_file: \"__DIR__/k\"}\n    seal_key: \"{{secret-file:__DIR__/seal}}\"\n__USER__store: {kind: file, file: {path: \"__DIR__/s\"}}\nservices:\n  shop: {kind: company, endpoint: \"https://example.com\", sign_in: [device], scopes: [\"poppy:read\"]}\n";
+    const BASE: &str = "security:\n  companies:\n    client: {id: \"https://agent.example/c.json\", name: A, key_file: \"__DIR__/k\"}\n    seal_key: \"{{secret-file:__DIR__/seal}}\"\n__USER__store: {kind: file, file: {path: \"__DIR__/s\"}}\ncompanies:\n  shop: {endpoint: \"https://example.com\", sign_in: [device], scopes: [\"poppy:read\"]}\n";
 
     /// The client reaches the daemon only over its unix listener, only for
     /// a declared Company, and only when the operator is the User.

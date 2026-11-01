@@ -380,7 +380,7 @@ impl Refused {
                 format!("company {company}: {u} is not an HTTPS URL with a plain host")
             }
             Refused::Host(h) => format!(
-                "company {company}: {h} is not one of the entry's hosts (services.{company}.hosts)"
+                "company {company}: {h} is not one of the entry's hosts (companies.{company}.hosts)"
             ),
             Refused::Redirect(to) => {
                 format!(

@@ -341,7 +341,7 @@ impl Supervisor {
             .contains(&Interface::Agent)
         {
             return Err(unsent(format!(
-                "company {} does not use the Company's agent (services.{}.interfaces lists no agent)",
+                "company {} does not use the Company's agent (companies.{}.interfaces lists no agent)",
                 company.name, company.name
             )));
         }

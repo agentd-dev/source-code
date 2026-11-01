@@ -54,7 +54,7 @@ impl Runtime {
     /// `share_availability`.
     fn company_context(&self, company: &str) -> Map<String, Value> {
         let mut out = Map::new();
-        let Some(svc) = self.settings.services.get(company) else {
+        let Some(svc) = self.settings.companies.get(company) else {
             return out;
         };
         let ctx = crate::config::settings::companies::context_of(&self.settings, svc);
@@ -183,7 +183,7 @@ impl Runtime {
         let entry = entry.to_string();
         let Some(company) = sup.company(&entry) else {
             return refuse(format!(
-                "{entry:?} is not a company entry (services.<name>.kind: company)"
+                "{entry:?} is not a company entry (companies.<name>)"
             ));
         };
         // The contract the call is: an operation tool's is `company.api`'s.

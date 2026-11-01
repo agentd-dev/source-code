@@ -502,7 +502,7 @@ struct Extra<'a> {
     entry: &'a str,
     /// Lines under `agent:`.
     agent: &'a str,
-    /// Configuration after the services: workflows.
+    /// Configuration after the companies: workflows.
     rest: &'a str,
     /// The entry lets agentd sign the User in: Device Sign-In for both of
     /// the draft's scopes, the Account Token sealed under a seal key of the
@@ -593,7 +593,7 @@ fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, St
     };
     let entry = |name: &str, origin: &str| {
         format!(
-            "  {name}: {{kind: company, endpoint: \"{origin}\", allow_private: true{signs_in}{}}}\n",
+            "  {name}: {{endpoint: \"{origin}\", allow_private: true{signs_in}{}}}\n",
             extra.entry
         )
     };
@@ -612,9 +612,9 @@ fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, St
         agent.push_str("  ask_human_unowned: gate\n");
         a2a = Some(addr);
     }
-    let mut services = entry("shop", &company.origin);
+    let mut entries = entry("shop", &company.origin);
     for (name, c) in &more {
-        services.push_str(&entry(name, &c.origin));
+        entries.push_str(&entry(name, &c.origin));
     }
     std::fs::write(
         &cfg,
@@ -625,7 +625,7 @@ fn prepare_with(h: &Harness, variants: &[&str], extra: &Extra) -> Result<Run, St
              lifecycle: {{run_until: drained}}\n\
              observability: {{log_level: debug, log_content: true}}\n\
              security:\n  tls_ca: \"{ca}\"\n  companies:\n    client: {{id: \"{o}/companies/client.json\", name: \"agentd conformance\", key_file: \"{dir}/client-key\"{client}}}\n{companies}\
-             services:\n{services}{listener}{rest}",
+             companies:\n{entries}{listener}{rest}",
             ca = tls_fixture("ca.pem").display(),
             o = host.origin,
             rest = extra.rest,

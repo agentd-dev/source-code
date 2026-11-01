@@ -668,6 +668,9 @@ pub struct IntelConfig {
     /// The ceiling on one model call (`timeout`); `None` is the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// The connection's `rate:`: every call on it waits for a token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<String>,
     /// The model REFERENCE this was resolved from — a model name or a
     /// literal — so a restore resolves it again against the live settings
     /// instead of replaying a connection that may have moved. `None`: the
@@ -743,6 +746,7 @@ impl IntelConfig {
             .with_headers(self.headers.clone())
             .with_dialect(self.dialect.as_deref())
             .with_timeout(self.timeout_ms.map(std::time::Duration::from_millis))
+            .with_rate(&self.login_target(), self.rate.clone())
             .with_reasoning(self.reasoning)
             .with_temperature(self.temperature)
             .with_structured_prompt(self.structured_prompt)

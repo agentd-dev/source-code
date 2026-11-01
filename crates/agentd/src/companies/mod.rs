@@ -3,7 +3,7 @@
 //! Personal Agent Protocol draft 0.1, pinned at commit `95fcbf2`
 //! (rfcs/0047).
 //!
-//! A Company is an operator-declared `services` entry of `kind: company`.
+//! A Company is an operator-declared `companies` entry.
 //! The supervisor — and only the supervisor — discovers and verifies each
 //! one ([`discover`]), presents the one client identity every Company sees
 //! ([`identity`]), keeps the User's pseudonymous ID there ([`user_id`]),
@@ -143,8 +143,8 @@ mod supervisor {
     use super::session::{Env, Session};
     use super::user_id::{self, UserIds};
     use super::wire;
+    use crate::config::settings::Settings;
     use crate::config::settings::companies::{self as cfg, Privacy};
-    use crate::config::settings::{ServiceKind, Settings};
     use crate::obs::log::Logger;
     use crate::state::Durable;
 
@@ -418,10 +418,7 @@ mod supervisor {
                 .map(|d| d.0)
                 .unwrap_or(Duration::from_secs(60));
             let mut companies = BTreeMap::new();
-            for (name, svc) in &settings.services {
-                if svc.kind != ServiceKind::Company {
-                    continue;
-                }
+            for (name, svc) in &settings.companies {
                 let privacy = svc.privacy.unwrap_or_default();
                 if privacy == Privacy::Standard {
                     log.warn("company.privacy.standard", json!({"company": name}));
@@ -1261,10 +1258,8 @@ mod supervisor {
         /// more is refused until one ends.
         #[test]
         fn a_company_takes_its_limit_of_calls_in_flight() {
-            let svc: crate::config::settings::Service = serde_json::from_value(
-                json!({"kind": "company", "endpoint": "https://shop.example"}),
-            )
-            .unwrap();
+            let svc: crate::config::settings::Company =
+                serde_json::from_value(json!({"endpoint": "https://shop.example"})).unwrap();
             let c = Arc::new(Company {
                 name: "shop".into(),
                 discovery: Discovery::new(Entry::from_settings(

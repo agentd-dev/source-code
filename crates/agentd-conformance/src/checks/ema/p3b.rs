@@ -631,10 +631,24 @@ pub(super) fn a_ciba_refresh_token_is_revoked_after_a_crash(h: &Harness) -> Outc
         .enumerate()
         .skip(mark)
         .find(|(_, r)| r["path"] == "/bc/authorize");
+    // `nightly` fires again once this run ends, and that run's approval is
+    // kept while it waits on `go`: so not "nothing kept", but every approval
+    // since the restart either kept by a run still going or revoked — the
+    // revocations since the mark less the one the start swept.
     let ended = s.until(
         "the second approval's refresh token revoked at the run's end",
         Duration::from_secs(20),
-        &|| s.ciba_revokes().len() >= 2 && s.approvals_kept().is_empty(),
+        &|| {
+            let approved = s
+                .xaa
+                .record()
+                .iter()
+                .skip(mark)
+                .filter(|r| r.get("issued_id_token").is_some())
+                .count();
+            let revoked = s.ciba_revokes().iter().filter(|(i, _)| *i >= mark).count();
+            revoked >= 2 && s.approvals_kept().len() + revoked == approved + 1
+        },
     );
     let t = |r: &Value| r["t"].as_u64().unwrap_or(0);
     completed(&run)

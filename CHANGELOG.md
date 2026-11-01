@@ -100,6 +100,26 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Added.**
 
+- Sign in on use (RFC 0055 §4.3, P2). A `connect: on_use` MCP server that
+  needs a person to sign in is signed in to when it is first needed, not
+  ahead with `agentd --login`: its `auth`'s device grant (or browser +
+  PKCE, `grant: authorization_code`) when the login cache holds nothing
+  usable, and, for a server with no `auth` that answers with an RFC 9728
+  challenge, the device grant at the authorization server its metadata
+  names, with agentd's Client ID Metadata Document as the client. Where to
+  sign in is a sign-in gate on the A2A interface — the waiting run's task
+  goes `input-required`, badged, with the URL and the code (`mcpSignIn`),
+  and its one answer is `cancel` — and is logged
+  (`mcp.sign_in.required {server, url, method, code}`). The step waits
+  durably; a restart starts a new sign-in. Once signed in
+  (`mcp.sign_in.done`) the token is cached under `mcp:<name>` as a login
+  is, the server is dialed and the step goes on; past the step's
+  `timeout` (else the server's, else the device code's life) it fails
+  `sign_in_timeout`, and a denied, expired or cancelled sign-in fails it
+  `sign_in_<reason>` (`mcp.sign_in.failed`). A turn is told which servers
+  are being signed in to (the prompt's `signing_in`). The internal mock MCP
+  server takes `--bearer <token>`.
+
 - `agent.on_instruction_updated: note | think`. Under `think`, with
   `instruction_updated` in `agent.wake_on`, a released change to the
   instruction starts a turn of the root conversation by itself: the agent

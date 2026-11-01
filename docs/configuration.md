@@ -598,7 +598,10 @@ needs it:
 - a workflow step that names it (`mcp.tool`, `mcp.resource`, with
   `server: <name>`). The step waits, durably like a rate wait, until the
   server connects, and fails if it has not connected within the server's
-  `timeout` (or `mcp.default_timeout`);
+  `timeout` (or `mcp.default_timeout`). A server that needs a person to
+  sign in first is signed in to then, at a gate, and the step waits for
+  that within its own `timeout`, else the server's, else the grant's code
+  ([Sign in on use](authentication.md#sign-in-on-use));
 - a `wait {on: resource}` or a `subscribe` start on it;
 - an instruction document that declares it: it is dialed right after the
   load, and its tools reach the turns after it connects.
@@ -1154,7 +1157,9 @@ An expression is a path first and CEL second. Bare paths (`{{instance}}`,
 feature, with two helpers CEL lacks: `take(list, n)` and `join(list, sep)`.
 The data names are `instance`, `instruction`, `agents_md`, `workflows`,
 `endpoints`, `egress_closed`, `streams`, `templates`, `skills`, `peers`,
-`signals`, `memory` and `tools.internal`. `agents_md` is the list of
+`signals`, `signing_in`, `memory` and `tools.internal`. `signing_in` lists
+the MCP servers a person is signing in to
+([Sign in on use](authentication.md#sign-in-on-use)). `agents_md` is the list of
 `agent.workspace`'s AGENTS.md files, root first, each `{path, text}`.
 `endpoints` is the operator's `mcp.servers`, `a2a.peers` and
 `http.endpoints`, each `{name, kind, tags, tags_text, tools, tools_text,

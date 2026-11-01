@@ -495,6 +495,58 @@ an `issuer` changed, or added to a block that only pinned `token_url` — the
 login is not presented, renewed or revoked, and requests fail naming the
 `--login` that fixes it.
 
+### Sign in on use
+
+A `connect: on_use` MCP server
+([Connecting on use](configuration.md#connecting-on-use)) needs no
+`--login` ahead of time. When it is first needed and needs a person to sign
+in, agentd signs in then, through the same grant `--login` runs, and keeps
+the token in the same cache under `mcp:<name>`:
+
+- **With `auth`.** An `oauth2` block whose grant is `device` (the default)
+  or `authorization_code`, for which the cache holds no token from its
+  authorization server and nothing to renew one from (no login, a refresh
+  token the server refused, or a record another server issued), is signed
+  in to by that grant. `client_credentials` needs nobody and is not
+  affected.
+- **Without `auth`.** A server whose dial fails is asked for its RFC 9728
+  protected-resource metadata (its `401` challenge, else the well-known
+  locations). When the metadata names an authorization server, agentd signs
+  in there by the device grant, with its
+  [Client ID Metadata Document](#client-id-metadata-document) as its client.
+  With no `security.client` nobody can sign in, and the steps that wait for
+  the server fail `sign_in_unavailable`, naming the fix. The authorization
+  server is held to the same rules as any server-named one: on the server's
+  own origin, or HTTPS through the SSRF guard (and in `http.endpoints` under
+  `security.egress: closed`).
+
+Where to sign in is logged (`mcp.sign_in.required {server, url, method,
+code}`) and shown on the A2A interface as a **sign-in gate**, the same
+surface a human approval uses: the run's task goes `input-required`, badged
+as a gate agentd raised itself, with the verification URL and the code in
+its question and in `mcpSignIn` on the task. The TUI and the web UI show it
+as they show any gate. When no step waits — an instruction declared the
+server — the gate is a task of its own. The person signs in at the
+authorization server, not at the gate; the gate closes by itself once they
+have (`mcp.sign_in.done`), and the server is dialed with the new token. The
+one answer the gate takes is `cancel`. A browser (`authorization_code`)
+sign-in listens on a loopback port of agentd's machine, so it suits an
+agentd running on the person's own machine; anywhere else, use the device
+grant.
+
+The waiting step waits durably, the way it waits for any on-use server: a
+restart keeps it waiting, closes the gate the previous process opened (the
+device code went with it), and starts a new sign-in with a new gate. It
+waits as long as its `timeout`, else the server's `timeout`, else as long as
+the device code is good; past that it fails `sign_in_timeout`. A sign-in
+that is denied, expires or is cancelled fails each waiting step with
+`sign_in_denied`, `sign_in_expired` or `sign_in_cancelled`
+(`mcp.sign_in.failed {server, reason}`), and the server is not dialed again
+until something needs it anew. A turn is not held: the prompt lists the
+servers being signed in to (`signing_in`), and their tools reach the turns
+after they connect. A token kept this way is refreshed, revoked by
+`--logout mcp:<name>`, and shared with `--login`, as any login is.
+
 **Waits the server asks for.** A token endpoint that answers `429` or `503`
 with `Retry-After` (seconds or an HTTP date) is not asked again before the
 wait is over, five minutes at most: a refresh in that time fails at once,

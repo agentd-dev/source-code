@@ -231,6 +231,16 @@ records whose condition is met or whose deadline has passed. Nothing about a
 wait lives only in memory, so a run can wait a month for a signal across any
 number of restarts.
 
+A step that names a `connect: on_use` MCP server waits the same way until
+the server connects, and, when the server needs a person to sign in, until
+they have: the sign-in is a gate on the run's task, showing where to sign in
+and the code, and the step goes on once the token arrives — after a restart
+too, with a new sign-in. Past the step's `timeout` (else the server's) it
+fails `sign_in_timeout`; a sign-in that is denied or expires fails it with
+that reason. There is no sign-in node: a workflow that would rather sign in
+before its expensive work calls a cheap tool on the server in an early step
+(see [Sign in on use](authentication.md#sign-in-on-use)).
+
 A wait's `on_timeout` turns a deadline into an expected branch rather than a
 failure: "the alert fired and did not clear in ten minutes" becomes a step
 that runs, not a failed run. The timeout target is reached only by that

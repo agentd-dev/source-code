@@ -620,6 +620,9 @@ its `jti`.
 | `mcp.listen.narrowed` | warn | `server`, `dropped` | A re-listen came back without some URIs; they are asked for again. |
 | `mcp.listen.resumed` | info | `server` |  |
 | `mcp.listen.unavailable` | warn | `server`, `reason`, `retry_ms` | The standing listen failed or was refused. |
+| `mcp.sign_in.done` | info | `server`, `method` | A person signed in to a server dialed on use (RFC 0055 §4.3); the token is in the login cache under `mcp:<server>`, and the server is dialed now. |
+| `mcp.sign_in.failed` | info, warn | `server`, `reason`, `method?`, `error?`, `task?` | A sign-in to a server dialed on use ended without a token. `reason`: `denied`, `expired`, `cancelled` (its gate was answered `cancel`, or its own task cancelled), `failed`, `unavailable` (nobody can sign in: no client, or an authorization server agentd may not reach), or `interrupted` (agentd restarted while its gate was open; a step still waiting starts a new one). Each step that waited fails `sign_in_<reason>`. |
+| `mcp.sign_in.required` | info | `server`, `url`, `method`, `code?`, `expires_in_s` | A server dialed on use needs a person to sign in: `method` `device` (open `url`, enter `code`) or `browser` (open `url` on agentd's machine). The same is shown as a sign-in gate on the A2A interface. |
 | `mcp.task.cancelled` | info | `server`, `task`, `reason` | `tasks/cancel` was sent for an MCP task — its step timed out, its run was cancelled, its step no longer waits, the run its `agent` step handed it over in or a step of which detached it ended (`the run ended`), or `mcp.task.cancel` — or the server cancelled it. `task` is agentd's handle (`mt_…`), never the server's id. |
 | `mcp.task.completed` | info | `server`, `task`, `is_error` | An MCP task completed; `is_error` is the tool's own. |
 | `mcp.task.created` | info | `server`, `tool`, `task`, `status`, `ttl_ms`, `poll_interval_ms`, `run`, `step` | A workflow step's tool call became an MCP task; the step waits on it, or, with `detach`, finishes (`mcp.task.detached`). |
@@ -870,6 +873,7 @@ an instruction's by `origin: instruction` and `name`.
 | `step.rate_wait_fail` | warn | `err`, `run`, `step` |  |
 | `step.retry` | info | `attempt`, `backoff_ms`, `run`, `step` | A step is retried after `backoff_ms`. |
 | `step.retry.skipped` | info | `attempt`, `reason`, `run`, `step` | A failed step with a `retry:` is not retried: `reason: outcome unknown`, a Company call that failed after it was sent and may have been performed. |
+| `step.sign_in_timeout` | info | `run`, `server`, `step` | A step waited for a sign-in to an on-use server longer than its `timeout` (else the server's, else the grant's code); it fails `sign_in_timeout`. |
 | `step.start` | info | `attempt`, `kind`, `run`, `step` | A workflow step started. |
 | `step.timeout_routed` | info | `run`, `step`, `to` |  |
 | `step.turn.spawn` | info | `node`, `run`, `step` |  |

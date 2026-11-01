@@ -424,7 +424,7 @@ pub struct Agent {
     #[serde(skip)]
     pub instruction_read: Option<Value>,
     /// The document's skills fetched by `src` at this load — DERIVED, each
-    /// logged as `skill.fetched`: `{name, src, url, bytes, digest}`.
+    /// logged as `skills.fetched`: `{name, src, url, bytes, digest}`.
     #[serde(skip)]
     pub skill_fetches: Vec<Value>,
     /// The `:::config` fragment the instruction declared — DERIVED. It is
@@ -1466,7 +1466,7 @@ struct DocumentFold {
     operator_intelligence: Option<Value>,
     /// The `workflows[]` indices the document contributed.
     workflows: std::collections::BTreeSet<usize>,
-    /// One `skill.fetched` record per remote skill fetched.
+    /// One `skills.fetched` record per remote skill fetched.
     skill_fetches: Vec<Value>,
 }
 
@@ -1721,7 +1721,7 @@ fn fold_instruction_document(
 /// policy (under `security.egress: closed` its host is in the services
 /// catalogue), on `https://`, to a public address, and no larger than
 /// `skills.max_bytes`. One that fails is a warning and that skill is left
-/// out; the document and the reload stand. Returns the `skill.fetched`
+/// out; the document and the reload stand. Returns the `skills.fetched`
 /// records.
 fn fetch_remote_skills(
     ex: &mut crate::config::idoc::Extraction,

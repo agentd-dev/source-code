@@ -83,7 +83,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   fetches it at load and reload instead of holding it as text. The fetch
   takes the rules a `url:` document gets (https, the egress policy, a public
   address) and is capped at `skills.max_bytes`. The text is marked
-  untrusted, like a server's skill. Each fetch logs `skill.fetched`. A failed
+  untrusted, like a server's skill. Each fetch logs `skills.fetched`. A failed
   fetch is a warning that leaves the skill out, and never refuses the
   document or the reload. Fetched skills count in
   `instruction.machinery.applied`.

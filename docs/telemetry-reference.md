@@ -814,10 +814,10 @@ an instruction's by `origin: instruction` and `name`.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `skill.fetched` | info | `bytes`, `digest`, `name`, `src`, `url` | A document's `:::skill{src}` was fetched at load or reload: `url` is the raw `SKILL.md` read, `digest` its `sha256:`. A failed fetch is a `config.warning` instead. |
 | `skills.collision` | warn | `candidates`, `kept`, `name`, `shadowed` | A name more than one skill holds: an operator's skill that shadows another (`kept`, `shadowed`), or skills of different origins (`candidates`, each reached by its qualified reference). |
 | `skills.declined` | warn | `ctx`, `file`, `path`, `reason`, `run`, `server`, `skill`, `step`, `uri` | agentd refused a skill: an entry that breaks a rule, a file whose bytes or frontmatter do not match, a `dynamic` skill its source does not allow. `ctx`, or `run` and `step`, name who asked. |
 | `skills.discovered` | info | `count`, `dir`, `origin`, `scope`, `server`, `skills`, `truncated` | A source's skills were listed (`server`, `skills: [{name, uri}]`), a folder read (`scope`, `dir`, `skills: [{name, path}]`), or the instruction's added (`origin`). |
+| `skills.fetched` | info | `bytes`, `digest`, `name`, `src`, `url` | A document's `:::skill{src}` was fetched at load or reload: `url` is the raw `SKILL.md` read, `digest` its `sha256:`. A failed fetch is a `config.warning` instead. |
 | `skills.load.failed` | warn | `ctx`, `err`, `run`, `server`, `skill`, `step`, `uri` | A skill's server was not connected or answered with an error. |
 | `skills.load.refused` | warn | `ctx`, `err`, `skill` | `skills.max_loaded` was reached. |
 | `skills.loaded` | info | `ctx`, `hash`, `name`, `origin`, `path`, `run`, `server`, `skill`, `step`, `uri`, `verified` | A skill body entered a context (`ctx`) or a step's prompt (`run`, `step`). `verified` is false for a `dynamic` skill. |

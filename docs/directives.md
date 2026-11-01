@@ -225,7 +225,7 @@ is at most `skills.max_bytes` (32 KiB by default). The document's `id` names
 the skill; its description comes from the `SKILL.md` front matter, or the
 block's `description` or `title`. The text is outside input: the catalogue
 lists it `untrusted`, and its body reaches the model inside a block that
-names the URL, like a server's skill. Each fetch logs `skill.fetched` with
+names the URL, like a server's skill. Each fetch logs `skills.fetched` with
 its size and digest. A fetch that fails (the network, a 404, a file too
 large, a host the policy refuses) is a `config.warning`, and that skill is
 left out; the document and the reload still apply.

@@ -364,7 +364,7 @@ fn serve_skill(path: &'static str, body: &'static str) -> String {
 
 /// A `::skill{src}` naming a SKILL.md is fetched when the document's
 /// machinery applies: registered under the document's id, logged as
-/// `skill.fetched` with its digest, and counted as added. One whose fetch
+/// `skills.fetched` with its digest, and counted as added. One whose fetch
 /// fails is a warning and is left out; the rest of the document applies.
 #[test]
 fn a_skill_named_by_src_is_fetched_and_one_that_fails_is_left_out() {
@@ -385,7 +385,7 @@ fn a_skill_named_by_src_is_fetched_and_one_that_fails_is_left_out() {
         "{first}"
     );
     let log = d.log();
-    let got = events(&log, "skill.fetched");
+    let got = events(&log, "skills.fetched");
     assert_eq!(got.len(), 1, "{log}");
     assert_eq!(got[0]["name"], "house-style");
     assert_eq!(got[0]["bytes"], SKILL.len());

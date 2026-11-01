@@ -184,7 +184,7 @@ impl Runtime {
         self.machinery_noted = None;
         let changed = self.commit_reload(&old, staged);
         for f in &self.settings.agent.skill_fetches {
-            self.log.info("skill.fetched", f.clone());
+            self.log.info("skills.fetched", f.clone());
         }
         if machinery_moved {
             let (servers_added, servers_removed) =

@@ -1121,7 +1121,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         log.info("instruction.read", read);
     }
     for f in &rt.settings.agent.skill_fetches {
-        log.info("skill.fetched", f.clone());
+        log.info("skills.fetched", f.clone());
     }
 
     if let Err(errs) = rt.load_workflows() {

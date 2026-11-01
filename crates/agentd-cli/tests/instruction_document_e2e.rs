@@ -147,9 +147,17 @@ Thanks — we are on it.
 :::
 "#;
 
+/// The grants FULL loads under: `identity` activates its A2A agent, which
+/// only a build with `a2a` can; without it the agent stays text.
+const GRANTS: &[&str] = if cfg!(feature = "a2a") {
+    &["identity"]
+} else {
+    &[]
+};
+
 #[test]
 fn a_full_document_loads_every_element() {
-    let (valid, err, caps) = load(FULL, &["identity"]);
+    let (valid, err, caps) = load(FULL, GRANTS);
     assert!(valid, "the document did not validate:\n{err}");
     let wf: Vec<&str> = caps["workflows"]
         .as_array()
@@ -166,12 +174,13 @@ fn a_full_document_loads_every_element() {
     );
     // A connected object agentd records but does not activate.
     assert_eq!(caps["document"]["declarations"]["tool"], 1, "{caps}");
-    assert!(
-        !err.contains("host-policy"),
-        "nothing was held back:\n{err}"
+    assert_eq!(
+        err.contains("host-policy"),
+        GRANTS.is_empty(),
+        "only an ungranted agent was held back:\n{err}"
     );
 
-    let s = settings(FULL, &["identity"]);
+    let s = settings(FULL, GRANTS);
     let search = s.mcp.servers.iter().find(|m| m.name == "search").unwrap();
     assert_eq!(search.endpoint, "https://mcp.internal.example/search");
     assert_eq!(
@@ -179,8 +188,11 @@ fn a_full_document_loads_every_element() {
         Some(&["query".to_string(), "fetch".to_string()][..])
     );
     assert_eq!(search.exclude, ["fetch"]);
-    let peer = s.a2a.peers.iter().find(|p| p.name == "deployer").unwrap();
-    assert_eq!(peer.endpoint, "https://deploy.internal.example/a2a");
+    #[cfg(feature = "a2a")]
+    {
+        let peer = s.a2a.peers.iter().find(|p| p.name == "deployer").unwrap();
+        assert_eq!(peer.endpoint, "https://deploy.internal.example/a2a");
+    }
     assert_eq!(s.limits.max_runs, Some(8));
     assert!(s.streams.contains_key("tickets"));
     assert_eq!(s.agent.inline_skills[0].name, "tone");
@@ -195,13 +207,26 @@ fn a_full_document_loads_every_element() {
 /// nothing, drops nothing, re-renders nothing.
 #[test]
 fn the_agent_text_is_the_sdks_byte_for_byte() {
-    let s = settings(FULL, &["identity"]);
+    let s = settings(FULL, GRANTS);
     let (sdk, diagnostics) = instruction_md::deliver(FULL, None);
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     assert_eq!(s.agent.instruction.as_deref(), Some(sdk.as_str()));
     // Declared defaults are substituted; metadata never reaches the model.
     assert!(sdk.contains("within 1 hour."), "{sdk}");
     assert!(!sdk.contains("spec: \"1\""), "{sdk}");
+}
+
+/// A granted A2A agent in a build without `a2a` refuses the document, naming
+/// the feature, rather than loading an agent it cannot reach.
+#[cfg(not(feature = "a2a"))]
+#[test]
+fn a_granted_agent_needs_the_a2a_build() {
+    let (valid, err, _) = load(FULL, &["identity"]);
+    assert!(!valid, "a granted agent loaded without a2a");
+    assert!(
+        err.contains("a2a.peers needs the a2a build feature"),
+        "{err}"
+    );
 }
 
 /// An A2A agent outside the grants is not activated: it stays in the agent
@@ -359,9 +384,13 @@ fn serve_document(body: &'static str) -> String {
 #[test]
 fn a_document_from_the_wire_activates_no_agent() {
     const AGENT: &str = "You review.\n\n::agent{id=reviewer title=\"Reviewer\" protocol=a2a endpoint=\"https://r.example/a2a\"}\n";
-    let (valid, err, _) = load(AGENT, &["identity"]);
-    assert!(valid, "the operator's own text did not load:\n{err}");
-    assert!(!err.contains("host-policy"), "{err}");
+    // The operator's own text activates the agent, which needs `a2a`.
+    #[cfg(feature = "a2a")]
+    {
+        let (valid, err, _) = load(AGENT, &["identity"]);
+        assert!(valid, "the operator's own text did not load:\n{err}");
+        assert!(!err.contains("host-policy"), "{err}");
+    }
     let mut cfg = config_for("", &["identity"], Value::Null);
     cfg["agent"]["instruction"] = json!({"url": serve_document(AGENT)});
     let (valid, err, _) = validate(&cfg);

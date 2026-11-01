@@ -73,7 +73,7 @@ fn lacks_feature(feature: &str) -> bool {
 }
 
 /// The features named when EVERY `config.invalid` line in `errtext` is a
-/// "needs the '<feature>' build feature" refusal for a feature this build
+/// "needs the '<feature>' build feature" (or unquoted) refusal for a feature this build
 /// lacks; `None` when any line is another error (or there are none), so a
 /// document refused for a real reason still fails.
 fn only_absent_feature_refusals(errtext: &str) -> Option<Vec<String>> {
@@ -86,9 +86,12 @@ fn only_absent_feature_refusals(errtext: &str) -> Option<Vec<String>> {
             continue;
         }
         let msg = ev["msg"].as_str().or(ev["error"].as_str())?;
-        let (_, rest) = msg.split_once("the '")?;
-        let (feature, tail) = rest.split_once('\'')?;
-        if !tail.starts_with(" build feature") || !lacks_feature(feature) {
+        // Both spellings agentd uses: "the 'cron' build feature" and
+        // "needs the a2a build feature, which this binary was built without".
+        let (head, _) = msg.split_once(" build feature")?;
+        let (_, feature) = head.rsplit_once("the ")?;
+        let feature = feature.trim_matches('\'');
+        if !lacks_feature(feature) {
             return None;
         }
         features.push(feature.to_string());

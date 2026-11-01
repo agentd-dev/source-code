@@ -334,3 +334,74 @@ fn under_reload_a_changed_machinery_waits_for_sighup() {
     );
     wait_calls(&two, 1, "server two's tool called after SIGHUP", &d);
 }
+
+/// Serve `body` at `path` on a loopback port, 404 for every other path;
+/// returns the server's origin.
+fn serve_skill(path: &'static str, body: &'static str) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut conn in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = conn.read(&mut buf).unwrap_or(0);
+            let head = String::from_utf8_lossy(&buf[..n]);
+            let asked = head.split_whitespace().nth(1).unwrap_or_default();
+            let (status, body) = if asked == path {
+                ("200 OK", body)
+            } else {
+                ("404 Not Found", "")
+            };
+            let _ = write!(
+                conn,
+                "HTTP/1.1 {status}\r\nContent-Type: text/markdown\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// A `::skill{src}` naming a SKILL.md is fetched when the document's
+/// machinery applies: registered under the document's id, logged as
+/// `skill.fetched` with its digest, and counted as added. One whose fetch
+/// fails is a warning and is left out; the rest of the document applies.
+#[test]
+fn a_skill_named_by_src_is_fetched_and_one_that_fails_is_left_out() {
+    const SKILL: &str = "---\nname: house-style\ndescription: Write in the house style.\n---\n# House style\n\nShort sentences.\n";
+    let origin = serve_skill("/skills/house-style/SKILL.md", SKILL);
+    let registry = common::spawn_mock_mcp("mock://unused", false);
+    let one = common::spawn_mock_mcp("mock://unused", false);
+    let fetched = format!(
+        "::skill{{id=house-style title=\"House style\" src=\"{origin}/skills/house-style/SKILL.md\"}}\n\n\
+         ::skill{{id=missing title=\"Missing\" src=\"{origin}/skills/missing/SKILL.md\"}}\n\n"
+    );
+    serve(&registry, &document(&[block("one", &one, "tone"), fetched]));
+    let mut d = boot(config(&registry, None));
+    let first = applied(&mut d, 0);
+    assert_eq!(
+        names(&first["skills_added"]),
+        ["house-style", "tone"],
+        "{first}"
+    );
+    let log = d.log();
+    let got = events(&log, "skill.fetched");
+    assert_eq!(got.len(), 1, "{log}");
+    assert_eq!(got[0]["name"], "house-style");
+    assert_eq!(got[0]["bytes"], SKILL.len());
+    assert!(
+        got[0]["digest"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("sha256:")),
+        "{}",
+        got[0]
+    );
+    assert_eq!(inline_skills(&log), ["house-style", "tone"], "{log}");
+    assert!(
+        events(&log, "config.warning").iter().any(|e| e["warning"]
+            .as_str()
+            .is_some_and(|w| w.contains("\"missing\"") && w.contains("left out"))),
+        "{log}"
+    );
+    wait_calls(&one, 1, "the rest of the document applies", &d);
+}

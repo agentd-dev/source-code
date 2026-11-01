@@ -423,6 +423,10 @@ pub struct Agent {
     /// prose, which is not read as a document.
     #[serde(skip)]
     pub instruction_read: Option<Value>,
+    /// The document's skills fetched by `src` at this load — DERIVED, each
+    /// logged as `skill.fetched`: `{name, src, url, bytes, digest}`.
+    #[serde(skip)]
+    pub skill_fetches: Vec<Value>,
     /// The `:::config` fragment the instruction declared — DERIVED. It is
     /// merged UNDER the document during typing and never written back into
     /// it, so `--effective-config` has no other way to show a setting that an
@@ -1462,6 +1466,8 @@ struct DocumentFold {
     operator_intelligence: Option<Value>,
     /// The `workflows[]` indices the document contributed.
     workflows: std::collections::BTreeSet<usize>,
+    /// One `skill.fetched` record per remote skill fetched.
+    skill_fetches: Vec<Value>,
 }
 
 /// Fold an instruction document's machinery into `doc` — the ONE fold every
@@ -1473,7 +1479,9 @@ struct DocumentFold {
 /// deserialized) capped by what its author attested (§7.6 step 5); the
 /// fragment merges UNDER the document, so an explicit config key still wins.
 /// `over_the_wire` holds the §7.8 floor. Every check that refuses a document
-/// runs here; placing the agent text is the caller's.
+/// runs here; placing the agent text is the caller's. The skills whose
+/// `SKILL.md` it names are fetched only for the MERGED document — once per
+/// load, not again for each file typed on its own.
 fn fold_instruction_document(
     doc: &mut Value,
     text: &str,
@@ -1481,6 +1489,7 @@ fn fold_instruction_document(
     over_the_wire: bool,
     source: &str,
     label: &str,
+    egress: &EgressPolicy,
     warnings: &mut Vec<String>,
 ) -> Result<DocumentFold, String> {
     let mut granted: std::collections::BTreeSet<String> = doc
@@ -1675,13 +1684,97 @@ fn fold_instruction_document(
             w.extend(ex.workflows.clone());
         }
     }
+    let mut ex = ex;
+    let skill_fetches = if source == MERGED_DOCUMENT {
+        fetch_remote_skills(&mut ex, doc, egress, warnings)
+    } else {
+        Vec::new()
+    };
     Ok(DocumentFold {
         extraction: ex,
         read,
         grants: granted,
         operator_intelligence,
         workflows,
+        skill_fetches,
     })
+}
+
+/// Fetch the `SKILL.md` of every skill a document names by `src`
+/// (`idoc::skill_url`) and add each to its skills, marked as fetched text —
+/// which reaches the model as untrusted input, inside a block that names the
+/// URL. A fetch is a URL read like a `url:` document's: through the egress
+/// policy (under `security.egress: closed` its host is in the services
+/// catalogue), on `https://`, to a public address, and no larger than
+/// `skills.max_bytes`. One that fails is a warning and that skill is left
+/// out; the document and the reload stand. Returns the `skill.fetched`
+/// records.
+fn fetch_remote_skills(
+    ex: &mut crate::config::idoc::Extraction,
+    doc: &Value,
+    egress: &EgressPolicy,
+    warnings: &mut Vec<String>,
+) -> Vec<Value> {
+    let cap = doc
+        .pointer("/skills/max_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(32_768) as usize;
+    let mut fetched = Vec::new();
+    for r in ex.remote_skills.clone() {
+        let got = fetch_skill_md(&r.url, egress, cap).and_then(|text| {
+            let (fm, body) = crate::context::skills::local::split(&text)?;
+            Ok((text, fm, body))
+        });
+        match got {
+            Ok((text, fm, body)) => {
+                let description = fm
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| r.description.clone())
+                    .unwrap_or_default();
+                ex.skills.push(crate::config::idoc::InlineSkill {
+                    name: r.name.clone(),
+                    description,
+                    when_to_use: r.when_to_use.clone(),
+                    body,
+                    fetched_from: Some(r.url.clone()),
+                });
+                fetched.push(json!({
+                    "name": r.name, "src": r.src, "url": r.url, "bytes": text.len(),
+                    "digest": format!("sha256:{}", crate::sha::sha256_hex(text.as_bytes())),
+                }));
+            }
+            Err(e) => warnings.push(format!(
+                "agent.instruction: skill {:?} ({}) is left out: {e}",
+                r.name, r.url
+            )),
+        }
+    }
+    fetched
+}
+
+/// Read a skill's `SKILL.md` at `url`, under the rules a document fetch
+/// follows ([`fetch_remote_skills`]): every hop is admitted by the egress
+/// policy and, on `https://`, must reach a public address.
+fn fetch_skill_md(url: &str, egress: &EgressPolicy, cap: usize) -> Result<String, String> {
+    let admit = |u: &str| -> Result<(), String> {
+        egress.allows(ServiceKind::Http, u)?;
+        let parsed = crate::net::http::Url::parse(u).map_err(|e| format!("url {u}: {e}"))?;
+        if parsed.is_tls() {
+            crate::net::ssrf::guard_host(&parsed.host, false).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    };
+    admit(url)?;
+    let text = crate::config::http_get(url, &admit)?;
+    if text.len() > cap {
+        return Err(format!(
+            "{} bytes, over skills.max_bytes ({cap})",
+            text.len()
+        ));
+    }
+    Ok(text)
 }
 
 fn document_label(path: Option<&str>) -> String {
@@ -5817,6 +5910,7 @@ impl Settings {
         let mut operator_intelligence: Option<Value> = None;
         let mut document_workflows = std::collections::BTreeSet::new();
         let mut document_grants = std::collections::BTreeSet::new();
+        let mut skill_fetches = Vec::new();
         // The document whose machinery folds: the instruction itself — an
         // instruction/1 document, read by the instruction.md SDK, the ONLY
         // surface extraction runs on (conversation text is never parsed) —
@@ -5864,6 +5958,7 @@ impl Settings {
                 wire,
                 source,
                 &label,
+                &egress_policy,
                 &mut instruction_warnings,
             )?;
             if !resource && let Some(a) = doc.get_mut("agent").and_then(Value::as_object_mut) {
@@ -5876,6 +5971,7 @@ impl Settings {
             document_grants = f.grants;
             operator_intelligence = f.operator_intelligence;
             document_workflows = f.workflows;
+            skill_fetches = f.skill_fetches;
             idoc_extraction = Some(f.extraction);
         }
         // `agent.prompt` is a document too — a one-shot task is as likely to
@@ -6005,6 +6101,7 @@ impl Settings {
         settings.agent.instruction_dir_files = instruction_dir_files;
         settings.agent.instruction_warnings = instruction_warnings;
         settings.agent.instruction_read = instruction_read;
+        settings.agent.skill_fetches = skill_fetches;
         Ok(settings)
     }
 
@@ -18066,6 +18163,37 @@ mod registry_document_tests {
             :::config{id=c dialect=\"agentd/config\"}\nsecurity:\n  allow_trifecta: true\n:::\n";
         let e = load(operator(), raw).unwrap_err();
         assert!(e.contains("operator configuration"), "{e}");
+    }
+
+    /// A skill named by `src` is fetched through the egress policy: under
+    /// `security.egress: closed` a host the catalogue lacks is refused, said,
+    /// and the skill left out — the document still loads.
+    #[test]
+    fn a_skill_fetch_closed_egress_refuses_is_left_out_not_fatal() {
+        let raw = "---\nspec: \"1\"\n---\n# Served\n\n\
+            ::skill{id=fd title=\"fd\" src=\"https://github.com/anthropics/skills/blob/main/skills/frontend-design/SKILL.md\"}\n\n\
+            :::skill{id=tone title=\"Tone\"}\nBe brief.\n:::\n";
+        let mut doc = operator();
+        doc["security"] = json!({"egress": "closed"});
+        doc["services"] =
+            json!({"registry": {"kind": "mcp", "endpoint": "http://127.0.0.1:9/mcp"}});
+        let s = load(doc, raw).unwrap();
+        let names: Vec<&str> = s
+            .agent
+            .inline_skills
+            .iter()
+            .map(|k| k.name.as_str())
+            .collect();
+        assert_eq!(names, ["tone"]);
+        assert!(s.agent.skill_fetches.is_empty());
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("\"fd\"") && w.contains("left out")),
+            "{:?}",
+            s.agent.instruction_warnings
+        );
     }
 
     #[test]

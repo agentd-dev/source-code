@@ -183,6 +183,9 @@ impl Runtime {
         self.machinery_in_force = digest;
         self.machinery_noted = None;
         let changed = self.commit_reload(&old, staged);
+        for f in &self.settings.agent.skill_fetches {
+            self.log.info("skill.fetched", f.clone());
+        }
         if machinery_moved {
             let (servers_added, servers_removed) =
                 added_removed(&document_servers(&old), &document_servers(&self.settings));

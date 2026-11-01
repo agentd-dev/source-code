@@ -209,6 +209,25 @@ pub struct InlineSkill {
     pub description: String,
     pub when_to_use: Option<String>,
     pub body: String,
+    /// The URL a fetched skill's text came from (a `:::skill{src}` naming a
+    /// `SKILL.md`): outside text, which reaches the model marked untrusted.
+    /// `None` for a body the document carries.
+    pub fetched_from: Option<String>,
+}
+
+/// A `:::skill{src}` naming a `SKILL.md` agentd fetches at load, before the
+/// fetch ([`skill_url`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RemoteSkill {
+    /// The document's id for it, which names the skill.
+    pub name: String,
+    /// Its title or description, the fallback when the `SKILL.md` has none.
+    pub description: Option<String>,
+    pub when_to_use: Option<String>,
+    /// The `src` as written.
+    pub src: String,
+    /// What is fetched: `src` normalised to the raw file.
+    pub url: String,
 }
 
 /// What a document yields: the agent text, a configuration fragment to merge
@@ -224,6 +243,9 @@ pub struct Extraction {
     /// not folded under a section.
     pub workflows: Vec<Value>,
     pub skills: Vec<InlineSkill>,
+    /// Skills whose `SKILL.md` is fetched at load, not yet fetched: the
+    /// configuration loader fetches them (`config::settings`).
+    pub remote_skills: Vec<RemoteSkill>,
     /// Connected objects recorded by kind (visible in `--capabilities`),
     /// activated by nothing.
     pub declarations: BTreeMap<String, Vec<Value>>,
@@ -444,13 +466,24 @@ impl Folder<'_> {
 
     fn skill(&mut self, o: &ConnectedObject<'_>) {
         let Some(id) = o.id else { return };
-        if o.src.is_some() {
-            return self.hold(
-                o,
-                "agentd loads packaged skills from its configuration (`skills:`), not from a \
-                 document's `src`"
-                    .into(),
-            );
+        if let Some(src) = o.src {
+            let Some(url) = skill_url(src) else {
+                return self.hold(
+                    o,
+                    "agentd fetches a skill's `src` only when it names a SKILL.md on GitHub \
+                     (a github.com blob or tree URL, or raw.githubusercontent.com); a packaged \
+                     skill is the configuration's (`skills:`)"
+                        .into(),
+                );
+            };
+            self.out.remote_skills.push(RemoteSkill {
+                name: id.to_string(),
+                description: o.description.or(o.title).map(str::to_string),
+                when_to_use: o.attr("trigger").map(str::to_string),
+                src: src.to_string(),
+                url,
+            });
+            return;
         }
         let body = o.body.map(str::trim).unwrap_or_default();
         if body.is_empty() {
@@ -461,6 +494,7 @@ impl Folder<'_> {
             description: o.description.or(o.title).unwrap_or_default().to_string(),
             when_to_use: o.attr("trigger").map(str::to_string),
             body: body.to_string(),
+            fetched_from: None,
         });
     }
 
@@ -560,6 +594,59 @@ pub fn merge_missing(into: &mut Map<String, Value>, add: Map<String, Value>) {
     }
 }
 
+/// The raw `SKILL.md` a skill's `src` names, or `None` for a `src` agentd
+/// does not fetch. Three spellings of one file on GitHub, all normalised to
+/// the raw URL:
+///
+/// - `https://github.com/{owner}/{repo}/blob/{ref}/{path}/SKILL.md`
+/// - `https://github.com/{owner}/{repo}/tree/{ref}/{dir}` (its `SKILL.md`)
+/// - `https://raw.githubusercontent.com/{owner}/{repo}/{ref}/{path}/SKILL.md`
+///
+/// A test build also takes a plain `http://` loopback URL ending in
+/// `/SKILL.md`, the one plaintext fetch agentd's URL reader makes, so an e2e
+/// can serve one without the internet.
+pub fn skill_url(src: &str) -> Option<String> {
+    let clean = |segments: &[&str]| {
+        segments
+            .iter()
+            .all(|s| !s.is_empty() && *s != "." && *s != ".." && !s.contains(['?', '#', '\\']))
+    };
+    if let Some(rest) = src.strip_prefix("https://github.com/") {
+        let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+        let [owner, repo, kind, git_ref, path @ ..] = parts.as_slice() else {
+            return None;
+        };
+        if path.is_empty() || !clean(&parts) {
+            return None;
+        }
+        let file = match *kind {
+            "blob" if path.last() == Some(&"SKILL.md") => path.join("/"),
+            "tree" if path.last() != Some(&"SKILL.md") => format!("{}/SKILL.md", path.join("/")),
+            _ => return None,
+        };
+        return Some(format!(
+            "https://raw.githubusercontent.com/{owner}/{repo}/{git_ref}/{file}"
+        ));
+    }
+    if let Some(rest) = src.strip_prefix("https://raw.githubusercontent.com/") {
+        let parts: Vec<&str> = rest.split('/').collect();
+        return (parts.len() >= 4 && parts.last() == Some(&"SKILL.md") && clean(&parts))
+            .then(|| src.to_string());
+    }
+    #[cfg(any(debug_assertions, feature = "internal-mocks"))]
+    if let Some(rest) = src.strip_prefix("http://") {
+        let (host, path) = rest.split_once('/')?;
+        let host = host.rsplit_once(':').map_or(host, |(h, _)| h);
+        if (host == "127.0.0.1" || host == "localhost")
+            && path.ends_with("SKILL.md")
+            && clean(&path.split('/').collect::<Vec<_>>())
+        {
+            return Some(src.to_string());
+        }
+    }
+    None
+}
+
 /// A digest of what a document's machinery maps onto — everything an
 /// [`Extraction`] carries but the agent text and the diagnostics — or `None`
 /// when it maps onto nothing. Two versions whose machinery is the same digest
@@ -569,6 +656,7 @@ pub fn machinery_digest(ex: &Extraction) -> Option<String> {
     if ex.config.is_empty()
         && ex.workflows.is_empty()
         && ex.skills.is_empty()
+        && ex.remote_skills.is_empty()
         && ex.declarations.is_empty()
         && ex.people.is_empty()
     {
@@ -581,6 +669,10 @@ pub fn machinery_digest(ex: &Extraction) -> Option<String> {
             serde_json::json!({"name": s.name, "description": s.description,
                                "when_to_use": s.when_to_use, "body": s.body})
         })
+        .chain(ex.remote_skills.iter().map(|s| {
+            serde_json::json!({"name": s.name, "description": s.description,
+                               "when_to_use": s.when_to_use, "src": s.src})
+        }))
         .collect();
     let all = serde_json::json!({
         "config": ex.config,
@@ -741,7 +833,64 @@ mod tests {
                 description: "Refunds".into(),
                 when_to_use: Some("a customer asks for a refund".into()),
                 body: "Refund within 30 days.".into(),
+                fetched_from: None,
             }]
+        );
+    }
+
+    #[test]
+    fn a_skill_src_on_github_names_its_raw_skill_md() {
+        let raw = "https://raw.githubusercontent.com/anthropics/skills/main/skills/frontend-design/SKILL.md";
+        for src in [
+            "https://github.com/anthropics/skills/blob/main/skills/frontend-design/SKILL.md",
+            "https://github.com/anthropics/skills/tree/main/skills/frontend-design",
+            "https://github.com/anthropics/skills/tree/main/skills/frontend-design/",
+            raw,
+        ] {
+            assert_eq!(skill_url(src).as_deref(), Some(raw), "{src}");
+        }
+        for src in [
+            // Not a SKILL.md, or not on GitHub, or not https.
+            "https://github.com/anthropics/skills/blob/main/skills/frontend-design/README.md",
+            "https://github.com/anthropics/skills/tree/main/skills/x/SKILL.md",
+            "https://github.com/anthropics/skills",
+            "https://github.com/anthropics/skills/blob/main",
+            "https://example.com/skills/x/SKILL.md",
+            "http://github.com/anthropics/skills/blob/main/x/SKILL.md",
+            "http://raw.githubusercontent.com/a/b/main/x/SKILL.md",
+            "https://raw.githubusercontent.com/a/b/SKILL.md",
+            "https://github.com/a/b/blob/main/../x/SKILL.md",
+            "https://raw.githubusercontent.com/a/b/main/x/SKILL.md?token=1",
+            "http://10.0.0.1/x/SKILL.md",
+            "mcp://server/skill",
+        ] {
+            assert_eq!(skill_url(src), None, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_skill_with_a_github_src_is_fetched_and_another_src_is_held() {
+        let ex = extract(
+            "::skill{id=frontend-design title=\"frontend-design\" src=\"https://github.com/anthropics/skills/blob/main/skills/frontend-design/SKILL.md\"}\n\n\
+             ::skill{id=other title=\"Other\" src=\"https://example.com/x.zip\"}\n",
+            &all_families(),
+        )
+        .unwrap();
+        assert_eq!(ex.remote_skills.len(), 1);
+        assert_eq!(ex.remote_skills[0].name, "frontend-design");
+        assert!(
+            ex.remote_skills[0]
+                .url
+                .starts_with("https://raw.githubusercontent.com/")
+        );
+        assert!(ex.skills.is_empty());
+        assert_eq!(ex.declarations["skill"].len(), 1);
+        assert!(
+            ex.warnings
+                .iter()
+                .any(|w| w.contains("\"other\"") && w.contains(HOST_POLICY)),
+            "{:?}",
+            ex.warnings
         );
     }
 

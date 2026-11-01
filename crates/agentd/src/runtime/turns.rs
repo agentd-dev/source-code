@@ -2189,7 +2189,10 @@ mod tests {
                 description: "d".into(),
                 when_to_use: None,
                 reference: format!("s{i}"),
-                source: crate::context::skills::Source::Inline { body: "b".into() },
+                source: crate::context::skills::Source::Inline {
+                    body: "b".into(),
+                    fetched_from: None,
+                },
             })
             .collect();
         let metas: Vec<&_> = metas.iter().collect();

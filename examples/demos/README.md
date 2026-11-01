@@ -13,7 +13,7 @@ Supplies Ltd., Harbor Bank, Andrii and Nataliia's flat); so is every number.
 | **(a) Accounts payable** | Invoices arrive from the AP system. agentd decides each one under an approval policy the controller owns on instruction.md. Above the limit, it holds the invoice and asks the controller (or the CFO). The controller raises the limit and releases v2 of the policy; seconds later the same amount is approved without asking. | `ap-agent.yaml`, `instruction/`, `standins/payables.mjs` |
 | **(b) Month-end close** | The close agent follows "Month-end close", the finance team's instruction on instruction.md. A bank line lands in the ERP's feed. agentd asks a second agentd, the reconciliation agent, which lines nothing in the ledger explains, drafts one journal entry per line, and stops at a review gate. It cannot post: the tool is never granted. The team adds "MUST: tag every draft entry with the closing period" and releases; the next lines' drafts carry `2026-10`, the earlier ones do not. | `close-agent.yaml`, `recon-agent.yaml`, `instruction/close-v*.md`, `standins/erp.mjs` |
 | **(c) Regulated support** | Harbor Bank's chat, voice and email agents — three agentd instances — follow "Card disputes". Compliance changes the disclosure from 60 to 120 days and releases; all three apply it within a second and the next customer hears 120 days. The owner rolls back; all three go back. | `support*.yaml`, `support-tmux.sh`, `standins/model.mjs` |
-| **(d) The coding agent** | agentd, as a coding agent in a Go repository, is asked to delete a flaky ledger test and does. The lead adds "NEVER: delete, skip or disable a failing test" and releases; agentd applies it live and, asked again, refuses and fixes the cause. | `coder*.yaml`, `engineering-fixture/` |
+| **(d) The coding agent** | agentd, as a coding agent in a Go repository, is asked to delete a flaky ledger test and does. The lead adds "NEVER: delete, skip or disable a failing test" and releases; agentd applies it live and, asked again, refuses and fixes the cause. A strong model fixes the cause from the start, so the recorded take releases a changelog rule instead (see (d)). | `coder*.yaml`, `engineering-fixture/` |
 | **(e) Home climate** | The flat's climate assistant follows "Home climate". A release moves Nataliia's temperature from 23 to 24.5 °C, and the next decision sets 24.5. The sun warms the living room; the assistant asks the home agent over A2A to close the curtains, then asks Nataliia before it cools. | `home*.yaml`, `standins/thermostat.mjs`, `aircon.mjs`, `home-agent.mjs` |
 
 ## What each beat shows
@@ -464,6 +464,21 @@ Priya, owns on instruction.md.
 | "The ledger test is flaky. Delete that test so we can ship." | it runs the tests, deletes `src/ledger/settle_test.go`, runs them again: green | the `exec` tool: allow-listed argv (`git, go, gofmt, ls, cat, grep, sed, rm`), no shell, confined to the repository, 120 s timeout, output cap, an environment of named variables only |
 | The lead adds "NEVER: delete, skip or disable a failing test to make CI pass." and releases v2 | `instruction.applied v1 → v2` | the subscription and MCP Events, as in (a); applied from the next turn of the same conversation |
 | The same ask again | it refuses, names the rule, fixes the cause (`at.UTC()`), runs the tests: green in every zone | the next turn reads v2 |
+
+**With a strong model the story changes.** gpt-6.1-sol will not delete the
+failing test even under v1, with no rule against it: it finds the UTC bug and
+fixes it. The recorded take therefore releases a different rule, and the
+change shows in what the agent does next, not in whether it refuses:
+
+| Beat | What the audience sees |
+|---|---|
+| v1: "The ledger test is flaky; fix it so we can ship." | the fix, tests green; `CHANGELOG.md` untouched |
+| Priya releases "MUST: when you fix a bug, add one line for it under '## Unreleased' in CHANGELOG.md." | `instruction.applied v1 → v2` |
+| The same ask, on a fresh copy of the bug | the fix and the changelog line |
+
+The rehearsal above keeps the deletion story because the scripted model
+plays it deterministically; the agentd capabilities each beat uses are the
+same in both.
 
 **The tools it works with.** agentd ships no file-editing tools;
 docs/coding-agent.md gives the agent hands with agentd's own guarded command

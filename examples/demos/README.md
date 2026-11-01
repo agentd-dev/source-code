@@ -579,6 +579,28 @@ rehearsing: `TZ=America/New_York go test ./...` and
    bucketing, runs the tests; `git -C "$REPO" diff` shows the fix and the
    test intact.
 
+## The coding agent gains a server and a skill (coder-e.yaml)
+
+The coding agent of demo (d), with no restart in between. The platform lead
+approves DeepWiki in the studio and releases v2 of the coder handbook, which
+adds `:::mcp{id=deepwiki src="https://mcp.deepwiki.com/mcp" tools="ask_wiki_question,read_wiki_structure"}`
+and a skill, inline or by `src` naming a SKILL.md on GitHub. Between turns
+agentd reads v2, fetches the skill (`skills.fetched`), dials DeepWiki beside
+the running servers and commits both in one step (`config.reloaded` with
+`trigger: instruction`, then `instruction.machinery.applied`). The next turn
+asks DeepWiki and writes `docs/deps/<dep>.html` with `exec` (`mkdir`, then
+`tee` with the page as stdin).
+
+```sh
+agentd -c examples/demos/coder.yaml -c examples/demos/coder-e.yaml 2> >(tee "$AGENTD_DEMO_HOME/coder.log" >&2)
+```
+
+`coder-e.yaml` adds DeepWiki and `raw.githubusercontent.com` to the services
+catalogue (egress stays closed), and `mkdir` and `tee` to the commands `exec`
+may run. A server the catalogue does not name refuses the release's reload
+whole, and the running agent keeps what it had; a skill on an uncatalogued
+host is left out with a warning.
+
 ## Demo (e): a home that follows instructions
 
 The flat's climate assistant follows "Home climate", which Andrii and

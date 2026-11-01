@@ -1,0 +1,46 @@
+# Demo (e): a release adds a server and a skill to a running coding agent.
+#
+# Layered over coder.yaml (demo (d)'s coding agent, same repository, same
+# handbook):
+#
+#   export REPO=/path/to/payments
+#   agentd -c examples/demos/coder.yaml -c examples/demos/coder-e.yaml
+#
+# The live beat. agentd is running in the TUI. The platform lead approves
+# DeepWiki in the studio and releases v2 of the coder handbook, which adds
+#
+#   :::mcp{id=deepwiki src="https://mcp.deepwiki.com/mcp" tools="ask_wiki_question,read_wiki_structure"}
+#   ::skill{id=frontend-design src="https://github.com/anthropics/skills/blob/main/skills/frontend-design/SKILL.md"}
+#
+# (and/or an inline :::skill). Between turns, with no restart, agentd reads v2,
+# fetches the skill (`skills.fetched {name, url, bytes, digest}`), dials
+# DeepWiki beside the running servers, and commits both in one step
+# (`config.reloaded {trigger: instruction}`, then
+# `instruction.machinery.applied {servers_added, skills_added}`). The next turn
+# calls DeepWiki and writes docs/deps/<dep>.html with `exec` (mkdir, then tee
+# with the page as stdin).
+#
+# `agent.instruction.machinery: live` is the default, stated here so the
+# kit says what the demo relies on. `reload` would log
+# `instruction.machinery.pending` and wait for a SIGHUP.
+#
+# Placeholders: those of coder.yaml. Nothing new.
+
+agent:
+  instruction:
+    machinery: live
+
+security:
+  exec:
+    # coder.yaml's list (a list replaces, it does not append), plus what
+    # writing a page needs: `mkdir -p docs/deps`, and `tee <file>` with the
+    # page as the command's stdin. Still no shell and no network tool.
+    allow: [git, go, gofmt, ls, cat, grep, sed, rm, mkdir, tee]
+
+# egress: closed (coder.yaml) dials only what the catalogue names. A
+# document's server missing here refuses the release's reload whole
+# (`config.reload.invalid` names it) and the running agent keeps what it had;
+# a skill whose host is missing is left out with a `config.warning`.
+services:
+  deepwiki: {kind: mcp, endpoint: "https://mcp.deepwiki.com/mcp"}
+  github-skills: {kind: http, endpoint: "https://raw.githubusercontent.com"}

@@ -18,6 +18,7 @@ pub mod delegation;
 pub mod events;
 pub mod inbound;
 pub mod payments;
+pub mod registries;
 pub mod schema;
 
 use super::file::{self, Format};
@@ -1278,6 +1279,10 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // When a server is dialed is the operator's (RFC 0055 §4.4): a document
     // declares the servers it needs, and the load dials an on-use one.
     "mcp.servers[].connect",
+    // The registries the operator trusts and the names it approves from
+    // each (RFC 0055 §4.4): a document names a registry server, and the
+    // operator's entry decides whether it resolves.
+    "mcp.registries",
     // Who may talk to THIS agent and as what, over which socket, with which
     // credential. Enumerated rather than taken as a section, because
     // `a2a.peers` — an outbound dial — is the document's and sits inside it;
@@ -2738,6 +2743,9 @@ pub struct Degrade {
 #[serde(deny_unknown_fields, default)]
 pub struct Mcp {
     pub servers: Vec<McpServer>,
+    /// The registries the operator trusts as directories of MCP servers,
+    /// and the names it approves from each (RFC 0055 §3.1). Operator-only.
+    pub registries: Vec<registries::McpRegistry>,
     pub default_timeout: Option<Dur>,
     /// NOT a config key: the operator's servers the instruction declared
     /// (RFC 0055 §3.1) — a `connect: on_use` one among them is dialed right
@@ -2753,9 +2761,7 @@ pub struct Mcp {
 impl Mcp {
     /// Whether `server` is a `connect: on_use` server.
     pub fn on_use(&self, server: &str) -> bool {
-        self.servers
-            .iter()
-            .any(|s| s.name == server && s.connect == Connect::OnUse)
+        self.servers.iter().any(|s| s.name == server && s.on_use())
     }
 }
 
@@ -2943,6 +2949,9 @@ pub struct FoldedServers {
     pub own: BTreeSet<String>,
     /// Host-policy diagnostics: what was narrowed, what was held as text.
     pub warnings: Vec<String>,
+    /// The `src` a document named beside a registry server, by the server
+    /// it folded into: the record's remotes must hold it (RFC 0055 §4.2).
+    pub registry_src: BTreeMap<String, String>,
 }
 
 /// Fold a document's `mcp.servers` and `a2a.peers` into the operator's
@@ -2983,6 +2992,23 @@ pub fn fold_document_servers(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        // A server named by registry (RFC 0055 §4.2): the registry is one
+        // the operator trusts and the name one it approves, whatever the
+        // egress policy — otherwise the block stays text.
+        if let Some(registry) = srv.get("registry").and_then(Value::as_str) {
+            if let Some(target) =
+                fold_registry_server(operator, &srv, &name, registry, &mut out.warnings)
+            {
+                if !endpoint.is_empty() {
+                    out.registry_src.insert(target.clone(), endpoint.clone());
+                }
+                if name != target {
+                    renames.insert(name.clone(), target.clone());
+                }
+                out.matched.insert(target);
+            }
+            continue;
+        }
         let target = operator
             .pointer_mut("/mcp/servers")
             .and_then(Value::as_array_mut)
@@ -3104,6 +3130,88 @@ pub fn fold_document_servers(
         }
     }
     out
+}
+
+/// Fold a document's server named by registry into the operator's servers:
+/// the operator's own entry for that registry server when there is one,
+/// else one made for it under its [`registries::implicit_name`], narrowed by
+/// the document's `allow` and `exclude`. `None` — the block held as text,
+/// said in `warnings` — when `registry` is no `mcp.registries` entry's URL
+/// or name, or the entry does not approve the name.
+fn fold_registry_server(
+    operator: &mut Value,
+    doc: &Value,
+    name: &str,
+    registry: &str,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let server = doc
+        .get("server")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let regs: Vec<registries::McpRegistry> = operator
+        .pointer("/mcp/registries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| serde_json::from_value(r.clone()).ok())
+        .collect();
+    let Some(reg) = regs
+        .iter()
+        .find(|r| r.is_url(registry) || r.name == registry)
+    else {
+        warnings.push(format!(
+            "mcp server {name:?} ({server} from {registry}) is not activated: {registry} is no registry the operator trusts (mcp.registries) — the document's block stays text (host-policy)"
+        ));
+        return None;
+    };
+    if server.is_empty() || !reg.approves(server) {
+        warnings.push(format!(
+            "mcp server {name:?} is not activated: {} — the document's block stays text (host-policy)",
+            registries::not_approved(reg, server)
+        ));
+        return None;
+    }
+    let version = doc.get("version").and_then(Value::as_str);
+    let same_version =
+        |v: Option<&str>| v.unwrap_or(registries::LATEST) == version.unwrap_or(registries::LATEST);
+    let servers = operator
+        .as_object_mut()?
+        .entry("mcp")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()?
+        .entry("servers")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()?;
+    let found = servers.iter().position(|o| {
+        o.get("registry").and_then(Value::as_str) == Some(reg.name.as_str())
+            && o.get("server").and_then(Value::as_str) == Some(server)
+            && same_version(o.get("version").and_then(Value::as_str))
+    });
+    let at = match found {
+        Some(i) => i,
+        None => {
+            let implicit = registries::implicit_name(&reg.name, server, version);
+            match servers
+                .iter()
+                .position(|o| o.get("name").and_then(Value::as_str) == Some(implicit.as_str()))
+            {
+                Some(i) => i,
+                None => {
+                    let mut made =
+                        json!({"name": implicit, "registry": reg.name, "server": server});
+                    if let Some(v) = version {
+                        made["version"] = json!(v);
+                    }
+                    servers.push(made);
+                    servers.len() - 1
+                }
+            }
+        }
+    };
+    let op = &mut servers[at];
+    narrow_operator_server(op, doc, name, warnings);
+    op.get("name").and_then(Value::as_str).map(str::to_string)
 }
 
 /// Narrow the operator's server `op` by the document's `doc` entry: `allow`
@@ -3517,8 +3625,20 @@ impl EgressPolicy {
 pub struct McpServer {
     pub name: String,
     /// The server's URL. A Company's servers are made with an empty one,
-    /// filled at discovery.
+    /// filled at discovery; a registry server has none, its registry's
+    /// record names it when it is dialed.
+    #[serde(default)]
     pub endpoint: String,
+    /// The `mcp.registries` entry this server comes from, in place of an
+    /// `endpoint` (RFC 0055 §4.2).
+    #[serde(default)]
+    pub registry: Option<String>,
+    /// The server's name in that registry (`io.github.github/github-mcp-server`).
+    #[serde(default)]
+    pub server: Option<String>,
+    /// The version resolved: `latest` (the default) or an exact one.
+    #[serde(default)]
+    pub version: Option<String>,
     #[serde(default)]
     pub ns: Option<String>,
     #[serde(default)]
@@ -3554,10 +3674,11 @@ pub struct McpServer {
     /// (the step field's shape); a step's own `breaker:` wins.
     #[serde(default)]
     pub breaker: Option<Value>,
-    /// When the server is dialed: at `boot` (the default), or `on_use` — on
-    /// the first call that needs it (RFC 0055 §4.3). Once connected it stays.
+    /// When the server is dialed: at `boot` (the default; `on_use` for a
+    /// registry server), or `on_use` — on the first call that needs it (RFC
+    /// 0055 §4.3). Once connected it stays.
     #[serde(default)]
-    pub connect: Connect,
+    pub connect: Option<Connect>,
     /// Whether this server may answer a call with an MCP task (RFC 0050):
     /// `auto` declares the Tasks extension where the revision defines it,
     /// `off` never does. Part of the dial spec: a change re-dials.
@@ -3575,9 +3696,58 @@ pub struct McpServer {
     /// ([`companies::synthesize`]), which only the supervisor dials.
     #[serde(skip)]
     pub company: Option<companies::CompanyServer>,
+    /// NOT a config key: the `src` an instruction's `:::mcp{registry server
+    /// src}` named beside the registry — the record's remotes must hold it,
+    /// or the server is refused when it is resolved (RFC 0055 §4.2).
+    #[serde(skip)]
+    pub document_src: Option<String>,
 }
 
 impl McpServer {
+    /// A registry server with nothing of its own: `server` from the
+    /// `mcp.registries` entry `registry`, at `version`.
+    pub fn from_registry(
+        name: &str,
+        registry: &str,
+        server: &str,
+        version: Option<String>,
+    ) -> McpServer {
+        McpServer {
+            name: name.to_string(),
+            endpoint: String::new(),
+            registry: Some(registry.to_string()),
+            server: Some(server.to_string()),
+            version,
+            ns: None,
+            headers: BTreeMap::new(),
+            tags: BTreeMap::new(),
+            allow: None,
+            exclude: Vec::new(),
+            aauth: None,
+            oauth: None,
+            auth: None,
+            timeout: None,
+            rate: None,
+            breaker: None,
+            connect: None,
+            tasks: super::TasksMode::default(),
+            events: Vec::new(),
+            event_grants: Vec::new(),
+            company: None,
+            document_src: None,
+        }
+    }
+
+    /// Whether it is dialed on the first call that needs it rather than at
+    /// start: `connect: on_use`, and a registry server unless it says
+    /// `connect: boot`.
+    pub fn on_use(&self) -> bool {
+        match self.connect {
+            Some(c) => c == Connect::OnUse,
+            None => self.registry.is_some(),
+        }
+    }
+
     /// The flattened, deduplicated trifecta tag set across every tool-pattern
     /// key — the legs it declares; `trusted` is none. An unknown tag name is
     /// an error rather than a silent drop, since a typo'd tag would otherwise
@@ -3641,6 +3811,7 @@ impl McpServer {
             company: self.company.as_ref().map(|c| c.entry.clone()),
             delegated: delegation::is_delegated(self),
             tasks: self.tasks,
+            registry: None,
         })
     }
 }
@@ -6478,6 +6649,11 @@ impl Settings {
         settings.agent.instruction_read = instruction_read;
         settings.agent.skill_fetches = skill_fetches;
         settings.mcp.document_matched = folded_servers.matched;
+        for srv in &mut settings.mcp.servers {
+            if let Some(src) = folded_servers.registry_src.get(&srv.name) {
+                srv.document_src = Some(src.clone());
+            }
+        }
         settings.mcp.document_servers = folded_servers.own;
         Ok(settings)
     }
@@ -7471,6 +7647,8 @@ pub fn load_with(
     // A Company's servers are made BEFORE validation and the trifecta gate,
     // so both judge them as the servers they are.
     let service_errors = resolve_companies(&mut settings);
+    // A registry server's tags and ceiling are its registry's (RFC 0055).
+    registries::complete(&mut settings);
     let mut loaded = Loaded {
         settings,
         doc,
@@ -9420,6 +9598,8 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     inbound::validate(s, &mut d);
     // `security.payments`: the spend policy (RFC 0049).
     payments::validate(s, &mut d);
+    // `mcp.registries` and the registry servers (RFC 0055 §3.1).
+    registries::validate(s, &mut d);
 
     // mcp servers
     let mut names = std::collections::HashSet::new();
@@ -9440,8 +9620,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                     .into(),
             );
         }
-        // A Company's servers have no endpoint until discovery.
-        if srv.company.is_some() {
+        // A Company's servers have no endpoint until discovery; a registry
+        // server's is its record's.
+        if srv.company.is_some() || srv.registry.is_some() {
         } else if srv.endpoint.is_empty() {
             err(
                 &mut d,
@@ -10741,6 +10922,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
     // tools, not a server, and carry the entry's tags as its MCP servers do
     // (RFC 0047 §6.3).
     tags.extend(companies::interface_tags(s));
+    // Every name a registry approves counts at the registry's tags, whether
+    // or not one is connected yet (RFC 0055 §4.4).
+    tags.extend(registries::approved_tags(s));
     use crate::sec::scope::{TrifectaVerdict, check_trifecta};
     if check_trifecta(tags, s.security.allow_trifecta) == TrifectaVerdict::RefusedTrifecta {
         err(&mut d, "lethal-trifecta refused: the root grant wires untrusted_input + sensitive + egress into one agent; narrow the tags or set security.allow_trifecta (audited)".into());
@@ -10967,6 +11151,23 @@ pub(crate) fn undeclared_references(
     ) {
         for (id, st) in steps {
             match st.kind.as_str() {
+                // A registry server a step names is approved by its
+                // registry, and made when the step first runs (RFC 0055 §4.2).
+                "mcp.tool" | "mcp.resource" | "wait"
+                    if let Some(named) = registries::StepServer::of(&st.spec) =>
+                {
+                    match registries::registry(s, &named.registry) {
+                        None => out.push(format!(
+                            "workflow {wf:?} step {id:?}: mcp registry {:?} is not declared under mcp.registries",
+                            named.registry
+                        )),
+                        Some(reg) if !reg.approves(&named.server) => out.push(format!(
+                            "workflow {wf:?} step {id:?}: {}",
+                            registries::not_approved(reg, &named.server)
+                        )),
+                        Some(_) => {}
+                    }
+                }
                 "mcp.tool" | "mcp.resource" => {
                     if let Some(srv) = st.field_str("server")
                         && !templated(srv)
@@ -11701,6 +11902,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "limits.subagents",
     "limits.workflow",
     "mcp.default_timeout",
+    "mcp.registries",
     "mcp.servers",
     "memory.list_default_limit",
     "memory.max_value_bytes",
@@ -12172,6 +12374,9 @@ mod tests {
                             json!([{"name": "a", "endpoint": "https://a.example/mcp"}])
                         }
                         "workflows" => json!([{"name": "w", "steps": {}}]),
+                        "mcp.registries" => {
+                            json!([{"name": "r", "url": "https://registry.example"}])
+                        }
                         "a2a.principals" => json!([{"match": {"any": true}, "role": "user"}]),
                         "a2a.peers" => json!([{"name": "p", "endpoint": "https://p.example"}]),
                         "a2a.inbound_tokens" => {
@@ -13467,9 +13672,13 @@ mod tests {
         let s = McpServer {
             name: "gh".into(),
             endpoint: "https://mcp.example".into(),
+            registry: None,
+            server: None,
+            version: None,
+            document_src: None,
             rate: None,
             breaker: None,
-            connect: Connect::Boot,
+            connect: Some(Connect::Boot),
             ns: None,
             headers: BTreeMap::new(),
             tags: BTreeMap::new(),
@@ -16862,6 +17071,195 @@ mod tests {
         .map_err(|e| e.to_string())
     }
 
+    const REGISTRY: &str = "mcp:\n  registries:\n    - {name: official, url: \"https://registry.example\", servers: [\"io.acme/*\"], allow: [\"get_*\", \"list_*\"], rate: 10/1s}\n";
+
+    /// A registry server takes its registry's tags, ceiling and pacing, and
+    /// is dialed on use; the registry's globs are the approval (RFC 0055).
+    #[test]
+    fn a_registry_server_is_its_registrys_and_approved_by_its_globs() {
+        use crate::sec::scope::TrifectaTag as T;
+        let l = load_yaml(&format!(
+            "store: {{kind: memory}}\n{REGISTRY}  servers:\n    - {{name: kb, registry: official, server: io.acme/kb, version: \"1.2.0\", allow: [get_doc, \"put_*\"]}}\n"
+        ))
+        .unwrap();
+        let s = &l.settings.mcp.servers[0];
+        assert!(s.on_use() && l.settings.mcp.on_use("kb"));
+        assert_eq!(s.counted_tags(), [T::UntrustedInput]);
+        assert_eq!(
+            s.allow.as_deref(),
+            Some(&["get_doc".to_string()][..]),
+            "a pattern outside the registry's ceiling is dropped"
+        );
+        assert_eq!(s.rate.as_deref(), Some("10/1s"));
+        let spec = crate::runtime::reload::dial_spec(&l.settings, s).unwrap();
+        let d = spec.registry.unwrap();
+        assert_eq!(
+            (d.base.as_str(), d.server.as_str(), d.version.as_str()),
+            ("https://registry.example", "io.acme/kb", "1.2.0")
+        );
+        // Under closed egress the registry entry is the declaration.
+        let l = load_yaml(&format!(
+            "store: {{kind: memory}}\nsecurity: {{egress: closed}}\n{REGISTRY}  servers:\n    - {{name: kb, registry: official, server: io.acme/kb}}\n"
+        ))
+        .unwrap();
+        assert!(crate::runtime::reload::dial_specs(&l.settings).is_ok());
+        // `connect: boot` dials it at start.
+        let l = load_yaml(&format!(
+            "store: {{kind: memory}}\n{REGISTRY}  servers:\n    - {{name: kb, registry: official, server: io.acme/kb, connect: boot}}\n"
+        ))
+        .unwrap();
+        assert!(!l.settings.mcp.servers[0].on_use());
+        // A name outside the globs, an undeclared registry, an endpoint
+        // beside the registry: refused.
+        for (server, want) in [
+            (
+                "{name: kb, registry: official, server: io.other/kb}",
+                "not approved by mcp registry \"official\"",
+            ),
+            (
+                "{name: kb, registry: nowhere, server: io.acme/kb}",
+                "registry \"nowhere\" is not declared",
+            ),
+            (
+                "{name: kb, registry: official, server: io.acme/kb, endpoint: \"https://kb/mcp\"}",
+                "keep one",
+            ),
+            ("{name: kb, server: io.acme/kb}", "add `registry`"),
+        ] {
+            let e = load_yaml(&format!(
+                "store: {{kind: memory}}\n{REGISTRY}  servers:\n    - {server}\n"
+            ))
+            .unwrap_err();
+            assert!(e.contains(want), "{server}: {e}");
+        }
+        // Missing or empty `servers` approves nothing.
+        let e = load_yaml(
+            "store: {kind: memory}\nmcp:\n  registries:\n    - {name: official, url: \"https://registry.example\"}\n  servers:\n    - {name: kb, registry: official, server: io.acme/kb}\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("approves no server"), "{e}");
+        // `trusted` on a registry is refused.
+        let e = load_yaml(
+            "store: {kind: memory}\nmcp:\n  registries:\n    - {name: official, url: \"https://registry.example\", servers: [\"*\"], tags: {\"*\": [trusted]}}\n",
+        )
+        .unwrap_err();
+        assert!(e.contains("`trusted` is refused on a registry"), "{e}");
+    }
+
+    /// Approving a registry is judged at load: its tags count in the root
+    /// grant's trifecta whether or not a server from it is connected.
+    #[test]
+    fn a_registrys_approved_names_count_in_the_trifecta_at_load() {
+        let base = "store: {kind: memory}\nmcp:\n  servers:\n    - {name: vault, endpoint: \"https://vault.example/mcp\", tags: {\"*\": [sensitive, egress]}}\n";
+        assert!(
+            load_yaml(&format!(
+                "{base}  registries:\n    - {{name: official, url: \"https://registry.example\"}}\n"
+            ))
+            .is_ok(),
+            "approving nothing counts nothing"
+        );
+        let e = load_yaml(&format!(
+            "{base}  registries:\n    - {{name: official, url: \"https://registry.example\", servers: [\"io.acme/*\"]}}\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("lethal-trifecta"), "{e}");
+    }
+
+    /// A workflow step names a registry server by registry and name: the
+    /// approval is checked at load, and every step naming it shares one
+    /// name.
+    #[test]
+    fn a_workflow_step_names_a_registry_server_its_registry_approves() {
+        let wf = |server: &str| {
+            format!(
+                "store: {{kind: memory}}\n{REGISTRY}workflows:\n  - name: w\n    steps:\n      s: {{kind: manual}}\n      c: {{kind: mcp.tool, depends_on: [s], registry: official, server: {server}, tool: get_doc}}\n      r: {{kind: mcp.resource, depends_on: [s], registry: official, server: {server}, op: list}}\n      f: {{kind: finish, depends_on: [c, r]}}\n"
+            )
+        };
+        let l = load_yaml(&wf("io.acme/kb")).unwrap();
+        let w = crate::engine::model::parse_workflow(&l.settings.workflows[0]).unwrap();
+        let named = registries::steps_naming(&w);
+        assert_eq!(named.len(), 2);
+        assert!(
+            named
+                .iter()
+                .all(|n| n.name == "official/io.acme/kb" && n.server == "io.acme/kb")
+        );
+        let e = load_yaml(&wf("io.other/kb")).unwrap_err();
+        assert!(
+            e.contains("step \"c\"") && e.contains("not approved"),
+            "{e}"
+        );
+    }
+
+    /// An instruction's `:::mcp{registry server}` is the registry server the
+    /// operator's registry approves, dialed after the load, its `src` kept
+    /// for the record to hold; any other is text (RFC 0055 §4.2).
+    #[test]
+    fn an_instructions_registry_server_folds_into_the_operators_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let instr = dir.path().join("i.md");
+        let load = |block: &str| {
+            let wf = if block.contains("io.acme/kb src") {
+                ":::workflow{id=w dialect=\"instruction/workflow\"}\nname: w\nsteps:\n  s: {kind: manual}\n  c: {kind: mcp.tool, depends_on: [s], server: kb, tool: get_doc}\n  f: {kind: finish, depends_on: [c]}\n:::\n"
+            } else {
+                ""
+            };
+            std::fs::write(
+                &instr,
+                format!("---\nspec: \"1\"\n---\nYou are the desk.\n\n{block}\n\n{wf}"),
+            )
+            .unwrap();
+            load_yaml(&format!(
+                "store: {{kind: memory}}\nagent: {{preflight: never, instruction: {{file: {}}}}}\n{REGISTRY}",
+                instr.display()
+            ))
+        };
+        let l = load(":::mcp{id=kb registry=\"https://registry.example/\" server=io.acme/kb src=\"https://kb.acme.example/mcp\" tools=\"get_doc,put_doc\" account=work}\nThe knowledge base.\n:::").unwrap();
+        let s = l
+            .settings
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == "official/io.acme/kb")
+            .expect("made");
+        assert!(s.on_use() && l.settings.mcp.document_matched.contains(&s.name));
+        assert_eq!(s.allow.as_deref(), Some(&["get_doc".to_string()][..]));
+        assert_eq!(
+            s.document_src.as_deref(),
+            Some("https://kb.acme.example/mcp")
+        );
+        assert!(
+            l.warnings
+                .iter()
+                .any(|w| w.contains("`account` is not activated")),
+            "{:?}",
+            l.warnings
+        );
+        // The document's workflow calls it by the name it folded into.
+        let w = l
+            .settings
+            .workflows
+            .iter()
+            .find(|w| w["name"] == "w")
+            .unwrap();
+        assert_eq!(w["steps"]["c"]["server"], "official/io.acme/kb");
+        // A registry the operator does not trust, a name it does not
+        // approve: the block is text, said.
+        for (block, want) in [
+            (
+                ":::mcp{id=kb registry=\"https://other.example\" server=io.acme/kb}\nx\n:::",
+                "no registry the operator trusts",
+            ),
+            (
+                ":::mcp{id=kb registry=\"https://registry.example\" server=io.other/kb}\nx\n:::",
+                "not approved",
+            ),
+        ] {
+            let l = load(block).map(|l| l.warnings).unwrap_or_else(|e| vec![e]);
+            assert!(l.iter().any(|w| w.contains(want)), "{block}: {l:?}");
+        }
+    }
+
     /// A server's pacing, breaker and `connect` are its own settings, read
     /// and checked where the server is declared.
     #[test]
@@ -16871,7 +17269,7 @@ mod tests {
         )
         .unwrap();
         let s = &l.settings.mcp.servers[0];
-        assert_eq!(s.connect, Connect::OnUse);
+        assert_eq!(s.connect, Some(Connect::OnUse));
         assert!(l.settings.mcp.on_use("billing"));
         assert_eq!(s.to_spec().unwrap().rate.as_deref(), Some("60/1m"));
         let e = load_yaml(

@@ -209,6 +209,7 @@ fn top_level_properties(
             "type": "object", "additionalProperties": false,
             "properties": {
                 "servers": { "type": "array", "items": { "$ref": "#/$defs/McpServer" } },
+                "registries": { "type": "array", "items": { "$ref": "#/$defs/McpRegistry" }, "description": "the MCP registries the operator trusts as directories of servers, and the names it approves from each (RFC 0055). Operator-only" },
                 "default_timeout": duration
             }
         }),
@@ -761,10 +762,29 @@ fn defs_properties(
                 "tokens": { "type": "integer", "minimum": 1 },
                 "requests": { "type": "integer", "minimum": 1 },
                 "reset": { "type": "string", "pattern": "^[0-9]{2}:[0-9]{2}Z$", "description": "calendar-window reset time (UTC), e.g. 00:00Z" } } }));
-    m.insert("McpServer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "endpoint"],
+    m.insert("McpRegistry".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "url"],
                 "properties": {
                 "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
-                "endpoint": { "type": "string", "description": "the server's URL; an instruction's :::mcp whose src falls under it (scheme, authority, path on a segment boundary) is this server" },
+                "url": { "type": "string", "description": "the registry API's base (https://registry.modelcontextprotocol.io); agentd reads its v0.1 paths" },
+                "auth": { "$ref": "#/$defs/Auth" },
+                "headers": string_map,
+                "servers": { "type": "array", "items": { "type": "string" }, "description": "globs over registry names (`io.github.github/*`, `*` within a segment; `*` alone approves every name): the approval — a name outside them is never resolved, and a missing or empty list approves nothing" },
+                "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress"] } },
+                          "description": "the Rule-of-Two legs every server from it counts as; default {\"*\": [untrusted_input]}. `trusted` is refused: vouch for one server with an mcp.servers entry" },
+                "allow": { "type": "array", "items": { "type": "string" }, "description": "the widest tool surface a server from it offers" },
+                "exclude": { "type": "array", "items": { "type": "string" }, "description": "tools no server from it offers" },
+                "rate": { "type": "string", "description": "per-process pacing of the calls to each server from it (`<burst>/<per>`)" },
+                "timeout": duration,
+                "refresh": duration,
+                "allow_private": { "type": "boolean", "description": "admit remotes on loopback, private and link-local addresses (and loopback http://): an internal registry's servers. Default false" },
+                "discover": { "type": "boolean", "description": "give the model mcp.registry.search and mcp.registry.connect over the names `servers` approves. Default false" } } }));
+    m.insert("McpServer".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name"],
+                "properties": {
+                "name": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$" },
+                "endpoint": { "type": "string", "description": "the server's URL; an instruction's :::mcp whose src falls under it (scheme, authority, path on a segment boundary) is this server. A server names an endpoint or a registry and server" },
+                "registry": { "type": "string", "description": "the mcp.registries entry the server comes from, in place of an endpoint: its record names the endpoint when it is dialed (on use, unless connect: boot)" },
+                "server": { "type": "string", "description": "the server's name in that registry (io.github.github/github-mcp-server); its globs must approve it" },
+                "version": { "type": "string", "description": "the registry version resolved: latest (default) or an exact one" },
                 "ns": { "type": "string", "pattern": "^[a-zA-Z0-9_-]+$", "description": "tool namespace prefix (`ns.tool`)" },
                 "headers": string_map,
                 "tags": { "type": "object", "additionalProperties": { "type": "array", "items": { "enum": ["untrusted_input", "sensitive", "egress", "trusted"] } },
@@ -780,7 +800,7 @@ fn defs_properties(
                 "breaker": { "type": "object", "additionalProperties": false,
                              "properties": { "failures": { "type": "integer", "minimum": 1 }, "cooldown": duration },
                              "description": "the default breaker of the mcp.tool steps that name this server; a step's own breaker wins" },
-                "connect": { "enum": ["boot", "on_use"], "description": "boot (default) dials the server at start; on_use dials it on the first call that needs it — a workflow step naming it, a wait or subscribe start on it, or the instruction declaring it — and it stays connected. Its tools reach a turn once it has connected. Operator-only" },
+                "connect": { "enum": ["boot", "on_use"], "description": "boot (default; on_use for a registry server) dials the server at start; on_use dials it on the first call that needs it — a workflow step naming it, a wait or subscribe start on it, or the instruction declaring it — and it stays connected. Its tools reach a turn once it has connected. Operator-only" },
                 "tasks": { "enum": ["auto", "off"], "description": "whether the server may answer a tool call with an MCP task (the Tasks extension, SEP-2663): auto (default) declares the extension on 2026-07-28 connections, on the calls that have a bound (a turn's, a workflow step's, a store adapter's), off never does, so the server must answer every call inline (RFC 0050)" },
                 "events": { "type": "array", "items": { "$ref": "#/$defs/EventBinding" }, "description": "MCP Events bindings (RFC 0045): each event type subscribed with fixed arguments, every occurrence appended to a declared stream; requires the mcp-events build feature" },
                 "event_grants": { "type": "array", "items": { "$ref": "#/$defs/EventGrant" }, "description": "event types runtime subscriptions may be made for — by a wait that subscribes or the events.* tools — and what each of them gets fixed (RFC 0045 §5.15)" } } }));

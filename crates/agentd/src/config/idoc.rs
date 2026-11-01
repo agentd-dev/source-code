@@ -395,17 +395,58 @@ impl Folder<'_> {
 
     fn mcp(&mut self, o: &ConnectedObject<'_>) {
         let Some(id) = o.id else { return };
-        let Some(src) = o.src else {
-            return self.hold(
-                o,
-                "agentd dials an MCP server by its URL (`src`); a registry entry or server \
-                 reference is not resolved"
-                    .into(),
-            );
-        };
+        let line = o.location.line().unwrap_or(0) as usize;
+        // A credential the operator bound, and a resolver of the document's
+        // choosing, are not agentd's to take from a document.
+        for (attr, why) in [
+            (
+                "account",
+                "an account is a credential the operator binds to a server",
+            ),
+            (
+                "resolver",
+                "agentd resolves a registry server through the operator's mcp.registries alone",
+            ),
+        ] {
+            if o.attr(attr).is_some() {
+                self.out.warnings.push(format!(
+                    "line {line}: mcp {id:?}: its `{attr}` is not activated: {why} ({HOST_POLICY})"
+                ));
+            }
+        }
         let mut server = Map::new();
         server.insert("name".into(), id.into());
-        server.insert("endpoint".into(), src.into());
+        match (o.attr("registry"), o.attr("server"), o.src) {
+            // By registry and name (RFC 0055 §4.2): the load holds it to the
+            // operator's mcp.registries; a `src` beside them must be one of
+            // the record's remotes.
+            (Some(registry), Some(name), src) => {
+                server.insert("registry".into(), registry.into());
+                server.insert("server".into(), name.into());
+                if let Some(src) = src {
+                    server.insert("endpoint".into(), src.into());
+                }
+            }
+            (Some(_), None, _) | (None, Some(_), None) => {
+                return self.hold(
+                    o,
+                    "a server named by registry needs both `registry` (the registry's URL) and \
+                     `server` (its name there)"
+                        .into(),
+                );
+            }
+            (None, _, Some(src)) => {
+                server.insert("endpoint".into(), src.into());
+            }
+            (None, None, None) => {
+                return self.hold(
+                    o,
+                    "agentd dials an MCP server by its URL (`src`) or by a registry and the \
+                     server's name there (`registry`, `server`)"
+                        .into(),
+                );
+            }
+        }
         let mut allow = o.list("tools");
         for a in o.list("allow") {
             if !allow.contains(&a) {

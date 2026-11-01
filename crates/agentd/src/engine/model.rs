@@ -366,6 +366,8 @@ pub const KINDS: &[KindInfo] = &[
         &[
             "on",
             "server",
+            "registry",
+            "version",
             "uri",
             "condition",
             "signal",
@@ -539,6 +541,8 @@ pub const KINDS: &[KindInfo] = &[
         false,
         &[
             "server",
+            "registry",
+            "version",
             "tool",
             "args",
             "idempotency",
@@ -557,6 +561,8 @@ pub const KINDS: &[KindInfo] = &[
         false,
         &[
             "server",
+            "registry",
+            "version",
             "op",
             "uri",
             "name",
@@ -2203,6 +2209,13 @@ fn parse_step(
         if !spec.contains_key(*req) {
             errs.push(format!("{at}: kind {kind:?} requires field {req:?}"));
         }
+    }
+    // A step naming a registry server (RFC 0055 §4.2) calls it by the name
+    // every step naming it shares.
+    if matches!(kind.as_str(), "mcp.tool" | "mcp.resource" | "wait")
+        && let Err(e) = crate::config::settings::registries::rewrite_step(&kind, &mut spec)
+    {
+        errs.push(format!("{at}: {e}"));
     }
     if !info.implemented {
         errs.push(format!(

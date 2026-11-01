@@ -1945,6 +1945,7 @@ fn validate_composed(doc: &Value, prose: &str) -> Result<(), String> {
         crate::config::settings::Settings::from_delivered_document(doc.clone(), "template", prose)
             .map_err(|e| e.to_string())?;
     let res = crate::config::settings::resolve_companies(&mut settings);
+    crate::config::settings::registries::complete(&mut settings);
     let loaded = crate::config::settings::Loaded {
         settings,
         doc: doc.clone(),

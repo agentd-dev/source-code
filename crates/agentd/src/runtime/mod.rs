@@ -59,6 +59,7 @@ pub mod nested;
 pub(crate) mod payments; // a step's x402 payment over HTTP, MCP or A2A: the policy, the approver's gate, the ledger (RFC 0049)
 pub mod pressure; // disk/memory pressure: shed new work, drain what is in flight
 pub mod reactor;
+pub(crate) mod registries; // registry servers: resolved on use, pinned per run (RFC 0055 §4)
 pub mod reload;
 pub(crate) mod retire;
 pub(crate) mod skills; // the skills catalogue: built, loaded into contexts, its tools (RFC 0051)
@@ -500,8 +501,15 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         }
         // A `connect: on_use` server is dialed when something first needs it
         // (`join`), never at boot.
-        if s.connect == crate::config::settings::Connect::OnUse {
+        if s.on_use() {
             log.info("mcp.connect.deferred", json!({"server": s.name}));
+            mcp_specs.insert(s.name.clone(), spec);
+            continue;
+        }
+        // A registry server's endpoint is its registry's record's, read off
+        // the loop when it is dialed (`join`), so even one dialed at boot
+        // joins that way.
+        if s.registry.is_some() {
             mcp_specs.insert(s.name.clone(), spec);
             continue;
         }
@@ -838,6 +846,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         mcp_tasks: Default::default(),
         joining: Default::default(),
         mcp_sign_ins: BTreeMap::new(),
+        registries: Default::default(),
         registry,
         contexts: Contexts::new(model_window),
         memory: Memory::new(

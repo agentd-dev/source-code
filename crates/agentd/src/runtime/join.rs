@@ -185,6 +185,9 @@ pub struct Reachable {
     /// itself — a server with no `auth` whose RFC 9728 metadata named its
     /// authorization server — to dial it with from now on.
     auth: Option<crate::config::AuthSpec>,
+    /// A registry server's resolution, found or refused, whatever the dial
+    /// that followed it came to.
+    registry: Option<super::registries::Resolved>,
 }
 
 impl std::fmt::Debug for Reachable {
@@ -255,11 +258,17 @@ impl Runtime {
             let tx = self.events_tx.clone();
             let server = name.clone();
             // An on-use server with no `auth` that turns out to want one is
-            // signed in to as this says (RFC 0055 §4.3).
-            let discovered =
-                (self.settings.mcp.on_use(&name) && spec.auth.is_none() && spec.oauth.is_none())
-                    .then(|| self.settings.discovered_mcp_auth(&spec.endpoint));
-            let on_use = self.settings.mcp.on_use(&name);
+            // signed in to as this says (RFC 0055 §4.3). A registry server is
+            // dialed on use too, and its endpoint is known only once its
+            // record is read: discovery for it runs on the dial's thread.
+            let no_auth = spec.auth.is_none() && spec.oauth.is_none();
+            let on_use = self.settings.mcp.on_use(&name) || spec.registry.is_some();
+            let discovered = (on_use && no_auth && spec.registry.is_none())
+                .then(|| self.settings.discovered_mcp_auth(&spec.endpoint));
+            let discover_with = (spec.registry.is_some() && no_auth).then(|| self.settings.clone());
+            // A registry server's record, as last read, for the dial to reuse
+            // while it is fresh.
+            let cached = spec.registry.as_ref().and_then(|d| self.registry_cached(d));
             #[cfg(feature = "companies")]
             let companies = self.companies.clone();
             #[cfg(feature = "companies")]
@@ -269,7 +278,7 @@ impl Runtime {
                 .spawn(move || {
                     // The dial boot makes, on its own thread: the loop is
                     // never held by a server that does not answer.
-                    let (mut sign_in, mut auth) = (None, None);
+                    let (mut sign_in, mut auth, mut registry) = (None, None, None);
                     let (found, refused) = match spec.company {
                         // A Company's OpenAPI operations: its description,
                         // read and made into tools.
@@ -303,33 +312,48 @@ impl Runtime {
                         },
                         #[cfg(not(feature = "companies"))]
                         Some(_) => (None, None),
-                        None if on_use => {
-                            let dialed = super::mcp_sign_in::dial_on_use(
-                                &spec,
-                                discovered.as_ref(),
-                                timeout,
-                                |s| {
-                                    crate::mcp::from_spec(s, timeout)
-                                        .map(super::supervisor_client)
-                                        .and_then(|mut c| c.initialize().map(|()| c))
-                                        .and_then(|c| c.list_tools().map(|t| (c, t)))
-                                        .ok()
-                                },
-                            );
-                            sign_in = dialed.sign_in;
-                            auth = dialed.auth;
-                            (dialed.found.map(|(c, t)| Found::Mcp(Box::new(c), t)), None)
+                        None => {
+                            let dial = |s: &crate::config::McpServerSpec| {
+                                crate::mcp::from_spec(s, timeout)
+                                    .map(super::supervisor_client)
+                                    .and_then(|mut c| c.initialize().map(|()| c))
+                                    .and_then(|c| c.list_tools().map(|t| (c, t)))
+                                    .ok()
+                            };
+                            // A registry server: its record first, then the
+                            // dial it names (RFC 0055 §4.1); refused, there
+                            // is nothing to dial and the resolution says why.
+                            registry = spec
+                                .registry
+                                .as_ref()
+                                .map(|_| super::registries::resolve(&spec, cached));
+                            let target = match &registry {
+                                Some(r) => r.spec.clone(),
+                                None => Some(spec.clone()),
+                            };
+                            match target {
+                                None => (None, None),
+                                Some(t) if on_use => {
+                                    let found_auth = discovered.clone().or_else(|| {
+                                        discover_with
+                                            .as_ref()
+                                            .map(|st| st.discovered_mcp_auth(&t.endpoint))
+                                    });
+                                    let dialed = super::mcp_sign_in::dial_on_use(
+                                        &t,
+                                        found_auth.as_ref(),
+                                        timeout,
+                                        dial,
+                                    );
+                                    sign_in = dialed.sign_in;
+                                    auth = dialed.auth;
+                                    (dialed.found.map(|(c, t)| Found::Mcp(Box::new(c), t)), None)
+                                }
+                                Some(t) => {
+                                    (dial(&t).map(|(c, tools)| Found::Mcp(Box::new(c), tools)), None)
+                                }
+                            }
                         }
-                        None => (
-                            crate::mcp::from_spec(&spec, timeout)
-                                .map(super::supervisor_client)
-                                .and_then(|mut c| c.initialize().map(|()| c))
-                                .and_then(|c| {
-                                    c.list_tools().map(|tools| Found::Mcp(Box::new(c), tools))
-                                })
-                                .ok(),
-                            None,
-                        ),
                     };
                     let _ = tx.send(Event::McpReachable(Box::new(Reachable {
                         server,
@@ -337,6 +361,7 @@ impl Runtime {
                         refused,
                         sign_in,
                         auth,
+                        registry,
                     })));
                 });
             if spawned.is_err()
@@ -351,6 +376,11 @@ impl Runtime {
     /// one and not connected: `true` when it is (so the caller waits for it).
     pub(crate) fn want_server(&mut self, server: &str) -> bool {
         if !self.settings.mcp.on_use(server) || self.mcp.contains_key(server) {
+            return false;
+        }
+        // A registry server whose record was refused is not waited for: the
+        // call fails now, with the refusal.
+        if self.registries.refused.contains_key(server) {
             return false;
         }
         if self.joining.wanted.insert(server.to_string()) {
@@ -500,12 +530,22 @@ impl Runtime {
             refused,
             sign_in,
             auth,
+            registry,
         } = r;
+        // A registry server's resolution is said and kept whatever came of
+        // the dial; one refused is dialed again once its record is stale.
+        let registry_refusal = registry
+            .as_ref()
+            .and_then(|r| self.on_registry_resolved(&server, r));
         let Some(probe) = self.joining.probes.get_mut(&server) else {
             return; // connected meanwhile (a reload dialed it), or gone
         };
         probe.out = false;
         if self.mcp.contains_key(&server) {
+            return;
+        }
+        if let Some(retry_in) = registry_refusal {
+            probe.due_at = now + retry_in;
             return;
         }
         // A person signs in before the server is dialed again (RFC 0055
@@ -539,7 +579,16 @@ impl Runtime {
             return;
         }
         let adopted = match found {
-            Some(Found::Mcp(client, tools)) => self.join_adopt(&server, *client, tools),
+            Some(Found::Mcp(client, tools)) => {
+                // A registry server runs on the spec it was resolved to: what
+                // a child is handed, and what a reload compares.
+                if let Some(r) = registry
+                    && let (Some(spec), Ok(res)) = (r.spec, r.resolution)
+                {
+                    self.registry_adopted(&server, spec, res.version);
+                }
+                self.join_adopt(&server, *client, tools)
+            }
             // The Company lists no API the server stands for: tools it
             // offered are withdrawn, and it is listed again on the backoff —
             // a listing reads discovery again once its copy expires — until

@@ -158,7 +158,12 @@ impl Runtime {
         // refusal puts them back — so a refused reload changes nothing. The
         // commit then switches everything in with no step left that can
         // fail, so an applied reload changed everything it reports.
-        let old = std::mem::replace(&mut self.settings, loaded.settings);
+        // The registry servers made at runtime (a step's, the model's
+        // `mcp.registry.connect`) stay while their registry still approves
+        // them (RFC 0055 §4.2).
+        let mut new_settings = loaded.settings;
+        self.keep_made_registry_servers(&mut new_settings);
+        let old = std::mem::replace(&mut self.settings, new_settings);
         let staged = match self.stage_reload(&old) {
             Ok(staged) => staged,
             Err(errs) => {
@@ -410,11 +415,32 @@ impl Runtime {
         let new = &self.settings;
         // Every spec first: one that cannot be built refuses the reload
         // before any server is dialed, as it refuses a start.
-        let specs = dial_specs(new)?;
+        let mut specs = dial_specs(new)?;
         let mut set = std::collections::BTreeMap::new();
         let mut fresh = Vec::new();
+        let mut resolved = Vec::new();
         for s in &new.mcp.servers {
             let spec = &specs[&s.name];
+            // A registry server keeps its connection, and the spec it was
+            // resolved to, while what it is resolved from is unchanged; one
+            // that changed is dialed again by the join, through its registry
+            // (RFC 0055 §4.1).
+            if spec.registry.is_some() {
+                if let Some(live) = self.registries.live.get(&s.name)
+                    && untagged(&live.unresolved) == untagged(spec)
+                    && let Some(conn) = self.mcp.get(&s.name)
+                {
+                    set.insert(s.name.clone(), conn.clone());
+                    resolved.push((
+                        s.name.clone(),
+                        crate::config::McpServerSpec {
+                            tags: spec.tags.clone(),
+                            ..live.resolved.clone()
+                        },
+                    ));
+                }
+                continue;
+            }
             // A Company's server keeps its connection: its entry cannot
             // change under a reload (`company_entries_moved`), and only the
             // supervisor's join dials it.
@@ -450,7 +476,7 @@ impl Runtime {
             }
             // An on-use server nothing has needed yet stays undialed: the
             // join dials it on first use (RFC 0055 §4.3).
-            if s.connect == cfg::Connect::OnUse
+            if s.on_use()
                 && !self.mcp.contains_key(&s.name)
                 && !self.joining.wants(&s.name)
                 && !new.mcp.document_matched.contains(&s.name)
@@ -475,6 +501,7 @@ impl Runtime {
                 }
             }
         }
+        specs.extend(resolved);
         Ok(StagedMcp { set, specs, fresh })
     }
 
@@ -807,6 +834,11 @@ impl Runtime {
             }
             let previous = std::mem::replace(&mut self.mcp, set);
             self.mcp_specs = specs;
+            // A registry server's connection the new set does not carry is
+            // resolved again when it is next dialed.
+            let live = &self.mcp;
+            self.registries.live.retain(|n, _| live.contains_key(n));
+            self.registries.refused.clear();
             // A replaced or dropped connection's webhook subscriptions are
             // let go on that connection (RFC 0045 §5.6.3).
             #[cfg(feature = "mcp-events")]
@@ -1362,6 +1394,55 @@ enum ReloadRefused {
     RestartRequired(Vec<String>),
 }
 
+/// The spec `srv` is dialed with: its own, its credential bound to its
+/// endpoint, and for a registry server how it is resolved.
+pub(crate) fn dial_spec(
+    s: &cfg::Settings,
+    srv: &cfg::McpServer,
+) -> Result<crate::config::McpServerSpec, String> {
+    let mut spec = srv.to_spec()?;
+    // An `oauth2` block with no client_id presents agentd's
+    // Client ID Metadata Document (RFC 0052), and every token
+    // request names the server as its RFC 8707 `resource`.
+    spec.auth = srv
+        .auth
+        .as_ref()
+        .map(|a| s.auth_spec_at(a, &srv.endpoint, true));
+    // A registry server's endpoint is its record's, read when it
+    // is dialed (RFC 0055 §4.1).
+    if let (Some(r), Some(name)) = (&srv.registry, &srv.server)
+        && let Some(reg) = cfg::registries::registry(s, r)
+    {
+        spec.registry = Some(crate::config::RegistryDial {
+            registry: reg.name.clone(),
+            base: reg.base().to_string(),
+            server: name.clone(),
+            version: srv
+                .version
+                .clone()
+                .unwrap_or_else(|| cfg::registries::LATEST.to_string()),
+            auth: reg
+                .auth
+                .as_ref()
+                .map(|a| s.auth_spec_at(a, &reg.url, false)),
+            headers: reg
+                .headers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            allow_private: reg.allow_private,
+            timeout: reg.timeout(),
+            refresh: reg.refresh(),
+            document_src: srv.document_src.clone(),
+            resource_auto: srv
+                .auth
+                .as_ref()
+                .is_some_and(|a| matches!(a.resource, None | Some(cfg::ResourceParam::Auto))),
+        });
+    }
+    Ok(spec)
+}
+
 /// Every configured MCP server's dial spec, or every reason one cannot be
 /// dialed: a spec that cannot be built, and an endpoint closed egress does
 /// not admit — the dial-time backstop behind validation, for whichever path
@@ -1383,15 +1464,8 @@ pub(crate) fn dial_specs(
             ));
             continue;
         }
-        match srv.to_spec() {
-            Ok(mut spec) => {
-                // An `oauth2` block with no client_id presents agentd's
-                // Client ID Metadata Document (RFC 0052), and every token
-                // request names the server as its RFC 8707 `resource`.
-                spec.auth = srv
-                    .auth
-                    .as_ref()
-                    .map(|a| s.auth_spec_at(a, &srv.endpoint, true));
+        match dial_spec(s, srv) {
+            Ok(spec) => {
                 specs.insert(srv.name.clone(), spec);
             }
             Err(e) => errs.push(format!("mcp server {:?}: {e}", srv.name)),

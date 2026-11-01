@@ -609,6 +609,8 @@ pub struct Runtime {
     pub(crate) joining: super::join::Joining,
     /// The sign-ins to MCP servers dialed on use, by server (RFC 0055 §4.3).
     pub(crate) mcp_sign_ins: BTreeMap<String, super::mcp_sign_in::McpSignIn>,
+    /// Registry servers: as resolved, made at run time, refused (RFC 0055).
+    pub(crate) registries: super::registries::State,
     /// When [`Runtime::release_unowned_subscriptions`] next looks.
     pub(crate) release_due_ms: u64,
     pub(crate) registry: Registry,

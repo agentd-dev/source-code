@@ -1374,6 +1374,10 @@ impl Runtime {
             }
             // ---- MCP Tasks (RFC 0050) ----
             "mcp.task.get" | "mcp.task.cancel" => self.mcp_task_tool(caller, name, args),
+            // ---- MCP registries (RFC 0055 §8.2) ----
+            "mcp.registry.search" | "mcp.registry.connect" => {
+                self.registry_tool(caller, name, args)
+            }
             // ---- guarded local command runner (default-OFF) ----
             #[cfg(feature = "exec")]
             "exec" => self.exec_tool(caller, args),

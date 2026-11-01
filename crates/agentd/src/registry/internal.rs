@@ -479,6 +479,38 @@ pub fn contracts() -> Vec<Contract> {
     // ---- MCP Tasks (RFC 0050): a tool call that became a task still
     // running when the call's time ran out; offered where a server may
     // answer with one (`registry::build`) ----
+    // ---- MCP registries (RFC 0055 §8.2): offered only where a registry
+    // entry sets `discover: true` (`registry::build`) ----
+    c(
+        "mcp.registry.search",
+        "registries",
+        "Search an MCP registry the operator lets you search for servers whose names match a term (at least 3 characters). Answers each approved server's name, title, description, version and remote kinds; only names the operator approves are listed.",
+        obj(
+            json!({"registry": s("The registry's name, as the operator configured it"), "query": s("A search term, at least 3 characters")}),
+            &["registry", "query"],
+        ),
+        open_obj(
+            json!({"registry": {"type": "string"}, "servers": arr(any())}),
+            &["servers"],
+        ),
+        true,
+        ROOT_ONLY,
+    );
+    c(
+        "mcp.registry.connect",
+        "registries",
+        "Connect an MCP server from a registry the operator lets you search, by its registry name — only a name the operator approves. It is dialed now; its tools are offered once it has connected.",
+        obj(
+            json!({"registry": s("The registry's name"), "server": s("The server's registry name, as mcp.registry.search listed it")}),
+            &["registry", "server"],
+        ),
+        open_obj(
+            json!({"server": {"type": "string"}, "connected": {"type": "boolean"}}),
+            &["server", "connected"],
+        ),
+        true,
+        ROOT_ONLY,
+    );
     c(
         "mcp.task.get",
         "tasks",

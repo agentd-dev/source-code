@@ -436,6 +436,11 @@ pub struct RunState {
     /// records (all durable by construction) default true.
     #[serde(default = "default_durable")]
     pub durable: bool,
+    /// The version of each `latest` registry server this run first called
+    /// (RFC 0055 §4.1), by the server's name: its later steps call that
+    /// version, whatever the registry publishes meanwhile. Durable.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registry_pins: BTreeMap<String, String>,
     #[serde(skip)]
     pub dirty: bool,
 }
@@ -498,6 +503,7 @@ impl RunState {
             finished: None,
             deadline_ms: wf.limits.deadline_ms.map(|d| now + d),
             durable: wf.durable.unwrap_or(true),
+            registry_pins: BTreeMap::new(),
             dirty: true,
         }
     }

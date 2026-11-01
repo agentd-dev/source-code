@@ -273,6 +273,13 @@ impl Registry {
                     },
                     vec![TrifectaTag::Sensitive, TrifectaTag::Egress],
                 )
+            } else if c.family == "registries" {
+                // What a searched or connected server answers is the
+                // registry's to vouch for: its tags.
+                (
+                    Impl::BuiltIn,
+                    crate::config::settings::registries::discover_tags(settings),
+                )
             } else if c.family == "events" {
                 // Subscribing sends arguments to the server, so the tools
                 // carry the tags of every server a grant offers them on.
@@ -293,6 +300,8 @@ impl Registry {
             // build that has MCP Events; the company tools only where a
             // Company is declared, in a build that can act at one.
             let offered = match c.family {
+                // Only where a registry entry lets the model discover.
+                "registries" => crate::config::settings::registries::discovers(settings),
                 // Only where a server may answer a call with a task.
                 "tasks" => settings
                     .mcp

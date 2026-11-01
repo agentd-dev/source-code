@@ -1573,8 +1573,23 @@ impl Runtime {
         // A `connect: on_use` server a step names is dialed now, and the
         // step waits for it — like a rate wait, before `begin_step`, so the
         // wait consumes no attempt (RFC 0055 §4.3).
+        // A registry server is made when a step first names it, and a run
+        // calls the version it first called (RFC 0055 §4).
+        let routed = if matches!(step.kind.as_str(), "mcp.tool" | "mcp.resource" | "wait") {
+            match self.registry_route(run_id, &step.spec) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if matches!(step.kind.as_str(), "mcp.tool" | "mcp.resource")
-            && let Some(server) = step.spec.get("server").and_then(Value::as_str)
+            && let Some(server) = routed
+                .as_deref()
+                .or_else(|| step.spec.get("server").and_then(Value::as_str))
             && !server.contains("{{")
             && self.connect_wait(run_id, step_id, server, step.timeout_ms)
         {
@@ -1646,13 +1661,16 @@ impl Runtime {
             env["attempt"] = json!(attempt);
             env["idempotency_key"] = json!(crate::engine::run::idempotency_key(run_id, step_id));
         }
-        let spec = match render_spec(&step, &data) {
+        let mut spec = match render_spec(&step, &data) {
             Ok(s) => s,
             Err(e) => {
                 self.finish_step(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
                 return;
             }
         };
+        if let Some(server) = routed {
+            spec.insert("server".into(), Value::String(server));
+        }
         let step_caller = ToolCaller {
             run: Some(run_id.to_string()),
             step: Some(step_id.to_string()),
@@ -2333,7 +2351,9 @@ impl Runtime {
                 let Some(client) = self.mcp.get(&server).cloned() else {
                     // A templated name the connect gate could not read: an
                     // on-use server it names is dialed now, for a retry.
-                    let why = if self.want_server(&server) {
+                    let why = if let Some(refused) = self.registries.refused.get(&server) {
+                        refused.clone()
+                    } else if self.want_server(&server) {
                         format!(
                             "mcp server {server:?} is not connected yet (connect: on_use; it is being dialed)"
                         )

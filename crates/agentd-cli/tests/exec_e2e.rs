@@ -193,3 +193,84 @@ fn every_exec_step_reports_its_exit_while_the_reactor_reaps() {
     drop(d);
     std::fs::remove_dir_all(&workdir).ok();
 }
+
+/// A turn's `exec` call refused before anything ran says why in the log —
+/// the code in the worker's `tool.result` (`refused`) and in the
+/// supervisor's `tool.refused` (`why`), the text only with content capture —
+/// and a call that gives its optional arguments as `null`, as a model asked
+/// for tools non-strictly does, runs. On the Responses API (`gpt-6.1-sol`),
+/// as demo (d) is asked live: a refusal that was invisible in the log cost
+/// that take.
+#[test]
+fn a_refused_exec_call_says_why_in_the_log_and_null_optionals_run() {
+    let workdir = common::unique_path("exec-wd", "d");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let play = common::unique_path("exec-play", "json");
+    std::fs::write(
+        &play,
+        r#"{"turns": [
+          {"tool_calls": [
+            {"name": "exec", "arguments": {"cmd": "echo", "args": ["nulls-ok"], "cwd": null, "stdin": null, "timeout": null}},
+            {"name": "exec", "arguments": {"cmd": "cat", "args": ["/etc/hostname"]}},
+            {"name": "exec", "arguments": {"cmd": "echo", "workdir": "."}}
+          ]},
+          {"content": "done"}, {"content": "done"}, {"content": "done"}, {"content": "done"}
+        ]}"#,
+    )
+    .unwrap();
+    let cfg = format!(
+        "agent:\n  name: exec\n  instruction: x\n  preflight: never\n\
+         store:\n  kind: memory\n\
+         security:\n  exec:\n    enabled: true\n    allow: [echo]\n    workdir: {workdir}\n    timeout: 10s\n\
+         lifecycle:\n  run_until: idle\n  idle_grace: 1s\n\
+         observability:\n  log_level: info\n"
+    );
+    let cfg_path = common::unique_path("exec-cfg", "yaml");
+    std::fs::write(&cfg_path, cfg).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg_path])
+        .args(["--intelligence", &format!("mock:file:{play}")])
+        .args(["--model", "gpt-6.1-sol", "--prompt", "run it"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run agentd");
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
+    let events = |name: &str| -> Vec<Value> {
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == name && v["tool"] == "exec")
+            .collect()
+    };
+    let results = events("tool.result");
+    assert_eq!(results.len(), 3, "three exec results:\n{log}");
+    assert_eq!(
+        results[0]["is_error"], false,
+        "null optionals run: {}",
+        results[0]
+    );
+    assert!(results[0].get("refused").is_none(), "{}", results[0]);
+    assert!(
+        log.lines()
+            .any(|l| l.contains("\"event\":\"exec.run\"") && l.contains("\"cmd\":\"echo\"")),
+        "echo ran:\n{log}"
+    );
+    assert_eq!(results[1]["is_error"], true);
+    assert_eq!(results[1]["refused"], "exec_not_allowed", "{}", results[1]);
+    assert_eq!(results[2]["is_error"], true);
+    assert_eq!(results[2]["refused"], "invalid_arguments", "{}", results[2]);
+    for r in &results {
+        assert!(r.get("error").is_none(), "no content without capture: {r}");
+    }
+    let why: Vec<Value> = events("tool.refused")
+        .iter()
+        .map(|e| e["why"].clone())
+        .collect();
+    assert_eq!(why, ["exec_not_allowed", "invalid_arguments"], "{log}");
+    assert!(
+        !log.contains("/etc/hostname"),
+        "the arguments stay out of the log:\n{log}"
+    );
+    std::fs::remove_file(&play).ok();
+    std::fs::remove_file(&cfg_path).ok();
+    std::fs::remove_dir_all(&workdir).ok();
+}

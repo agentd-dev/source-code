@@ -129,6 +129,7 @@ impl Runtime {
     /// A child asked for an internal tool.
     pub(crate) fn on_tool_request(&mut self, node: NodeId, id: u64, name: &str, args: Value) {
         self.counters.tool_calls += 1;
+        self.refusal = None;
         let Some(caller) = self.child_caller(node, id) else {
             return;
         };
@@ -155,6 +156,7 @@ impl Runtime {
                 "tool.refused",
                 json!({"node": node.0, "req": id, "tool": name, "why": "not_offered"}),
             );
+            self.refusal = Some("not_offered");
             self.child_tool_outcome(
                 node,
                 id,
@@ -243,7 +245,10 @@ impl Runtime {
         outcome: ToolOutcome,
     ) {
         match outcome {
-            ToolOutcome::Ready(v, err) => self.reply_tool(node, id, v, err),
+            ToolOutcome::Ready(v, err) => {
+                let why = self.refusal.take().filter(|_| err);
+                self.reply_tool_why(node, id, v, err, why);
+            }
             ToolOutcome::Deferred(kind) => {
                 // Report the unit as parked on a wait, not thinking, so the
                 // live-activity feed does not show it burning a model call.
@@ -261,9 +266,23 @@ impl Runtime {
 
     /// Answer a child's tool request.
     pub(crate) fn reply_tool(&mut self, node: NodeId, req: u64, result: Value, is_error: bool) {
+        self.reply_tool_why(node, req, result, is_error, None);
+    }
+
+    /// [`Runtime::reply_tool`], saying why the call was refused when it was
+    /// (`why`, a [`Runtime::refuse_call`] code): the worker logs it in its
+    /// `tool.result`.
+    fn reply_tool_why(
+        &mut self,
+        node: NodeId,
+        req: u64,
+        result: Value,
+        is_error: bool,
+        why: Option<&'static str>,
+    ) {
         self.child_log(node).debug(
             "tool.reply",
-            json!({"node": node.0, "req": req, "is_error": is_error}),
+            json!({"node": node.0, "req": req, "is_error": is_error, "refused": why}),
         );
         if !self.children.send(
             node,
@@ -271,6 +290,7 @@ impl Runtime {
                 id: req,
                 result,
                 is_error,
+                refused: why.map(str::to_string),
             },
         ) {
             self.log
@@ -330,6 +350,49 @@ impl Runtime {
         self.execute_tool_as(caller, name, args, super::reactor::Passed::default())
     }
 
+    /// Refuse a tool call before anything runs: the text is what the caller
+    /// reads; `why` is a code that says which check refused it, logged at
+    /// info as `tool.refused` (the text too, with content capture: it can
+    /// quote the arguments) and handed to the worker for its `tool.result`.
+    /// A refusal that is invisible in the log costs the operator the run.
+    pub(crate) fn refuse_call(
+        &mut self,
+        caller: &ToolCaller,
+        name: &str,
+        why: &'static str,
+        text: String,
+    ) -> ToolOutcome {
+        self.refused_call(
+            caller,
+            name,
+            why,
+            ToolOutcome::Ready(Value::String(text), true),
+        )
+    }
+
+    /// `out`, marked as refused by `why` when it is an error answered now
+    /// (see [`Runtime::refuse_call`]); any other outcome (a deferral, a gate, a
+    /// result) passes through untouched.
+    pub(crate) fn refused_call(
+        &mut self,
+        caller: &ToolCaller,
+        name: &str,
+        why: &'static str,
+        out: ToolOutcome,
+    ) -> ToolOutcome {
+        if let ToolOutcome::Ready(v, true) = &out {
+            self.refusal = Some(why);
+            let mut fields = json!({"tool": name, "why": why, "caller": caller.label()});
+            if self.log.content_capture() {
+                fields["error"] = v.clone();
+            }
+            self.log
+                .in_trace(self.caller_trace(caller).as_ref())
+                .info("tool.refused", fields);
+        }
+        out
+    }
+
     /// [`Runtime::execute_tool`], with every gate applied but those `passed`
     /// says the call was approved past — a policy gate's addressee, or the
     /// User for a Company gate: the grant, the argument schema, every other
@@ -341,6 +404,7 @@ impl Runtime {
         args: Value,
         passed: super::reactor::Passed,
     ) -> ToolOutcome {
+        self.refusal = None;
         // Grant + availability.
         let allowed = match (&caller.subagent, &caller.run) {
             (Some(_), _) => self
@@ -352,25 +416,33 @@ impl Runtime {
             _ => self.registry.allowed(&crate::registry::Caller::Root, name),
         };
         if !allowed {
-            let reason = match self.registry.get(name) {
-                None => format!("no such tool {name:?}"),
-                Some(t) if t.disabled => format!("tool {name:?} is disabled by configuration"),
-                Some(t) if !t.is_available() => {
-                    format!("tool {name:?} has no implementation (map it with tools.overrides)")
-                }
-                Some(_) => format!("tool {name:?} is not granted to {}", caller.label()),
+            let (why, reason) = match self.registry.get(name) {
+                None => ("unknown_tool", format!("no such tool {name:?}")),
+                Some(t) if t.disabled => (
+                    "disabled",
+                    format!("tool {name:?} is disabled by configuration"),
+                ),
+                Some(t) if !t.is_available() => (
+                    "unimplemented",
+                    format!("tool {name:?} has no implementation (map it with tools.overrides)"),
+                ),
+                Some(_) => (
+                    "not_granted",
+                    format!("tool {name:?} is not granted to {}", caller.label()),
+                ),
             };
-            return ToolOutcome::Ready(Value::String(reason), true);
+            return self.refuse_call(caller, name, why, reason);
         }
+        let args = self.registry.drop_null_optionals(name, args);
         if let Err(e) = self.registry.validate_args(name, &args) {
-            return ToolOutcome::Ready(Value::String(e), true);
+            return self.refuse_call(caller, name, "invalid_arguments", e);
         }
         // A Company's tool acts for its one User, and a subagent reaches one
         // of a Company's servers only by a grant its spawn made (RFC 0047
         // §5.6).
         if self.is_company_tool(name) {
             if let Err(e) = self.company_work_admitted(caller.principal.as_deref()) {
-                return ToolOutcome::Ready(Value::String(e), true);
+                return self.refuse_call(caller, name, "company_not_admitted", e);
             }
             if let Some(h) = &caller.subagent
                 && self.company_server_of(name).is_some()
@@ -382,10 +454,8 @@ impl Runtime {
                     .and_then(|p| p["gated_tools"].as_array())
                     .is_some_and(|g| g.iter().any(|t| t.as_str() == Some(name)));
                 if !granted {
-                    return ToolOutcome::Ready(
-                        Value::String(format!("tool {name:?} is not granted to subagent:{h}")),
-                        true,
-                    );
+                    let text = format!("tool {name:?} is not granted to subagent:{h}");
+                    return self.refuse_call(caller, name, "not_granted", text);
                 }
             }
         }
@@ -402,20 +472,18 @@ impl Runtime {
             && let Some(p) = self.acting_principal(caller.principal.as_deref())
             && !p.is_operator()
         {
-            return ToolOutcome::Ready(
-                Value::String(format!(
-                    "tool {name:?} acts on the whole instance and is not permitted for {}",
-                    p.id
-                )),
-                true,
+            let text = format!(
+                "tool {name:?} acts on the whole instance and is not permitted for {}",
+                p.id
             );
+            return self.refuse_call(caller, name, "instance_wide", text);
         }
         // A call to one Company from work holding another's content asks the
         // User first (RFC 0047 §6.2), before any rule is consulted: no
         // policy can answer for the User.
         #[cfg(feature = "companies")]
         if let Some(outcome) = self.company_cross_check(caller, name, &args, passed) {
-            return outcome;
+            return self.refused_call(caller, name, "company_cross", outcome);
         }
         // Work acting with a person's grant does not reach agentd's own,
         // broader authority at an agent-mode server tagged `sensitive` or
@@ -427,7 +495,7 @@ impl Runtime {
             && let Some(server) = self.agent_mode_server_of(name)
             && let Some(e) = self.mode_mixing(caller, &server, Some(name), name)
         {
-            return ToolOutcome::Ready(Value::String(e), true);
+            return self.refuse_call(caller, name, "mode_mixing", e);
         }
         // The policy verdict, at the one chokepoint every call passes — and
         // deliberately AFTER `validate_args`, so an argument guard judges
@@ -437,7 +505,7 @@ impl Runtime {
             && !self.settings.security.policies.is_empty()
             && let Some(outcome) = self.apply_policy(caller, name, &args, passed)
         {
-            return outcome;
+            return self.refused_call(caller, name, "policy", outcome);
         }
         // The enrolled person's consent, after every rule the operator wrote
         // (RFC 0044 §5.10): a delegated sensitive or egress call, or an
@@ -446,7 +514,7 @@ impl Runtime {
         if !passed.consent
             && let Some(outcome) = self.consent_check(caller, name, &args, passed)
         {
-            return outcome;
+            return self.refused_call(caller, name, "consent", outcome);
         }
         let route = self.registry.route(name).map(|r| match r {
             Route::Internal => RouteKind::Internal,
@@ -456,9 +524,12 @@ impl Runtime {
             Route::Workflow { workflow, sync } => RouteKind::Workflow(workflow.to_string(), sync),
         });
         let out = match route {
-            None => {
-                ToolOutcome::Ready(Value::String(format!("tool {name:?} is unavailable")), true)
-            }
+            None => self.refuse_call(
+                caller,
+                name,
+                "unavailable",
+                format!("tool {name:?} is unavailable"),
+            ),
             Some(RouteKind::Internal) => self.builtin(caller, name, args),
             Some(RouteKind::Mapped(m)) => self.run_mapped(caller, name, &m, args),
             Some(RouteKind::Code) => match crate::tools::call(name, &args) {
@@ -502,6 +573,7 @@ impl Runtime {
                 Err(e) => {
                     self.log
                         .warn("tool.result.schema", json!({"tool": name, "err": e}));
+                    self.refusal = Some("result_schema");
                     ToolOutcome::Ready(Value::String(e), true)
                 }
             },
@@ -1794,33 +1866,26 @@ impl Runtime {
         use super::exec;
         let cfg = self.settings.security.exec.clone();
         if !cfg.enabled {
-            return ToolOutcome::Ready(
-                Value::String("exec: local execution is disabled (security.exec.enabled)".into()),
-                true,
-            );
+            let text = "exec: local execution is disabled (security.exec.enabled)".to_string();
+            return self.refuse_call(caller, "exec", "exec_disabled", text);
         }
         let cmd = args["cmd"].as_str().unwrap_or_default().to_string();
         if cmd.is_empty() {
-            return ToolOutcome::Ready(Value::String("exec: `cmd` is required".into()), true);
+            let text = "exec: `cmd` is required".to_string();
+            return self.refuse_call(caller, "exec", "exec_no_cmd", text);
         }
         // Allow-list (argv[0]); empty allow-list denies everything.
         if !cfg.allow.iter().any(|a| a == &cmd) {
-            return ToolOutcome::Ready(
-                Value::String(format!(
-                    "exec: command {cmd:?} is not in security.exec.allow"
-                )),
-                true,
-            );
+            let text = format!("exec: command {cmd:?} is not in security.exec.allow");
+            return self.refuse_call(caller, "exec", "exec_not_allowed", text);
         }
         let Some(workdir) = cfg.workdir.clone() else {
-            return ToolOutcome::Ready(
-                Value::String("exec: security.exec.workdir must be set".into()),
-                true,
-            );
+            let text = "exec: security.exec.workdir must be set".to_string();
+            return self.refuse_call(caller, "exec", "exec_no_workdir", text);
         };
         let cwd = match exec::resolve_cwd(std::path::Path::new(&workdir), args["cwd"].as_str()) {
             Ok(c) => c,
-            Err(e) => return ToolOutcome::Ready(Value::String(format!("exec: {e}")), true),
+            Err(e) => return self.refuse_call(caller, "exec", "exec_cwd", format!("exec: {e}")),
         };
         let argv: Vec<String> = args["args"]
             .as_array()

@@ -119,7 +119,9 @@ impl SelfHandler for NoSelfTools {
         );
         let deadline = std::time::Instant::now() + b.timeout;
         match b.replies.wait(id, deadline, &b.cancel) {
-            Some(crate::subagent::replies::Reply::Tool { result, is_error }) => {
+            Some(crate::subagent::replies::Reply::Tool {
+                result, is_error, ..
+            }) => {
                 let text = match &result {
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
@@ -408,9 +410,9 @@ pub fn run() -> i32 {
             );
             let (result, is_error) =
                 match replies.wait(id, Instant::now() + Duration::from_secs(10), &cancel) {
-                    Some(crate::subagent::replies::Reply::Tool { result, is_error }) => {
-                        (result, is_error)
-                    }
+                    Some(crate::subagent::replies::Reply::Tool {
+                        result, is_error, ..
+                    }) => (result, is_error),
                     _ => (serde_json::Value::Null, true),
                 };
             crate::obs::log::write_line(&serde_json::json!({"event": "test.worker_ask",
@@ -1009,10 +1011,15 @@ fn spawn_control_thread(
                         id,
                         result,
                         is_error,
+                        refused,
                     }) => {
                         replies.deliver(
                             id,
-                            crate::subagent::replies::Reply::Tool { result, is_error },
+                            crate::subagent::replies::Reply::Tool {
+                                result,
+                                is_error,
+                                refused,
+                            },
                         );
                     }
                     Ok(ControlMsg::BudgetGrant {

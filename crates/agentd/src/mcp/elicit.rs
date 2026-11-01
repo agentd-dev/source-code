@@ -89,7 +89,9 @@ impl Handler for ElicitationBridge {
 
         let deadline = Instant::now() + self.timeout;
         match self.replies.wait(id, deadline, &self.cancel) {
-            Some(Reply::Tool { result, is_error }) => {
+            Some(Reply::Tool {
+                result, is_error, ..
+            }) => {
                 if is_error {
                     // The ask failed or the configured fallback refused it.
                     return Some(Answer::Cancel);

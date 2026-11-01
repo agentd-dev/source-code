@@ -18,6 +18,8 @@ pub enum Reply {
     Tool {
         result: Value,
         is_error: bool,
+        /// Why the call was refused, when it was (`ControlMsg::ToolResult`).
+        refused: Option<String>,
     },
     Budget {
         ok: bool,
@@ -114,6 +116,7 @@ mod tests {
                 Reply::Tool {
                     result: json!("other"),
                     is_error: false,
+                    refused: None,
                 },
             );
             r2.deliver(
@@ -121,6 +124,7 @@ mod tests {
                 Reply::Tool {
                     result: json!({"ok": true}),
                     is_error: false,
+                    refused: None,
                 },
             );
         });
@@ -132,7 +136,8 @@ mod tests {
             got,
             Reply::Tool {
                 result: json!({"ok": true}),
-                is_error: false
+                is_error: false,
+                refused: None,
             }
         );
         t.join().unwrap();

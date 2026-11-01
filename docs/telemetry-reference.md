@@ -927,11 +927,11 @@ an instruction's by `origin: instruction` and `name`.
 | `tool.policy.error` | error | `caller`, `rule`, `tool` |  |
 | `tool.policy.refused` | info | `action`, `caller`, `rule`, `tool` | A `security.policies` rule refused a tool call. |
 | `tool.policy.unanswerable` | warn | `fallback`, `note`, `question`, `rule`, `tool` |  |
-| `tool.refused` | warn | `node`, `req`, `tool`, `why` | A turn worker asked for a delegated server's tool its plan did not offer, or a subagent for one its spawn did not (`why: not_offered`): refused before any check or mint. |
-| `tool.reply` | debug | `is_error`, `node`, `req` |  |
+| `tool.refused` | info, warn | `caller`, `error`, `node`, `req`, `tool`, `why` | A tool call refused before anything ran, with `why`: `unknown_tool`, `disabled`, `unimplemented`, `not_granted`, `invalid_arguments`, `company_not_admitted`, `instance_wide`, `company_cross`, `mode_mixing`, `policy`, `consent`, `unavailable`, `exec_disabled`, `exec_no_cmd`, `exec_not_allowed`, `exec_no_workdir`, `exec_cwd` (info; `error`, the text the caller read, only under `log_content`: it can quote the arguments). At warn, with `node` and `req`: a turn worker asked for a delegated server's tool its plan did not offer, or a subagent for one its spawn did not (`why: not_offered`): refused before any check or mint. |
+| `tool.reply` | debug | `is_error`, `node`, `refused`, `req` |  |
 | `tool.reply.dropped` | debug | `node`, `req` |  |
 | `tool.request` | info | `args`, `caller`, `node`, `req`, `tool` | A child asked the supervisor to run an internal tool. `args` only under `log_content`. |
-| `tool.result` | info | `is_error`, `ms`, `tool`, `turn` | A tool call returned. `content` only under `log_content`, in a subagent loop. |
+| `tool.result` | info | `error`, `is_error`, `ms`, `refused`, `tool`, `turn` | A tool call returned. `refused`, in a turn, when it was refused before anything ran: the `tool.refused` code, or `unknown_tool` for a name the turn was not given; `error` with it only under `log_content`. `content` only under `log_content`, in a subagent loop. |
 | `tool.result.schema` | warn | `err`, `tool` |  |
 
 ### turn

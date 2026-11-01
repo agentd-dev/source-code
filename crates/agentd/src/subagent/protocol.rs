@@ -71,6 +71,13 @@ pub enum ControlMsg {
         result: Value,
         #[serde(default)]
         is_error: bool,
+        /// When the call was refused before anything ran, why, as a code
+        /// (`invalid_arguments`, `not_granted`, `policy`, `exec_not_allowed`,
+        /// …): what the worker's `tool.result` logs, so a refusal says why
+        /// without the content. Absent for a result, or an error the tool
+        /// itself returned.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refused: Option<String>,
     },
     /// The answer to an [`AgentMsg::BudgetRequest`]. `ok` means proceed now;
     /// otherwise wait `wait_ms` and ask again, or the request is refused with a

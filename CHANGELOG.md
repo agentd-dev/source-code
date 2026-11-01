@@ -2573,6 +2573,22 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Fixed.**
 
+- A tool call refused before anything ran says why in the log. The
+  supervisor logs `tool.refused` at info with a code (`why`:
+  `invalid_arguments`, `not_granted`, `policy`, `consent`,
+  `exec_not_allowed`, `exec_cwd`, …), and a turn's `tool.result` carries it
+  as `refused`; the text the model read is added only under `log_content`,
+  as it can quote the arguments. Before, a refused `exec` was a bare
+  `tool.result is_error=true ms=0`, and a live take of the coding-agent
+  demo was lost to a refusal nobody could see.
+- An internal tool's optional argument given as `null`, where its schema
+  takes no `null`, is read as not given rather than refusing the call
+  (`{"cmd": "go", "cwd": null}` was `invalid arguments for exec: /cwd:
+  expected type string, got null`). A model asked for tools non-strictly,
+  as the Responses dialect asks, often fills every parameter it was shown.
+  A required argument, one that takes `null`, and nested values are left as
+  sent.
+
 - `instructions_bindings_create` names its target as the registry takes
   it. agentd sent `@latest` (the `@` and all), which the registry refused
   with a 400 on `target`, "a ref name is lowercase letters, digits and

@@ -710,6 +710,11 @@ pub struct Runtime {
     /// alone. Not the run id, which an operator may pin across lives.
     pub(crate) process_nonce: String,
     pub(crate) counters: Counters,
+    /// Why the tool call being executed was refused, when it was: the code
+    /// [`Runtime::refuse_call`] set, read back where the call is answered so the
+    /// worker's `tool.result` says it (`refused`). Set and taken within one
+    /// synchronous dispatch.
+    pub(crate) refusal: Option<&'static str>,
     /// The `once`-started run(s) whose finish decides a job's exit code.
     pub(crate) job_runs: Vec<String>,
     /// Steps executing on executor threads (`run/step` → started).

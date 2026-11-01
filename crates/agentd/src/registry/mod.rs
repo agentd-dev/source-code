@@ -945,6 +945,42 @@ impl Registry {
             .map_err(|e| format!("invalid arguments for {name}: {}", jsonschema::explain(&e)))
     }
 
+    /// `args` without the optional top-level arguments it gives as `null`
+    /// where the tool's schema takes no `null` there: such an argument is
+    /// read as not given. A model asked for tools non-strictly still often
+    /// fills every parameter it was shown, `null` for the ones it means to
+    /// leave out (`{"cmd": "go", "cwd": null}`), and refusing that call as
+    /// invalid refuses every call the model makes. A required argument, one
+    /// the schema lets be `null`, and every nested value are left as given.
+    pub fn drop_null_optionals(&self, name: &str, mut args: Value) -> Value {
+        let Some(t) = self.tools.get(name) else {
+            return args;
+        };
+        let schema = &t.input_schema;
+        let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+            return args;
+        };
+        let required = |k: &str| {
+            schema
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|r| r.iter().any(|n| n.as_str() == Some(k)))
+        };
+        // A property takes `null` when it says so, or names no type at all.
+        let takes_null = |p: &Value| match p.get("type") {
+            None => true,
+            Some(Value::String(t)) => t == "null",
+            Some(Value::Array(ts)) => ts.iter().any(|t| t.as_str() == Some("null")),
+            Some(_) => false,
+        };
+        if let Some(obj) = args.as_object_mut() {
+            obj.retain(|k, v| {
+                !(v.is_null() && !required(k) && props.get(k).is_some_and(|p| !takes_null(p)))
+            });
+        }
+        args
+    }
+
     /// Validate a result against the tool's output schema (when it has one).
     pub fn validate_result(&self, name: &str, result: &Value) -> Result<(), String> {
         let t = self
@@ -1656,5 +1692,21 @@ mod tests {
             "{e}"
         );
         assert!(reg.validate_args("nope", &json!({})).is_err());
+
+        // An optional argument given as `null` is not given; a required one,
+        // one that takes `null` (no type), and nested values stay as sent.
+        let exec = reg.drop_null_optionals(
+            "exec",
+            json!({"cmd": "go", "args": ["test"], "cwd": null, "stdin": null, "timeout": null}),
+        );
+        assert_eq!(exec, json!({"cmd": "go", "args": ["test"]}));
+        assert!(reg.validate_args("exec", &exec).is_ok());
+        let required = reg.drop_null_optionals("memory.get", json!({"key": null}));
+        assert_eq!(required, json!({"key": null}));
+        assert!(reg.validate_args("memory.get", &required).is_err());
+        let set = reg.drop_null_optionals("memory.set", json!({"key": "k", "value": null}));
+        assert_eq!(set, json!({"key": "k", "value": null}));
+        let nested = json!({"cmd": "go", "args": [null]});
+        assert_eq!(reg.drop_null_optionals("exec", nested.clone()), nested);
     }
 }

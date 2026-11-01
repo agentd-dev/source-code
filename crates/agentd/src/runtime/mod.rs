@@ -891,6 +891,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         seq: 0,
         process_nonce: crate::state::ulid::new(),
         counters: Default::default(),
+        refusal: None,
         job_runs: Vec::new(),
         executing: BTreeMap::new(),
         last_manifest_flush: Instant::now(),

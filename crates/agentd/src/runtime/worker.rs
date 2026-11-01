@@ -68,6 +68,11 @@ pub trait Bridge {
     fn cancelled(&self) -> bool;
     /// A progress event (liveness).
     fn progress(&mut self, _event: &str, _fields: Value) {}
+    /// Why the supervisor refused the last [`Bridge::tool_request`], when it
+    /// did: a code (`invalid_arguments`, `policy`, …), taken once.
+    fn take_refused(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// The process bridge: frames over the control channel.
@@ -75,6 +80,8 @@ pub struct ChildBridge<'a> {
     pub up: &'a Up,
     pub replies: &'a Arc<Replies>,
     pub cancel: &'a Arc<AtomicBool>,
+    /// The refusal code of the last tool reply, until `take_refused`.
+    pub refused: Option<String>,
 }
 
 impl Bridge for ChildBridge<'_> {
@@ -93,8 +100,16 @@ impl Bridge for ChildBridge<'_> {
                 args: args.clone(),
             },
         );
+        self.refused = None;
         match self.replies.wait(id, deadline, self.cancel)? {
-            Reply::Tool { result, is_error } => Some((result, is_error)),
+            Reply::Tool {
+                result,
+                is_error,
+                refused,
+            } => {
+                self.refused = refused;
+                Some((result, is_error))
+            }
             Reply::Budget { .. } => None,
         }
     }
@@ -118,6 +133,9 @@ impl Bridge for ChildBridge<'_> {
     }
     fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+    fn take_refused(&mut self) -> Option<String> {
+        self.refused.take()
     }
     fn progress(&mut self, event: &str, fields: Value) {
         send_up(
@@ -526,8 +544,18 @@ pub fn run_turn(
                 let call = turn_span
                     .as_ref()
                     .map(crate::obs::trace::TraceContext::child);
-                let (content, is_error) =
-                    execute_call(spec, limits, tc, i, call.as_ref(), mcp, bridge, log);
+                let mut refused = None;
+                let (content, is_error) = execute_call(
+                    spec,
+                    limits,
+                    tc,
+                    i,
+                    call.as_ref(),
+                    mcp,
+                    bridge,
+                    log,
+                    &mut refused,
+                );
                 crate::obs::otel::tool_span(
                     call.as_ref(),
                     &tc.name,
@@ -535,7 +563,17 @@ pub fn run_turn(
                     !is_error,
                     tool_span_start,
                 );
-                log.info("tool.result", json!({"turn": spec.turn_id, "tool": tc.name, "is_error": is_error, "ms": call_start.elapsed().as_millis() as u64}));
+                let mut fields = json!({"turn": spec.turn_id, "tool": tc.name, "is_error": is_error, "ms": call_start.elapsed().as_millis() as u64});
+                // A call the supervisor refused before anything ran says why:
+                // the code always, the text the model read only with content
+                // capture (it can quote the arguments).
+                if let Some(why) = refused {
+                    fields["refused"] = json!(why);
+                    if log.content_capture() {
+                        fields["error"] = content.clone();
+                    }
+                }
+                log.info("tool.result", fields);
                 let msg = Msg::tool(tc.id.clone(), tc.name.clone(), content, is_error);
                 messages.push(msg.to_wire());
                 delta.push(msg);
@@ -1024,7 +1062,9 @@ fn mcp_route<'a>(spec: &'a TurnSpec, name: &str) -> Option<(&'a str, &'a str)> {
 }
 
 /// Dispatch one tool call: internal (round-trip) → MCP (own call) → code.
-/// An MCP tool's request is the span `call`.
+/// An MCP tool's request is the span `call`. `refused` is set to why the
+/// call was refused before anything ran, when it was: the supervisor's code
+/// for an internal tool, `unknown_tool` for a name the turn was not given.
 #[allow(clippy::too_many_arguments)]
 fn execute_call(
     spec: &TurnSpec,
@@ -1035,6 +1075,7 @@ fn execute_call(
     mcp: &dyn McpCaller,
     bridge: &mut dyn Bridge,
     log: &Logger,
+    refused: &mut Option<String>,
 ) -> (Value, bool) {
     let name = tc.name.as_str();
     log.info(
@@ -1043,7 +1084,10 @@ fn execute_call(
     );
     if spec.internal.iter().any(|n| n == name) {
         return match bridge.tool_request(name, &tc.arguments, limits.deadline) {
-            Some(r) => r,
+            Some(r) => {
+                *refused = bridge.take_refused();
+                r
+            }
             None => (
                 Value::String(format!(
                     "{name}: no answer from the supervisor (cancelled or deadline)"
@@ -1090,6 +1134,7 @@ fn execute_call(
             Err(e) => (Value::String(e), true),
         };
     }
+    *refused = Some("unknown_tool".into());
     (Value::String(format!("error: no such tool '{name}'")), true)
 }
 
@@ -1208,6 +1253,7 @@ pub fn run_turn_child(
         up,
         replies,
         cancel,
+        refused: None,
     };
     let result = run_turn(spec, &limits, intel, &McpClients(servers), &mut bridge, log);
     let code = match result.status.as_str() {

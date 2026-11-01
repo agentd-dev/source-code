@@ -218,7 +218,11 @@ rather than undetected ([Servers a document declares](configuration.md#servers-a
 `security.egress: closed` turns the operator's sections into an allow-list.
 Every outbound destination agentd reaches must then be declared in the
 section of its kind, matched on scheme, `host[:port]` and a path prefix that
-ends on a segment boundary:
+ends on a segment boundary. A URL whose path holds a dot-segment (`.` or
+`..`, plain or percent-encoded as `%2e`, also between `%2f`/`%5c`/`\`)
+matches no entry, since a server resolves it to a path outside the prefix
+its text names; an `http` step with one fails unsent in either egress mode,
+so no `http.endpoints` entry's credential reaches `/v1/../admin`:
 
 | Surface | Must match | Checked |
 |---|---|---|

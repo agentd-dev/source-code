@@ -233,6 +233,55 @@ fn an_http_node_posts_json_and_the_structured_response_flows_into_the_run() {
     std::fs::remove_file(&cfg_path).ok();
 }
 
+/// A dot-segment climbs out of an `http.endpoints` entry's path on the
+/// server's side: a step whose URL holds one — under the entry by its text,
+/// or a relative `url` under a named entry, plain or percent-encoded — fails
+/// before anything is sent, so the entry's headers reach no other path.
+#[test]
+fn a_dot_segment_past_an_endpoint_prefix_is_refused_unsent() {
+    let (port, seen, _mock) = spawn_mock_rest();
+    let cfg_path = common::unique_path("agentd-http-dots", "yaml");
+    let cfg = format!(
+        "\
+         agent:\n  name: caller\n  instruction: make a call\n  preflight: never\n\
+         intelligence:\n  endpoints: http://127.0.0.1:1\n  model: mock\n\
+         store:\n  kind: memory\n\
+         http:\n  endpoints:\n    api: {{endpoint: \"http://127.0.0.1:{port}/v1\", headers: {{X-Test: the-v1-credential}}}}\n\
+         workflows:\n  - name: call\n    steps:\n\
+         \x20     s:    {{kind: once}}\n\
+         \x20     a: {{kind: http, depends_on: [s], url: \"http://127.0.0.1:{port}/v1/../admin\", allow_private: true, on_error: continue}}\n\
+         \x20     b: {{kind: http, depends_on: [s], endpoint: api, url: \"../admin\", allow_private: true, on_error: continue}}\n\
+         \x20     c: {{kind: http, depends_on: [s], endpoint: api, url: \"%2e%2e/admin\", allow_private: true, on_error: continue}}\n\
+         \x20     done: {{kind: finish, depends_on: [a, b, c], status: completed}}\n\
+         lifecycle:\n  run_until: drained\n\
+         observability:\n  log_level: info\n"
+    );
+    std::fs::write(&cfg_path, &cfg).unwrap();
+    let daemon = spawn_daemon(&cfg_path);
+    assert!(
+        wait_for(|| !daemon.events("run.done").is_empty(), 15),
+        "the run ended:\n{}",
+        daemon.stderr()
+    );
+    let refused: Vec<Value> = daemon
+        .events("step.done")
+        .into_iter()
+        .filter(|e| {
+            e["status"] == "failed" && e["err"].as_str().is_some_and(|m| m.contains("dot-segment"))
+        })
+        .collect();
+    assert_eq!(refused.len(), 3, "{}", daemon.stderr());
+    assert!(
+        seen.lock().unwrap().is_none(),
+        "nothing reached the server: {:?}",
+        seen.lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| (r.path.clone(), r.x_test.clone()))
+    );
+    std::fs::remove_file(&cfg_path).ok();
+}
+
 #[test]
 fn an_http_node_emits_a_signed_webhook_the_receiver_can_verify() {
     let (port, seen, _mock) = spawn_mock_rest();

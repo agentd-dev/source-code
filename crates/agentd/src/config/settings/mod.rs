@@ -3470,12 +3470,17 @@ impl Settings {
 /// Whether `url` falls under the declared `endpoint`: scheme and authority
 /// equal (host case-insensitively), and the URL's path extends the
 /// endpoint's on a segment boundary — so `/v1` never matches `/v1betaX`.
+/// A URL whose path has a dot-segment ([`has_dot_segment`]) matches nothing:
+/// `/v1/../admin` is not under `/v1`, whatever the text says.
 pub fn endpoint_matches(endpoint: &str, url: &str) -> bool {
     let (Some((scheme, authority, path)), Some((es, ea, ep))) =
         (split_url(url), split_url(endpoint))
     else {
         return false;
     };
+    if has_dot_segment(url) {
+        return false;
+    }
     scheme == es
         && authority.eq_ignore_ascii_case(&ea)
         && (ep.is_empty()
@@ -3483,6 +3488,25 @@ pub fn endpoint_matches(endpoint: &str, url: &str) -> bool {
             || path == ep
             || (path.starts_with(&ep)
                 && (ep.ends_with('/') || path.as_bytes().get(ep.len()) == Some(&b'/'))))
+}
+
+/// Whether `url`'s path holds a dot-segment — `.` or `..`, written plainly or
+/// percent-encoded (`%2e`), between `/`s or `\`s, which a server may also
+/// take from `%2f` or `%5c` — that a server resolves to a path the text of
+/// the URL is not under (RFC 3986 §5.2.4). The query and fragment are not
+/// the path.
+pub fn has_dot_segment(url: &str) -> bool {
+    let Some((_, _, path)) = split_url(url) else {
+        return false;
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("");
+    let lower = path.to_ascii_lowercase();
+    let decoded = lower
+        .replace("%2e", ".")
+        .replace("%2f", "/")
+        .replace("%5c", "/")
+        .replace('\\', "/");
+    decoded.split('/').any(|seg| seg == "." || seg == "..")
 }
 
 /// `scheme://authority/path` → (scheme, authority, path). `unix:` sockets
@@ -17379,6 +17403,38 @@ mod tests {
             "scheme must match"
         );
         assert!(endpoint_matches("https://S.example", "https://s.example/x"));
+    }
+
+    /// A dot-segment climbs out of the endpoint's path on the server's side:
+    /// a URL holding one, plain or percent-encoded, matches no endpoint —
+    /// and so reaches none's credential.
+    #[test]
+    fn a_dot_segment_matches_no_endpoint() {
+        let e = "https://s.example/v1";
+        for url in [
+            "https://s.example/v1/../admin",
+            "https://s.example/v1/./x",
+            "https://s.example/v1/..",
+            "https://s.example/v1/%2e%2e/admin",
+            "https://s.example/v1/%2E%2E/admin",
+            "https://s.example/v1/.%2e/admin",
+            "https://s.example/v1%2f..%2fadmin",
+            "https://s.example/v1/..\\admin",
+        ] {
+            assert!(has_dot_segment(url), "{url}");
+            assert!(!endpoint_matches(e, url), "{url}");
+            assert!(!endpoint_matches("https://s.example", url), "{url}");
+        }
+        // Dots that are no segment, and a query, are not.
+        for url in [
+            "https://s.example/v1/a..b",
+            "https://s.example/v1/.well-known",
+            "https://s.example/v1/x?next=/../admin",
+            "https://s.example/v1/file.tar.gz",
+        ] {
+            assert!(!has_dot_segment(url), "{url}");
+            assert!(endpoint_matches(e, url), "{url}");
+        }
     }
 
     /// The policy is per kind: an endpoint declared in one section admits

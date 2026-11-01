@@ -45,6 +45,30 @@ impl crate::runtime::reactor::Runtime {
             .and_then(Value::as_str)
             .unwrap_or("GET")
             .to_ascii_uppercase();
+        // A dot-segment climbs out of the path the URL's text names: refused,
+        // so no entry's credential reaches a path outside its endpoint.
+        let joined = match spec.get("endpoint").and_then(Value::as_str) {
+            Some(name) if !url.contains("://") => self
+                .settings
+                .http
+                .endpoints
+                .get(name)
+                .map_or_else(|| url.clone(), |e| join_url(&e.endpoint, &url)),
+            _ => url.clone(),
+        };
+        if crate::config::settings::has_dot_segment(&joined) {
+            self.finish_step_pub(
+                run_id,
+                step_id,
+                StepStatus::Failed,
+                None,
+                Some(format!(
+                    "http: {joined} has a dot-segment (`.` or `..`, plain or percent-encoded) in its path — refused"
+                )),
+                0,
+            );
+            return;
+        }
         // The `http.endpoints` entry the step names, or the one its URL
         // falls under (RFC 0055 §3.2). With a name, `url` may be a path
         // under the entry's endpoint.

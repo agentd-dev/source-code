@@ -741,7 +741,7 @@ live · op.
 
 | Path | Type | Default | What it does |
 |---|---|---|---|
-| `http.endpoints.<name>.endpoint` | URL | required | The base URL, and the match base: a request matches when its scheme and `host[:port]` are the endpoint's and its path extends the endpoint's path on a `/` segment boundary. |
+| `http.endpoints.<name>.endpoint` | URL | required | The base URL, and the match base: a request matches when its scheme and `host[:port]` are the endpoint's and its path extends the endpoint's path on a `/` segment boundary. A path with a dot-segment (`.`, `..`, or `%2e` forms) matches no entry, and an `http` step with one fails unsent. |
 | `http.endpoints.<name>.auth` | object | — | A credential provider; see [Credentials](#credentials). An interactive grant logs in with `agentd --login http:<name>`. |
 | `http.endpoints.<name>.headers` | map | `{}` | Headers sent on every request to it, under a step's own. A credential-shaped one needs a reference. |
 | `http.endpoints.<name>.methods` | list of methods | any | The methods `http` steps may use against it. |

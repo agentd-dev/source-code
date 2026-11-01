@@ -1305,7 +1305,8 @@ for every outbound TLS dial, in the daemon and its child processes.
 | | `static` token | `static` header | `oauth2` | `aws` | `spiffe` jwt | `spiffe` x509 |
 |---|---|---|---|---|---|---|
 | model connection or provider | yes | refused at load | yes | yes | yes | refused at load |
-| MCP server or HTTP endpoint | yes | yes | yes | yes | yes | yes (mutual TLS) |
+| MCP server | yes | yes | yes | yes | yes | yes (mutual TLS) |
+| HTTP endpoint | yes | yes | yes | yes | yes | refused at load |
 | A2A peer | yes | yes | yes | yes | yes | use `client_cert` and `client_key` |
 
 ## When a credential is missing or refused

@@ -329,6 +329,8 @@ fn spiffe_x509_identity(
 // `{{secret:…}}` header templates into wire headers at connect time.
 pub mod auth;
 pub mod elicit;
+// The MCP registry client: records resolved into endpoints (RFC 0055 §4).
+pub mod registry;
 // OAuth 2.1 client-credentials (M2M) token source for endpoints sitting behind an
 // OAuth gateway. Feature-gated; dependency-free.
 #[cfg(feature = "oauth")]

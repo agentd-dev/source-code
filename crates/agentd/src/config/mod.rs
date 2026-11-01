@@ -432,6 +432,63 @@ pub struct McpServerSpec {
     /// the supervisor's does.
     #[serde(default, skip_serializing_if = "TasksMode::is_auto")]
     pub tasks: TasksMode,
+    /// A registry server's registry and name (RFC 0055 §4): its endpoint
+    /// and headers are the record's, read when it is dialed. Never in a spawn
+    /// payload: a child is handed the spec as resolved.
+    #[serde(skip)]
+    pub registry: Option<RegistryDial>,
+}
+
+/// How a registry server is resolved: the registry's API and the name and
+/// version asked for, with what the operator set on it (RFC 0055 §4.1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RegistryDial {
+    /// The `mcp.registries` entry's name.
+    pub registry: String,
+    /// Its API base, without a trailing `/`.
+    pub base: String,
+    /// The server's registry name.
+    pub server: String,
+    /// `latest` or an exact version.
+    pub version: String,
+    /// The registry API's own credential and headers (secret-free templates).
+    pub auth: Option<AuthSpec>,
+    pub headers: Vec<(String, String)>,
+    pub allow_private: bool,
+    pub timeout: Duration,
+    /// How long a resolution is reused.
+    pub refresh: Duration,
+    /// A document's `src` beside the registry name: the record's remotes must
+    /// hold it.
+    pub document_src: Option<String>,
+    /// The server's own `auth` names its RFC 8707 resource `auto`: the
+    /// resolved endpoint, in canonical form.
+    pub resource_auto: bool,
+}
+
+impl McpServerSpec {
+    /// This registry server's spec as dialed: the record's endpoint and
+    /// headers, and its credential bound to that endpoint.
+    pub fn resolved(&self, url: &str, headers: Vec<(String, String)>) -> McpServerSpec {
+        let mut out = McpServerSpec {
+            endpoint: url.to_string(),
+            headers,
+            registry: None,
+            ..self.clone()
+        };
+        if let Some(a) = out.auth.as_mut() {
+            if a.protected_resource.as_deref() == Some("") {
+                a.protected_resource = Some(url.to_string());
+            }
+            if a.kind == "oauth2"
+                && a.resource.is_none()
+                && self.registry.as_ref().is_some_and(|r| r.resource_auto)
+            {
+                a.resource = settings::canonical_resource(url);
+            }
+        }
+        out
+    }
 }
 
 /// `mcp.servers[].tasks` (RFC 0050): whether agentd lets a server answer its

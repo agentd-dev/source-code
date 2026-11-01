@@ -162,7 +162,7 @@ what a build carries.
 
 ## Crates
 
-The workspace publishes five crates to crates.io. A sixth, the conformance
+The workspace publishes four crates to crates.io. A fifth, the conformance
 suite, is not published and links none of the others: it drives the binary
 from outside.
 
@@ -210,14 +210,14 @@ unique package names from `cargo tree -p agentd-cli -e normal --prefix none`
 
 | Build | Crates | Not from this repository |
 |---|---|---|
-| `--no-default-features` | 82 | 77 |
-| default (`tls`) | 89 | 84 |
-| default + `cel` | 111 | 106 |
-| default + `a2a` | 146 | 141 |
-| default + `x402` | 119 | 114 |
-| the release feature set | 193 | 188 |
+| `--no-default-features` | 82 | 78 |
+| default (`tls`) | 89 | 85 |
+| default + `cel` | 111 | 107 |
+| default + `a2a` | 146 | 142 |
+| default + `x402` | 119 | 115 |
+| the release feature set | 193 | 189 |
 
-The right-hand column leaves out the five workspace crates the command lists.
+The right-hand column leaves out the four workspace crates the command lists.
 `a2a` and `cel` overlap in five crates and `x402` overlaps neither; the other
 fourteen release features add none. Measured with cargo 1.98.0 against the
 committed `Cargo.lock` after v1.20.0, when `companies`, `xaa` and `x402`

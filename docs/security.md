@@ -2042,14 +2042,15 @@ Refused as non-global, unless `allow_private` is set:
 
 ### Instruction provenance refusal codes
 
-A refusal of an author signature or a delivery attestation carries its
-Instruction Specification Appendix B code in the `agentd-instruction` crate's
-refusal type: `signature-typ-mismatch`, `audience-mismatch`,
-`digest-mismatch`, `manifest-dropped-missing`, `unpinned-publisher`,
-`delivery-ceiling-exceeded`, `wire-floor` or `ungranted-family`. A condition
-Appendix B has no row for, such as a JWS that does not parse or verify or an
-expired signature, carries `attestation`. The log line is the refusal's
-message.
+A refusal of an author signature or a delivery attestation carries the
+instruction.md SDK's verification code (`instruction_md::VERIFY_CODES`):
+`malformed`, `unknown-key`, `bad-algorithm`, `bad-signature`,
+`unknown-format`, `typ-mismatch`, `expired`, `digest-mismatch`,
+`doc-mismatch`, `unpinned-publisher`, `audience-mismatch`,
+`manifest-invalid`, `author-missing` or `capabilities-exceeded`. A condition
+the SDK has no code for, such as a resolved read under a pinned publisher
+with no `reader` pinned, or a build without `sign`, carries `attestation`.
+The log line is the refusal's message.
 
 ### A2A limits
 

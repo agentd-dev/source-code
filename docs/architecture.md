@@ -61,9 +61,10 @@ Three ideas shape every part of it:
   cron, a YAML subset) are written by hand.
   [Engineering choices](why-rust.md) explains why.
 
-The code ships as five crates — `agentd-net`, `agentd-mcp`,
-`agentd-instruction`, `agentd-core` and the `agentd-cli` binary — described
-with their cargo features in [Build features and crates](features.md).
+The code ships as four crates — `agentd-net`, `agentd-mcp`, `agentd-core` and
+the `agentd-cli` binary — described with their cargo features in
+[Build features and crates](features.md). Instruction documents are read with
+the instruction.md project's official Rust SDK, `instruction-md`.
 
 ## Two loops
 

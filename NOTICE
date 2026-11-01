@@ -7,13 +7,20 @@ licence statement that names only the project's own licence is silent about
 precisely the files someone might copy out of it.
 
 Instruction documents are read with the official instruction.md Rust SDK,
-`instruction-md` (https://github.com/instruction-md/source-code, `sdks/rust`),
-a dependency rather than vendored code. It is MIT OR Apache-2.0; it embeds the
-specification's registry (`src/registry.json`), which is the instruction.md
-specification's, under CC BY 4.0 — attribution "The instruction.md
-Specification", instruction.md, https://github.com/instruction-md/specification
-— as its own NOTICE states. That registry is compiled into a release binary as
-data, inside the SDK.
+`instruction-md` (crates.io; https://github.com/instruction-md/source-code,
+`sdks/rust`), a dependency rather than vendored code. The crate itself is
+MIT OR Apache-2.0. It embeds, and so every agentd binary carries as data, the
+specification's registries, under a different licence. The attribution, as
+the crate's own NOTICE gives it:
+
+  The instruction.md specification's registry and workflow registry
+  (`src/registry.json` and `src/workflow-registry.json`, verbatim;
+  specification commit af8400f)
+    Source:  https://github.com/instruction-md/specification
+    Licence: Creative Commons Attribution 4.0 International (CC BY 4.0)
+             https://creativecommons.org/licenses/by/4.0/
+    Author:  instruction.md (TSOK Inc.)
+    Changes: none; redistributed verbatim.
 
 The Personal Agent Protocol (https://personalagentprotocol.org,
 https://github.com/personal-agent-protocol/personal-agent-protocol). agentd's
@@ -35,7 +42,8 @@ version signal.
 
 These licences are compatible with distributing this repository under the
 AGPL: CC BY 4.0 and Apache-2.0 permit redistribution with attribution, which
-this notice and the copied LICENSE files provide. No vendored artifact is
-compiled into a release binary as code — the draft's pages are test input, and
-the draft's schemas are read as data by the fake Company, test scaffolding that only debug builds and
-`internal-mocks` builds with `oauth` (and the default `tls`) carry.
+this notice and the copied LICENSE files provide. No third-party artifact is
+compiled into a release binary as code — the instruction.md registries are
+data inside the SDK, the draft's pages are test input, and the draft's schemas
+are read as data by the fake Company, test scaffolding that only debug builds
+and `internal-mocks` builds with `oauth` (and the default `tls`) carry.

@@ -273,13 +273,19 @@ operator's configuration rather than the other way round
   first use. `discover: true`, which lets the model search and connect, adds
   no reach the approval did not.
 - **The record is checked.** A record whose name differs from the name
-  asked for, a deleted one, one with only local packages, and a remote that
+  asked for, one of another version than an exact one asked for, a deleted
+  one, one with only local packages, and a remote that
   is not `https://` to a public address (unless the registry entry sets
   `allow_private`) are refused. A registry never supplies a credential: a
   remote header's `{variable}` is filled from the operator's headers, and a
-  fixed value marked secret is not sent.
+  fixed value marked secret is not sent. A re-dial after the record went
+  stale (`refresh`) reads it again, so a record since deleted is no longer
+  dialed and a moved remote is followed.
 - **A run's version is pinned.** A run keeps calling the version it first
   called, so a publish under it does not change the server it talks to.
+- **A document does not refuse the operator's server.** A document's
+  `src` the record disagrees with refuses the document's block — its steps
+  that named the server — never the operator's entry it folded into.
 
 The remote's address is checked when the record is resolved; the dial that
 follows resolves the host again. Network policy at the host or cluster

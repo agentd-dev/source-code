@@ -140,7 +140,9 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   packages only refused), `https://` to a public address unless
   `allow_private`, remote header `{variable}`s filled from the operator's
   headers, a document's `src` one of its remotes — kept in the store for
-  `refresh`, and a run keeps calling the version it first called. The
+  `refresh` and read again on any re-dial once stale (a moved remote is
+  followed, a record since `deleted` refused), and a run keeps calling the
+  version it first called. The
   lethal-trifecta check counts every approved name at the registry's tags at
   load. `discover: true` gives the model `mcp.registry.search` and
   `mcp.registry.connect` over the approved names. `agentd mcp registry

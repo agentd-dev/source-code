@@ -193,6 +193,13 @@ A refused server fails the steps that name it with the reason, and its
 record is read again after `refresh`. The record is kept in the store and
 reused for `refresh` (default `1h`), across restarts.
 
+A live connection is not torn down when its record goes stale. When it is
+dialed again — its server lost the session — a record older than `refresh`
+is read again first: a remote that moved is followed, and a record the
+registry has since marked `deleted` is refused (`mcp.registry.refused`) and
+the server stays down. The log says `mcp.disconnect` with `registry: stale`.
+A run keeps its pinned version across the re-dial.
+
 A server that needs authorization goes through its `auth` block, as any
 `mcp.servers` entry does. See [Connect MCP servers](connect-mcp.md#authenticate).
 

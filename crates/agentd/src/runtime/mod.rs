@@ -2858,6 +2858,12 @@ impl Runtime {
         else {
             return;
         };
+        // A registry server whose record is stale is not dialed again at the
+        // endpoint the record named: its record is read again first.
+        if self.registry_record_stale(&name) {
+            self.registry_redial(&name, "session_lost");
+            return;
+        }
         if c.redial_failures() == 0 {
             self.log.warn(
                 "mcp.disconnect",

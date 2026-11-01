@@ -236,6 +236,55 @@ impl Runtime {
         );
     }
 
+    /// Whether the connected registry server `server`'s record is stale —
+    /// older than its registry's `refresh`, or no longer kept: a re-dial of
+    /// it reads the record again rather than dial the endpoint it named.
+    pub(crate) fn registry_record_stale(&self, server: &str) -> bool {
+        let Some(d) = self
+            .registries
+            .live
+            .get(server)
+            .and_then(|l| l.unresolved.registry.as_ref())
+        else {
+            return false;
+        };
+        match self.registry_cached(d) {
+            Some((_, at)) => now_ms().saturating_sub(at) >= d.refresh.as_millis() as u64,
+            None => true,
+        }
+    }
+
+    /// The connection of the registry server `server`, whose record is
+    /// stale, is to be dialed again: it is let go, and the join dials the
+    /// server through its registry (RFC 0055 §4.1) — a `deleted` record is
+    /// refused there and the server stays down, a moved remote is followed.
+    /// It is dialed on the spec it was resolved from, without a credential
+    /// found for the old endpoint where its entry names none: the new one's
+    /// is found for it.
+    pub(crate) fn registry_redial(&mut self, server: &str, reason: &str) {
+        let Some(live) = self.registries.live.remove(server) else {
+            return;
+        };
+        let mut spec = live.unresolved;
+        let own_auth = self
+            .settings
+            .mcp
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .is_some_and(|s| s.auth.is_some());
+        if !own_auth {
+            spec.auth = None;
+        }
+        self.mcp.remove(server);
+        self.mcp_specs.insert(server.to_string(), spec);
+        self.joining.want(server);
+        self.log.info(
+            "mcp.disconnect",
+            json!({"server": server, "reason": reason, "registry": "stale"}),
+        );
+    }
+
     /// Make the registry server a step or the model names, when it is not
     /// configured yet: approved by its registry, as the operator's own
     /// entry for it when there is one.

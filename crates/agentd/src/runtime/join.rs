@@ -101,6 +101,11 @@ impl Joining {
         self.wanted.remove(server);
     }
 
+    /// Something needs the server `server`: dialed until it connects.
+    pub(crate) fn want(&mut self, server: &str) {
+        self.wanted.insert(server.to_string());
+    }
+
     /// Whether something has needed the on-use server `server`.
     pub(crate) fn wants(&self, server: &str) -> bool {
         self.wanted.contains(server)

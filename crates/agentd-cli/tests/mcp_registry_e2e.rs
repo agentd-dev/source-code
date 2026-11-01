@@ -460,6 +460,94 @@ fn packages_only_is_refused_and_deprecated_warns() {
     let _ = std::fs::remove_file(&cfg);
 }
 
+/// A registry server whose session was lost after its record went stale is
+/// re-dialed through its registry, not at the endpoint the record named:
+/// with `edit`, the registry changed the record meanwhile. The run calls
+/// `kb` once, the mock restarts (forgetting the session) past `refresh`,
+/// and the run's second call goes where the record now says.
+fn re_dialed_after_the_record_went_stale(
+    edit: impl FnOnce(&Registry, &common::MockMcp, &common::MockMcp),
+    c2: &str,
+) -> (String, common::MockMcp, common::MockMcp) {
+    let one = common::spawn_mock_mcp("mock://unused", false);
+    let two = common::spawn_mock_mcp("mock://unused", false);
+    let reg = Registry::start();
+    reg.publish(
+        record("io.acme/kb", "1.0.0", &format!("{}/mcp", one.uri())),
+        "active",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(&format!(
+        "agent: {{name: reg}}\n{}mcp:\n{}  servers:\n    - {{name: kb, registry: official, server: io.acme/kb}}\nworkflows:\n  - name: call\n    steps:\n      s: {{kind: once}}\n      c1: {{kind: mcp.tool, depends_on: [s], server: kb, tool: mock.ops}}\n      w: {{kind: wait, depends_on: [c1], on: signal, signal: never, timeout: 4s, on_timeout: c2}}\n      c2: {{kind: mcp.tool, server: kb, tool: mock.ops{c2}}}\n      f: {{kind: finish, depends_on: [c2], status: completed}}\nlifecycle: {{run_until: drained}}\nobservability: {{log_level: info}}\n",
+        store(&dir),
+        registries(&reg, "")
+    ));
+    let d = Daemon::start(&cfg);
+    d.wait_for("the first call", |_| calls(&one) == 1);
+    edit(&reg, &one, &two);
+    std::thread::sleep(Duration::from_millis(1100)); // past `refresh`
+    one.control("mock.restart", json!({}));
+    let log = d.wait_for("the run", |l| run_done(l, "call").is_some());
+    let _ = std::fs::remove_file(&cfg);
+    (log, one, two)
+}
+
+/// The record moved to another remote: the re-dial follows it.
+#[test]
+fn a_stale_record_is_read_again_on_a_re_dial_and_a_moved_remote_followed() {
+    let (log, one, two) = re_dialed_after_the_record_went_stale(
+        |reg, _, two| {
+            reg.publish(
+                record("io.acme/kb", "1.0.0", &format!("{}/mcp", two.uri())),
+                "active",
+            )
+        },
+        ", retry: {max: 6, backoff: 1s}",
+    );
+    assert_eq!(
+        run_done(&log, "call").unwrap()["status"],
+        "completed",
+        "{log}"
+    );
+    assert!(
+        events(&log, "mcp.disconnect")
+            .iter()
+            .any(|e| e["server"] == "kb" && e["registry"] == "stale"),
+        "{log}"
+    );
+    assert!(
+        events(&log, "mcp.registry.resolved")
+            .iter()
+            .any(|e| e["name"] == "kb" && e["url"] == format!("{}/mcp", two.uri())),
+        "the record was read again:\n{log}"
+    );
+    assert_eq!(calls(&one), 1, "the second call did not go to the old remote");
+    assert_eq!(calls(&two), 1, "the second call went where the record says");
+}
+
+/// The registry marked the record deleted: the re-dial refuses it, said,
+/// and the server is not dialed again at its old remote.
+#[test]
+fn a_stale_record_deleted_meanwhile_refuses_the_re_dial() {
+    let (log, one, _two) = re_dialed_after_the_record_went_stale(
+        |reg, one, _| {
+            reg.publish(
+                record("io.acme/kb", "1.0.0", &format!("{}/mcp", one.uri())),
+                "deleted",
+            )
+        },
+        ", on_error: continue",
+    );
+    assert!(
+        events(&log, "mcp.registry.refused")
+            .iter()
+            .any(|e| e["name"] == "kb"
+                && e["err"].as_str().is_some_and(|m| m.contains("deleted"))),
+        "{log}"
+    );
+    assert_eq!(calls(&one), 1, "the deleted server was not called again");
+}
+
 /// A name outside the registry's globs, and a registry approving nothing,
 /// refuse the configuration before anything is dialed.
 #[test]

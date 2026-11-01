@@ -764,6 +764,14 @@ impl Runtime {
     /// `policy: always` fires regardless.
     pub(crate) fn arm_workflows(&mut self) {
         let names: Vec<String> = self.workflows.keys().cloned().collect();
+        self.arm_workflows_named(names);
+    }
+
+    /// [`Self::arm_workflows`] over `names` only: a reload arms the
+    /// definitions it installed new or replaced, so an unchanged one's
+    /// `policy: always` start, which already fired this boot, does not fire
+    /// again.
+    pub(crate) fn arm_workflows_named(&mut self, names: Vec<String>) {
         for name in names {
             let Some(w) = self.workflows.get(&name) else {
                 continue;

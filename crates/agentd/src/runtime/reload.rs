@@ -939,13 +939,16 @@ impl Runtime {
                 };
                 self.retire_workflow(wf, reason);
             }
-            self.arm_workflows();
             anew = self
                 .workflows
                 .iter()
                 .filter(|(n, w)| previous.get(*n).is_none_or(|p| p.hash != w.hash))
                 .map(|(n, _)| n.clone())
                 .collect();
+            // Only what this reload installed: an unchanged definition's
+            // `once` start fired at boot (`policy: always` is every boot,
+            // not every reload).
+            self.arm_workflows_named(anew.clone());
             // A replaced definition's schedule keeps its deadline when the
             // schedule itself is what it was: only an edit to the start node
             // re-arms it from now.

@@ -50,6 +50,12 @@ fn dispatch() -> i32 {
         }
     }
 
+    // `agentd mcp registry search <term>`: what an MCP registry lists, for
+    // the operator writing `mcp.registries` and `mcp.servers` (RFC 0055 §5).
+    if argv.get(1).map(String::as_str) == Some("mcp") {
+        return mcp_cli(&argv[2..]);
+    }
+
     // Hidden built-in Streamable HTTP mock MCP server (tests/dev). Binds
     // loopback TCP (127.0.0.1:0) and announces the bound address through
     // <addr-file>.
@@ -302,6 +308,174 @@ fn mock_company(args: &[String]) -> i32 {
     run_with(&addr_file, &opts)
 }
 
+/// `agentd mcp registry search <term> [--registry <url-or-name>] [-c
+/// <config>] [--limit <n>] [--json]`: the servers an MCP registry lists
+/// whose names match `term`, one per line — name, version, remotes — and,
+/// for a registry the configuration names, whether its `servers` globs
+/// approve each. With no `--registry`: every registry the configuration
+/// declares, or else the MCP project's registry.
+fn mcp_cli(args: &[String]) -> i32 {
+    const USAGE: &str = "usage: agentd mcp registry search <term> [--registry <url-or-name>] [-c <config>] [--limit <n>] [--json]";
+    let usage = |what: &str| {
+        eprintln!("agentd mcp: {what}\n{USAGE}");
+        exit::USAGE
+    };
+    if args.first().map(String::as_str) != Some("registry")
+        || args.get(1).map(String::as_str) != Some("search")
+    {
+        return usage("unknown command");
+    }
+    let (mut term, mut registry, mut config, mut limit, mut as_json) =
+        (None, None, None, 30usize, false);
+    let mut it = args[2..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--registry" => registry = it.next().cloned(),
+            "-c" | "--config" => config = it.next().cloned(),
+            "--limit" => match it.next().and_then(|n| n.parse().ok()) {
+                Some(n) => limit = n,
+                None => return usage("--limit needs a number"),
+            },
+            "--json" => as_json = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return exit::SUCCESS;
+            }
+            other if other.starts_with('-') => return usage(&format!("unknown flag {other:?}")),
+            other if term.is_none() => term = Some(other.to_string()),
+            other => return usage(&format!("unexpected argument {other:?}")),
+        }
+    }
+    let Some(term) = term else {
+        return usage("a search term is required");
+    };
+    use agentd::config::settings::registries::McpRegistry;
+    let configured: Vec<McpRegistry> = match &config {
+        None => Vec::new(),
+        Some(path) => {
+            let env: Vec<(String, String)> = std::env::vars().collect();
+            match agentd::config::settings::load(&["-c".to_string(), path.clone()], &env) {
+                Ok((loaded, _)) => loaded.settings.mcp.registries,
+                Err(e) => {
+                    eprintln!("agentd mcp: {path}: {e}");
+                    return exit::USAGE;
+                }
+            }
+        }
+    };
+    let timeout = std::time::Duration::from_secs(30);
+    // (label, api, the configured entry when there is one)
+    let mut targets: Vec<(String, agentd::mcp::registry::Api, Option<McpRegistry>)> = Vec::new();
+    let api_of = |r: &McpRegistry| agentd::mcp::registry::Api {
+        base: r.base().to_string(),
+        headers: r
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        auth: None,
+        target: format!("registry:{}", r.name),
+        timeout: r.timeout(),
+    };
+    match &registry {
+        Some(want) => match configured
+            .iter()
+            .find(|r| r.name == *want || r.is_url(want))
+        {
+            Some(r) => targets.push((r.name.clone(), api_of(r), Some(r.clone()))),
+            None if want.contains("://") => targets.push((
+                want.clone(),
+                agentd::mcp::registry::Api::bare(want, timeout),
+                None,
+            )),
+            None => {
+                return usage(&format!(
+                    "--registry {want:?} is neither a URL nor a registry the configuration declares"
+                ));
+            }
+        },
+        None if !configured.is_empty() => {
+            for r in &configured {
+                targets.push((r.name.clone(), api_of(r), Some(r.clone())));
+            }
+        }
+        None => targets.push((
+            agentd::mcp::registry::OFFICIAL.to_string(),
+            agentd::mcp::registry::Api::bare(agentd::mcp::registry::OFFICIAL, timeout),
+            None,
+        )),
+    }
+    let mut failed = false;
+    let mut all = Vec::new();
+    for (label, api, entry) in targets {
+        if entry.as_ref().is_some_and(|e| e.auth.is_some()) {
+            eprintln!(
+                "agentd mcp: registry {label:?} takes `auth`, which this command does not present; the request goes without it"
+            );
+        }
+        match api.search(&term, limit) {
+            Ok(records) => {
+                for rec in &records {
+                    let mut s = agentd::mcp::registry::summary(rec);
+                    s["registry"] = json!(label);
+                    if let Some(e) = &entry {
+                        s["approved"] = json!(s["name"].as_str().is_some_and(|n| e.approves(n)));
+                    }
+                    all.push(s);
+                }
+            }
+            Err(e) => {
+                eprintln!("agentd mcp: {label}: {e}");
+                failed = true;
+            }
+        }
+    }
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&all).unwrap_or_else(|_| "[]".into())
+        );
+    } else {
+        for s in &all {
+            let remotes: Vec<String> = s["remotes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| {
+                    format!(
+                        "{} {}",
+                        r["type"].as_str().unwrap_or("?"),
+                        r["url"].as_str().unwrap_or("")
+                    )
+                })
+                .collect();
+            let remotes = if remotes.is_empty() {
+                match s["packages"].as_u64() {
+                    Some(n) if n > 0 => format!("(packages only: {n}; agentd cannot dial it)"),
+                    _ => "(no remotes)".into(),
+                }
+            } else {
+                remotes.join(", ")
+            };
+            let approval = match s["approved"].as_bool() {
+                Some(true) => "\tapproved",
+                Some(false) => "\tnot approved",
+                None => "",
+            };
+            let status = match s["status"].as_str() {
+                Some("active") | None => String::new(),
+                Some(other) => format!(" [{other}]"),
+            };
+            println!(
+                "{}\t{}{status}\t{remotes}{approval}",
+                s["name"].as_str().unwrap_or("?"),
+                s["version"].as_str().unwrap_or("?"),
+            );
+        }
+    }
+    if failed { exit::GENERIC } else { exit::SUCCESS }
+}
+
 /// A loaded daemon invocation: the configuration, what was asked of it, and
 /// the arguments and environment it was loaded from — the per-process intents
 /// (`--fresh`, `--prompt-missing`, `--env`) already consumed.
@@ -426,10 +600,8 @@ fn run(args: &[String], env: &[(String, String)]) -> i32 {
                 eprintln!(
                     "{}",
                     json!({"event": "config.effective_server", "server": s.name,
-                           "endpoint": s.endpoint, "connect": match s.connect {
-                               agentd::config::settings::Connect::Boot => "boot",
-                               agentd::config::settings::Connect::OnUse => "on_use",
-                           },
+                           "endpoint": s.endpoint, "connect": if s.on_use() { "on_use" } else { "boot" },
+                           "registry": s.registry, "registry_server": s.server, "version": s.version,
                            "document": document, "rate": s.rate,
                            "allow": s.allow, "exclude": s.exclude, "tags": s.tags})
                 );

@@ -3587,6 +3587,13 @@
           "description": "instance identity (falls back to the downward-API instance, then the hostname)",
           "type": "string"
         },
+        "on_instruction_updated": {
+          "description": "what a changed instruction leaves the root conversation, when wake_on names instruction_updated: note (default; read on its next turn) or think (that note delivered, starting a turn: the agent acts on the change with nobody prompting it)",
+          "enum": [
+            "note",
+            "think"
+          ]
+        },
         "on_workflow_finished": {
           "description": "what a finished run leaves in the root transcript, for the runs wake_on names: ignore (default), note (a note with its output or error), or think (that note delivered, starting a turn). Withheld there, as any read-back is, when the run may carry outside input and the root holds sensitive and egress",
           "enum": [

@@ -111,17 +111,19 @@ fn run_parent(
     let cfg = format!("{dir}/c.yaml");
     std::fs::write(&cfg, cfg_text).unwrap();
     let log_path = format!("{dir}/stderr.log");
-    let mut child = Command::new(exe)
-        .args(["--config", &cfg])
-        .args(extra)
-        .env("AGENTD_STATE_DIR", format!("{dir}/state"))
-        .env("TMPDIR", dir)
-        .env_remove("XDG_RUNTIME_DIR")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(&log_path).unwrap())
-        .spawn()
-        .expect("run the parent");
+    let mut child = common::retry_busy(|| {
+        Command::new(exe)
+            .args(["--config", &cfg])
+            .args(extra)
+            .env("AGENTD_STATE_DIR", format!("{dir}/state"))
+            .env("TMPDIR", dir)
+            .env_remove("XDG_RUNTIME_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log_path).unwrap())
+            .spawn()
+    })
+    .expect("run the parent");
     let mut seen = std::collections::BTreeSet::new();
     let code = loop {
         if let Some(status) = child.try_wait().expect("wait") {

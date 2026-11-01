@@ -980,3 +980,22 @@ pub fn send_text(addr: &str, text: &str) -> Value {
 pub fn send_command(addr: &str, op: &str, args: Value) -> Value {
     SendMessage::command(op, args).post(addr)
 }
+
+/// Start a binary a test has just copied, retrying while the kernel says
+/// it is busy. Another test thread's `fork` inherits the copy's write
+/// descriptor until its own child execs, and until then executing the copy
+/// fails with `ETXTBSY` — a race in the harness, not in agentd.
+pub fn retry_busy<T>(mut start: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match start() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            r => return r,
+        }
+    }
+}

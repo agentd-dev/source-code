@@ -74,14 +74,16 @@ fn a_turn_worker_runs_as_the_configured_uid_inside_its_landlock_domain() {
         ),
     )
     .unwrap();
-    let out = Command::new(&exe)
-        .args(["--config", &cfg])
-        .env("AGENTD_TEST_WORKER_ID", "1")
-        .env("AGENTD_TEST_WORKER_OPEN", format!("{chain}:{public}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .output()
-        .expect("run");
+    let out = common::retry_busy(|| {
+        Command::new(&exe)
+            .args(["--config", &cfg])
+            .env("AGENTD_TEST_WORKER_ID", "1")
+            .env("AGENTD_TEST_WORKER_OPEN", format!("{chain}:{public}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .output()
+    })
+    .expect("run");
     let log = String::from_utf8_lossy(&out.stderr).to_string();
     assert_eq!(out.status.code(), Some(0), "{log}");
     assert!(
@@ -154,12 +156,14 @@ fn an_exec_command_runs_as_the_configured_uid() {
         ),
     )
     .unwrap();
-    let out = Command::new(&exe)
-        .args(["--config", &cfg])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .output()
-        .expect("run");
+    let out = common::retry_busy(|| {
+        Command::new(&exe)
+            .args(["--config", &cfg])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .output()
+    })
+    .expect("run");
     let log = String::from_utf8_lossy(&out.stderr).to_string();
     let done: Vec<Value> = events(&log, "run.done").collect();
     assert_eq!(done.len(), 1, "{log}");

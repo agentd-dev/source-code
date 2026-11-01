@@ -21,7 +21,8 @@
 # instruction/1 document, which only a build that reads instruction/1 parses
 # (its `:::mcp` blocks have no `!`): rehearse it with that binary. A demo the
 # binary cannot run is reported as skipped, with the reason, and fails
-# nothing; naming it explicitly makes the skip a failure.
+# nothing; naming it explicitly makes the skip a failure. MOCK_CHAT_ONLY=1
+# is for a binary whose built-in mock predates the Responses API (see mock()).
 #
 # Needs: node >= 20; curl. Each demo checks its own loopback ports first:
 # (a) 8701, 8703, 8420; (b) 8702, 8421, 8422; (c) 8723, 8729, 8430-8432;
@@ -159,12 +160,16 @@ ANDRII_TOKEN="and-$RANDOM$RANDOM$RANDOM"; HOME_PEER_TOKEN="hp-$RANDOM$RANDOM$RAN
 export CONTROLLER_TOKEN CFO_TOKEN RECON_PEER_TOKEN SUPPORT_TOKEN ENGINEER_TOKEN \
   NATALIIA_TOKEN ANDRII_TOKEN HOME_PEER_TOKEN
 # `--intelligence` points the model at the mock; `--intelligence-token ""`
-# drops the config's {{secret:OPENAI_API_KEY}} reference, so no key is read;
-# the turn goes to a model named `mock`, declared here: gpt-6.1-sol is
-# asked on the Responses API, which the mock does not speak.
+# drops the config's {{secret:OPENAI_API_KEY}} reference, so no key is read.
+# The turn stays the config's own, gpt-6.1-sol, as in the live run.
+# MOCK_CHAT_ONLY=1 is for a binary that asks gpt-6.1-sol on the Responses
+# API but whose mock answers chat completions only (built before the mock
+# learned the Responses API): the turn then goes to a model named `mock`.
 mock() {
-  MOCK=(--intelligence "mock:file:$HERE/mock/$1.json" --intelligence-token ""
-    --intelligence.models '{mock: {model: mock}}' --intelligence.roles.turn mock)
+  MOCK=(--intelligence "mock:file:$HERE/mock/$1.json" --intelligence-token "")
+  if [ "${MOCK_CHAT_ONLY:-0}" = 1 ]; then
+    MOCK+=(--intelligence.models '{mock: {model: mock}}' --intelligence.roles.turn mock)
+  fi
 }
 FEATURES="$(features)"
 echo "agentd: $("$AGENTD" --version)   ($AGENTD)   work: $WORK"

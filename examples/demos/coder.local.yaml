@@ -4,8 +4,7 @@
 #
 #   export REPO=/path/to/a/copy/of/engineering-fixture
 #   agentd -c examples/demos/coder.yaml -c examples/demos/coder.local.yaml \
-#     --intelligence mock:file:examples/demos/mock/coder.json --intelligence-token "" \
-#     --intelligence.models '{mock: {model: mock}}' --intelligence.roles.turn mock
+#     --intelligence mock:file:examples/demos/mock/coder.json --intelligence-token ""
 #
 # The server list is restated with `instruction-md` pointing at the stand-in
 # (no sign-in), and the stand-in is catalogued for egress: closed. The local

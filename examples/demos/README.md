@@ -89,10 +89,9 @@ intelligence:
 ```
 
 The scripted-model layers (`support.mock.yaml`, `home.mock.yaml`) set their
-own endpoint, a model `scripted` and `roles: {turn: scripted}`; agentd's mock (`--intelligence
-mock:file:…`) is given the turn with `--intelligence.models '{mock: {model:
-mock}}' --intelligence.roles.turn mock` beside it, for gpt-6.1-sol is asked
-on the Responses API, which the mock does not speak.
+own endpoint, a model `scripted` and `roles: {turn: scripted}`. agentd's
+mock (`--intelligence mock:file:…`) keeps the config's model, gpt-6.1-sol,
+and answers it on the API agentd asks it on, the Responses API included.
 
 ### What the recorder exports, per demo
 
@@ -600,6 +599,12 @@ run looked like on the builds here:
 | (d) coder | `main` built with `exec` | 17 passed |
 | (e) home | the instruction/1 build | 20 passed |
 
+(a) and (b) on the instruction/1 build ran with `MOCK_CHAT_ONLY=1`: that
+build asks gpt-6.1-sol on the Responses API, and its built-in mock predates
+answering it, so the flag gives the mock's turn to a model named `mock`. A
+build from `main` needs no flag: the turn stays gpt-6.1-sol, as live. (c)
+and (e) use the scripted model and need it on neither.
+
 `rehearse.sh` starts the stand-ins and the agents on each demo's own
 loopback ports — (a) 8701, 8703, 8420; (b) 8702, 8421, 8422; (c) 8723,
 8729, 8430–8432; (d) 8733, 8440; (e) 8741–8744, 8749, 8450 — (stop a live
@@ -632,16 +637,14 @@ To rehearse demo (a) by hand the same way:
 cp examples/demos/instruction/ap-policy-v1.md "$AGENTD_DEMO_HOME/ap-policy.md"
 (cd examples/demos/standins && npm start -- --policy "$AGENTD_DEMO_HOME/ap-policy.md")
 agentd -c examples/demos/ap-agent.yaml -c examples/demos/ap-agent.local.yaml \
-  --intelligence mock:file:examples/demos/mock/ap-agent.json --intelligence-token "" \
-  --intelligence.models '{mock: {model: mock}}' --intelligence.roles.turn mock
+  --intelligence mock:file:examples/demos/mock/ap-agent.json --intelligence-token ""
 # release v2:
 cp examples/demos/instruction/ap-policy-v2.md "$AGENTD_DEMO_HOME/ap-policy.md"
 ```
 
-The last two flags give the turn to a model named `mock`: agentd asks
-gpt-6.1-sol on the Responses API, which the mock does not speak. Drop the
-four `--intelligence` flags to rehearse on the real model
-instead (it spends tokens). The same flags work for `recon-agent.yaml` and
+The turn keeps the config's model, gpt-6.1-sol, as the live run does; the
+mock answers it on the Responses API. Drop the two `--intelligence` flags
+to rehearse on the real model instead (it spends tokens). The same flags work for `recon-agent.yaml` and
 `close-agent.yaml`, with `mock/recon-agent.json` and `mock/close-agent.json`.
 
 Demos (c)–(e) by hand, the same way:
@@ -662,8 +665,7 @@ export TZ=America/New_York GOPROXY=off GOTOOLCHAIN=local GOFLAGS=-count=1
 cp examples/demos/instruction/payments-handbook-v1.md "$AGENTD_DEMO_HOME/handbook.md"
 (cd examples/demos/standins && npm start -- --demo coder --policy "$AGENTD_DEMO_HOME/handbook.md")
 agentd -c examples/demos/coder.yaml -c examples/demos/coder.local.yaml \
-  --intelligence mock:file:examples/demos/mock/coder.json --intelligence-token "" \
-  --intelligence.models '{mock: {model: mock}}' --intelligence.roles.turn mock
+  --intelligence mock:file:examples/demos/mock/coder.json --intelligence-token ""
 
 # (e) the home stand-ins, the registry and the scripted model
 cp examples/demos/instruction/home-climate-v1.md "$AGENTD_DEMO_HOME/home-climate.md"

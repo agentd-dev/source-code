@@ -537,10 +537,16 @@ fn a_listen_stream_that_ends_is_said_and_a_narrowed_one_fails_the_wait_it_droppe
     // fails rather than parking for ever.
     let mock = common::spawn_mock_mcp_at("2026-07-28", WATCHED, true);
     let daemon = Daemon::start("mcp-listen", &watch_and_wait(&mock.uri(), "listener"));
+    // And the acknowledgment's baseline read of the waited URI to have been
+    // answered: a read that finishes after the stream ends is doubted and
+    // its URI woken once, which resolves this one-shot wait before the
+    // narrowing it is here to see.
     daemon.wait_for(
-        "the start to fire and the wait to be in the listen",
+        "the start to fire, the wait to be in the listen, and its baseline read",
         |log| {
-            !events(log, "run.done").is_empty() && listened_for(&mock, &[WATCHED, "mock://waited"])
+            !events(log, "run.done").is_empty()
+                && listened_for(&mock, &[WATCHED, "mock://waited"])
+                && mock.reads("mock://waited") >= 1
         },
     );
 

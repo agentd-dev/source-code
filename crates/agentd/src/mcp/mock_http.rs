@@ -134,6 +134,9 @@ pub struct Options {
     /// Serve RFC 9728 protected-resource metadata naming this authorization
     /// server, for the URL a request reaches it at.
     pub prm: Option<String>,
+    /// Answer every MCP request that does not carry `Authorization: Bearer
+    /// <this>` with `401` and the RFC 9728 challenge naming its metadata.
+    pub bearer: Option<String>,
 }
 
 impl Options {
@@ -151,6 +154,7 @@ impl Options {
             tasks_push: false,
             skills: true,
             prm: None,
+            bearer: None,
         }
     }
 }
@@ -222,6 +226,8 @@ struct State {
     /// The authorization server its RFC 9728 metadata names, when it serves
     /// any.
     prm: Option<String>,
+    /// The bearer token every MCP request must carry, when one must.
+    bearer: Option<String>,
     /// Its webhook delivery.
     #[cfg(all(feature = "mcp-events", feature = "tls"))]
     hooks: Arc<super::mock_hooks::Hooks>,
@@ -321,6 +327,7 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
         tasks_push: opts.tasks_push,
         skills: opts.skills,
         prm: opts.prm.clone(),
+        bearer: opts.bearer.clone(),
     });
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
@@ -346,6 +353,28 @@ fn handle_conn(mut stream: TcpStream, state: Arc<State>) {
         let v =
             json!({"resource": format!("http://{host}{rest}"), "authorization_servers": [issuer]});
         write_json(&mut stream, 200, &v, None);
+        return;
+    }
+    // A request without the bearer token draws the challenge an MCP client
+    // signs in from (RFC 9728 §5.1).
+    if let Some(token) = &state.bearer
+        && http.header("authorization") != Some(format!("Bearer {token}").as_str())
+    {
+        eprintln!("MOCK_UNAUTHORIZED");
+        let host = http.header("host").unwrap_or_default();
+        let path = http.line.split_whitespace().nth(1).unwrap_or("/");
+        let challenge = format!(
+            "Bearer resource_metadata=\"http://{host}/.well-known/oauth-protected-resource{}\"",
+            path.trim_end_matches('/')
+        );
+        let body = br#"{"error":"invalid_token"}"#;
+        let head = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nWWW-Authenticate: {challenge}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
         return;
     }
     match state.lifecycle {

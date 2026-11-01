@@ -185,14 +185,16 @@ fn dispatch() -> i32 {
 /// `--internal-mock-mcp-http <addr-file> <uri> [--no-emit]
 /// [--protocol-version <v>] [--events <extension|top-level|none>]
 /// [--hook-ca <pem>] [--listen <addr>] [--tasks-push] [--no-skills]
-/// [--prm <issuer>]`: the
+/// [--prm <issuer>] [--bearer <token>]`: the
 /// mock at 2025-11-25 (the `initialize` handshake; the default) or
 /// 2026-07-28 (`server/discover`), its MCP Events declared in SEP-3415's
 /// spelling (the default), the design sketch's, or not at all; its webhook
 /// deliveries trust the CA in `--hook-ca`; its MCP tasks' ends pushed down
 /// a listen that asks for them with `--tasks-push`; the Skills extension
 /// left undeclared with `--no-skills`; RFC 9728 metadata naming the
-/// authorization server `--prm` names served at its well-known paths.
+/// authorization server `--prm` names served at its well-known paths; and
+/// every MCP request without `Authorization: Bearer <token>` answered `401`
+/// with the RFC 9728 challenge, with `--bearer`.
 /// Anything else is a usage error.
 #[cfg(any(feature = "internal-mocks", debug_assertions))]
 fn mock_mcp_http(args: &[String]) -> i32 {
@@ -232,6 +234,7 @@ fn mock_mcp_http(args: &[String]) -> i32 {
             "--tasks-push" => opts.tasks_push = true,
             "--no-skills" => opts.skills = false,
             "--prm" => opts.prm = it.next().cloned(),
+            "--bearer" => opts.bearer = it.next().cloned(),
             _ => positional.push(arg.as_str()),
         }
     }

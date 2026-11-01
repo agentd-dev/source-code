@@ -4,7 +4,7 @@
 # handbook):
 #
 #   export REPO=/path/to/payments
-#   agentd -c examples/demos/coder.yaml -c examples/demos/coder-e.yaml
+#   agentd -c examples/demos/coder.yaml -c examples/demos/coder.release.yaml
 #
 # The live beat. agentd is running in the TUI. The platform lead approves
 # DeepWiki in the studio and releases v2 of the coder handbook, which adds

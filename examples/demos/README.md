@@ -579,7 +579,7 @@ rehearsing: `TZ=America/New_York go test ./...` and
    bucketing, runs the tests; `git -C "$REPO" diff` shows the fix and the
    test intact.
 
-## The coding agent gains a server and a skill (coder-e.yaml)
+## The coding agent gains a server and a skill (coder.release.yaml)
 
 The coding agent of demo (d), with no restart in between. The platform lead
 approves DeepWiki in the studio and releases v2 of the coder handbook, which
@@ -592,10 +592,10 @@ asks DeepWiki and writes `docs/deps/<dep>.html` with `exec` (`mkdir`, then
 `tee` with the page as stdin).
 
 ```sh
-agentd -c examples/demos/coder.yaml -c examples/demos/coder-e.yaml 2> >(tee "$AGENTD_DEMO_HOME/coder.log" >&2)
+agentd -c examples/demos/coder.yaml -c examples/demos/coder.release.yaml 2> >(tee "$AGENTD_DEMO_HOME/coder.log" >&2)
 ```
 
-`coder-e.yaml` adds DeepWiki and `raw.githubusercontent.com` to the services
+`coder.release.yaml` adds DeepWiki and `raw.githubusercontent.com` to the services
 catalogue (egress stays closed), and `mkdir` and `tee` to the commands `exec`
 may run, and sets `security.allow_trifecta: true`: DeepWiki's answers are
 untrusted text and `exec` writes the repository and runs `git`, so without it

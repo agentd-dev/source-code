@@ -212,11 +212,14 @@ pub(crate) fn pins_every_endpoint(auth: &AuthSpec) -> bool {
 
 /// Run the device-authorization flow: print the prompt, then poll to a token.
 /// `sleep` is injected so tests drive the poll loop without real delay.
+/// `sleep` is injected so tests drive the poll loop without real delay; an
+/// `Err` from it ends the flow with that error (a sign-in stopped while it
+/// waits).
 pub fn device_login(
     params: &OAuth2Params,
     timeout: Duration,
     on_prompt: impl FnOnce(&DevicePrompt),
-    sleep: impl Fn(Duration),
+    sleep: impl Fn(Duration) -> Result<(), String>,
 ) -> Result<CachedCred, String> {
     let da: DeviceAuth = oauth2::start_device(params, timeout)?;
     on_prompt(&DevicePrompt {
@@ -248,7 +251,7 @@ pub fn device_login(
         if wait >= deadline.saturating_duration_since(Instant::now()) {
             return Err("device code expired before authorization".into());
         }
-        sleep(wait);
+        sleep(wait)?;
     }
 }
 
@@ -335,7 +338,60 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
         ));
     }
     let spec = spec_of(settings, target, auth)?;
-    let mut params = params_from_auth(&spec, timeout)?;
+    // The document's client returns to the redirect URI it registers.
+    let redirect_uri = settings
+        .security
+        .client
+        .as_ref()
+        .and_then(|c| c.redirect_uris.first().cloned());
+    let dir = cache::default_dir();
+    sign_in(
+        &spec,
+        target,
+        redirect_uri,
+        timeout,
+        timeout,
+        |p| match p {
+            Prompt::Device(p) => print_prompt(target, p),
+            Prompt::Browser(url) => print_browser_prompt(target, url),
+        },
+        |d| {
+            std::thread::sleep(d);
+            Ok(())
+        },
+    )?;
+    Ok(format!(
+        "logged in to {target} — token cached in {}",
+        dir.display()
+    ))
+}
+
+/// What a sign-in asks its person to do: enter a device code, or open an
+/// authorization URL in a browser.
+pub enum Prompt<'a> {
+    Device(&'a DevicePrompt<'a>),
+    Browser(&'a str),
+}
+
+/// Sign in for `target` with the interactive `auth` block `spec`, and keep
+/// the token in the login cache: its authorization server's endpoints
+/// discovered as the block needs, the scopes a server asked for since the
+/// last sign-in added, then the browser + PKCE loopback flow for `grant:
+/// authorization_code` — the redirect awaited for at most `browser_for` —
+/// and otherwise the device grant, polled with `sleep` between polls. The
+/// record is kept with the authorization server it came from. What
+/// `agentd --login` runs, and what a server dialed on use signs in with
+/// (RFC 0055 §4.3).
+pub fn sign_in(
+    spec: &AuthSpec,
+    target: &str,
+    redirect_uri: Option<String>,
+    timeout: Duration,
+    browser_for: Duration,
+    prompt: impl FnOnce(Prompt),
+    sleep: impl Fn(Duration) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut params = params_from_auth(spec, timeout)?;
     let dir = cache::default_dir();
     // The scopes a server asked for since the last login, which its renewal
     // could not get (MCP's step-up flow): this login asks for them too.
@@ -348,27 +404,18 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
     }
     // The document's client returns to the redirect URI it registers.
     if spec.client_id_metadata_document {
-        params.redirect_uri = settings
-            .security
-            .client
-            .as_ref()
-            .and_then(|c| c.redirect_uris.first().cloned());
+        params.redirect_uri = redirect_uri;
     }
     // `grant: authorization_code` → the browser + PKCE loopback flow; otherwise
     // the device grant (the default).
-    let cred = if auth.grant == Some(OAuthGrant::AuthorizationCode) {
+    let cred = if spec.grant.as_deref() == Some("authorization_code") {
         crate::auth::browser::browser_login(
             &params,
-            |url| print_browser_prompt(target, url),
-            timeout,
+            |url| prompt(Prompt::Browser(url)),
+            browser_for,
         )?
     } else {
-        device_login(
-            &params,
-            timeout,
-            |p| print_prompt(target, p),
-            std::thread::sleep,
-        )?
+        device_login(&params, timeout, |p| prompt(Prompt::Device(p)), sleep)?
     };
     // Kept with the authorization server it came from: it is never
     // presented to another.
@@ -377,11 +424,7 @@ pub fn run_cli(settings: &Settings, target: &str, timeout: Duration) -> Result<S
         ..cred
     };
     let _held = cache::lock_file(&dir, target, timeout)?;
-    cache::store_file(&dir, target, &cred)?;
-    Ok(format!(
-        "logged in to {target} — token cached in {}",
-        dir.display()
-    ))
+    cache::store_file(&dir, target, &cred)
 }
 
 /// The runtime spec of `target`'s `auth:` block, as the daemon builds it
@@ -533,7 +576,10 @@ mod tests {
             &params,
             Duration::from_secs(5),
             |_| {},
-            |d| slept.lock().unwrap().push(d),
+            |d| {
+                slept.lock().unwrap().push(d);
+                Ok(())
+            },
         )?;
         assert_eq!(cred.access_token, "at");
         Ok(slept.into_inner().unwrap())

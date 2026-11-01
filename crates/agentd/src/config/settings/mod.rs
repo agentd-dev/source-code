@@ -12571,10 +12571,12 @@ mod tests {
             .expect("an MCP server may be vouched for");
         let e = validate("companies:\n  calc:\n    endpoint: https://calc.example\n    tags: {\"*\": [trusted]}\n")
             .unwrap_err();
-        assert!(
-            format!("{e}").contains("companies.calc: `trusted` marks an MCP server's results"),
-            "{e}"
-        );
+        let want = if cfg!(feature = "companies") {
+            "companies.calc: `trusted` marks an MCP server's results"
+        } else {
+            "companies.calc: a company entry needs the `companies` feature"
+        };
+        assert!(format!("{e}").contains(want), "{e}");
     }
 
     /// `local` is the origin agentd's own skills answer to in a reference: a
@@ -16930,9 +16932,14 @@ mod tests {
         .expect("a declared endpoint passes closed egress");
         // An MCP server, a peer and an intelligence endpoint are declarations
         // themselves.
-        load_yaml(
-            "store: {kind: memory}\nsecurity: {egress: closed}\nintelligence: {endpoints: \"https://intel.example/v1\"}\nmcp:\n  servers:\n    - {name: m, endpoint: \"https://m.example/mcp\"}\na2a:\n  peers:\n    - {name: pal, endpoint: \"https://peer.example\"}\n",
-        )
+        let peers = if cfg!(feature = "a2a") {
+            "a2a:\n  peers:\n    - {name: pal, endpoint: \"https://peer.example\"}\n"
+        } else {
+            ""
+        };
+        load_yaml(&format!(
+            "store: {{kind: memory}}\nsecurity: {{egress: closed}}\nintelligence: {{endpoints: \"https://intel.example/v1\"}}\nmcp:\n  servers:\n    - {{name: m, endpoint: \"https://m.example/mcp\"}}\n{peers}"
+        ))
         .expect("the sections are the allow-list");
     }
 

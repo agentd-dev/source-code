@@ -1470,6 +1470,17 @@ struct DocumentFold {
     skill_fetches: Vec<Value>,
 }
 
+/// The document a load folds, and how it came ([`fold_instruction_document`]).
+struct Folding<'a> {
+    text: &'a str,
+    /// The families its author attested, when a pin verified it.
+    attested: Option<&'a [String]>,
+    /// Fetched rather than read from the operator's disk: the §7.8 floor.
+    over_the_wire: bool,
+    /// What a refusal names it by.
+    label: String,
+}
+
 /// Fold an instruction document's machinery into `doc` — the ONE fold every
 /// source takes: a file, a folder, a URL, an OCI artifact, and a document an
 /// MCP registry served ([`RegistryDocument`]). Its connected objects and
@@ -1484,14 +1495,17 @@ struct DocumentFold {
 /// load, not again for each file typed on its own.
 fn fold_instruction_document(
     doc: &mut Value,
-    text: &str,
-    attested: Option<&[String]>,
-    over_the_wire: bool,
+    folding: &Folding<'_>,
     source: &str,
-    label: &str,
     egress: &EgressPolicy,
     warnings: &mut Vec<String>,
 ) -> Result<DocumentFold, String> {
+    let Folding {
+        text,
+        attested,
+        over_the_wire,
+        ref label,
+    } = *folding;
     let mut granted: std::collections::BTreeSet<String> = doc
         .get("agent")
         .and_then(|a| a.get("document_capabilities"))
@@ -1585,7 +1599,7 @@ fn fold_instruction_document(
     // No delegated server, no delegation pin and no secret the
     // operator's delegation or identity sections reference.
     let delegating =
-        delegation::document_declared(&ex.config, &delegation::reserved_refs_of_doc(&doc));
+        delegation::document_declared(&ex.config, &delegation::reserved_refs_of_doc(doc));
     if !delegating.is_empty() {
         return Err(format!(
             "{source}: the instruction declares {} — a server an enrolled person's grant reaches, its pins and client authentication, and every secret identity.* or a delegated server references are the operator's (RFC 0044 §5.14.1)",
@@ -5930,34 +5944,27 @@ impl Settings {
         let folding = match &instruction {
             Some(instr) if !resource => (crate::config::idoc::needs_delivery(instr)
                 && !delivered_already(instr, delivered.as_deref()))
-            .then(|| {
-                (
-                    instr.as_str(),
-                    attested_capabilities.as_deref(),
-                    over_the_wire,
-                    document_label(instruction_path.as_deref()),
-                )
+            .then(|| Folding {
+                text: instr.as_str(),
+                attested: attested_capabilities.as_deref(),
+                over_the_wire,
+                label: document_label(instruction_path.as_deref()),
             }),
             Some(instr) => registry
                 .filter(|r| r.uri == *instr && crate::config::idoc::needs_delivery(&r.raw))
-                .map(|r| {
-                    (
-                        r.raw.as_str(),
-                        r.attested.as_deref(),
-                        true,
-                        document_label(Some(&r.uri)),
-                    )
+                .map(|r| Folding {
+                    text: r.raw.as_str(),
+                    attested: r.attested.as_deref(),
+                    over_the_wire: true,
+                    label: document_label(Some(&r.uri)),
                 }),
             None => None,
         };
-        if let Some((text, attested, wire, label)) = folding {
+        if let Some(folding) = folding {
             let f = fold_instruction_document(
                 &mut doc,
-                text,
-                attested,
-                wire,
+                &folding,
                 source,
-                &label,
                 &egress_policy,
                 &mut instruction_warnings,
             )?;

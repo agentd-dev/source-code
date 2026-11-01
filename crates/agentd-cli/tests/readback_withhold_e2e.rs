@@ -123,6 +123,8 @@ struct Cfg<'a> {
     agent: &'a str,
     /// More top-level sections.
     top: &'a str,
+    /// More `mcp.servers` entries, beside `vault`.
+    servers: &'a str,
     workflows: &'a str,
     /// The root's turns (a mock playbook).
     turns: Value,
@@ -181,13 +183,14 @@ fn run_cfg(dir: &Path, c: Cfg, settle: Duration) -> Ran {
              lifecycle: {{run_until: drained}}\n\
              observability:\n  log_level: info\n  log_content: true\n{}\
              mcp:\n  servers:\n\
-             \x20   - {{name: vault, endpoint: \"https://vault.invalid/mcp\", tags: {{\"*\": [{}]}}}}\n\
+             \x20   - {{name: vault, endpoint: \"https://vault.invalid/mcp\", tags: {{\"*\": [{}]}}}}\n{}\
              workflows:\n{}",
             c.agent,
             play_path.display(),
             state.display(),
             c.top,
             c.vault_tags,
+            c.servers,
             c.workflows,
         ),
     )
@@ -1492,8 +1495,8 @@ fn the_root_is_judged_by_what_it_can_hand_on() {
          f: {{kind: finish, depends_on: [c], status: completed}}\n",
         hold(true)
     );
-    let top = "mcp:\n  servers:\n    - {name: web, endpoint: \"https://web.invalid/mcp\", connect: on_use, tags: {\"*\": [egress]}}\n\
-               subagents:\n  templates:\n    desk:\n      instruction: |\n        The desk.\n        \
+    let servers = "    - {name: web, endpoint: \"https://web.invalid/mcp\", connect: on_use, tags: {\"*\": [egress]}}\n";
+    let top = "subagents:\n  templates:\n    desk:\n      instruction: |\n        The desk.\n        \
                :::config{id=m dialect=agentd/config}\n        mcp: {servers: [{name: web, endpoint: \"https://web.invalid/mcp\"}]}\n        :::\n\
                tools:\n  disabled: [subagent.run, subagent.send]\n";
     let turns = json!([
@@ -1506,6 +1509,7 @@ fn the_root_is_judged_by_what_it_can_hand_on() {
             Cfg {
                 vault_tags: tags,
                 top,
+                servers,
                 workflows: &workflows,
                 turns: turns.clone(),
                 ..Default::default()

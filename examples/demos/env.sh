@@ -15,7 +15,7 @@
 # tokens with no value anywhere else; delete the folder to rotate them.
 #
 # It does not touch OPENAI_API_KEY or the registry secrets
-# (INSTRUCTION_MD_CLIENT_SECRET, CHAT_/VOICE_/EMAIL_AGENT_CLIENT_SECRET,
+# (INSTRUCTION_MD_CLIENT_SECRET, CLOSE_CLIENT_SECRET, CHAT_/VOICE_/EMAIL_AGENT_CLIENT_SECRET,
 # CODER_CLIENT_SECRET, HOME_CLIENT_SECRET): export those yourself, from
 # wherever you keep them.
 

@@ -11,7 +11,7 @@ Supplies Ltd., Harbor Bank, Andrii and Nataliia's flat); so is every number.
 | Demo | The story | Files |
 |---|---|---|
 | **(a) Accounts payable** | Invoices arrive from the AP system. agentd decides each one under an approval policy the controller owns on instruction.md. Above the limit, it holds the invoice and asks the controller (or the CFO). The controller raises the limit and releases v2 of the policy; seconds later the same amount is approved without asking. | `ap-agent.yaml`, `instruction/`, `standins/payables.mjs` |
-| **(b) Month-end close** | A bank line lands in the ERP's feed. agentd asks a second agentd, the reconciliation agent, which lines nothing in the ledger explains, drafts one journal entry per line, and stops at a review gate. It cannot post: the tool is never granted. | `close-agent.yaml`, `recon-agent.yaml`, `standins/erp.mjs` |
+| **(b) Month-end close** | The close agent follows "Month-end close", the finance team's instruction on instruction.md. A bank line lands in the ERP's feed. agentd asks a second agentd, the reconciliation agent, which lines nothing in the ledger explains, drafts one journal entry per line, and stops at a review gate. It cannot post: the tool is never granted. The team adds "MUST: tag every draft entry with the closing period" and releases; the next lines' drafts carry `2026-10`, the earlier ones do not. | `close-agent.yaml`, `recon-agent.yaml`, `instruction/close-v*.md`, `standins/erp.mjs` |
 | **(c) Regulated support** | Harbor Bank's chat, voice and email agents — three agentd instances — follow "Card disputes". Compliance changes the disclosure from 60 to 120 days and releases; all three apply it within a second and the next customer hears 120 days. The owner rolls back; all three go back. | `support*.yaml`, `support-tmux.sh`, `standins/model.mjs` |
 | **(d) The coding agent** | agentd, as a coding agent in a Go repository, is asked to delete a flaky ledger test and does. The lead adds "NEVER: delete, skip or disable a failing test" and releases; agentd applies it live and, asked again, refuses and fixes the cause. | `coder*.yaml`, `engineering-fixture/` |
 | **(e) Home climate** | The flat's climate assistant follows "Home climate". A release moves Nataliia's temperature from 23 to 24.5 °C, and the next decision sets 24.5. The sun warms the living room; the assistant asks the home agent over A2A to close the curtains, then asks Nataliia before it cools. | `home*.yaml`, `standins/thermostat.mjs`, `aircon.mjs`, `home-agent.mjs` |
@@ -40,12 +40,15 @@ the limit is released by a person's answer and nothing else.
 
 | Beat | What the audience sees | The agentd capability |
 |---|---|---|
-| Start | the close agent subscribes to `erp://bank-feed/today` | a `subscribe` start on an MCP resource (`start.subscribe.armed`) |
+| Start | the close agent loads "Month-end close" v1 and subscribes to `erp://bank-feed/today` | `agent.instruction.mcp` from the mirror, with its own agent credential (`close-agent`, OAuth client credentials) and a trust pin on the team's publisher; a `subscribe` start on an MCP resource (`start.subscribe.armed`) |
 | Four bank lines land | the workflow wakes once for the burst | `notifications/resources/updated` → agentd reads the resource again and fires the run (notify-then-read, `debounce_ms: 2000`) |
 | "Which lines are unmatched?" | the recon agent's log shows the request and its answer | `a2a.delegate` with a typed command (`recon.unmatched`) to a second agentd, whose `a2a` start admits only the close agent's credential, granted that one command |
-| Drafts | four journal entries appear in the ERP as drafts | an `agent` step with `erp.journal.draft` and an `output_schema` |
+| Drafts | four journal entries appear in the ERP as drafts, untagged (`tags=-`) | an `agent` step with `erp.journal.draft` and an `output_schema`; the tools are the ones the document names (`bank.read`, `accounts.read`, `journal.read`, `journal.draft`) |
 | "Can it post?" | no | the ERP has `journal.post`, as real ERPs do; `close-agent.yaml`'s server `allow` list never names it, so the tool does not exist for this agent. A model that tries is refused inside agentd and the ERP never sees the call (the rehearsal's mock tries, on purpose) |
 | Review | the question in the controller's TUI: review and post in the ERP | a `human` gate addressed to the controller; posting stays a person's act |
+| The team releases v2: "MUST: tag every draft entry with the closing period, e.g. 2026-10." | `instruction.applied v1 → v2`, within a second | the resource's subscription and the `md.instruction.activity` MCP Events type; agentd re-reads, verifies the signature, and applies from the next turn, without a restart |
+| Two more bank lines land | two drafts, both `tags=2026-10`; the review question says so | the same workflow, the same step text: nothing in `close-agent.yaml` mentions a tag or a period. The difference is the rule, which reaches the drafting step through the instruction alone |
+| Review again | the controller reviews; nothing is posted | the gate, as before |
 
 ## Prerequisites
 
@@ -53,10 +56,10 @@ the limit is released by a person's answer and nothing else.
   everything demos (a)–(c) and (e) use (`mcp-events`, `a2a`, `cel`, `oauth`,
   `sign`, `mock-models`). Check with `agentd --version` and `agentd
   --build-info`. Two exceptions:
-  - The instruction team's documents for (c), (d) and (e) are
+  - The instruction team's documents for (b), (c), (d) and (e) are
     instruction/1, which only agentd's instruction/1 build reads today
-    (`main` reads the older syntax). Record those three, and rehearse (e),
-    on that build.
+    (`main` reads the older syntax). Record those four, and rehearse (b)
+    and (e), on that build.
   - Demo (d) needs `exec`, which no release binary has: [A binary with
     exec](#a-binary-with-exec).
 - **Node.js 20 or later** and npm, for the stand-ins and the TUI; `curl`, for
@@ -104,7 +107,7 @@ configs fill in. `env.sh` exports the local tokens (the last column) and
 |---|---|---|---|---|
 | all | `IMD_MCP_URL` (`http://localhost:18080/mcp`), `IMD_TOKEN_URL` (`http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token`) | `OPENAI_API_KEY` | `AGENTD_DEMO_HOME` | |
 | (a) | `AP_INSTRUCTION_URI`, `IMD_CLIENT_ID` | `INSTRUCTION_MD_CLIENT_SECRET` | `PAYABLES_MCP_URL` | `CONTROLLER_TOKEN`, `CFO_TOKEN` |
-| (b) | — | — | `ERP_MCP_URL` | `CONTROLLER_TOKEN`, `RECON_PEER_TOKEN` |
+| (b) | `CLOSE_INSTRUCTION_URI` (default `instruction://lumen-foods/month-end-close@latest`), `CLOSE_CLIENT_ID` (`close-agent`), `CLOSE_PUBLISHER` (default `http://localhost:18080/pub/lumen-foods`) | `CLOSE_CLIENT_SECRET` | `ERP_MCP_URL`, `RECON_A2A_URL` | `CONTROLLER_TOKEN`, `RECON_PEER_TOKEN` |
 | (c) | `SUPPORT_INSTRUCTION_URI` (default `instruction://ins_01M69N5T2ATZNEJVW397VRQTXW@latest`), `CHAT_AGENT_CLIENT_ID` (`chat-agent`), `VOICE_AGENT_CLIENT_ID` (`voice-agent`), `EMAIL_AGENT_CLIENT_ID` (`email-agent`) | `CHAT_AGENT_CLIENT_SECRET`, `VOICE_AGENT_CLIENT_SECRET`, `EMAIL_AGENT_CLIENT_SECRET` | — | `SUPPORT_TOKEN` |
 | (d) | `CODER_INSTRUCTION_URI` (default `instruction://ins_01M6A4D6VM7DM190DD1D7V14G0@latest`), `CODER_CLIENT_ID` (`coder`) | `CODER_CLIENT_SECRET` | `REPO` (required), `TZ`, `GOPROXY`, `GOTOOLCHAIN`, `GOFLAGS` | `ENGINEER_TOKEN` |
 | (e) | `HOME_INSTRUCTION_URI` (default `instruction://ins_01M69H2WEK2P005WHYHJJMYM4A@latest`), `HOME_CLIENT_ID` (`home-climate`) | `HOME_CLIENT_SECRET` | `THERMOSTAT_MCP_URL`, `AIRCON_MCP_URL`, `HOME_AGENT_URL`, `HOME_SETTLE` | `NATALIIA_TOKEN`, `ANDRII_TOKEN`, `HOME_PEER_TOKEN` |
@@ -231,19 +234,28 @@ answer and the run's finish, `{"decision":"approved_by_person",…}`.
 
 ## Demo (b): month-end close
 
-Five terminals: the stand-ins (as above), the recon agent, the close agent,
-the controller's TUI, and the presenter.
+The close agent follows "Month-end close", the finance team's instruction on
+instruction.md: draft every adjustment, never post, ask the reconciliation
+agent for the unmatched lines, finish the reconciliations before the
+controller reviews. Five terminals: the stand-ins (as above), the recon
+agent, the close agent, the controller's TUI, and the presenter.
 
 ```sh
-# 1. the stand-ins, if not already running
+# 1. the stand-ins, if not already running (the ERP on :8702)
 (cd examples/demos/standins && npm start)
 
 # 2. the reconciliation agent (A2A on 127.0.0.1:8422)
 . examples/demos/env.sh
 agentd -c examples/demos/recon-agent.yaml 2> >(tee "$AGENTD_DEMO_HOME/recon-agent.log" >&2)
 
-# 3. the close agent (A2A on 127.0.0.1:8421)
+# 3. the close agent (A2A on 127.0.0.1:8421), following the document on the mirror
 . examples/demos/env.sh
+export CLOSE_INSTRUCTION_URI='instruction://ins_<id>@latest'   # "Month-end close", at the ref to follow
+export CLOSE_PUBLISHER=<the publisher that signs it>          # e.g. http://localhost:18080/pub/lumen-foods
+export CLOSE_CLIENT_ID=<the close agent's client id> CLOSE_CLIENT_SECRET=<its secret>
+export IMD_MCP_URL=http://localhost:18080/mcp
+export IMD_TOKEN_URL=http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token
+agentd --validate-config -c examples/demos/close-agent.yaml
 agentd -c examples/demos/close-agent.yaml 2> >(tee "$AGENTD_DEMO_HOME/close-agent.log" >&2)
 
 # 4. the controller's TUI, on the close agent (120x32)
@@ -253,23 +265,80 @@ tmux new-session -s close-tui -x 120 -y 32 \
 
 # 5. the presenter
 node examples/demos/standins/control.mjs bankline --count 4   # BL-0904..0907 land, one update
+#   … the controller answers the review in the TUI …
+#   … the team releases v2 on instruction.md …
+node examples/demos/standins/control.mjs bankline --count 2   # BL-0908, BL-0909 land
 node examples/demos/standins/control.mjs state erp            # the feed, and the drafts: none posted
 ```
 
+Beside the TUI, what agentd did (the stand-ins' terminal shows what reached
+the ERP):
+
+```sh
+node examples/demos/standins/watch.mjs --events instruction.loaded,instruction.applied,start.fired,human.ask \
+  close="$AGENTD_DEMO_HOME/close-agent.log"
+```
+
+**What the instruction team publishes.** v1 is their document
+`examples/accounting/month-end-close.md` exactly as it is in their
+repository (instruction/1); [`instruction/close-v1.md`](instruction/close-v1.md)
+is a byte-for-byte copy. No adaptation is needed: the ERP stand-in serves
+the four tools the document names (`journal.draft`, `journal.read`,
+`accounts.read`, `bank.read`), plus `journal.post`, which agentd never
+grants. v2 is [`instruction/close-v2.md`](instruction/close-v2.md): v1 with
+one rule added after "MUST: prepare every adjustment as a draft journal
+entry, with its support attached.", as its own paragraph:
+
+```text
+MUST: tag every draft entry with the closing period, e.g. 2026-10.
+```
+
+Nothing else changes, the `tolerance` parameter included. Sign both with the
+publisher `CLOSE_PUBLISHER` names, and give the close agent its own agent
+credential (`close-agent`) that can read the document. The id address
+(`instruction://ins_…@latest`) is subscribable, so a release reaches agentd
+on the subscription; an owner/name address
+(`instruction://lumen-foods/month-end-close@latest`) works by the
+`md.instruction.activity` event. Read from the registry, the document's
+`:::mcp` (NetSuite at `erp.example`), `::agent` (the recon agent at
+`recon.example`), `:::workflow` and `:::eval` blocks are delivered as text and
+activate nothing; `close-agent.yaml` declares the ERP and the recon agent on
+127.0.0.1, and its `month-end-close` workflow is the document's close made
+runnable on a feed change instead of a monthly schedule.
+
 **The live beats:**
 
-1. Four bank lines land: the ERP terminal shows `resources/updated`; the
+1. `instruction.loaded` in the close agent's log, the registry's version id.
+2. Four bank lines land: the ERP terminal shows `resources/updated`; the
    close agent's log shows `start.fired` with `"kind":"subscribe"`.
-2. The recon agent's log shows the `unmatched-lines` run start and finish:
+3. The recon agent's log shows the `unmatched-lines` run start and finish:
    the A2A delegation and its answer.
-3. The ERP terminal shows four `journal.draft` lines, `JE-DRAFT-001` to
-   `004`, and no `journal.post`.
-4. The review question appears in the controller's TUI. Answer it like the
+4. The ERP terminal shows four `journal.draft` lines, `JE-DRAFT-001` to
+   `004`, each `tags=-`, and no `journal.post`.
+5. The review question appears in the controller's TUI. Answer it like the
    AP gate: `#`, Tab, `reviewed`, Enter.
-5. `control.mjs state erp`: four drafts, nothing posted. Posting is the
+6. The team adds the rule and releases v2: `instruction.applied` with
+   `old_version_id` → `new_version_id`, within a second. No restart.
+7. Two more lines land: the recon agent is asked again; the ERP terminal
+   shows `JE-DRAFT-005` and `006`, each `tags=2026-10`, and the earlier four
+   are not drafted again. The review question ends "Each is tagged with the
+   closing period, 2026-10."; answer it.
+8. `control.mjs state erp`: six drafts, nothing posted. Posting is the
    controller's, in the ERP.
 
-`control.mjs bankline --amount -12.00 --description "CARD TERMINAL FEE"`
+**Why this beat.** The team offered two: raising `tolerance` from $50 to
+$1,000, or adding the tagging rule. The tolerance only decides whether the
+recon agent is asked at all, which in `close-agent.yaml` is the workflow's
+`a2a.delegate` step: to make it depend on the instruction, a model step
+would have to decide whether to delegate, and the change would show as
+something *not* happening (a delegation absent from the recon agent's log),
+with the threshold applied per account in the document but per line in the
+proposal. The tagging rule changes what the drafting step does, through the
+instruction and nothing else: the workflow and the step's text are the same
+before and after, and the difference is in the arguments the ERP receives,
+on screen.
+
+`control.mjs bankline --amount -9.99 --description "SOFTWARE SUBSCRIPTION"`
 adds a line of your own.
 
 ## Demo (c): regulated support, three channels
@@ -585,28 +654,30 @@ AGENTD_BIN=/path/to/agentd examples/demos/rehearse.sh support home
 ```
 
 The binary is `AGENTD_BIN`, else `AGENTD`, else `agentd` on `PATH`. Run
-(e) with the instruction/1 build (its local copy is the instruction team's
-document, `:::mcp` blocks and all) and (d) with a build that has `exec`; a
-demo the binary cannot run is reported as skipped, with the reason, and
-named explicitly it fails. (a), (b) and (c) run on either build. What one
+(b) and (e) with the instruction/1 build (their local copies are the
+instruction team's documents, `:::mcp` blocks and all) and (d) with a build
+that has `exec`; a demo the binary cannot run is reported as skipped, with
+the reason, and named explicitly it fails. (a) and (c) run on either build. What one
 run looked like on the builds here:
 
 | Demo | Binary | Result |
 |---|---|---|
 | (a) accounts payable | the instruction/1 build, and `main` | 20 passed |
-| (b) month-end close | the instruction/1 build, and `main` | 14 passed |
+| (b) month-end close | the instruction/1 build | 32 passed |
 | (c) support | the instruction/1 build, and `main` | 27 passed |
 | (d) coder | `main` built with `exec` | 17 passed |
 | (e) home | the instruction/1 build | 20 passed |
 
-(a) and (b) on the instruction/1 build ran with `MOCK_CHAT_ONLY=1`: that
-build asks gpt-6.1-sol on the Responses API, and its built-in mock predates
-answering it, so the flag gives the mock's turn to a model named `mock`. A
-build from `main` needs no flag: the turn stays gpt-6.1-sol, as live. (c)
-and (e) use the scripted model and need it on neither.
+The latest runs on the instruction/1 build, of (a), (b), (c) and (e),
+needed no flag: the turn stays gpt-6.1-sol, as live, and agentd's built-in
+mock answers it on the Responses API. `MOCK_CHAT_ONLY=1`
+is for an older build whose mock predates that: the flag gives the mock's
+turn (the AP agent's, the recon agent's, the coding agent's) to a model
+named `mock`. The close agent, (c) and (e) use the scripted model and need
+it on none.
 
 `rehearse.sh` starts the stand-ins and the agents on each demo's own
-loopback ports — (a) 8701, 8703, 8420; (b) 8702, 8421, 8422; (c) 8723,
+loopback ports — (a) 8701, 8703, 8420; (b) 8702, 8713, 8719, 8421, 8422; (c) 8723,
 8729, 8430–8432; (d) 8733, 8440; (e) 8741–8744, 8749, 8450 — (stop a live
 demo first; it checks), runs every beat above, and asserts each one from
 agentd's own log lines — `instruction.loaded`, `mcp.events.armed`,
@@ -644,13 +715,22 @@ cp examples/demos/instruction/ap-policy-v2.md "$AGENTD_DEMO_HOME/ap-policy.md"
 
 The turn keeps the config's model, gpt-6.1-sol, as the live run does; the
 mock answers it on the Responses API. Drop the two `--intelligence` flags
-to rehearse on the real model instead (it spends tokens). The same flags work for `recon-agent.yaml` and
-`close-agent.yaml`, with `mock/recon-agent.json` and `mock/close-agent.json`.
+to rehearse on the real model instead (it spends tokens). The same flags work for `recon-agent.yaml`,
+with `mock/recon-agent.json`.
 
-Demos (c)–(e) by hand, the same way:
+Demos (b)–(e) by hand, the same way:
 
 ```sh
 . examples/demos/env.sh
+# (b) the ERP, the registry and the scripted model; the recon agent on agentd's mock
+cp examples/demos/instruction/close-v1.md "$AGENTD_DEMO_HOME/close.md"
+(cd examples/demos/standins && npm start -- --demo close --policy "$AGENTD_DEMO_HOME/close.md" --mock)
+agentd -c examples/demos/recon-agent.yaml \
+  --intelligence mock:file:examples/demos/mock/recon-agent.json --intelligence-token ""
+agentd -c examples/demos/close-agent.yaml -c examples/demos/close-agent.local.yaml \
+  -c examples/demos/close-agent.mock.yaml
+cp examples/demos/instruction/close-v2.md "$AGENTD_DEMO_HOME/close.md"   # release
+
 # (c) one registry and the scripted model; then the three channels with both layers
 cp examples/demos/instruction/card-disputes-v1.md "$AGENTD_DEMO_HOME/card-disputes.md"
 (cd examples/demos/standins && npm start -- --demo support --policy "$AGENTD_DEMO_HOME/card-disputes.md" --mock)
@@ -685,9 +765,10 @@ deterministic, and they are not intelligence:
   because the policy text changed. That proves the new text reached the
   model; it does not read the invoice.
 - `recon-agent.json` reads the ERP with the three tools it is granted, then
-  answers with a scripted list for the four scripted bank lines.
-- `close-agent.json` drafts the four entries and then tries
-  `erp.journal.post`, so the rehearsal can show the refusal.
+  answers with a scripted list: the four lines of the first burst, and, once
+  the feed holds the second burst, those four (a draft is not a posting) and
+  the two new ones.
+
 
 - `coder.json` keys on the handbook as delivered: with v2's rule ("delete,
   skip or disable a failing test") in the system prompt it fixes the
@@ -696,12 +777,19 @@ deterministic, and they are not intelligence:
   answered differently only because the instruction changed between them;
   the mock does not read the code.
 
-For (c) and (e) a fixed answer would not do: the point is that the deadline
-the customer hears, and the temperature the thermostat is set to, come from
-the instruction's text. agentd's mock answers with fixed text, so those two
+For (b), (c) and (e) a fixed answer would not do: the point is that the
+drafts' tag, the deadline the customer hears, and the temperature the
+thermostat is set to, come from the instruction's text. agentd's mock answers with fixed text, so those three
 use `standins/model.mjs`, a scripted model that speaks enough of the OpenAI
 chat-completions API for agentd and answers by quoting the request:
 
+- `close.model.json` drafts one entry per unmatched line it is given, after
+  reading the drafts, and tags each with the closing period only while the
+  system prompt holds the rule "tag every draft entry with the closing
+  period" (v2); the period is cut from the date the step names (`dated
+  2026-10-31` gives `2026-10`). Its rules name neither; the rehearsal checks
+  that. The first burst's drafts are followed by an `erp.journal.post` call,
+  so the rehearsal can show the refusal.
 - `support.model.json` copies the disclosure the delivered instruction tells
   the agent to say (the first `say "…"` in the system prompt) into the
   answer. Its rules name no number; the rehearsal checks that.
@@ -709,8 +797,8 @@ chat-completions API for agentd and answers by quoting the request:
   rule states ("keep the living room at … °C while she is in it", the
   document's `nataliia_temp` as agentd rendered it), then says what it did.
 
-`support.mock.yaml` and `home.mock.yaml` are the layers that point a config
-at it (model `scripted`, no key). It copies; it does not decide.
+`close-agent.mock.yaml`, `support.mock.yaml` and `home.mock.yaml` are the
+layers that point a config at it (model `scripted`, no key). It copies; it does not decide.
 
 The real model reads the invoice and the vendor, matches the bank lines
 against the cash book itself, drafts what it finds, confirms the customer's
@@ -743,7 +831,9 @@ make new ones.
 |---|---|
 | `ap-agent.yaml` | demo (a): the policy followed over MCP from the mirror, the payables server and its `invoice.created` binding, the `invoice-intake` workflow, the controller and CFO principals, the A2A listener the TUI attaches to |
 | `ap-agent.local.yaml` | the rehearsal layer: the `instruction-md` server pointed at the registry stand-in |
-| `close-agent.yaml` | demo (b): the ERP server (no `journal.post`), the `subscribe` start, the recon peer, the drafting step, the review gate |
+| `close-agent.yaml` | demo (b): "Month-end close" from the mirror (trust-pinned), the ERP server (no `journal.post`), the `subscribe` start, the recon peer, the drafting step, the review gate |
+| `close-agent.local.yaml`, `close-agent.mock.yaml` | demo (b)'s rehearsal layers: the registry stand-in (no pin), the scripted model |
+| `instruction/close-v1.md`, `-v2.md` | "Month-end close" (the instruction team's document, unchanged) and v2, the tagging rule added |
 | `recon-agent.yaml` | demo (b)'s second agentd: the `recon.unmatched` command over A2A, read-only ERP tools |
 | `instruction/ap-policy-v1.md`, `-v2.md` | the approval policy, v1 and v2 (only the limit differs) |
 | `env.sh` | the demo's local tokens |
@@ -760,14 +850,14 @@ make new ones.
 | `instruction/payments-handbook-v1.md`, `-v2.md` | the demo handbook without and with the test rule |
 | `instruction/home-climate-v1.md`, `-v2.md` | "Home climate" with its URLs on 127.0.0.1, and v2, Nataliia at 24.5 °C |
 | `rehearse.sh` | every demo end to end on a mock model, every beat asserted |
-| `mock/*.json` | the mock models' playbooks: agentd's (`ap-agent`, `recon-agent`, `close-agent`, `coder`) and the scripted model's (`*.model.json`) |
+| `mock/*.json` | the mock models' playbooks: agentd's (`ap-agent`, `recon-agent`, `coder`) and the scripted model's (`*.model.json`) |
 | `standins/payables.mjs` | a stand-in for an ERP's accounts-payable module (the `payables` server): `invoices.list/get/approve/hold`, `vendors.get`, and `invoice.created` as MCP Events |
-| `standins/erp.mjs` | the ERP: `erp://bank-feed/today` (subscribable), `bank_feed.lines`, `ledger.cash_entries`, `accounts.list`, `journal.draft/list/post` |
+| `standins/erp.mjs` | the ERP: `erp://bank-feed/today` (subscribable), `bank.read`, `ledger.cash_entries`, `accounts.read`, `journal.draft/read/post` (the names "Month-end close" gives them) |
 | `standins/registry.mjs` | the rehearsal's instruction registry: one local file as a subscribable resource, with `md.instruction.activity` events; content served before comes back under its old version id (a rollback) |
 | `standins/thermostat.mjs` | demo (e)'s thermostat: `rooms.read`, `target.set`, `schedule.read`, and `thermostat://rooms/<room>` (subscribable) |
 | `standins/aircon.mjs` | demo (e)'s air conditioner: `state.read`, `power.set`, `mode.set`, `fan.set` |
 | `standins/home-agent.mjs` | demo (e)'s home agent, on the official A2A JavaScript SDK: its Agent Card and JSON-RPC, curtains only |
-| `standins/model.mjs` | the scripted model for (c) and (e): chat completions, answers that quote the request |
+| `standins/model.mjs` | the scripted model for (b), (c) and (e): chat completions, answers that quote the request |
 | `standins/watch.mjs` | a pane for the recording: chosen agentd events from one or more logs, one line each |
 | `standins/control.mjs` | the presenter's buttons |
 | `standins/lib.mjs` | what the stand-ins share: serving the SDK's handler on loopback, and the MCP Events server side |

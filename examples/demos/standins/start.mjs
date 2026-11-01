@@ -5,15 +5,16 @@
 //   npm start -- --policy /path/to/policy.md   and the registry stand-in on :8703
 //                                              (rehearsing demo (a) without the mirror)
 //
+//   npm start -- --demo close   [--policy F] [--mock]     demo (b): the ERP on :8702
 //   npm start -- --demo support [--policy F] [--mock]     demo (c)
 //   npm start -- --demo coder   [--policy F]              demo (d)
 //   npm start -- --demo home    [--policy F] [--mock]     demo (e): thermostat :8741,
 //                                                         aircon :8742, home agent :8744
 //
-// For demos (c)–(e), --policy F serves F as the demo's instruction from a
-// registry stand-in under the instruction's own address (support :8723,
-// coder :8733, home :8743), and --mock starts the scripted model with the
-// demo's playbook (support :8729, home :8749). Leave both out when recording
+// For demos (b)–(e), --policy F serves F as the demo's instruction from a
+// registry stand-in under the instruction's own address (close :8713,
+// support :8723, coder :8733, home :8743), and --mock starts the scripted
+// model with the demo's playbook (close :8719, support :8729, home :8749). Leave both out when recording
 // on the mirror and a real model. The home agent asks for the bearer in
 // $AGENTD_DEMO_HOME/tokens/home-peer.token (env.sh makes it) when it exists.
 import { spawn } from 'node:child_process';
@@ -35,6 +36,11 @@ switch (demo) {
     servers.push(['payables.mjs'], ['erp.mjs']);
     if (policy) servers.push(['registry.mjs', '--file', policy]);
     break;
+  case 'close':
+    servers.push(['erp.mjs']);
+    if (policy) servers.push(registry(8713, 'instruction://lumen-foods/month-end-close@latest', 'Month-end close'));
+    if (has('mock')) servers.push(mock('close.model.json', 8719));
+    break;
   case 'support':
     if (policy) servers.push(registry(8723, 'instruction://ins_01M69N5T2ATZNEJVW397VRQTXW@latest', 'Card disputes'));
     if (has('mock')) servers.push(mock('support.model.json', 8729));
@@ -50,7 +56,7 @@ switch (demo) {
     break;
   }
   default:
-    console.error(`start.mjs: no demo "${demo}" (support, coder or home)`);
+    console.error(`start.mjs: no demo "${demo}" (close, support, coder or home)`);
     process.exit(2);
 }
 if (!servers.length) {

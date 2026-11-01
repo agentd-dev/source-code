@@ -8,8 +8,11 @@
 //
 // MCP (http://127.0.0.1:8702/mcp):
 //   resource  erp://bank-feed/today — subscribable; updated when a line lands
-//   tools     bank_feed.lines, ledger.cash_entries, accounts.list,
-//             journal.draft, journal.list, journal.post
+//   tools     bank.read, ledger.cash_entries, accounts.read,
+//             journal.draft, journal.read, journal.post
+// The names are the ones the instruction team's "Month-end close" document
+// gives the ERP (journal.draft, journal.read, accounts.read, bank.read), so
+// the document works as published; ledger.cash_entries is the recon agent's.
 // journal.post exists because a real ERP has it. agentd's configurations never
 // grant it (their server `allow` lists leave it out), so no model and no step
 // of theirs can post; the rehearsal checks this server never saw the call.
@@ -46,7 +49,7 @@ function factory() {
     mimeType: 'application/json',
   }, async () => ({ contents: [{ uri: FEED, mimeType: 'application/json', text: JSON.stringify(feed(), null, 2) }] }));
 
-  mcp.registerTool('bank_feed.lines', {
+  mcp.registerTool('bank.read', {
     description: "Today's bank statement lines for the operating account (the same as erp://bank-feed/today). Amounts are signed: money in is positive.",
     inputSchema: z.object({}),
     annotations: { readOnlyHint: true },
@@ -58,7 +61,7 @@ function factory() {
     annotations: { readOnlyHint: true },
   }, async ({ date }) => result({ entries: data.cashBook.filter((e) => !date || e.date === date) }));
 
-  mcp.registerTool('accounts.list', {
+  mcp.registerTool('accounts.read', {
     description: 'The chart of accounts: code, name and type.',
     inputSchema: z.object({}),
     annotations: { readOnlyHint: true },
@@ -70,12 +73,13 @@ function factory() {
       date: z.string(),
       memo: z.string(),
       sourceBankLine: z.string().optional(),
+      tags: z.array(z.string()).optional().describe('Labels on the entry.'),
       lines: z.array(z.object({ account: z.string(), debit: z.string().optional(), credit: z.string().optional() })).min(2),
     }),
     annotations: { idempotentHint: false },
-  }, async ({ date, memo, sourceBankLine, lines: jl }) => {
+  }, async ({ date, memo, sourceBankLine, tags, lines: jl }) => {
     const unknown = jl.filter((l) => !accounts.has(l.account)).map((l) => l.account);
-    if (unknown.length) return refusal(`unknown account(s): ${unknown.join(', ')} — see accounts.list`);
+    if (unknown.length) return refusal(`unknown account(s): ${unknown.join(', ')} — see accounts.read`);
     const dr = jl.reduce((s, l) => s + money(l.debit ?? 0), 0);
     const cr = jl.reduce((s, l) => s + money(l.credit ?? 0), 0);
     if (dr !== cr || dr === 0) return refusal(`the entry does not balance: debits ${(dr / 100).toFixed(2)}, credits ${(cr / 100).toFixed(2)}`);
@@ -83,13 +87,13 @@ function factory() {
       const j = journals.find((x) => x.sourceBankLine === sourceBankLine);
       return result({ journalId: j.journalId, status: j.status, message: `${sourceBankLine} already has draft ${j.journalId}` });
     }
-    const j = { journalId: `JE-DRAFT-${String(journals.length + 1).padStart(3, '0')}`, status: 'draft', date, memo, sourceBankLine, lines: jl, total: (dr / 100).toFixed(2) };
+    const j = { journalId: `JE-DRAFT-${String(journals.length + 1).padStart(3, '0')}`, status: 'draft', date, memo, sourceBankLine, tags: tags ?? [], lines: jl, total: (dr / 100).toFixed(2) };
     journals.push(j);
-    log('journal.draft', { journalId: j.journalId, sourceBankLine: sourceBankLine ?? '-', total: `GBP ${j.total}`, memo });
+    log('journal.draft', { journalId: j.journalId, sourceBankLine: sourceBankLine ?? '-', tags: tags?.length ? tags.join(',') : '-', total: `GBP ${j.total}`, memo });
     return result({ journalId: j.journalId, status: 'draft', message: `draft ${j.journalId} saved for review; nothing is posted` });
   });
 
-  mcp.registerTool('journal.list', {
+  mcp.registerTool('journal.read', {
     description: 'Journal entries, optionally only drafts or only posted ones.',
     inputSchema: z.object({ status: z.enum(['draft', 'posted']).optional() }),
     annotations: { readOnlyHint: true },

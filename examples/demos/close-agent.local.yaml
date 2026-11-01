@@ -1,0 +1,34 @@
+# Rehearsal layer for demo (b): "Month-end close" from a local file, served by
+# the registry stand-in (standins/registry.mjs, on 127.0.0.1:8713) instead of
+# the instruction.md mirror. Layer it over close-agent.yaml:
+#
+#   node standins/registry.mjs --file "$AGENTD_DEMO_HOME/close.md" --port 8713 \
+#     --uri instruction://lumen-foods/month-end-close@latest --title 'Month-end close' &
+#   agentd -c examples/demos/close-agent.yaml -c examples/demos/close-agent.local.yaml
+#
+# Files merge as JSON Merge Patch, later over earlier, and a list replaces the
+# list: the server list is restated with `instruction-md` pointing at the
+# stand-in, which needs no sign-in, and the trust pin is dropped (an empty
+# list): the local copies are unsigned, and a pinned publisher refuses an
+# unsigned document. Everything else — the instruction source and its
+# events, the ERP and its allow list, the recon peer, the workflow, the gate
+# — is close-agent.yaml's, unchanged, so the rehearsal follows a release the
+# same way the recording does: the resource's subscription and an MCP Events
+# occurrence, then `instruction.applied`.
+#
+# "Releasing v2" is copying instruction/close-v2.md over the served file.
+
+agent:
+  instruction:
+    trust: []
+
+mcp:
+  servers:
+    - name: erp
+      endpoint: "${ERP_MCP_URL:-http://127.0.0.1:8702/mcp}"
+      ns: erp
+      tags: {"*": [sensitive, untrusted_input]}
+      allow: [bank.read, accounts.read, journal.draft, journal.read]
+    - name: instruction-md
+      endpoint: "${REGISTRY_MCP_URL:-http://127.0.0.1:8713/mcp}"
+      tags: {"*": [trusted]}

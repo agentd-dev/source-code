@@ -1,0 +1,20 @@
+# The scripted model for demo (b): standins/model.mjs on 127.0.0.1:8719,
+# playing mock/close.model.json. Layer it over the close agent to run with no
+# model account:
+#
+#   node examples/demos/standins/model.mjs --port 8719 --playbook examples/demos/mock/close.model.json &
+#   agentd -c examples/demos/close-agent.yaml -c examples/demos/close-agent.local.yaml \
+#          -c examples/demos/close-agent.mock.yaml
+#
+# Its drafts carry the closing period only when the delivered instruction has
+# the rule that asks for it, and the period comes from the date it is told to
+# draft on; the playbook names neither the rule's period nor a date. It is
+# not intelligence; the real model is the demo. Leave this layer out to run
+# on gpt-6.1-sol.
+
+intelligence:
+  endpoints: "${MODEL_URL:-http://127.0.0.1:8719/v1/chat/completions}"
+  token: null
+  # The turn goes to the scripted model; `sol` stays declared and unused.
+  models: {scripted: {model: scripted}}
+  roles: {turn: scripted}

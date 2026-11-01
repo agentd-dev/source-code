@@ -7,7 +7,7 @@
 # reached the outside world, from the stand-ins' own lines).
 #
 #   examples/demos/rehearse.sh                  # every demo the binary can run
-#   examples/demos/rehearse.sh ap close         # demos (a) and (b)
+#   examples/demos/rehearse.sh ap close         # demos (a) and (b) (b needs instruction/1)
 #   examples/demos/rehearse.sh support          # (c) regulated support, three channels
 #   examples/demos/rehearse.sh coder            # (d) the coding agent (needs `exec`)
 #   examples/demos/rehearse.sh home             # (e) home climate (needs instruction/1)
@@ -17,15 +17,15 @@
 # The binary: AGENTD_BIN, else AGENTD, else `agentd` on PATH. Demos (a)–(c)
 # need the release features (mcp-events, a2a, cel, mock-models). Demo (d)
 # needs a build with `exec`, which no release binary has (README.md, "A
-# binary with exec"), and Go. Demo (e) serves the instruction team's
-# instruction/1 document, which only a build that reads instruction/1 parses
-# (its `:::mcp` blocks have no `!`): rehearse it with that binary. A demo the
+# binary with exec"), and Go. Demos (b) and (e) serve the instruction team's
+# instruction/1 documents, which only a build that reads instruction/1 parses
+# (their `:::mcp` blocks have no `!`): rehearse them with that binary. A demo the
 # binary cannot run is reported as skipped, with the reason, and fails
 # nothing; naming it explicitly makes the skip a failure. MOCK_CHAT_ONLY=1
 # is for a binary whose built-in mock predates the Responses API (see mock()).
 #
 # Needs: node >= 20; curl. Each demo checks its own loopback ports first:
-# (a) 8701, 8703, 8420; (b) 8702, 8421, 8422; (c) 8723, 8729, 8430-8432;
+# (a) 8701, 8703, 8420; (b) 8702, 8713, 8719, 8421, 8422; (c) 8723, 8729, 8430-8432;
 # (d) 8733, 8440; (e) 8741-8744, 8749, 8450. Leaves nothing running; KEEP=1
 # keeps the logs and state folder.
 set -euo pipefail
@@ -79,6 +79,34 @@ until_has() {
   local end=$((SECONDS + secs))
   while [ "$SECONDS" -lt "$end" ]; do has "$@" && return 0; sleep 0.2; done
   return 1
+}
+# nlines <log> <fixed string>…: how many lines have every string.
+nlines() {
+  local log="$1"; shift
+  local lines; lines="$(grep -F -- "$1" "$log" 2>/dev/null)" || { echo 0; return; }
+  shift
+  for s in "$@"; do lines="$(grep -F -- "$s" <<<"$lines")" || { echo 0; return; }; done
+  grep -c . <<<"$lines"
+}
+# until_n <seconds> <n> <log> <fixed string>…: wait for n such lines.
+until_n() {
+  local secs="$1" n="$2"; shift 2
+  local end=$((SECONDS + secs))
+  while [ "$SECONDS" -lt "$end" ]; do [ "$(nlines "$@")" -ge "$n" ] && return 0; sleep 0.2; done
+  return 1
+}
+# latency_ms <registry log> <agent log> <new version prefix>: from the
+# stand-in's release of that version to agentd's instruction.applied for it.
+latency_ms() {
+  node -e '
+    const fs = require("fs");
+    const [reg, log, ver] = process.argv.slice(1);
+    const rel = fs.readFileSync(reg, "utf8").split("\n").find((l) => / released /.test(l) && l.includes("versionId=" + ver));
+    const app = fs.readFileSync(log, "utf8").split("\n")
+      .map((l) => { try { return JSON.parse(l); } catch { return null; } })
+      .find((e) => e && e.event === "instruction.applied" && String(e.new_version_id ?? "").startsWith(ver));
+    const t0 = rel ? Date.parse(rel.split(" ")[0]) : NaN, t1 = app ? Date.parse(app.ts) : NaN;
+    console.log(Number.isFinite(t0) && Number.isFinite(t1) ? t1 - t0 : -1);' "$1" "$2" "$3"
 }
 # start <name> <command…>: run in the background, its output in $WORK/<name>.log.
 start() {
@@ -241,22 +269,40 @@ demo_ap() {
 
 # ---- demo (b): month-end close ---------------------------------------------
 demo_close() {
-  say "demo (b): month-end close"
-  ports_free 8702 8421 8422 || return 0
-  local erp="$WORK/erp.log" recon="$WORK/recon-agent.log" close="$WORK/close-agent.log"
+  say "demo (b): month-end close — drafts under \"Month-end close\", never a post"
+  if ! "$AGENTD" --validate-config --instruction "$HERE/instruction/close-v1.md" --intelligence mock:final >/dev/null 2>&1; then
+    skip close "this agentd does not read instruction/1 (the document's :::mcp blocks): rehearse with the build that does"
+    return 0
+  fi
+  ports_free 8702 8713 8719 8421 8422 || return 0
+  local erp="$WORK/erp.log" reg="$WORK/close-registry.log" model="$WORK/close-model.log"
+  local recon="$WORK/recon-agent.log" close="$WORK/close-agent.log"
+  local uri='instruction://lumen-foods/month-end-close@latest'
+  export CLOSE_INSTRUCTION_URI="$uri"
+  cp "$HERE/instruction/close-v1.md" "$WORK/close.md"
   start erp node "$HERE/standins/erp.mjs"
-  until_has 10 "$erp" "listening" || { bad "the ERP stand-in starts"; return; }
+  start close-registry node "$HERE/standins/registry.mjs" --file "$WORK/close.md" --port 8713 --uri "$uri" --title 'Month-end close'
+  start close-model node "$HERE/standins/model.mjs" --port 8719 --playbook "$HERE/mock/close.model.json"
+  if ! { until_has 10 "$erp" listening && until_has 10 "$reg" serving && until_has 10 "$model" listening; }; then
+    bad "the ERP, registry and model stand-ins start"; return 0
+  fi
+  check "the scripted model's rules name no period or date of their own" rules_lack "$HERE/mock/close.model.json" '20[0-9]{2}-[0-9]{2}|2026'
+  check "v1 and v2 differ in one line, the rule" \
+    test "$(diff "$HERE/instruction/close-v1.md" "$HERE/instruction/close-v2.md" | grep -c '^[<>] .')" = 1
   mock recon-agent
   start recon-agent "$AGENTD" -c "$HERE/recon-agent.yaml" "${MOCK[@]}"
-  mock close-agent
-  start close-agent "$AGENTD" -c "$HERE/close-agent.yaml" "${MOCK[@]}"
+  start close-agent "$AGENTD" -c "$HERE/close-agent.yaml" -c "$HERE/close-agent.local.yaml" -c "$HERE/close-agent.mock.yaml"
 
+  check "the close agent follows Month-end close over MCP: v1 loaded" \
+    until_has 20 "$close" '"event":"instruction.loaded"' '"version_id":"ver_local_1_'
+  check "the md.instruction.activity type is followed for it" \
+    until_has 20 "$close" '"event":"mcp.events.armed"' '"event_type":"md.instruction.activity"'
   check "the recon agent is up, its a2a start armed" \
     until_has 20 "$recon" '"event":"proc.ready"'
   check "the close agent subscribes to erp://bank-feed/today" \
     until_has 20 "$close" '"event":"start.subscribe.armed"' 'erp://bank-feed/today'
 
-  say "beat 1: bank lines land in the feed (four, one update)"
+  say "beat 1: bank lines land in the feed (four, one update), under v1"
   node "$HERE/standins/control.mjs" bankline --count 4 >/dev/null
   check "the resource subscription fires the workflow (subscribe start)" \
     until_has 20 "$close" '"event":"start.fired"' '"kind":"subscribe"'
@@ -266,24 +312,56 @@ demo_close() {
     until_has 30 "$recon" '"event":"run.done"' '"workflow":"unmatched-lines"' '"status":"completed"'
   check "the A2A step completes in the close agent" \
     until_has 30 "$close" '"event":"step.done"' '"step":"unmatched"' '"status":"done"'
-
-  say "beat 2: drafts, never a post"
   check "journal.draft is called, one per unmatched line" until_has 30 "$erp" 'journal.draft journalId=JE-DRAFT-004'
   check "four drafts in the ERP" test "$(count "$erp" 'journal.draft journalId=')" = 4
+  check "none tagged with a period: v1 has no such rule" test "$(nlines "$erp" 'journal.draft journalId=' ' tags=- ')" = 4
   check "the model's journal.post attempt is refused inside agentd" \
     until_has 20 "$close" '"event":"tool.result"' '"is_error":true' '"tool":"erp.journal.post"'
   check "the ERP never received journal.post" bash -c "! grep -qF 'journal.post' '$erp'"
-
-  say "beat 3: the review gate"
   check "the review gate is raised for the controller (human.ask)" \
     until_has 20 "$close" '"event":"human.ask"' 'Month-end close'
   local gate; gate="$(task_of "$close" 1)"
-  answer http://127.0.0.1:8421 "$CONTROLLER_TOKEN" "$gate" reviewed >"$WORK/answer-close.json"
+  answer http://127.0.0.1:8421 "$CONTROLLER_TOKEN" "$gate" reviewed >"$WORK/answer-close-1.json"
   check "the controller's review is taken, as the addressee (human.answered)" \
     until_has 20 "$close" '"event":"human.answered"' '"labels":{"approver":"controller"}'
   check "the run completes at its finish" \
     until_has 20 "$close" '"event":"run.done"' '"workflow":"month-end-close"' '"status":"completed"'
-  check "still nothing posted" bash -c "! grep -qF 'journal.post' '$erp'"
+  local first_done; first_done="$(line_of "$close" '"event":"run.done"' '"workflow":"month-end-close"')"
+
+  say "beat 2: the team releases v2 (MUST: tag every draft entry with the closing period)"
+  cp "$HERE/instruction/close-v2.md" "$WORK/close.md"
+  check "the registry stand-in releases version 2" until_has 10 "$reg" 'released' 'ver_local_2_'
+  check "agentd applies v2: instruction.applied, v1 → v2" \
+    until_has 20 "$close" '"event":"instruction.applied"' '"new_version_id":"ver_local_2_' '"old_version_id":"ver_local_1_'
+  local lat; lat="$(latency_ms "$reg" "$close" ver_local_2_)"
+  check "applied ${lat} ms after the release (under 3 s)" test "$lat" -ge 0 -a "$lat" -lt 3000
+  local applied; applied="$(line_of "$close" '"event":"instruction.applied"' '"new_version_id":"ver_local_2_')"
+
+  say "beat 3: the next bank lines land (two), under v2"
+  node "$HERE/standins/control.mjs" bankline --count 2 >/dev/null
+  check "the subscription fires a second run" \
+    until_n 20 2 "$close" '"event":"start.fired"' '"kind":"subscribe"'
+  local second; second="$(awk -v a="${applied:-0}" 'NR > a && /"event":"start.fired"/ && /"kind":"subscribe"/ {print NR; exit}' "$close")"
+  check "v2 was applied between the two bursts (line ${first_done:-?} < ${applied:-?} < ${second:-?})" \
+    test -n "$first_done" -a -n "$applied" -a -n "$second" -a "${first_done:-0}" -lt "${applied:-0}" -a "${applied:-0}" -lt "${second:-0}"
+  check "the recon agent is asked again, over A2A, and answers" \
+    until_n 30 2 "$recon" '"event":"run.done"' '"workflow":"unmatched-lines"' '"status":"completed"'
+  check "two new drafts, JE-DRAFT-005 and 006" until_has 30 "$erp" 'journal.draft journalId=JE-DRAFT-006'
+  check "both tagged with the closing period, 2026-10, as the new rule asks" \
+    test "$(nlines "$erp" 'journal.draft journalId=JE-DRAFT-00' ' tags=2026-10 ')" = 2
+  check "six drafts in all: lines drafted before were not drafted again" test "$(count "$erp" 'journal.draft journalId=')" = 6
+  check "the model tagged because the delivered instruction said so (v1 untagged, v2 tagged)" \
+    test "$(count "$model" 'answered rule=draft-first ')" = 1 -a "$(count "$model" 'answered rule=draft-second-tagged ')" = 1
+  check "the review gate is raised again, its summary naming the period" \
+    until_has 20 "$close" '"event":"human.ask"' 'closing period, 2026-10'
+  gate="$(task_of "$close" 2)"
+  answer http://127.0.0.1:8421 "$CONTROLLER_TOKEN" "$gate" reviewed >"$WORK/answer-close-2.json"
+  check "the second run completes after the controller's review" \
+    until_n 20 2 "$close" '"event":"run.done"' '"workflow":"month-end-close"' '"status":"completed"'
+  check "two gates in the whole demo, both answered by the controller" \
+    test "$(count "$close" '"event":"human.ask"')" = 2 -a "$(nlines "$close" '"event":"human.answered"' '"labels":{"approver":"controller"}')" = 2
+  check "still nothing posted, by anyone" bash -c "! grep -qF 'journal.post' '$erp'"
+  unset CLOSE_INSTRUCTION_URI
 }
 
 

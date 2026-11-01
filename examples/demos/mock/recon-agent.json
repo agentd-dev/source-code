@@ -1,11 +1,17 @@
 {
-  "_note": "agentd's mock model for rehearsing the reconciliation agent with no provider: `--intelligence mock:file:mock/recon-agent.json`. Turn one reads the ERP with the three tools the agent is granted; turn two answers. The answer is scripted for the four bank lines rehearse.sh adds (fixtures/erp.json nextBankLines): a real model works the match out from what it read.",
+  "_note": "agentd's mock model for rehearsing the reconciliation agent with no provider: `--intelligence mock:file:mock/recon-agent.json`. Turn one reads the ERP with the three tools the agent is granted; turn two answers. The answers are scripted for the bank lines rehearse.sh adds (fixtures/erp.json nextBankLines): the four of the first burst, and, once the feed it read holds BL-0908 (the `match` rule, tried first), those four (still unmatched: a draft is not a posting) and the two of the second burst. A real model works the match out from what it read.",
+  "match": [
+    {
+      "when_contains": "BL-0908",
+      "content": "{\"date\": \"2026-10-31\", \"unmatched\": [{\"id\": \"BL-0904\", \"amount\": \"-38.50\", \"description\": \"ALBION BANK CHARGES OCT\", \"suggested_account\": \"6810\", \"why\": \"monthly bank charges, not in the cash book\"}, {\"id\": \"BL-0905\", \"amount\": \"1212.40\", \"description\": \"INTEREST CREDIT OCT\", \"suggested_account\": \"4900\", \"why\": \"interest paid by the bank\"}, {\"id\": \"BL-0906\", \"amount\": \"-2400.00\", \"description\": \"DD WESTMERE ESTATES RENT NOV\", \"suggested_account\": \"6200\", \"why\": \"rent direct debit with no ledger entry\"}, {\"id\": \"BL-0907\", \"amount\": \"5000.00\", \"description\": \"OAKRIDGE GARDEN CTRS\", \"suggested_account\": \"1190\", \"why\": \"customer receipt with no invoice reference: hold in suspense\"}, {\"id\": \"BL-0908\", \"amount\": \"-12.00\", \"description\": \"CARD TERMINAL FEE OCT\", \"suggested_account\": \"6810\", \"why\": \"card terminal fee, not in the cash book\"}, {\"id\": \"BL-0909\", \"amount\": \"-640.00\", \"description\": \"DD WESTMERE ESTATES SERVICE CHG Q4\", \"suggested_account\": \"6200\", \"why\": \"the landlord's service charge, with no ledger entry\"}]}"
+    }
+  ],
   "turns": [
     {
       "tool_calls": [
-        {"name": "erp.bank_feed.lines", "arguments": {}},
+        {"name": "erp.bank.read", "arguments": {}},
         {"name": "erp.ledger.cash_entries", "arguments": {"date": "2026-10-31"}},
-        {"name": "erp.accounts.list", "arguments": {}}
+        {"name": "erp.accounts.read", "arguments": {}}
       ]
     },
     {

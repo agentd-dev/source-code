@@ -47,7 +47,7 @@ mcp:
       # Ledger data is sensitive; bank-line text comes from outside.
       tags: {"*": [sensitive, untrusted_input]}
       # Read-only: journal.draft and journal.post are never registered here.
-      allow: [bank_feed.lines, ledger.cash_entries, accounts.list]
+      allow: [bank.read, ledger.cash_entries, accounts.read]
 
 a2a:
   listen: http://127.0.0.1:8422

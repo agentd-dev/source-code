@@ -34,6 +34,8 @@
     { "id": "BL-0904", "date": "2026-10-31", "amount": "-38.50", "description": "ALBION BANK CHARGES OCT" },
     { "id": "BL-0905", "date": "2026-10-31", "amount": "1212.40", "description": "INTEREST CREDIT OCT" },
     { "id": "BL-0906", "date": "2026-10-31", "amount": "-2400.00", "description": "DD WESTMERE ESTATES RENT NOV" },
-    { "id": "BL-0907", "date": "2026-10-31", "amount": "5000.00", "description": "OAKRIDGE GARDEN CTRS" }
+    { "id": "BL-0907", "date": "2026-10-31", "amount": "5000.00", "description": "OAKRIDGE GARDEN CTRS" },
+    { "id": "BL-0908", "date": "2026-10-31", "amount": "-12.00", "description": "CARD TERMINAL FEE OCT" },
+    { "id": "BL-0909", "date": "2026-10-31", "amount": "-640.00", "description": "DD WESTMERE ESTATES SERVICE CHG Q4" }
   ]
 }

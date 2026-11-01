@@ -1,0 +1,378 @@
+{
+  "_note": "The scripted model for demo (b) (standins/model.mjs), the close agent's draft step. It reads the drafts (erp.journal.read), drafts one entry per unmatched line the step was given, and answers. Whether a draft carries the closing period is the delivered instruction's: the *-tagged rules hold only while the system prompt has the rule \"tag every draft entry with the closing period\" (v2), and the period is cut from the date the step names (`dated 2026-10-31` gives 2026-10); nothing here names a period or a date. Under v1 the same lines are drafted untagged. The second burst's rules come first: its request lists BL-0904 to BL-0907 too, still unmatched (a draft is not a posting), and it drafts only BL-0908 and BL-0909, the others having drafts. The first burst's drafts are followed by an erp.journal.post call, the way a careless or manipulated model might try: agentd never registered that tool (close-agent.yaml's allow list leaves it out), so it is refused inside agentd and never reaches the ERP. Accounts and memos are scripted for the six scripted bank lines; the real model works them out.",
+  "rules": [
+    {
+      "name": "read",
+      "when": {
+        "last_user": "unmatched bank lines",
+        "no_tool_result": true
+      },
+      "tool_calls": [
+        {
+          "name": "erp.journal.read",
+          "arguments": {
+            "status": "draft"
+          }
+        }
+      ]
+    },
+    {
+      "name": "draft-second-tagged",
+      "when": {
+        "last_user": "BL-0908",
+        "last_tool": "\"journals\"",
+        "system": "tag every draft entry with the closing period"
+      },
+      "capture": {
+        "date": {
+          "from": "last_user",
+          "re": "dated\\s+(\\d{4}-\\d{2}-\\d{2})"
+        },
+        "period": {
+          "from": "last_user",
+          "re": "dated\\s+(\\d{4}-\\d{2})-\\d{2}"
+        }
+      },
+      "tool_calls": [
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Card terminal fee, October (BL-0908)",
+            "sourceBankLine": "BL-0908",
+            "tags": [
+              "{{period}}"
+            ],
+            "lines": [
+              {
+                "account": "6810",
+                "debit": "12.00"
+              },
+              {
+                "account": "1010",
+                "credit": "12.00"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Service charge, Westmere Estates, Q4 (BL-0909)",
+            "sourceBankLine": "BL-0909",
+            "tags": [
+              "{{period}}"
+            ],
+            "lines": [
+              {
+                "account": "6200",
+                "debit": "640.00"
+              },
+              {
+                "account": "1010",
+                "credit": "640.00"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "draft-second",
+      "when": {
+        "last_user": "BL-0908",
+        "last_tool": "\"journals\""
+      },
+      "capture": {
+        "date": {
+          "from": "last_user",
+          "re": "dated\\s+(\\d{4}-\\d{2}-\\d{2})"
+        }
+      },
+      "tool_calls": [
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Card terminal fee, October (BL-0908)",
+            "sourceBankLine": "BL-0908",
+            "lines": [
+              {
+                "account": "6810",
+                "debit": "12.00"
+              },
+              {
+                "account": "1010",
+                "credit": "12.00"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Service charge, Westmere Estates, Q4 (BL-0909)",
+            "sourceBankLine": "BL-0909",
+            "lines": [
+              {
+                "account": "6200",
+                "debit": "640.00"
+              },
+              {
+                "account": "1010",
+                "credit": "640.00"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "answer-second-tagged",
+      "when": {
+        "last_user": "BL-0908",
+        "system": "tag every draft entry with the closing period"
+      },
+      "capture": {
+        "period": {
+          "from": "last_user",
+          "re": "dated\\s+(\\d{4}-\\d{2})-\\d{2}"
+        }
+      },
+      "content": "{\"drafts\": [{\"journal_id\": \"JE-DRAFT-005\", \"bank_line\": \"BL-0908\"}, {\"journal_id\": \"JE-DRAFT-006\", \"bank_line\": \"BL-0909\"}], \"summary\": \"2 drafts: a card terminal fee of GBP 12.00 and the landlord's Q4 service charge of GBP 640.00. BL-0904 to BL-0907 already have drafts, so I left them. Each is tagged with the closing period, {{period}}.\"}"
+    },
+    {
+      "name": "answer-second",
+      "when": {
+        "last_user": "BL-0908"
+      },
+      "content": "{\"drafts\": [{\"journal_id\": \"JE-DRAFT-005\", \"bank_line\": \"BL-0908\"}, {\"journal_id\": \"JE-DRAFT-006\", \"bank_line\": \"BL-0909\"}], \"summary\": \"2 drafts: a card terminal fee of GBP 12.00 and the landlord's Q4 service charge of GBP 640.00. BL-0904 to BL-0907 already have drafts, so I left them.\"}"
+    },
+    {
+      "name": "draft-first-tagged",
+      "when": {
+        "last_user": "BL-0904",
+        "last_tool": "\"journals\"",
+        "system": "tag every draft entry with the closing period"
+      },
+      "capture": {
+        "date": {
+          "from": "last_user",
+          "re": "dated\\s+(\\d{4}-\\d{2}-\\d{2})"
+        },
+        "period": {
+          "from": "last_user",
+          "re": "dated\\s+(\\d{4}-\\d{2})-\\d{2}"
+        }
+      },
+      "tool_calls": [
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Bank charges, October (BL-0904)",
+            "sourceBankLine": "BL-0904",
+            "tags": [
+              "{{period}}"
+            ],
+            "lines": [
+              {
+                "account": "6810",
+                "debit": "38.50"
+              },
+              {
+                "account": "1010",
+                "credit": "38.50"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Interest credited, October (BL-0905)",
+            "sourceBankLine": "BL-0905",
+            "tags": [
+              "{{period}}"
+            ],
+            "lines": [
+              {
+                "account": "1010",
+                "debit": "1212.40"
+              },
+              {
+                "account": "4900",
+                "credit": "1212.40"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Rent direct debit, Westmere Estates, November (BL-0906)",
+            "sourceBankLine": "BL-0906",
+            "tags": [
+              "{{period}}"
+            ],
+            "lines": [
+              {
+                "account": "6200",
+                "debit": "2400.00"
+              },
+              {
+                "account": "1010",
+                "credit": "2400.00"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Unidentified receipt, Oakridge Garden Centres, to suspense (BL-0907)",
+            "sourceBankLine": "BL-0907",
+            "tags": [
+              "{{period}}"
+            ],
+            "lines": [
+              {
+                "account": "1010",
+                "debit": "5000.00"
+              },
+              {
+                "account": "1190",
+                "credit": "5000.00"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.post",
+          "arguments": {
+            "journalId": "JE-DRAFT-001"
+          }
+        }
+      ]
+    },
+    {
+      "name": "draft-first",
+      "when": {
+        "last_user": "BL-0904",
+        "last_tool": "\"journals\""
+      },
+      "capture": {
+        "date": {
+          "from": "last_user",
+          "re": "dated\\s+(\\d{4}-\\d{2}-\\d{2})"
+        }
+      },
+      "tool_calls": [
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Bank charges, October (BL-0904)",
+            "sourceBankLine": "BL-0904",
+            "lines": [
+              {
+                "account": "6810",
+                "debit": "38.50"
+              },
+              {
+                "account": "1010",
+                "credit": "38.50"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Interest credited, October (BL-0905)",
+            "sourceBankLine": "BL-0905",
+            "lines": [
+              {
+                "account": "1010",
+                "debit": "1212.40"
+              },
+              {
+                "account": "4900",
+                "credit": "1212.40"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Rent direct debit, Westmere Estates, November (BL-0906)",
+            "sourceBankLine": "BL-0906",
+            "lines": [
+              {
+                "account": "6200",
+                "debit": "2400.00"
+              },
+              {
+                "account": "1010",
+                "credit": "2400.00"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.draft",
+          "arguments": {
+            "date": "{{date}}",
+            "memo": "Unidentified receipt, Oakridge Garden Centres, to suspense (BL-0907)",
+            "sourceBankLine": "BL-0907",
+            "lines": [
+              {
+                "account": "1010",
+                "debit": "5000.00"
+              },
+              {
+                "account": "1190",
+                "credit": "5000.00"
+              }
+            ]
+          }
+        },
+        {
+          "name": "erp.journal.post",
+          "arguments": {
+            "journalId": "JE-DRAFT-001"
+          }
+        }
+      ]
+    },
+    {
+      "name": "answer-first-tagged",
+      "when": {
+        "last_user": "BL-0904",
+        "system": "tag every draft entry with the closing period"
+      },
+      "capture": {
+        "period": {
+          "from": "last_user",
+          "re": "dated\\s+(\\d{4}-\\d{2})-\\d{2}"
+        }
+      },
+      "content": "{\"drafts\": [{\"journal_id\": \"JE-DRAFT-001\", \"bank_line\": \"BL-0904\"}, {\"journal_id\": \"JE-DRAFT-002\", \"bank_line\": \"BL-0905\"}, {\"journal_id\": \"JE-DRAFT-003\", \"bank_line\": \"BL-0906\"}, {\"journal_id\": \"JE-DRAFT-004\", \"bank_line\": \"BL-0907\"}], \"summary\": \"4 drafts: bank charges GBP 38.50, interest GBP 1,212.40, rent GBP 2,400.00, and GBP 5,000.00 from Oakridge Garden Centres held in suspense until it is identified. Each is tagged with the closing period, {{period}}.\"}"
+    },
+    {
+      "name": "answer-first",
+      "when": {
+        "last_user": "BL-0904"
+      },
+      "content": "{\"drafts\": [{\"journal_id\": \"JE-DRAFT-001\", \"bank_line\": \"BL-0904\"}, {\"journal_id\": \"JE-DRAFT-002\", \"bank_line\": \"BL-0905\"}, {\"journal_id\": \"JE-DRAFT-003\", \"bank_line\": \"BL-0906\"}, {\"journal_id\": \"JE-DRAFT-004\", \"bank_line\": \"BL-0907\"}], \"summary\": \"4 drafts: bank charges GBP 38.50, interest GBP 1,212.40, rent GBP 2,400.00, and GBP 5,000.00 from Oakridge Garden Centres held in suspense until it is identified.\"}"
+    }
+  ]
+}

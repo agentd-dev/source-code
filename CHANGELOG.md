@@ -78,6 +78,15 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   for the next reload (`instruction.machinery.pending`). A text-only edit is
   adopted live, as before. `instruction.machinery.applied` names the servers
   and skills added and removed.
+- A document's skill can name its `SKILL.md` by `src` on GitHub (a
+  `github.com` blob or tree link, or `raw.githubusercontent.com`), and agentd
+  fetches it at load and reload instead of holding it as text. The fetch
+  takes the rules a `url:` document gets (https, the egress policy, a public
+  address) and is capped at `skills.max_bytes`. The text is marked
+  untrusted, like a server's skill. Each fetch logs `skill.fetched`. A failed
+  fetch is a warning that leaves the skill out, and never refuses the
+  document or the reload. Fetched skills count in
+  `instruction.machinery.applied`.
 - The built-in HTTP mock MCP server's `mock.serve_document` replaces the
   document `instruction://ins_live…` reads as, for e2e tests.
 - The OpenAI Responses API dialect (`POST /v1/responses`), for OpenAI's

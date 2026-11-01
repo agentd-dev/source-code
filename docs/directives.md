@@ -205,6 +205,31 @@ operator wrote it closer to this agent. A name an inline skill shares with a
 server's skill names neither: write `@skill:local/<name>` or
 `@skill:<server>/<name>`.
 
+A skill can also name its `SKILL.md` by `src` instead of carrying a body:
+
+```markdown
+::skill{id=frontend-design title="frontend-design" src="https://github.com/anthropics/skills/blob/main/skills/frontend-design/SKILL.md"}
+```
+
+agentd fetches it when the configuration loads or reloads, as part of the
+same whole-or-nothing reload. It takes three spellings of a file on GitHub
+and reads each as its raw URL: a `github.com/…/blob/<ref>/…/SKILL.md` link, a
+`github.com/…/tree/<ref>/<dir>` link (its `SKILL.md`), and a
+`raw.githubusercontent.com/…/SKILL.md` URL. A `src` of any other shape is not
+fetched: the skill stays text, with a `host-policy` warning.
+
+The fetch follows the rules for a `url:` document. It is `https://` only, it
+goes through the egress policy (under `security.egress: closed` the host must
+be in the `services` catalogue), and it must reach a public address. The file
+is at most `skills.max_bytes` (32 KiB by default). The document's `id` names
+the skill; its description comes from the `SKILL.md` front matter, or the
+block's `description` or `title`. The text is outside input: the catalogue
+lists it `untrusted`, and its body reaches the model inside a block that
+names the URL, like a server's skill. Each fetch logs `skill.fetched` with
+its size and digest. A fetch that fails (the network, a 404, a file too
+large, a host the policy refuses) is a `config.warning`, and that skill is
+left out; the document and the reload still apply.
+
 > **Limit.** agentd loads nothing a document composes: an `::include` or an
 > `extends` is delivered as the SDK reads the document alone. A registry that
 > resolves composition serves the result as a resolved read.

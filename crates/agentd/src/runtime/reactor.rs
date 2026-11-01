@@ -607,6 +607,8 @@ pub struct Runtime {
     pub(crate) mcp_tasks: super::mcp_tasks::Tasks,
     /// Servers down at boot, probed until they answer (`runtime::join`).
     pub(crate) joining: super::join::Joining,
+    /// The sign-ins to MCP servers dialed on use, by server (RFC 0055 §4.3).
+    pub(crate) mcp_sign_ins: BTreeMap<String, super::mcp_sign_in::McpSignIn>,
     /// When [`Runtime::release_unowned_subscriptions`] next looks.
     pub(crate) release_due_ms: u64,
     pub(crate) registry: Registry,
@@ -977,6 +979,7 @@ impl Runtime {
             self.dispatch_turns();
             // 8. Pending waits + MCP notifications.
             self.poll_pending();
+            self.poll_mcp_sign_ins();
             #[cfg(feature = "companies")]
             self.poll_company_sign_ins();
             #[cfg(feature = "companies")]
@@ -1152,6 +1155,7 @@ impl Runtime {
             #[cfg(feature = "mcp-events")]
             Event::McpEventHook(d) => self.events_hook_delivery(*d),
             Event::McpReachable(r) => self.on_mcp_reachable(*r),
+            Event::McpSignIn { server, step } => self.on_mcp_sign_in(&server, step),
             Event::McpTask(n) => self.on_mcp_task(*n),
             Event::Read { into, carries } => self.read_into(into, &carries),
             #[cfg(feature = "xaa")]

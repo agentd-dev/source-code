@@ -73,6 +73,9 @@ The workspace's notes for agents working in it, one file each, the workspace's r
 ## Signals (durable coordination; deliver with workflow.signal)
 {{#each signals.waiting}}- waiting: {{this.name}} (run {{this.run}}, step {{this.step}})
 {{/each}}{{#each signals.recent}}- fired recently: {{this}}
+{{/each}}{{/if}}{{#if signing_in}}
+## Signing in (MCP servers a person is signing in to; their tools appear once signed in)
+{{#each signing_in}}- {{this}}
 {{/each}}{{/if}}{{#if memory.keys_text}}
 ## Memory
 Keys you can read with memory.get: {{memory.keys_text}}
@@ -156,6 +159,9 @@ impl Runtime {
             "endpoints".into(),
             Value::Array(servers.chain(peers).chain(http).take(CAP_LIST).collect()),
         );
+        // The servers a person is signing in to (RFC 0055 §4.3): a turn is
+        // told, not held — their tools reach it once they have joined.
+        d.insert("signing_in".into(), json!(self.mcp_signing_in()));
         d.insert(
             "egress_closed".into(),
             json!(self.settings.security.egress == crate::config::settings::Egress::Closed),

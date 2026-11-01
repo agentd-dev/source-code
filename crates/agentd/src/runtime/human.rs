@@ -471,9 +471,11 @@ impl Runtime {
         let open = |t: &String| self.gate_open_on(t);
         #[cfg(not(feature = "companies"))]
         let open = |t: &String| {
-            self.pending
-                .iter()
-                .any(|p| matches!(&p.kind, PendingKind::Human { task, .. } if task == t))
+            self.mcp_sign_in_on(t).is_some()
+                || self
+                    .pending
+                    .iter()
+                    .any(|p| matches!(&p.kind, PendingKind::Human { task, .. } if task == t))
         };
         if let GateOn::Owned(t) = &on
             && open(t)

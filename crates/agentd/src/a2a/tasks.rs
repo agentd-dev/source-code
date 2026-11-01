@@ -199,6 +199,13 @@ pub struct Task {
     /// relay again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub company_gate: Option<CompanyGate>,
+    /// The sign-in to an MCP server this task's gate is (RFC 0055 §4.3),
+    /// while it is open: the server, and where and how its person signs in.
+    /// Durable with the task: a grant does not outlive the process that
+    /// started it, so a restart that finds one open closes it, and a new
+    /// sign-in starts when a step waits for the server again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_sign_in: Option<McpSignInGate>,
     /// The handle of the MCP task whose question this task's gate puts
     /// (RFC 0054): a task made for the question alone. Durable with the
     /// task: an answer is not kept across a restart, so a restart that finds
@@ -263,6 +270,22 @@ pub struct SignInGate {
     pub standalone: bool,
 }
 
+/// A sign-in to an MCP server a task's gate is ([`Task::mcp_sign_in`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpSignInGate {
+    /// The `mcp.servers` entry being signed in to.
+    pub server: String,
+    /// The task exists only for the sign-in: it ends with it.
+    pub standalone: bool,
+    /// `device` or `browser`.
+    pub method: String,
+    /// Where the person signs in.
+    pub url: String,
+    /// The code they enter or check there (device grant).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
 /// A Company gate a task is ([`Task::company_gate`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompanyGate {
@@ -304,6 +327,7 @@ impl Task {
             sign_in_link: None,
             sign_in: None,
             company_gate: None,
+            mcp_sign_in: None,
             mcp_question: None,
             id: id.to_string(),
             context_id: context_id.to_string(),

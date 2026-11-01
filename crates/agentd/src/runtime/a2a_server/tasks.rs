@@ -867,6 +867,7 @@ impl Runtime {
         }
         self.rebuild_human_asks();
         self.interrupt_mcp_task_questions();
+        self.interrupt_mcp_sign_ins();
         #[cfg(feature = "companies")]
         {
             self.interrupt_company_sign_ins();

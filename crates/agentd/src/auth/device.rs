@@ -239,6 +239,30 @@ impl TokenSource {
         Ok(access)
     }
 
+    /// Why only a person signing in again gives this target a token, when
+    /// that is so: the login cache holds no record for it, or one another
+    /// authorization server issued, or one past its life with no refresh
+    /// token, or the authorization server refused its refresh token
+    /// (`invalid_grant`). `None` when a token is at hand, and when one is
+    /// missing for a reason a later try may not meet — an issuer or a token
+    /// endpoint that does not answer, a renewal the server asked to wait for.
+    pub fn wants_login(&self) -> Option<String> {
+        let err = self.bearer().err()?;
+        // The server a record must have come from is not known yet (its
+        // discovery did not answer): nothing is said about the record.
+        self.endpoints.server().ok()?;
+        let Some(file) = cache::load_file(&self.dir, &self.target) else {
+            return Some(err);
+        };
+        if self.same_server(&file, "").is_err()
+            || (file.refresh_token.is_none() && !file.valid_at(cache::now_ms(), REFRESH_SKEW_MS))
+            || err.contains("invalid_grant")
+        {
+            return Some(err);
+        }
+        None
+    }
+
     /// A `403 insufficient_scope` challenge asked for `wanted` (MCP's step-up
     /// authorization flow): renew the token for the union of the scopes it
     /// holds and `wanted`, and say whether the request should be sent again

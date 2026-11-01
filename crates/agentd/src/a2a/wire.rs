@@ -312,6 +312,12 @@ pub fn annotations(t: &Task) -> Value {
     if let Some(l) = &t.sign_in_link {
         a["signIn"] = l.clone();
     }
+    // The MCP server sign-in the gate is: where and how to sign in, for a
+    // client that shows it beside the question.
+    if let Some(g) = &t.mcp_sign_in {
+        a["mcpSignIn"] =
+            json!({"server": g.server, "method": g.method, "url": g.url, "code": g.code});
+    }
     if let Some(op) = &t.command {
         a["command"] = json!(op);
     }

@@ -239,6 +239,22 @@ impl Settings {
         spec
     }
 
+    /// How agentd signs in to the MCP server at `endpoint` when its entry
+    /// has no `auth` and the server asks for authorization (RFC 0055 §4.3):
+    /// the device grant, at the authorization server the server's RFC 9728
+    /// metadata names, with agentd's Client ID Metadata Document
+    /// (`security.client`) as its client — as an `oauth2` block naming
+    /// nothing but `grant: device` would. With no `security.client` the spec
+    /// names no `client_id`, and there is nobody agentd could sign in as.
+    pub fn discovered_mcp_auth(&self, endpoint: &str) -> crate::config::AuthSpec {
+        let auth: Auth = serde_json::from_value(serde_json::json!({
+            "kind": "oauth2",
+            "grant": "device",
+        }))
+        .expect("a bare device-grant oauth2 block is an Auth");
+        self.auth_spec_at(&auth, endpoint, true)
+    }
+
     /// [`Self::auth_spec`] for a block that authenticates to `endpoint`, an
     /// MCP server's when `mcp`: the RFC 8707 `resource` it sends
     /// ([`Auth::resource_for`]); for an MCP server's `oauth2` block that
@@ -510,6 +526,32 @@ mod tests {
         ] {
             assert!(loopback(bad).is_none(), "{bad}");
         }
+    }
+
+    /// A server with no `auth` that asks for one is signed in to by the
+    /// device grant, at the authorization server its RFC 9728 metadata
+    /// names, as agentd's Client ID Metadata Document — and with no
+    /// `security.client`, as nobody (RFC 0055 §4.3).
+    #[test]
+    fn a_server_without_auth_signs_in_as_the_client_document() {
+        let at = "https://mcp.example/mcp";
+        let a = settings(CLIENT).discovered_mcp_auth(at);
+        assert_eq!(a.kind, "oauth2");
+        assert_eq!(a.grant.as_deref(), Some("device"));
+        assert_eq!(
+            a.client_id.as_deref(),
+            Some("https://agent.example/oauth/client.json")
+        );
+        assert!(a.client_id_metadata_document);
+        assert_eq!(a.protected_resource.as_deref(), Some(at));
+        assert_eq!(a.issuer, None);
+        assert_eq!(
+            a.client_auth.map(|c| c.method).as_deref(),
+            Some("private_key_jwt")
+        );
+        let none = settings("agent:\n  name: t\n").discovered_mcp_auth(at);
+        assert_eq!(none.client_id, None);
+        assert_eq!(none.protected_resource.as_deref(), Some(at));
     }
 
     /// The document's grant types and response types follow `grants`, and

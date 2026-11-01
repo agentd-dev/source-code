@@ -59,6 +59,13 @@ pub(crate) struct Joining {
     wanted: std::collections::BTreeSet<String>,
     /// When each step waiting for an on-use server (`run/step`) began to.
     connect_waits: BTreeMap<String, u64>,
+    /// The on-use servers whose sign-in failed: not dialed again until
+    /// something needs one anew, so a refused sign-in does not ask again on
+    /// every backoff.
+    held: std::collections::BTreeSet<String>,
+    /// When each server's last sign-in failed, and what a step that waited
+    /// for it fails with.
+    sign_in_failed: BTreeMap<String, (u64, String)>,
 }
 
 /// The tools of a Company OpenAPI API's operations (RFC 0047 §9, P5a): the
@@ -76,6 +83,24 @@ pub(crate) struct Operations {
 }
 
 impl Joining {
+    /// The sign-in of `server` ended well: it is dialed again now, its
+    /// backoff forgotten.
+    pub(crate) fn dial_now(&mut self, server: &str) {
+        if let Some(p) = self.probes.get_mut(server) {
+            p.failures = 0;
+            p.due_at = 0;
+        }
+    }
+
+    /// The sign-in of `server` failed at `at`: each step that waited for it
+    /// fails with `why`, and the server is not dialed again until something
+    /// needs it anew.
+    pub(crate) fn sign_in_failed(&mut self, server: &str, at: u64, why: String) {
+        self.sign_in_failed.insert(server.to_string(), (at, why));
+        self.held.insert(server.to_string());
+        self.wanted.remove(server);
+    }
+
     /// Whether something has needed the on-use server `server`.
     pub(crate) fn wants(&self, server: &str) -> bool {
         self.wanted.contains(server)
@@ -153,6 +178,13 @@ pub struct Reachable {
     server: String,
     found: Option<Found>,
     refused: Option<String>,
+    /// The server needs a person to sign in first (RFC 0055 §4.3): with
+    /// the `auth` spec to sign in by, or why agentd cannot.
+    sign_in: Option<Result<crate::config::AuthSpec, String>>,
+    /// The `auth` spec the connection was made with, where agentd found it
+    /// itself — a server with no `auth` whose RFC 9728 metadata named its
+    /// authorization server — to dial it with from now on.
+    auth: Option<crate::config::AuthSpec>,
 }
 
 impl std::fmt::Debug for Reachable {
@@ -190,11 +222,15 @@ impl Runtime {
             // credential: its connections are the supervisor's pool's.
             .filter(|n| !self.mcp_specs.get(n).is_some_and(|s| s.delegated))
             // An on-use server is dialed once something needs it: a step, a
-            // wait, a start, or the instruction that declared it.
+            // wait, a start, or the instruction that declared it — and not
+            // while a person signs in to it, nor after a sign-in that failed
+            // until something needs it again.
             .filter(|n| {
                 !self.settings.mcp.on_use(n)
-                    || self.joining.wanted.contains(n)
-                    || self.settings.mcp.document_matched.contains(n)
+                    || ((self.joining.wanted.contains(n)
+                        || self.settings.mcp.document_matched.contains(n))
+                        && !self.mcp_sign_ins.contains_key(n)
+                        && !self.joining.held.contains(n))
             })
             .collect();
         self.joining.probes.retain(|n, _| down.contains(n));
@@ -218,6 +254,12 @@ impl Runtime {
                 .unwrap_or(std::time::Duration::from_secs(60));
             let tx = self.events_tx.clone();
             let server = name.clone();
+            // An on-use server with no `auth` that turns out to want one is
+            // signed in to as this says (RFC 0055 §4.3).
+            let discovered =
+                (self.settings.mcp.on_use(&name) && spec.auth.is_none() && spec.oauth.is_none())
+                    .then(|| self.settings.discovered_mcp_auth(&spec.endpoint));
+            let on_use = self.settings.mcp.on_use(&name);
             #[cfg(feature = "companies")]
             let companies = self.companies.clone();
             #[cfg(feature = "companies")]
@@ -227,6 +269,7 @@ impl Runtime {
                 .spawn(move || {
                     // The dial boot makes, on its own thread: the loop is
                     // never held by a server that does not answer.
+                    let (mut sign_in, mut auth) = (None, None);
                     let (found, refused) = match spec.company {
                         // A Company's OpenAPI operations: its description,
                         // read and made into tools.
@@ -260,6 +303,23 @@ impl Runtime {
                         },
                         #[cfg(not(feature = "companies"))]
                         Some(_) => (None, None),
+                        None if on_use => {
+                            let dialed = super::mcp_sign_in::dial_on_use(
+                                &spec,
+                                discovered.as_ref(),
+                                timeout,
+                                |s| {
+                                    crate::mcp::from_spec(s, timeout)
+                                        .map(super::supervisor_client)
+                                        .and_then(|mut c| c.initialize().map(|()| c))
+                                        .and_then(|c| c.list_tools().map(|t| (c, t)))
+                                        .ok()
+                                },
+                            );
+                            sign_in = dialed.sign_in;
+                            auth = dialed.auth;
+                            (dialed.found.map(|(c, t)| Found::Mcp(Box::new(c), t)), None)
+                        }
                         None => (
                             crate::mcp::from_spec(&spec, timeout)
                                 .map(super::supervisor_client)
@@ -275,6 +335,8 @@ impl Runtime {
                         server,
                         found,
                         refused,
+                        sign_in,
+                        auth,
                     })));
                 });
             if spawned.is_err()
@@ -292,6 +354,7 @@ impl Runtime {
             return false;
         }
         if self.joining.wanted.insert(server.to_string()) {
+            self.joining.held.remove(server);
             self.log
                 .info("mcp.connect.on_use", json!({"server": server}));
         }
@@ -301,28 +364,74 @@ impl Runtime {
     /// Hold the step `run_id/step_id` until the on-use server `server` it
     /// names connects: `true` when it is held — suspended on a durable timer
     /// that puts it back to pending, as a rate wait does, so a restart keeps
-    /// it waiting. Once the server's `timeout` (else `mcp.default_timeout`,
-    /// else 60 s) has passed it is let go, and the call fails as one to a
-    /// server that is not connected does, for its `retry:` to take.
-    pub(crate) fn connect_wait(&mut self, run_id: &str, step_id: &str, server: &str) -> bool {
+    /// it waiting (when it began is kept with it) — or has failed here.
+    /// Once the server's `timeout` (else `mcp.default_timeout`, else 60 s)
+    /// has passed it is let go, and the call fails as one to a server that
+    /// is not connected does, for its `retry:` to take.
+    ///
+    /// While a person signs in to the server (RFC 0055 §4.3) the wait is
+    /// the sign-in's: it lasts the step's `timeout` (`step_timeout`), else
+    /// the server's own `timeout`, else as long as the grant's code does,
+    /// and fails the step `sign_in_timeout` once that has passed; the
+    /// step's run is shown the sign-in gate. A sign-in that fails while
+    /// the step waits fails it with the sign-in's reason.
+    pub(crate) fn connect_wait(
+        &mut self,
+        run_id: &str,
+        step_id: &str,
+        server: &str,
+        step_timeout: Option<u64>,
+    ) -> bool {
         let key = format!("{run_id}/{step_id}");
+        if let Some(&since) = self.joining.connect_waits.get(&key)
+            && let Some((at, why)) = self.joining.sign_in_failed.get(server)
+            && since <= *at
+        {
+            let why = why.clone();
+            self.joining.connect_waits.remove(&key);
+            self.fail_connect_wait(run_id, step_id, why);
+            return true;
+        }
         if !self.want_server(server) {
             self.joining.connect_waits.remove(&key);
             return false;
         }
         let now = now_ms();
         let started = *self.joining.connect_waits.entry(key.clone()).or_insert(now);
-        let limit = self
-            .settings
-            .mcp
-            .servers
-            .iter()
-            .find(|s| s.name == server)
-            .and_then(|s| s.timeout)
-            .or(self.settings.mcp.default_timeout)
-            .map_or(60_000, |d| d.0.as_millis() as u64);
+        let entry = self.settings.mcp.servers.iter().find(|s| s.name == server);
+        let signing = self.mcp_sign_ins.get(server).map(|s| s.until);
+        let limit = match signing {
+            Some(until) => step_timeout
+                .or(entry
+                    .and_then(|s| s.timeout)
+                    .map(|d| d.0.as_millis() as u64))
+                .unwrap_or_else(|| {
+                    until.map_or(super::mcp_sign_in::SIGN_IN_FOR_MS, |u| {
+                        u.saturating_sub(started)
+                    })
+                }),
+            None => entry
+                .and_then(|s| s.timeout)
+                .or(self.settings.mcp.default_timeout)
+                .map_or(60_000, |d| d.0.as_millis() as u64),
+        };
         if now.saturating_sub(started) > limit {
             self.joining.connect_waits.remove(&key);
+            if signing.is_some() {
+                self.run_log(run_id).info(
+                    "step.sign_in_timeout",
+                    json!({"run": run_id, "step": step_id, "server": server}),
+                );
+                self.fail_connect_wait(
+                    run_id,
+                    step_id,
+                    format!(
+                        "sign_in_timeout: nobody signed in to the MCP server {server:?} within {}s",
+                        limit / 1000
+                    ),
+                );
+                return true;
+            }
             return false;
         }
         match self.timers.arm(
@@ -341,14 +450,44 @@ impl Runtime {
                 if let Some(r) = self.runs.get_mut(run_id) {
                     r.suspend_step(
                         step_id,
-                        json!({"kind": "connect_wait", "server": server, "timer": id}),
+                        json!({"kind": "connect_wait", "server": server, "timer": id, "since": started}),
                     );
+                }
+                #[cfg(feature = "a2a")]
+                if signing.is_some() {
+                    self.mcp_sign_in_gate_for_run(server, run_id);
                 }
                 self.checkpoint(false);
                 true
             }
             Err(_) => false,
         }
+    }
+
+    /// A connect wait's step fails with `why`: as an attempt, so a `retry:`
+    /// counts it and a failure that repeats ends.
+    fn fail_connect_wait(&mut self, run_id: &str, step_id: &str, why: String) {
+        if let Some(r) = self.runs.get_mut(run_id) {
+            r.begin_step(step_id);
+        }
+        self.finish_step_pub(
+            run_id,
+            step_id,
+            crate::engine::run::StepStatus::Failed,
+            None,
+            Some(why),
+            0,
+        );
+    }
+
+    /// A step that waited for an on-use server was restored, its timer
+    /// fired: the wait keeps the instant it began, so a restart does not
+    /// restart its timeout.
+    pub(crate) fn connect_wait_restored(&mut self, run_id: &str, step_id: &str, since: u64) {
+        self.joining
+            .connect_waits
+            .entry(format!("{run_id}/{step_id}"))
+            .or_insert(since);
     }
 
     /// A dial came back. A connection is adopted; nothing is dialed again
@@ -359,6 +498,8 @@ impl Runtime {
             server,
             found,
             refused,
+            sign_in,
+            auth,
         } = r;
         let Some(probe) = self.joining.probes.get_mut(&server) else {
             return; // connected meanwhile (a reload dialed it), or gone
@@ -366,6 +507,26 @@ impl Runtime {
         probe.out = false;
         if self.mcp.contains_key(&server) {
             return;
+        }
+        // A person signs in before the server is dialed again (RFC 0055
+        // §4.3); or nobody can, and the steps that wait for it fail.
+        match sign_in {
+            Some(Ok(spec)) => {
+                self.start_mcp_sign_in(&server, spec);
+                return;
+            }
+            Some(Err(why)) => {
+                self.mcp_sign_in_impossible(&server, &why);
+                return;
+            }
+            None => {}
+        }
+        // Found by discovery: the connection's credential is the server's
+        // from now on, for every client built for it.
+        if let Some(a) = auth
+            && let Some(s) = self.mcp_specs.get_mut(&server)
+        {
+            s.auth = Some(a);
         }
         // A server that refused this agent outright is not dialled again in
         // this life.

@@ -52,6 +52,7 @@ pub(crate) mod intel; // intelligence connections + model resolution (RFC 0046)
 pub mod join; // servers down at boot join when they come up
 #[cfg(feature = "mcp-events")]
 pub mod mcp_events; // MCP Events (RFC 0045): occurrences into declared streams
+pub mod mcp_sign_in; // a server dialed on use signs in then, at a gate (RFC 0055 §4.3)
 pub mod mcp_tasks; // MCP Tasks (RFC 0050): a step's or a turn's task, followed to its end
 pub mod nested;
 #[cfg(feature = "x402")]
@@ -836,6 +837,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         mcp_events: Default::default(),
         mcp_tasks: Default::default(),
         joining: Default::default(),
+        mcp_sign_ins: BTreeMap::new(),
         registry,
         contexts: Contexts::new(model_window),
         memory: Memory::new(

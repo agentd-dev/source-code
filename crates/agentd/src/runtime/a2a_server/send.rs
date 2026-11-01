@@ -442,6 +442,14 @@ impl Runtime {
                 return self.company_direct_relay(&id, tid, principal, text, message);
             }
         }
+        // A sign-in to an MCP server (RFC 0055 §4.3): its person signs in at
+        // the authorization server, and the one answer it takes here is
+        // cancel.
+        if let Some((tid, _)) = &existing
+            && let Some(server) = self.mcp_sign_in_on(tid)
+        {
+            return self.mcp_sign_in_answer(&server, tid, text, message);
+        }
         // A payment's approval, the approver's alone to give (RFC 0049 D6);
         // and a closed one, which takes no answer.
         #[cfg(feature = "x402")]

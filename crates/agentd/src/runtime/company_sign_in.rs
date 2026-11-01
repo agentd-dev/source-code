@@ -183,6 +183,7 @@ impl Runtime {
     /// Conversation's.
     pub(crate) fn gate_open_on(&self, task: &str) -> bool {
         self.sign_in_on(task).is_some()
+            || self.mcp_sign_in_on(task).is_some()
             || self
                 .company_sign_ins
                 .values()

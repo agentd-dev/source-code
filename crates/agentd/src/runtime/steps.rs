@@ -1576,7 +1576,7 @@ impl Runtime {
         if matches!(step.kind.as_str(), "mcp.tool" | "mcp.resource")
             && let Some(server) = step.spec.get("server").and_then(Value::as_str)
             && !server.contains("{{")
-            && self.connect_wait(run_id, step_id, server)
+            && self.connect_wait(run_id, step_id, server, step.timeout_ms)
         {
             return;
         }
@@ -3291,13 +3291,23 @@ impl Runtime {
         payload: &Value,
     ) {
         if budget {
+            let mut since = None;
             if let Some(st) = self
                 .runs
                 .get_mut(run_id)
                 .and_then(|r| r.steps.get_mut(step_id))
             {
+                // A wait for an on-use server keeps when it began.
+                since = st
+                    .wait
+                    .as_ref()
+                    .filter(|w| w["kind"] == "connect_wait")
+                    .and_then(|w| w["since"].as_u64());
                 st.status = StepStatus::Pending;
                 st.wait = None;
+            }
+            if let Some(since) = since {
+                self.connect_wait_restored(run_id, step_id, since);
             }
             if let Some(r) = self.runs.get_mut(run_id) {
                 r.touch();

@@ -73,6 +73,13 @@ pub enum Event {
     McpEventHook(Box<super::mcp_events::hook::Arrival>),
     /// A probe of a server down since boot answered (`runtime::join`).
     McpReachable(Box<super::join::Reachable>),
+    /// A sign-in to an MCP server dialed on use moved on (RFC 0055 §4.3):
+    /// where its person signs in, or how it ended. Sent by the sign-in's own
+    /// thread.
+    McpSignIn {
+        server: String,
+        step: super::mcp_sign_in::Step,
+    },
     /// An MCP task moved on: a step's call became one, a poll answered, a
     /// listen took its ids (`runtime::mcp_tasks`).
     McpTask(Box<super::mcp_tasks::Note>),

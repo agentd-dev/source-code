@@ -307,6 +307,7 @@ pub struct Agent {
     pub preflight: Preflight,
     pub wake_on: Option<Vec<WakeEvent>>,
     pub on_workflow_finished: OnWorkflowFinished,
+    pub on_instruction_updated: OnInstructionUpdated,
     pub tools: AgentTools,
     pub max_parallel_turns: Option<u32>,
     pub conversation_budget: Option<Budget>,
@@ -1163,6 +1164,7 @@ pub const DOCUMENT_MAY_WRITE: &[&str] = &[
     "agent.ask_human_unowned",
     "agent.conversation_budget",
     "agent.max_parallel_turns",
+    "agent.on_instruction_updated",
     "agent.on_workflow_finished",
     "agent.preflight",
     "agent.wake_on",
@@ -2104,6 +2106,18 @@ pub enum WakeEvent {
 pub enum OnWorkflowFinished {
     #[default]
     Ignore,
+    Note,
+    Think,
+}
+
+/// What a changed instruction leaves the root conversation, when `wake_on`
+/// names `instruction_updated`: a note it reads on its next turn (default),
+/// or that note delivered, which starts a turn — the agent acts on the
+/// change with nobody prompting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum OnInstructionUpdated {
+    #[default]
     Note,
     Think,
 }
@@ -11366,6 +11380,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "agent.gate_channels",
     "agent.instruction",
     "agent.max_parallel_turns",
+    "agent.on_instruction_updated",
     "agent.on_workflow_finished",
     "agent.preflight",
     "agent.prompt",

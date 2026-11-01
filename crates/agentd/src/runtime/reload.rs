@@ -831,14 +831,15 @@ impl Runtime {
             // Read again only because its server was re-dialed: a change
             // only if the text is not what was running.
             let before = self.instruction.text.clone();
-            self.adopt_instruction(fetched);
+            self.adopt_instruction(fetched, true);
             if self.instruction.text != before {
                 changed.push("agent.instruction");
             }
         } else if let Some(instruction) = instruction {
             match instruction {
+                // The configured source changed: the wake below says so.
                 StagedInstruction::Resource(fetched) | StagedInstruction::Reread(fetched) => {
-                    self.adopt_instruction(fetched)
+                    self.adopt_instruction(fetched, false)
                 }
                 StagedInstruction::Text(text) => {
                     self.instruction = super::reactor::Instruction {
@@ -857,7 +858,12 @@ impl Runtime {
                 .wake_on()
                 .contains(&cfg::WakeEvent::InstructionUpdated)
             {
-                self.note_root("instruction.updated: the configuration changed the instruction; re-read it with instruction.read".into());
+                let before = self.instruction.version.saturating_sub(1);
+                self.instruction_changed(
+                    "the configuration changed the instruction",
+                    before,
+                    new.agent.on_instruction_updated,
+                );
             }
             changed.push("agent.instruction");
         }

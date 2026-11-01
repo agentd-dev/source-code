@@ -405,3 +405,46 @@ fn a_skill_named_by_src_is_fetched_and_one_that_fails_is_left_out() {
     );
     wait_calls(&one, 1, "the rest of the document applies", &d);
 }
+
+/// `agent.on_instruction_updated: think`: a released edit starts a turn of
+/// the root conversation by itself — nobody sends anything — and says so
+/// (`instruction.woke`). Under the default (`note`) the same edit leaves a
+/// note and starts nothing.
+#[test]
+fn a_changed_instruction_starts_a_turn_under_think_and_only_then() {
+    for think in [true, false] {
+        let registry = common::spawn_mock_mcp("mock://unused", false);
+        serve(&registry, &document(&[]));
+        let mut cfg = config(&registry, None);
+        cfg["intelligence"] = json!({"endpoints": "mock:final", "model": "mock"});
+        cfg["agent"]["wake_on"] = json!(["instruction_updated"]);
+        if think {
+            cfg["agent"]["on_instruction_updated"] = json!("think");
+        }
+        let mut d = boot(cfg);
+        d.wait_for("the first version applied", |l| {
+            !events(l, "instruction.applied").is_empty()
+        });
+        serve(
+            &registry,
+            &document(&[]).replace("Serve the mock.", "Keep the living room at 24.5."),
+        );
+        d.wait_for("the edit adopted", |l| {
+            !events(l, "instruction.updated").is_empty()
+        });
+        std::thread::sleep(Duration::from_millis(2500));
+        let log = d.log();
+        let woke = events(&log, "instruction.woke");
+        let turns = events(&log, "turn.done");
+        if think {
+            assert_eq!(woke.len(), 1, "think wakes the root once:\n{log}");
+            assert!(
+                !turns.is_empty(),
+                "and a turn runs with nobody prompting it:\n{log}"
+            );
+        } else {
+            assert!(woke.is_empty(), "note starts nothing:\n{log}");
+            assert!(turns.is_empty(), "no turn runs:\n{log}");
+        }
+    }
+}

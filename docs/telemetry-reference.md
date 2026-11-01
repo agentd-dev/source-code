@@ -538,7 +538,9 @@ its `jti`.
 | `instruction.subscribe.fail` | warn | `err`, `server`, `uri` |  |
 | `instruction.subscribe.unsupported` | info | `server`, `uri` |  |
 | `instruction.unavailable` | warn | `err`, `policy`, `server`, `trust_pinned`, `uri` | The instruction source could not be re-read before its deadline; `policy` is what agentd did. |
-| `instruction.updated` | info | `version` | A changed instruction took effect. |
+| `instruction.updated` | info | `version`, `version_id` | A changed instruction took effect. |
+| `instruction.woke` | info | `context`, `from`, `to` | A changed instruction started a turn of the root conversation (`agent.on_instruction_updated: think`), nobody prompting it. |
+| `instruction.woke.fail` | warn | `err`, `to` | The turn could not be started; the change was left as a note instead. |
 | `instruction.verified` | info | `author_capabilities`, `capabilities`, `delivery_checked`, `key_state`, `kid`, `publisher`, `uri` | A signed instruction verified against a trusted publisher. |
 
 ### intel

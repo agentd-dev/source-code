@@ -2044,7 +2044,7 @@ impl Runtime {
         }
         let (server, res) = instruction_resource(uri);
         let fetched = self.fetch_instruction_mcp(&self.mcp, server, res)?;
-        self.adopt_instruction(fetched);
+        self.adopt_instruction(fetched, true);
         Ok(())
     }
 
@@ -2528,7 +2528,12 @@ impl Runtime {
     /// running instruction, and report the apply boundary. Nothing here
     /// refuses — the subscription and the binding report are best-effort and
     /// logged — so a reload that fetched it can adopt it with everything else.
-    pub(crate) fn adopt_instruction(&mut self, fetched: FetchedInstruction) {
+    /// `wake`: a change of text is said (`instruction.updated`) and handed to
+    /// the root conversation (`agent.wake_on` / `agent.on_instruction_updated`)
+    /// here, however it was noticed — a notification, the refresh re-read, a
+    /// re-dial — except on the first read, and where the caller says it
+    /// itself (a reload that changed the configured source).
+    pub(crate) fn adopt_instruction(&mut self, fetched: FetchedInstruction, wake: bool) {
         let FetchedInstruction {
             server: name,
             client: c,
@@ -2569,6 +2574,8 @@ impl Runtime {
             }
         }
         let changed = self.instruction.text != text;
+        let first = self.instruction.version == 0 || self.instruction.text.is_empty();
+        let before = self.instruction.version;
         let old_version_id = self.instruction.version_id.clone();
         self.instruction = reactor::Instruction {
             text,
@@ -2597,6 +2604,24 @@ impl Runtime {
                 delivered_digest.as_deref(),
                 &res,
             );
+        }
+        if wake && changed && !first {
+            self.log.info(
+                "instruction.updated",
+                json!({"version": self.instruction.version, "version_id": self.instruction.version_id}),
+            );
+            if self
+                .settings
+                .agent
+                .wake_on()
+                .contains(&crate::config::settings::WakeEvent::InstructionUpdated)
+            {
+                self.instruction_changed(
+                    "the instruction resource changed",
+                    before,
+                    self.settings.agent.on_instruction_updated,
+                );
+            }
         }
         self.track_machinery(&name, &res, machinery);
     }
@@ -2745,23 +2770,46 @@ impl Runtime {
         let Some(full) = self.instruction.source_ref() else {
             return Ok(());
         };
-        let before = self.instruction.version;
+        // A changed text is said and handed on where it is adopted.
         self.subscribe_instruction(&full)?;
-        if self.instruction.version != before {
-            self.log.info(
-                "instruction.updated",
-                json!({"version": self.instruction.version}),
-            );
-            if self
-                .settings
-                .agent
-                .wake_on()
-                .contains(&crate::config::settings::WakeEvent::InstructionUpdated)
-            {
-                self.note_root("instruction.updated: the instruction resource changed; re-read it with instruction.read".into());
+        Ok(())
+    }
+
+    /// Tell the root conversation its instruction changed: a note it reads on
+    /// its next turn, or — under `agent.on_instruction_updated: think` — that
+    /// note delivered, which starts a turn now, so the agent acts on the
+    /// change with nobody prompting it (`instruction.woke`).
+    pub(crate) fn instruction_changed(
+        &mut self,
+        what: &str,
+        before: u64,
+        on: crate::config::settings::OnInstructionUpdated,
+    ) {
+        let after = self.instruction.version;
+        let line = format!(
+            "instruction.updated: {what} (version {before} → {after}); re-read it with \
+             instruction.read and act on what changed"
+        );
+        if on != crate::config::settings::OnInstructionUpdated::Think {
+            return self.note_root(line);
+        }
+        match self.accept_event_in(
+            events::kinds::A2A_MESSAGE,
+            None,
+            None,
+            json!({"text": line.clone(), "context_id": crate::context::ROOT, "msg_depth": 1}),
+            None,
+        ) {
+            Ok(_) => self.log.info(
+                "instruction.woke",
+                json!({"from": before, "to": after, "context": crate::context::ROOT}),
+            ),
+            Err(e) => {
+                self.log
+                    .warn("instruction.woke.fail", json!({"to": after, "err": e}));
+                self.note_root(line);
             }
         }
-        Ok(())
     }
 
     /// Re-dial a server that forgot its session, and subscribe again on the

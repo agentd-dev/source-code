@@ -65,6 +65,14 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Added.**
 
+- `agent.on_instruction_updated: note | think`. Under `think`, with
+  `instruction_updated` in `agent.wake_on`, a released change to the
+  instruction starts a turn of the root conversation by itself: the agent
+  acts on the change with nobody prompting it (`instruction.woke`). The
+  default, `note`, leaves a note as before. `instruction.updated`, and the
+  wake, now fire however the change was noticed — the refresh re-read and a
+  re-dial as well as a subscription notification.
+
 - A document an MCP registry serves (`agent.instruction: instruction://…`)
   now applies its machinery: its `:::mcp` servers, inline skills, workflows
   and `:::config`. Before, only its text was kept, and nothing it declared

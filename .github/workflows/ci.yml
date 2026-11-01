@@ -7,6 +7,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Test builds keep file:line for backtraces but not full debug info: with
+  # it, one feature row's target dir outgrew the runner's disk (the linker
+  # died with SIGBUS / "No space left on device").
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 permissions:
   contents: read

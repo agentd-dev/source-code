@@ -122,15 +122,33 @@ pub fn default_tags() -> BTreeMap<String, Vec<String>> {
 /// Whether the glob `glob` matches the registry name `name`, exactly: a
 /// name is `namespace/server`, a glob has as many `/`-separated segments,
 /// and `*` matches any run of characters within one segment (never a `/`).
-/// `*` alone matches every name.
+/// `*` alone matches every name. A name that is not a registry name —
+/// `namespace/server` of ASCII letters, digits, `.`, `_` and `-` — matches
+/// nothing: it is what a step, a document or the model wrote, and an `@`
+/// in it would pass for a pinned version's [`implicit_name`].
 pub fn name_matches(glob: &str, name: &str) -> bool {
+    if !is_registry_name(name) {
+        return false;
+    }
     let glob = glob.trim();
     if glob == "*" {
-        return !name.is_empty();
+        return true;
     }
     let g: Vec<&str> = glob.split('/').collect();
     let n: Vec<&str> = name.split('/').collect();
     g.len() == n.len() && g.iter().zip(&n).all(|(g, n)| segment_matches(g, n))
+}
+
+/// Whether `name` is a registry name: two non-empty segments of ASCII
+/// letters, digits, `.`, `_` and `-`, split by one `/`.
+pub fn is_registry_name(name: &str) -> bool {
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    name.split_once('/')
+        .is_some_and(|(ns, server)| ok(ns) && ok(server))
 }
 
 /// `*`-wildcard match of one segment.
@@ -140,13 +158,11 @@ fn segment_matches(glob: &str, text: &str) -> bool {
         return glob == text;
     }
     let (first, last) = (parts[0], parts[parts.len() - 1]);
-    if !text.starts_with(first) || text.len() < first.len() + last.len() {
+    // Both ends first: the slice between them is then on char boundaries.
+    if !text.starts_with(first) || !text.ends_with(last) || text.len() < first.len() + last.len() {
         return false;
     }
     let mut rest = &text[first.len()..text.len() - last.len()];
-    if !text.ends_with(last) {
-        return false;
-    }
     for mid in &parts[1..parts.len() - 1] {
         match rest.find(mid) {
             Some(i) => rest = &rest[i + mid.len()..],
@@ -561,6 +577,25 @@ mod tests {
         // `*` alone approves every name.
         assert!(name_matches("*", "io.github.github/github-mcp-server"));
         assert!(!name_matches("*", ""));
+    }
+
+    /// A name a step, a document or the model writes is held to a registry
+    /// name's shape before any glob reads it: one that is not matches
+    /// nothing — not `*`, and without panicking on a multi-byte character
+    /// against a glob with a suffix — and none passes for a pinned version's
+    /// name.
+    #[test]
+    fn a_name_that_is_not_a_registry_name_matches_nothing() {
+        assert!(!name_matches("io.acme/*x", "io.acme/é"));
+        assert!(!name_matches("io.acme/*-mcp", "io.acme/ü-mcp"));
+        assert!(!name_matches("*", "io.acme/kb@1.0.0"));
+        assert!(!name_matches("io.acme/*", "io.acme/kb@1.0.0"));
+        assert!(!name_matches("*", "kb"));
+        assert!(!name_matches("*", "io.acme/"));
+        assert!(!name_matches("*", "a/b/c"));
+        assert!(!name_matches("*", "io.acme/k b"));
+        assert!(name_matches("io.acme/*-mcp", "io.acme/kb-mcp"));
+        assert!(name_matches("io.acme/*", "io.acme/kb_2.x"));
     }
 
     #[test]

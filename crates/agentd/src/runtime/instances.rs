@@ -408,8 +408,9 @@ impl Runtime {
     }
 
     /// Compose the child's settings document from four sources: the template's
-    /// frozen machinery, the folded prose, the parent's inherited intelligence
-    /// and service catalog, and the parent-owned store, listener and lifecycle.
+    /// frozen machinery, the folded prose, the parent's inherited intelligence,
+    /// MCP servers and `http.endpoints`, and the parent-owned store, listener
+    /// and lifecycle.
     /// Structured data end to end — the child never re-parses prose as config.
     #[allow(clippy::too_many_arguments)]
     fn compose_instance_doc(
@@ -554,6 +555,19 @@ impl Runtime {
         {
             crate::config::settings::adopt_operator_servers(servers, &self.settings_doc);
         }
+        // The parent's `http.endpoints`, as its service catalogue was: an
+        // `http` step of the child's reaches what the parent's reaches, with
+        // the same credential, headers, method ceiling, pacing and timeout —
+        // and under `egress: closed` nothing more. Assigned unconditionally:
+        // `http` is `OPERATOR_ONLY`, so no template wrote one, and a parent
+        // with none hands the child none.
+        doc["http"] = json!({
+            "endpoints": self
+                .settings_doc
+                .pointer("/http/endpoints")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+        });
         let mut security = json!({});
         if self.settings.security.allow_trifecta {
             security["allow_trifecta"] = json!(true);

@@ -468,7 +468,9 @@ child's own `a2a`, `intelligence`, `store` and `lifecycle` sections (the
 parent composes those), MCP Events bindings and grants, and webhook starts or
 waits (a child has no webhook listener). Its MCP servers are checked against
 the parent's `mcp.servers` and egress posture, and must not compose the
-trifecta. These checks run when the parent loads. The child validates the
+trifecta. Its `http` steps use the parent's `http.endpoints`, which the child
+is composed whole: the same credentials and ceilings, and under
+`egress: closed` nothing else. These checks run when the parent loads. The child validates the
 composed file again at spawn, and that is where the template's workflow steps
 are checked. [Instruction documents](directives.md) explains the boundary.
 

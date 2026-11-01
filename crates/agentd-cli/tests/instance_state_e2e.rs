@@ -172,6 +172,77 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> Option<Value>) -> Value {
     }
 }
 
+/// An instance child is composed its parent's `http.endpoints`: under
+/// `egress: closed` its template's `http` step reaches the parent's endpoint
+/// — with the entry's headers — and nothing else.
+#[test]
+fn a_child_inherits_its_parents_http_endpoints() {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let got = seen.clone();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(mut conn) = conn else { continue };
+            let mut r = BufReader::new(conn.try_clone().unwrap());
+            let mut lines = Vec::new();
+            loop {
+                let mut l = String::new();
+                if r.read_line(&mut l).is_err() || l.trim().is_empty() {
+                    break;
+                }
+                lines.push(l.trim().to_string());
+            }
+            got.lock().unwrap().push(lines.join("\n"));
+            let body = r#"{"pong":true}"#;
+            let _ = write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let dirs = Dirs::new("inst-http");
+    let room = format!(
+        "subagents:\n\
+         \x20 templates:\n\
+         \x20   room:\n\
+         \x20     instruction: |\n\
+         \x20       You are the room.\n\
+         \x20       :::workflow{{id=on-ping dialect=instruction/workflow}}\n\
+         \x20       name: on-ping\n\
+         \x20       steps:\n\
+         \x20         cmd: {{ kind: a2a, command: room.ping, roles: [agent, operator] }}\n\
+         \x20         h:   {{ kind: http, depends_on: [cmd], url: \"http://127.0.0.1:{port}/v1/ping\", allow_private: true }}\n\
+         \x20         f:   {{ kind: finish, depends_on: [h], status: completed, output: \"{{{{steps.h.output.status}}}}\" }}\n\
+         \x20       :::\n\
+         \x20     ttl: 15s\n"
+    );
+    let cfg = format!(
+        "agent: {{ name: parent }}\nstore: {{ kind: memory }}\n\
+         lifecycle: {{ run_until: idle, idle_grace: 1500ms, run_id: pinned }}\n\
+         security: {{ egress: closed }}\n\
+         http:\n  endpoints:\n    api: {{ endpoint: \"http://127.0.0.1:{port}/v1\", headers: {{ X-From: the-parents-entry }} }}\n\
+         observability: {{ log_level: info, log_content: true }}\n{room}\
+         workflows:\n  - name: caller\n    steps:\n\
+         \x20     s:     {{ kind: once }}\n\
+         \x20     spawn: {{ kind: subagent, template: room, depends_on: [s] }}\n\
+         \x20     ping:  {{ kind: a2a.delegate, depends_on: [spawn], peer: \"{{{{steps.spawn.output.peer}}}}\", command: room.ping, args: {{}}, timeout: 20s, retry: {{ max: 6, backoff: 1s }} }}\n\
+         \x20     f:     {{ kind: finish, depends_on: [ping], status: completed, output: \"{{{{steps.ping.output}}}}\" }}\n"
+    );
+    let (code, log) = dirs.run("http", &cfg);
+    assert_eq!(code, Some(0), "{log}");
+    let out = caller_output(&log);
+    assert!(out.to_string().contains("200"), "{out}\n{log}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(
+        seen[0].starts_with("GET /v1/ping") && seen[0].contains("the-parents-entry"),
+        "{seen:?}"
+    );
+}
+
 /// A memory-store parent's `inst-1` is its own: a second parent of the same
 /// name, under the same state directory and run id, spawns a child that
 /// holds nothing the first parent's `inst-1` was doing when it died — no run

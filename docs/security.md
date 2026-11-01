@@ -240,7 +240,8 @@ so no `http.endpoints` entry's credential reaches `/v1/../admin`:
 A document's `:::mcp` (or `:::agent`) that matches no operator entry is not
 activated under `closed`: it is held as text with a `host-policy` warning, and
 the load goes on. A document cannot add to the operator's sections under
-`closed`. An instance child inherits the closed setting. The built-in `mock:`
+`closed`. An instance child inherits the closed setting, and its parent's
+`http.endpoints` as its allow-list for plain HTTP. The built-in `mock:`
 model endpoint opens no socket and is exempt. There is deliberately no
 in-config exception list: the way to allow an endpoint is to declare it in its
 section, which is the reviewable event it should be.

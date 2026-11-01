@@ -719,7 +719,7 @@ What the instance tier needs and offers:
 | `mode` | `detached` (default) returns when the child starts; `sync` waits for a result | `warm` and `async` are refused |
 | `result: {workflow: <name>}` | With `mode: sync`, resolves the spawn with the output of the named workflow's first completion in the child | Needs `a2a.listen` on the parent |
 | `mirror_streams` | Forwards each event of these child streams into the parent's stream of the same name, with source `instance:<handle>` | The stream must exist on both sides; needs `a2a.listen` |
-| `model`, `budget` | The child's turn model and its own token budget | The child gets the parent's intelligence section without its budget or routes |
+| `model`, `budget` | The child's turn model and its own token budget | The child gets the parent's intelligence section without its budget or routes, and the parent's `http.endpoints` whole |
 | `limits` | `memory` and `cpu` only | Token ceilings belong in `budget` |
 | `ttl`, `until` | Retire after a duration, or when the named signal is delivered in the child | `until` must use a parameter unless `singleton: true` |
 | `durable` | `false` runs the child on a memory store, unmetered and not restarted | Default follows `store.durability.work`; a parent with a `memory` or `none` store runs every child this way |

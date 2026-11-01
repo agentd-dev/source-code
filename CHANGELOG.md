@@ -59,7 +59,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `timeout`; an `http` step uses the entry its URL matches, or names it with
   `endpoint:` and a relative `url`; a URL whose path holds a dot-segment,
   plain or percent-encoded, matches no entry and an `http` step with one
-  fails unsent), and `kind: company` to the new
+  fails unsent; an instance child is composed its parent's `http.endpoints`), and `kind: company` to the new
   top-level `companies.<name>`, every field as it was, without `kind`.
   `service:` on `mcp.servers[]` and `a2a.peers[]` is removed: an entry
   carries its own endpoint, credential, tags and ceiling. A `connect: on_use`

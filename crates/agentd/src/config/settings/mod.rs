@@ -9707,6 +9707,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             "skills",
             "peers",
             "signals",
+            "signing_in",
             "memory",
             "agents_md",
         ];

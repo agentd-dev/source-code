@@ -76,7 +76,7 @@ ring = "0.17"
 tempfile = "3"
 # The instruction.md SDK, read directly: the agent text agentd delivers is
 # compared with the SDK's own, byte for byte (instruction_document_e2e).
-instruction-md = { path = "/root/instruction-md/source-code/sdks/rust" }
+instruction-md = "0.1"
 
 # Unix-only test helper: send SIGTERM to a spawned agent to exercise the
 # graceful-drain → exit-0 contract for the long-lived (loop/schedule/reactive)

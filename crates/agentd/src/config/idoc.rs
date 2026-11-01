@@ -560,6 +560,38 @@ pub fn merge_missing(into: &mut Map<String, Value>, add: Map<String, Value>) {
     }
 }
 
+/// A digest of what a document's machinery maps onto — everything an
+/// [`Extraction`] carries but the agent text and the diagnostics — or `None`
+/// when it maps onto nothing. Two versions whose machinery is the same digest
+/// the same however their prose moved, so a text-only edit is told apart from
+/// one that adds a server. Canonical: object keys serialize sorted.
+pub fn machinery_digest(ex: &Extraction) -> Option<String> {
+    if ex.config.is_empty()
+        && ex.workflows.is_empty()
+        && ex.skills.is_empty()
+        && ex.declarations.is_empty()
+        && ex.people.is_empty()
+    {
+        return None;
+    }
+    let skills: Vec<Value> = ex
+        .skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({"name": s.name, "description": s.description,
+                               "when_to_use": s.when_to_use, "body": s.body})
+        })
+        .collect();
+    let all = serde_json::json!({
+        "config": ex.config,
+        "workflows": ex.workflows,
+        "skills": skills,
+        "declarations": ex.declarations,
+        "people": ex.people,
+    });
+    Some(instruction_md::digest(all.to_string().as_bytes()))
+}
+
 /// What a document's mapping would give it of the floor's grants through
 /// blocks every document may use: `a2a.peers` written by a config block, and
 /// a secret named anywhere in its configuration or workflows

@@ -3401,6 +3401,13 @@
                   "description": "a path on disk; watched when lifecycle.watch_config is on",
                   "type": "string"
                 },
+                "machinery": {
+                  "description": "when a served (mcp:/instruction://) document's CHANGED machinery — its :::mcp servers, skills, workflows and :::config — applies: live (default — the staged reload runs as the version arrives, applied whole or refused) or reload (logged as instruction.machinery.pending and applied at the next reload). The first read at startup always applies it. Text changes are adopted live either way",
+                  "enum": [
+                    "live",
+                    "reload"
+                  ]
+                },
                 "mcp": {
                   "description": "a resource a configured MCP server serves, read and subscribed — the URI alone, or {server, resource, events} when it matters which server is asked or the instruction follows its updates by MCP Events",
                   "oneOf": [

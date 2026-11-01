@@ -734,6 +734,23 @@ pub struct Runtime {
     /// deadline (§7.7 rule 2): new autonomous work is refused; live work drains.
     /// A successful re-read clears it.
     pub(crate) freshness_frozen: bool,
+    /// The machinery of the document a resource instruction was last read
+    /// as — what every config load folds (`cfg::load_with`); `None` when it
+    /// carries none.
+    pub(crate) served_machinery: Option<super::ServedMachinery>,
+    /// The digest of the served machinery the running settings were loaded
+    /// with; `None` when they fold none.
+    pub(crate) machinery_in_force: Option<String>,
+    /// The digest last acted on — a reload asked for, or `pending` said — so
+    /// one version is acted on once, and a refused one is not retried on
+    /// every re-read.
+    pub(crate) machinery_noted: Option<String>,
+    /// A staged reload the served machinery asked for, run at the loop's
+    /// signal check (trigger `instruction`).
+    pub(crate) machinery_reload: bool,
+    /// The instruction has not been read yet: its first read applies its
+    /// machinery whatever `agent.instruction.machinery` says.
+    pub(crate) machinery_first_read: bool,
     /// Durable A2A tasks, keyed by task id.
     #[cfg(feature = "a2a")]
     pub(crate) tasks: BTreeMap<String, crate::a2a::Task>,
@@ -2136,6 +2153,9 @@ impl Runtime {
         if crate::signals::reload_requested() {
             crate::signals::clear_reload();
             self.on_reload_requested();
+        }
+        if std::mem::take(&mut self.machinery_reload) {
+            self.reload("instruction");
         }
     }
 

@@ -38,6 +38,13 @@ impl Runtime {
         } else {
             "sighup"
         };
+        self.reload(trigger);
+    }
+
+    /// Reload, diff, apply (or refuse), and say so under `trigger`: a signal,
+    /// a watched file, or `instruction` — a served document whose machinery
+    /// moved.
+    pub(crate) fn reload(&mut self, trigger: &'static str) {
         crate::signals::set_reloading(true);
         let outcome = self.reload_inner();
         crate::signals::set_reloading(false);
@@ -111,8 +118,15 @@ impl Runtime {
     }
 
     fn reload_inner(&mut self) -> Result<Vec<&'static str>, ReloadRefused> {
-        let (loaded, _ask) = cfg::load(&self.args, &self.env)
-            .map_err(|e| ReloadRefused::Invalid(vec![e.to_string()]))?;
+        // With the document a resource instruction was last read as, so its
+        // machinery folds as a file's does — and a SIGHUP never drops the
+        // servers it declares.
+        let (loaded, _ask) = cfg::load_with(
+            &self.args,
+            &self.env,
+            self.served_machinery.as_ref().map(|m| &m.document),
+        )
+        .map_err(|e| ReloadRefused::Invalid(vec![e.to_string()]))?;
         // Over every layer, the instruction's `:::config` included: a
         // document that changes `lifecycle.run_until` would otherwise reload
         // into a process whose job shape was settled at startup — and with it
@@ -155,7 +169,33 @@ impl Runtime {
         self.settings_doc = loaded.doc;
         crate::sec::harden::set_reserved(self.settings.supervisor_only_env());
         crate::sec::harden::set_passthrough(self.settings.spawn.env_passthrough.clone());
-        Ok(self.commit_reload(&old, staged))
+        // The served machinery these settings folded — none when the
+        // instruction is no longer the resource it was read for. Recorded
+        // before the commit, which may read the instruction again and must
+        // compare what it reads with what is now in force.
+        let folded = self
+            .served_machinery
+            .as_ref()
+            .filter(|m| self.settings.agent.instruction.as_deref() == Some(&m.document.uri))
+            .map(|m| (m.digest.clone(), m.version_id.clone()));
+        let digest = folded.as_ref().map(|(d, _)| d.clone());
+        let machinery_moved = digest != self.machinery_in_force;
+        self.machinery_in_force = digest;
+        self.machinery_noted = None;
+        let changed = self.commit_reload(&old, staged);
+        if machinery_moved {
+            let (servers_added, servers_removed) =
+                added_removed(&document_servers(&old), &document_servers(&self.settings));
+            let (skills_added, skills_removed) =
+                added_removed(&document_skills(&old), &document_skills(&self.settings));
+            self.log.info(
+                "instruction.machinery.applied",
+                json!({"version": folded.and_then(|(_, v)| v),
+                       "servers_added": servers_added, "servers_removed": servers_removed,
+                       "skills_added": skills_added, "skills_removed": skills_removed}),
+            );
+        }
+        Ok(changed)
     }
 
     /// Build and check everything the reload changes, beside the running
@@ -1261,6 +1301,40 @@ fn revise_origins(
 /// the way `stage_workflows` decides it: a `file:` wins over a `uri:`.
 fn reads_a_resource(entry: &serde_json::Value) -> bool {
     entry.get("file").is_none() && entry.get("uri").is_some()
+}
+
+/// The MCP servers an instruction document declared, by name.
+fn document_servers(s: &cfg::Settings) -> std::collections::BTreeSet<String> {
+    s.agent
+        .document_config
+        .get("mcp")
+        .and_then(|m| m.get("servers"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.get("name").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The skills an instruction document declared inline, by name.
+fn document_skills(s: &cfg::Settings) -> std::collections::BTreeSet<String> {
+    s.agent
+        .inline_skills
+        .iter()
+        .map(|k| k.name.clone())
+        .collect()
+}
+
+/// What `new` has that `old` lacks, and what `old` has that `new` lacks.
+fn added_removed(
+    old: &std::collections::BTreeSet<String>,
+    new: &std::collections::BTreeSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    (
+        new.difference(old).cloned().collect(),
+        old.difference(new).cloned().collect(),
+    )
 }
 
 /// Why a reload did not apply.

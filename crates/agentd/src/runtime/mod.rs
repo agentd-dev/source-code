@@ -900,6 +900,11 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         goal_judge_at: None,
         freshness_deadline_ms: None,
         freshness_frozen: false,
+        served_machinery: None,
+        machinery_in_force: None,
+        machinery_noted: None,
+        machinery_reload: false,
+        machinery_first_read: true,
         #[cfg(feature = "a2a")]
         tasks: BTreeMap::new(),
         #[cfg(feature = "a2a")]
@@ -1850,6 +1855,68 @@ pub(crate) struct FetchedInstruction {
     /// registry delivered the text for this reader, which is then used as
     /// served; anything else was delivered here.
     resolution: Option<String>,
+    /// What the document's machinery folds into, when it carries any: a
+    /// resolved read, plain prose and a document of text alone carry none.
+    machinery: Option<ServedMachinery>,
+}
+
+/// A served document's machinery as read: the document a config load folds
+/// ([`crate::config::settings::RegistryDocument`]), and the digest of what it
+/// maps onto (`config::idoc::machinery_digest`), which tells an edit that
+/// moves a server from one that moves only prose.
+#[derive(Debug, Clone)]
+pub(crate) struct ServedMachinery {
+    pub(crate) document: crate::config::settings::RegistryDocument,
+    pub(crate) digest: String,
+    /// The registry's version id for it, when it is a registry.
+    pub(crate) version_id: Option<String>,
+}
+
+/// What a served read delivers, and the machinery it carries. A RESOLVED read
+/// is text the registry already delivered for this reader, used as served and
+/// carrying acknowledgements, not machinery. Otherwise (`raw`, the default, or
+/// no resolution at all) the delivered text is the CLEANED document when it
+/// carries anything delivery renders or removes — a block, a keyword line, a
+/// note, front or end matter — gated exactly as at load, under grant ∩
+/// ceiling ∩ author-attested (§7.8 wire admission: a signature CAPS). A
+/// document that no longer folds is an error, and the running text stays.
+///
+/// The machinery joins the configuration through a reload, which folds
+/// `raw` as a load folds a fetched file (`Runtime::track_machinery`).
+fn deliver_served(
+    raw: String,
+    resolved: bool,
+    grants: &[String],
+    attested: Option<Vec<String>>,
+    res: &str,
+    version_id: Option<String>,
+) -> Result<(String, Option<ServedMachinery>), String> {
+    if resolved || !crate::config::idoc::needs_delivery(&raw) {
+        return Ok((raw, None));
+    }
+    let mut granted: std::collections::BTreeSet<String> = grants.iter().cloned().collect();
+    if let Some(caps) = &attested {
+        granted.retain(|g| caps.contains(g));
+    }
+    let ex = crate::config::idoc::extract_from_wire(&raw, &granted).map_err(|errs| {
+        format!(
+            "instruction no longer folds: {}",
+            errs.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+    })?;
+    let machinery = crate::config::idoc::machinery_digest(&ex).map(|digest| ServedMachinery {
+        document: crate::config::settings::RegistryDocument {
+            uri: res.to_string(),
+            raw,
+            attested,
+        },
+        digest,
+        version_id,
+    });
+    Ok((ex.cleaned, machinery))
 }
 
 /// An instruction resource reference split into the server it names (an
@@ -2426,41 +2493,16 @@ impl Runtime {
                         return Err("registry delivered text does not match its deliveredDigest"
                             .to_string());
                     }
-                    // Otherwise (`raw`, the default, or no resolution at all)
-                    // delivered text is the CLEANED document when it carries
-                    // anything delivery renders or removes — a block, a
-                    // keyword line, a note, front or end matter — gated
-                    // exactly as at load; the machinery itself applies on
-                    // reload/restart. A document that no longer folds keeps
-                    // the running text. (`sealed` was decrypted above.)
-                    let text = if !resolved && crate::config::idoc::needs_delivery(&raw) {
-                        let mut granted: std::collections::BTreeSet<String> = self
-                            .settings
-                            .agent
-                            .document_capabilities
-                            .iter()
-                            .cloned()
-                            .collect();
-                        // §7.8 wire admission: a verified document folds under
-                        // grant ∩ ceiling ∩ author-attested — a signature CAPS.
-                        if let Some(caps) = &attested {
-                            granted.retain(|g| caps.contains(g));
-                        }
-                        match crate::config::idoc::extract_from_wire(&raw, &granted) {
-                            Ok(ex) => ex.cleaned,
-                            Err(errs) => {
-                                return Err(format!(
-                                    "instruction no longer folds: {}",
-                                    errs.iter()
-                                        .map(ToString::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join("; ")
-                                ));
-                            }
-                        }
-                    } else {
-                        raw
-                    };
+                    // The delivered text, and the machinery it carries
+                    // (`deliver_served`). (`sealed` was decrypted above.)
+                    let (text, machinery) = deliver_served(
+                        raw,
+                        resolved,
+                        &self.settings.agent.document_capabilities,
+                        attested,
+                        res,
+                        get_meta("versionId"),
+                    )?;
                     return Ok(FetchedInstruction {
                         server: name,
                         client: c,
@@ -2470,6 +2512,7 @@ impl Runtime {
                         delivered_digest: get_meta("deliveredDigest"),
                         canonical: get_meta("canonical"),
                         resolution,
+                        machinery,
                     });
                 }
                 Err(e) => last_err = e.to_string(),
@@ -2492,6 +2535,7 @@ impl Runtime {
             delivered_digest,
             canonical,
             resolution,
+            machinery,
         } = fetched;
         // Watched only where the server offers subscriptions. A server that
         // serves resources and no subscriptions is followed by the refresh
@@ -2549,6 +2593,63 @@ impl Runtime {
                 version_id.as_deref(),
                 delivered_digest.as_deref(),
                 &res,
+            );
+        }
+        self.track_machinery(&name, &res, machinery);
+    }
+
+    /// Follow the machinery of the document the configured resource
+    /// instruction was just read as. It is what every config load folds from
+    /// here on; when it differs from the machinery the running settings were
+    /// loaded with, the staged reload applies it — on the first read at boot
+    /// always, after that under `agent.instruction.machinery: live` (the
+    /// default) — or, under `reload`, `instruction.machinery.pending` says it
+    /// waits for the next reload. Each version is acted on once. A document read for anything
+    /// but the configured instruction (`instruction.subscribe` to another
+    /// uri) lends no machinery.
+    fn track_machinery(&mut self, server: &str, res: &str, machinery: Option<ServedMachinery>) {
+        let Some(configured) = self
+            .settings
+            .agent
+            .instruction
+            .clone()
+            .filter(|t| crate::config::settings::looks_like_resource_uri(t))
+        else {
+            return;
+        };
+        let (want_server, want_res) = instruction_resource(&configured);
+        if want_res != res || want_server.is_some_and(|s| s != server) {
+            return;
+        }
+        let first = std::mem::replace(&mut self.machinery_first_read, false);
+        let machinery = machinery.map(|mut m| {
+            m.document.uri = configured.clone();
+            m
+        });
+        let digest = machinery.as_ref().map(|m| m.digest.clone());
+        let version_id = machinery
+            .as_ref()
+            .and_then(|m| m.version_id.clone())
+            .or_else(|| self.instruction.version_id.clone());
+        self.served_machinery = machinery;
+        if digest == self.machinery_in_force {
+            self.machinery_noted = None;
+            return;
+        }
+        if digest == self.machinery_noted {
+            return;
+        }
+        self.machinery_noted = digest;
+        if first
+            || self.settings.agent.instruction_spec.machinery
+                == crate::config::settings::InstructionMachinery::Live
+        {
+            self.machinery_reload = true;
+        } else {
+            self.log.warn(
+                "instruction.machinery.pending",
+                json!({"uri": configured, "version_id": version_id,
+                       "note": "the served document's machinery changed; under agent.instruction.machinery: reload it applies at the next reload (SIGHUP) or restart"}),
             );
         }
     }
@@ -3069,6 +3170,56 @@ mod binding_target_tests {
             binding_target("instruction://acme/support@v3-beta", v),
             ("v3-beta".to_string(), "follow")
         );
+    }
+}
+
+#[cfg(test)]
+mod served_machinery_tests {
+    use super::*;
+
+    const WITH_SERVER: &str = "---\nspec: \"1\"\n---\n# Served\n\nUse the tools.\n\n\
+        :::mcp{id=two title=\"Two\" src=\"http://127.0.0.1:10/mcp\"}\nThe second server.\n:::\n";
+
+    fn deliver(raw: &str, resolved: bool) -> (String, Option<ServedMachinery>) {
+        deliver_served(
+            raw.to_string(),
+            resolved,
+            &["compute".to_string()],
+            None,
+            "instruction://x",
+            Some("ver_1".into()),
+        )
+        .unwrap()
+    }
+
+    /// A resolved read is text the registry already delivered: used as
+    /// served, it carries no machinery to fold.
+    #[test]
+    fn a_resolved_read_carries_no_machinery() {
+        let (text, m) = deliver(WITH_SERVER, true);
+        assert_eq!(text, WITH_SERVER);
+        assert!(m.is_none());
+    }
+
+    #[test]
+    fn a_raw_read_carries_its_machinery_and_prose_carries_none() {
+        let (text, m) = deliver(WITH_SERVER, false);
+        assert!(!text.contains(":::mcp"), "{text}");
+        let m = m.expect("machinery");
+        assert_eq!(m.document.raw, WITH_SERVER);
+        assert_eq!(m.version_id.as_deref(), Some("ver_1"));
+        assert!(deliver("You are a plain agent.\n", false).1.is_none());
+    }
+
+    /// The digest is the machinery's, not the text's: a prose edit keeps it,
+    /// a server edit moves it.
+    #[test]
+    fn only_a_machinery_edit_moves_the_digest() {
+        let digest = |raw: &str| deliver(raw, false).1.map(|m| m.digest);
+        let prose = WITH_SERVER.replace("Use the tools.", "Use the tools carefully.");
+        assert_eq!(digest(WITH_SERVER), digest(&prose));
+        let moved = WITH_SERVER.replace("127.0.0.1:10", "127.0.0.1:11");
+        assert_ne!(digest(WITH_SERVER), digest(&moved));
     }
 }
 

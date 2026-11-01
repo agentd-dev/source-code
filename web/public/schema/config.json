@@ -726,6 +726,94 @@
       ],
       "type": "object"
     },
+    "McpRegistry": {
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "description": "the widest tool surface a server from it offers",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "allow_private": {
+          "description": "admit remotes on loopback, private and link-local addresses (and loopback http://): an internal registry's servers. Default false",
+          "type": "boolean"
+        },
+        "auth": {
+          "$ref": "#/$defs/Auth"
+        },
+        "discover": {
+          "description": "give the model mcp.registry.search and mcp.registry.connect over the names `servers` approves. Default false",
+          "type": "boolean"
+        },
+        "exclude": {
+          "description": "tools no server from it offers",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "name": {
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "type": "string"
+        },
+        "rate": {
+          "description": "per-process pacing of the calls to each server from it (`<burst>/<per>`)",
+          "type": "string"
+        },
+        "refresh": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "servers": {
+          "description": "globs over registry names (`io.github.github/*`, `*` within a segment; `*` alone approves every name): the approval — a name outside them is never resolved, and a missing or empty list approves nothing",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "tags": {
+          "additionalProperties": {
+            "items": {
+              "enum": [
+                "untrusted_input",
+                "sensitive",
+                "egress"
+              ]
+            },
+            "type": "array"
+          },
+          "description": "the Rule-of-Two legs every server from it counts as; default {\"*\": [untrusted_input]}. `trusted` is refused: vouch for one server with an mcp.servers entry",
+          "type": "object"
+        },
+        "timeout": {
+          "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "url": {
+          "description": "the registry API's base (https://registry.modelcontextprotocol.io); agentd reads its v0.1 paths",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "url"
+      ],
+      "type": "object"
+    },
     "McpServer": {
       "additionalProperties": false,
       "properties": {
@@ -761,14 +849,14 @@
           "type": "object"
         },
         "connect": {
-          "description": "boot (default) dials the server at start; on_use dials it on the first call that needs it — a workflow step naming it, a wait or subscribe start on it, or the instruction declaring it — and it stays connected. Its tools reach a turn once it has connected. Operator-only",
+          "description": "boot (default; on_use for a registry server) dials the server at start; on_use dials it on the first call that needs it — a workflow step naming it, a wait or subscribe start on it, or the instruction declaring it — and it stays connected. Its tools reach a turn once it has connected. Operator-only",
           "enum": [
             "boot",
             "on_use"
           ]
         },
         "endpoint": {
-          "description": "the server's URL; an instruction's :::mcp whose src falls under it (scheme, authority, path on a segment boundary) is this server",
+          "description": "the server's URL; an instruction's :::mcp whose src falls under it (scheme, authority, path on a segment boundary) is this server. A server names an endpoint or a registry and server",
           "type": "string"
         },
         "event_grants": {
@@ -835,6 +923,14 @@
           "description": "per-process pacing of calls to this server (`<burst>/<per>`, e.g. `60/1m`); a dry bucket fails the call, which a step's retry absorbs",
           "type": "string"
         },
+        "registry": {
+          "description": "the mcp.registries entry the server comes from, in place of an endpoint: its record names the endpoint when it is dialed (on use, unless connect: boot)",
+          "type": "string"
+        },
+        "server": {
+          "description": "the server's name in that registry (io.github.github/github-mcp-server); its globs must approve it",
+          "type": "string"
+        },
         "tags": {
           "additionalProperties": {
             "items": {
@@ -863,11 +959,14 @@
             "string",
             "integer"
           ]
+        },
+        "version": {
+          "description": "the registry version resolved: latest (default) or an exact one",
+          "type": "string"
         }
       },
       "required": [
-        "name",
-        "endpoint"
+        "name"
       ],
       "type": "object"
     },
@@ -2273,6 +2372,8 @@
       "mcp.resource": {
         "fields": [
           "server",
+          "registry",
+          "version",
           "op",
           "uri",
           "name",
@@ -2290,6 +2391,8 @@
       "mcp.tool": {
         "fields": [
           "server",
+          "registry",
+          "version",
           "tool",
           "args",
           "idempotency",
@@ -2703,6 +2806,8 @@
         "fields": [
           "on",
           "server",
+          "registry",
+          "version",
           "uri",
           "condition",
           "signal",
@@ -4996,6 +5101,13 @@
             "string",
             "integer"
           ]
+        },
+        "registries": {
+          "description": "the MCP registries the operator trusts as directories of servers, and the names it approves from each (RFC 0055). Operator-only",
+          "items": {
+            "$ref": "#/$defs/McpRegistry"
+          },
+          "type": "array"
         },
         "servers": {
           "items": {

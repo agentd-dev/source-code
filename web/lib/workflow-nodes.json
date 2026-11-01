@@ -542,6 +542,8 @@
     "category": "io",
     "fields": [
       "server",
+      "registry",
+      "version",
       "op",
       "uri",
       "name",
@@ -561,6 +563,8 @@
     "category": "io",
     "fields": [
       "server",
+      "registry",
+      "version",
       "tool",
       "args",
       "idempotency",
@@ -1040,6 +1044,8 @@
     "fields": [
       "on",
       "server",
+      "registry",
+      "version",
       "uri",
       "condition",
       "signal",

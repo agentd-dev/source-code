@@ -475,6 +475,8 @@
       "mcp.resource": {
         "fields": [
           "server",
+          "registry",
+          "version",
           "op",
           "uri",
           "name",
@@ -492,6 +494,8 @@
       "mcp.tool": {
         "fields": [
           "server",
+          "registry",
+          "version",
           "tool",
           "args",
           "idempotency",
@@ -905,6 +909,8 @@
         "fields": [
           "on",
           "server",
+          "registry",
+          "version",
           "uri",
           "condition",
           "signal",

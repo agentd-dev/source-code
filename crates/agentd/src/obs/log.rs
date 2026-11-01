@@ -130,6 +130,19 @@ pub struct Logger {
 // One lock so concurrent threads in a process don't interleave partial lines.
 static STDERR_LOCK: Mutex<()> = Mutex::new(());
 
+/// Write `value` to stderr as one NDJSON line: the whole line built first,
+/// then one locked write. Stderr is unbuffered, so `eprintln!("{}", value)`
+/// goes out as one `write` per formatted piece, and a line another process
+/// writes to the same pipe (a worker's stderr is the supervisor's) lands
+/// inside it, breaking both. One `write` of a line under `PIPE_BUF` is not
+/// split; the lock keeps this process's threads apart.
+pub fn write_line(value: &Value) {
+    let mut line = serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec());
+    line.push(b'\n');
+    let _guard = STDERR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = std::io::stderr().write_all(&line);
+}
+
 // ---------------------------------------------------------------------------
 // The bounded in-memory event ring. A projection of the same stderr stream —
 // identical lines, identical closed event vocabulary — captured into a
@@ -665,11 +678,7 @@ impl Logger {
             event,
             &value,
         );
-        // Build the whole line, then one locked write.
-        let mut line = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
-        line.push(b'\n');
-        let _guard = STDERR_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = std::io::stderr().write_all(&line);
+        write_line(&value);
     }
 
     pub fn info(&self, event: &str, fields: Value) {

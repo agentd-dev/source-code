@@ -182,21 +182,19 @@ pub fn run() -> i32 {
                 libc::getegid(),
             )
         };
-        eprintln!(
-            "{}",
-            serde_json::json!({"event": "test.worker_id", "uid": uid, "euid": euid,
+        crate::obs::log::write_line(
+            &serde_json::json!({"event": "test.worker_id", "uid": uid, "euid": euid,
                                "gid": gid, "egid": egid,
-                               "groups": groups.get(..n.max(0) as usize).unwrap_or_default()})
+                               "groups": groups.get(..n.max(0) as usize).unwrap_or_default()}),
         );
     }
     #[cfg(any(feature = "internal-mocks", debug_assertions))]
     if let Ok(paths) = std::env::var("AGENTD_TEST_WORKER_OPEN") {
         for p in paths.split(':').filter(|p| !p.is_empty()) {
             let r = std::fs::read(p);
-            eprintln!(
-                "{}",
-                serde_json::json!({"event": "test.worker_open", "path": p, "opened": r.is_ok(),
-                                   "err": r.err().map(|e| e.to_string())})
+            crate::obs::log::write_line(
+                &serde_json::json!({"event": "test.worker_open", "path": p, "opened": r.is_ok(),
+                                   "err": r.err().map(|e| e.to_string())}),
             );
         }
     }
@@ -415,12 +413,9 @@ pub fn run() -> i32 {
                     }
                     _ => (serde_json::Value::Null, true),
                 };
-            eprintln!(
-                "{}",
-                serde_json::json!({"event": "test.worker_ask",
+            crate::obs::log::write_line(&serde_json::json!({"event": "test.worker_ask",
                                    "turn": payload.role == crate::subagent::protocol::Role::Turn,
-                                   "tool": name, "result": result, "is_error": is_error})
-            );
+                                   "tool": name, "result": result, "is_error": is_error}));
         }
     }
 

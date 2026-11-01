@@ -70,8 +70,8 @@ one does without it, and gives the message.
 | `mcp.servers[].events`, `event_grants`, `agent.instruction.mcp.events`, a `wait` with `on: event` that subscribes | `mcp-events` |
 | a step's `payment`, `security.payments` | `x402` |
 | a workflow's `act_for`, `identity.providers`, `identity.delegation`, `grant: id_jag` on an MCP server | `xaa` |
-| a `services` entry of `kind: company`, and an `http` step with `auth: {kind: company}` that names it | `companies` |
-| `auth` on a model, an MCP server or a peer; `security.client`; `agentd --login` | `oauth` |
+| a `companies` entry, and an `http` step with `auth: {kind: company}` that names it | `companies` |
+| `auth` on a model, an MCP server, a peer or an HTTP endpoint; `security.client`; `agentd --login` | `oauth` |
 | `security.aauth`, `mcp.servers[].aauth: true` | `aauth` |
 | `agent.instruction.trust`, a signed instruction | `sign` |
 | an encrypted instruction envelope, `agent.instruction.decrypt` | `decrypt` |

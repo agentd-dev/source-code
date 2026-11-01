@@ -949,8 +949,12 @@ outside world.
   application key.
 - A server the configuration does not declare is refused at load. A
   declared server that is down when the step runs fails the step; one down
-  at startup joins when it comes up. A server in the `services:` catalog
-  with a `rate` paces calls.
+  at startup joins when it comes up. A server declared with
+  `connect: on_use` is dialed when the step first runs; the step waits for
+  it, durably, up to the server's `timeout` (or `mcp.default_timeout`) and
+  fails if it has not connected by then. The server's `rate` paces calls
+  (a dry bucket fails the call, which the step's `retry` can absorb), and
+  its `breaker` is the step's default breaker.
 - A call the server makes an MCP task of is waited for durably, bounded by
   the step's `timeout` (default `limits.step_timeout`), which cancels the
   task when it passes, and with it any question the task asks.
@@ -1067,9 +1071,9 @@ plan: {kind: tool, depends_on: [start], name: plan.get, args: {}}
 
 One outbound HTTP request.
 
-- **Fields:** **`url`**, `method`, `headers`, `query`, `body`, `json`,
-  `timeout`, `expect`, `allow_private`, `sign`, `idempotency`, `breaker`,
-  `rate`, `auth`, `payment`.
+- **Fields:** **`url`**, `endpoint`, `method`, `headers`, `query`, `body`,
+  `json`, `timeout`, `expect`, `allow_private`, `sign`, `idempotency`,
+  `breaker`, `rate`, `auth`, `payment`.
 - **Output:** `{status, ok, headers, body, json}`; `json` is the body parsed,
   or null. A paid request's adds `payment`.
 - `method` defaults to `GET`. Success is a status from 200 to 399 unless
@@ -1079,8 +1083,13 @@ One outbound HTTP request.
   `body`. `query` values are percent-encoded.
 - The target is resolved once and dialled by the vetted address; private,
   loopback and link-local addresses are refused unless the step sets
-  `allow_private: true`. Under `security.egress: closed` the URL must match
-  a `kind: http` service, whose `methods` list is also a ceiling.
+  `allow_private: true`.
+- The step uses the `http.endpoints` entry its URL matches: the entry's
+  `methods` list is a ceiling, its `headers` go under the step's own, and
+  its `auth`, `timeout` default and `rate` apply. `endpoint: <name>` names
+  the entry, and `url` may then be a path relative to its endpoint
+  (`{endpoint: github, url: /owner/repo/main/README.md}`). Under
+  `security.egress: closed` the URL must match an entry.
 - `headers` and `sign.secret` resolve `{{secret:NAME}}` references; nothing
   else in the step does.
 - `sign: {secret, header?, prefix?}` adds an HMAC-SHA256 of the body,

@@ -111,14 +111,11 @@ security:
     # network; GOFLAGS=-count=1 keeps a cached pass from hiding a failure;
     # TZ is the zone the flaky test fails in.
     env: [PATH, HOME, LANG, TZ, GOPROXY, GOTOOLCHAIN, GOFLAGS, GOCACHE]
-  # agentd dials only what the catalogue below names: the model and the
-  # mirror. (What a command run by `exec` may reach is the host's firewall's
-  # to decide; with the allow-list above none of them opens a connection.)
+  # agentd dials only what this file declares: the model (`intelligence`)
+  # and the mirror (`mcp.servers`). (What a command run by `exec` may reach
+  # is the host's firewall's to decide; with the allow-list above none of
+  # them opens a connection.)
   egress: closed
-
-services:
-  openai: {kind: intelligence, endpoint: "https://api.openai.com"}
-  mirror: {kind: mcp, endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"}
 
 limits:
   run: {steps: 40, tokens: 400000, deadline: 20m}

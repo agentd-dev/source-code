@@ -310,9 +310,9 @@ routes exactly as they were.
 
 | Area | Reloads in place |
 |---|---|
-| Models | `intelligence.endpoints`, `token`, `token_file`, `model`, `models`, `providers`, `roles`, `routes`, `dialect`, `headers`, `auth`, `timeout`, `structured_output`, `swap_policy`, `budget` |
+| Models | `intelligence.endpoints`, `token`, `token_file`, `model`, `models`, `providers`, `roles`, `routes`, `dialect`, `headers`, `auth`, `timeout`, `rate`, `structured_output`, `swap_policy`, `budget` |
 | Agent | `agent.instruction` (all but `trust`), `prompt`, `description`, `preflight`, `wake_on`, `tools`, `max_parallel_turns`, `on_workflow_finished`, `conversation_budget`, `approval`, `ask_human_fallback`, `ask_human_unowned`, `gate_channels` |
-| Tools | `mcp.servers`, `mcp.default_timeout`, `services`, `tools`, `knowledge`, `search`, `skills` |
+| Tools | `mcp.servers`, `mcp.default_timeout`, `http.endpoints`, `tools`, `knowledge`, `search`, `skills` |
 | Work | `workflows`, `streams`, `vars`, `limits`, `lifecycle.idle_grace`, `lifecycle.until_signal`, `goal`, `subagents`, `context`, `memory`, `identity` |
 | A2A | `a2a.principals`, `cors`, `introspection`, `push`, `peers`; `webhooks.default_auth` and the webhook routes |
 | Store and telemetry | `store.retention`, `checkpoint`, `durability`, `on_error`, `timeout`; `observability.log_level`, `log_content`, `audit`, `runtime_events`, `status_values` |

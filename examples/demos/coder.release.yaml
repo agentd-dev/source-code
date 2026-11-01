@@ -14,7 +14,8 @@
 #
 # (and/or an inline :::skill). Between turns, with no restart, agentd reads v2,
 # fetches the skill (`skills.fetched {name, url, bytes, digest}`), dials
-# DeepWiki beside the running servers, and commits both in one step
+# DeepWiki (approved below, not dialed until a document asks for it) beside
+# the running servers, and commits both in one step
 # (`config.reloaded {trigger: instruction}`, then
 # `instruction.machinery.applied {servers_added, skills_added}`). The next turn
 # calls DeepWiki and writes docs/deps/<dep>.html with `exec` (mkdir, then tee
@@ -32,16 +33,16 @@ agent:
 
 security:
   # The release completes the lethal trifecta, and agentd says so: DeepWiki's
-  # answers are text generated from public repositories (untrusted input: a
-  # document's server is untrusted, and this one should be), while `exec`
-  # writes the repository (sensitive) and runs `git`, which can push (egress).
-  # Without this the v2 reload is refused (`config.reload.invalid`,
-  # "lethal-trifecta refused") and the agent keeps v1's servers. Saying yes
-  # is the operator's decision, made here at start: `security` is
-  # restart-only, so no release can widen it. What still holds: no shell, an
-  # exact allow-list with no network tool, the repository as the only working
-  # directory, an environment without the model key or the registry secret,
-  # and closed egress for agentd's own connections.
+  # answers are text generated from public repositories (untrusted input),
+  # while `exec` writes the repository (sensitive) and runs `git`, which can
+  # push (egress). DeepWiki is declared below, and the trifecta check counts
+  # a server at load whether it is connected yet or not, so without this
+  # agentd refuses to start ("lethal-trifecta refused"). Saying yes is the
+  # operator's decision, made here at start: `security` is restart-only, so
+  # no release can widen it. What still holds: no shell, an exact allow-list
+  # with no network tool, the repository as the only working directory, an
+  # environment without the model key or the registry secret, and closed
+  # egress for agentd's own connections.
   allow_trifecta: true
   exec:
     # coder.yaml's list (a list replaces, it does not append), plus what
@@ -49,10 +50,36 @@ security:
     # page as the command's stdin. Still no shell and no network tool.
     allow: [git, go, gofmt, ls, cat, grep, sed, rm, mkdir, tee]
 
-# egress: closed (coder.yaml) dials only what the catalogue names. A
-# document's server missing here refuses the release's reload whole
-# (`config.reload.invalid` names it) and the running agent keeps what it had;
-# a skill whose host is missing is left out with a `config.warning`.
-services:
-  deepwiki: {kind: mcp, endpoint: "https://mcp.deepwiki.com/mcp"}
-  github-skills: {kind: http, endpoint: "https://raw.githubusercontent.com"}
+# egress: closed (coder.yaml) dials only what the operator declares. DeepWiki
+# is approved here, and dialed only once something needs it: the handbook's
+# `:::mcp{id=deepwiki src="https://mcp.deepwiki.com/mcp" …}` matches this
+# endpoint, so it IS this server (one connection, these tags, this ceiling;
+# the document's `tools=` only narrows it), dialed right after the release
+# loads. A document server that matches no `mcp.servers` endpoint is held as
+# text with a `host-policy` warning, and the reload goes on without it; a
+# skill whose host matches no `http.endpoints` entry is left out with a
+# `config.warning`.
+mcp:
+  servers:
+    # coder.yaml's server, restated: a list replaces, it does not append.
+    - name: instruction-md
+      endpoint: "${IMD_MCP_URL:-http://localhost:18080/mcp}"
+      auth:
+        kind: oauth2
+        grant: client_credentials
+        client_id: "${CODER_CLIENT_ID:-coder}"
+        client_secret: "{{secret:CODER_CLIENT_SECRET}}"
+        token_url: "${IMD_TOKEN_URL:-http://localhost:18080/auth/realms/instruction-md-agents/protocol/openid-connect/token}"
+      allow: []
+      tags: {"*": [trusted]}
+    - name: deepwiki
+      endpoint: https://mcp.deepwiki.com/mcp
+      tags: {"*": [untrusted_input]}
+      connect: on_use
+
+# Where a skill named by `src` is fetched from: GitHub's raw host, read-only.
+http:
+  endpoints:
+    github:
+      endpoint: https://raw.githubusercontent.com
+      methods: [GET]

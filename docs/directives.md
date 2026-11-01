@@ -120,7 +120,7 @@ write the settings that describe the agent: its workflows and streams, the MCP
 servers it needs, its context and limits, which model it runs and how much of
 it, when it is finished, how loud its log is. Everything else belongs to the
 operator: the grants, where the instruction comes from and who may sign it,
-the security gates and the service catalogue, the listeners and their
+the security gates and the endpoints the deployment may reach, the listeners and their
 credentials, where model calls go and with which credential, the model that
 answers approvals, subagent templates, and where state lives. A path on
 neither list is refused, so a setting nobody has classified stays the
@@ -141,13 +141,19 @@ config file, an environment variable or a flag beats the document. A turn
 model the operator names wins over the document's, in either spelling. MCP
 servers a document declares are added to the operator's list, and a document
 server with the same name as an operator server is refused: a document can add
-a server, never re-point one.
+a server, never re-point one. A document server whose endpoint matches an
+operator server's is that operator server: one connection, the operator's
+name, credential, tags and tool ceiling, which the document's `tools=` can
+only narrow ([Servers a document declares](configuration.md#servers-a-document-declares)).
 
 The boundary makes `security.egress: closed` mean what it says, because the
-document cannot write the `services` catalogue that egress is checked against.
-It does not make `open` safe: under `open`, a document may name any host in an
-`:::mcp` block. For a deployment whose document is not fully under the
-operator's control, `closed` plus an operator-written catalogue is the posture.
+document cannot add to the operator's sections that egress is checked against:
+under `closed` a document's `:::mcp` that matches no operator server is held as
+text with a `host-policy` warning. It does not make `open` safe: under `open`,
+a document may name any host in an `:::mcp` block, and that server counts as
+`untrusted_input`. For a deployment whose document is not fully under the
+operator's control, `closed` plus the operator's own server list is the
+posture.
 
 ## Grants: what a document may activate
 
@@ -220,7 +226,7 @@ fetched: the skill stays text, with a `host-policy` warning.
 
 The fetch follows the rules for a `url:` document. It is `https://` only, it
 goes through the egress policy (under `security.egress: closed` the host must
-be in the `services` catalogue), and it must reach a public address. The file
+match an `http.endpoints` entry), and it must reach a public address. The file
 is at most `skills.max_bytes` (32 KiB by default). The document's `id` names
 the skill; its description comes from the `SKILL.md` front matter, or the
 block's `description` or `title`. The text is outside input: the catalogue

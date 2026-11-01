@@ -20,7 +20,7 @@ key rather than a setting that silently does nothing.
 | `lifecycle` | how long the process lives, run id, drain, config watching |
 | `store` | durability of conversations/tasks/runs |
 | `context` | compaction, retained turns, model window, plan size |
-| `mcp` | MCP servers (HTTPS), their tags and tool exposure |
+| `mcp` | MCP servers (HTTPS): credential, tags, tool ceiling, rate, breaker, when to connect |
 | `tools` | tool overrides, renames, routing |
 | `security` | the `exec` fence, trifecta allowance, TLS CA, AAuth, cgroups |
 | `a2a` | the HTTP listener, its public URL, peers, principals, TLS/bearer client auth, browser origins, device sign-in, the event feed |
@@ -29,7 +29,8 @@ key rather than a setting that silently does nothing.
 | `observability` | log level, metrics, OTLP, health/report files |
 | `memory` `knowledge` `search` `skills` | agent-side state and retrieval surfaces |
 | `goal` | goal statement + stuck/achieved policy |
-| `services` | the external-service catalog: shared credentials, authoritative tags, tool ceilings |
+| `http` | the plain-HTTP endpoints `http` steps and fetches may reach: credential, methods, rate |
+| `companies` | the Companies agentd acts at for one person (the `companies` feature) |
 | `subagents` | spawn policy and the templates the model may instantiate |
 | `streams` | named durable event streams (declare before `emit`/`stream` may use one) |
 | `vars` | operator constants, referenced as `{{config.NAME}}` |
@@ -76,8 +77,10 @@ intelligence:
 
 OpenAI-compatible wire with native tool-calling. `auth:` covers OAuth2 (device,
 browser+PKCE, client-credentials — so Azure OpenAI and Google Vertex work
-directly), AWS SigV4, and SPIFFE. `agentd --login <target>` completes a device
-login and caches the token.
+directly), AWS SigV4, and SPIFFE. `agentd --login <target>` (`intelligence`,
+`intelligence:<provider>`, `mcp:<name>`, `a2a:<peer>`, `http:<endpoint>`)
+completes a device login and caches the token. `rate` on a connection paces
+its model calls.
 
 ## limits and lifecycle
 

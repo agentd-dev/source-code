@@ -726,7 +726,7 @@ What the instance tier needs and offers:
 
 `servers` and `tools` are refused on an instance template: its own
 `:::mcp` blocks declare its servers. A child's MCP servers are checked
-against the parent's service catalogue and egress posture, and the
+against the parent's `mcp.servers` and egress posture, and the
 template's machinery may not write operator-only configuration, define
 `a2a`, `intelligence`, `store` or `lifecycle`, declare MCP Events bindings,
 or open webhook routes; the parent composes those, and external events reach

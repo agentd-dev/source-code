@@ -339,6 +339,13 @@ intelligence:
   endpoints: https://api.openai.com/v1/chat/completions
   model: gpt-5.1
   token: "{{secret:OPENAI_API_KEY}}"
+http:
+  endpoints:
+    github:
+      endpoint: https://api.github.com
+      auth: {kind: static, token: "{{secret:GITHUB_TOKEN}}"}
+      methods: [GET]
+      rate: "30/1m"
 workflows:
   - name: dependency-audit
     steps:
@@ -346,8 +353,8 @@ workflows:
       list:
         kind: http
         depends_on: [weekly]
-        url: https://api.github.com/orgs/example/repos
-        headers: {Authorization: "Bearer {{secret:GITHUB_TOKEN}}"}
+        endpoint: github
+        url: /orgs/example/repos
       each:
         kind: foreach
         depends_on: [list]
@@ -360,8 +367,8 @@ workflows:
           steps:
             manifest:
               kind: http
-              url: "https://api.github.com/repos/{{ repo.full_name }}/contents/Cargo.toml"
-              headers: {Authorization: "Bearer {{secret:GITHUB_TOKEN}}"}
+              endpoint: github
+              url: "/repos/{{ repo.full_name }}/contents/Cargo.toml"
             check:
               kind: judge
               depends_on: [manifest]
@@ -384,6 +391,9 @@ workflows:
   paces how fast elements start.
 - Inside the body, `steps.<sibling>` reads the current element's sibling.
   The logs show each instance under a scoped id such as `each[3].check`.
+- The `http` steps name the `github` entry of `http.endpoints`, so `url` is a
+  path under its endpoint, and the entry supplies the credential, the
+  `methods` ceiling and a `rate` shared by every request to it.
 
 Use `batch` instead when the body should see groups of elements (`size`, or
 `by` a key), `iterate` to repeat until a condition holds, `parallel` to run
@@ -905,9 +915,8 @@ security:
       id: https://agent.example.com/companies/client.json
       name: Dana's agent
     seal_key: "{{secret:AGENTD_COMPANY_SEAL}}"
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://shop.example.com
     sign_in: [device]
     scopes: ["poppy:read", "poppy:write"]

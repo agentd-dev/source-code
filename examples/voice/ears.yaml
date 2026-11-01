@@ -42,7 +42,7 @@ agent:
 #
 # (`model:` would work on the `extract` and `judge` steps below — every kind
 # that makes a model call takes a tier. One model for one job needs no
-# catalogue, and config that exists to demonstrate a feature is still config
+# list of models, and config that exists to demonstrate a feature is still config
 # someone has to read.)
 intelligence:
   endpoints: https://api.openai.com/v1/chat/completions

@@ -20,8 +20,9 @@
 #
 # Secrets (env vars; `{{secret:NAME}}` resolves at startup, never logged):
 #   OPENAI_API_KEY          — platform.openai.com; plain completions scope.
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c support.yaml)
+#   HELPDESK_TOKEN          — ticket read + reply ONLY: this key must not delete
+#                             tickets or touch billing/admin; the narrow token is the enforcement.
+#   (The docs server is public and unauthenticated.)
 #   HELPDESK_WEBHOOK_SECRET — the shared secret you configure on the
 #                             helpdesk's outgoing-webhook settings. agentd
 #                             verifies sha256 HMAC of the RAW BODY against
@@ -78,10 +79,13 @@ mcp:
   servers:
     # The helpdesk: customer-authored ticket text comes IN (untrusted), and
     # replies go OUT through the same API (egress). Two legs — allowed.
-    - { name: helpdesk, service: helpdesk }
+    - name: helpdesk
+      endpoint: https://mcp.helpdesk.example/mcp
+      auth: { kind: static, token: "{{secret:HELPDESK_TOKEN}}" }
+      tags: { "*": [untrusted_input, egress] }
     # Product docs, read-only, public content — untagged on purpose.
-    - { name: docs, service: docs }
-
+    - name: docs
+      endpoint: https://mcp.docs.beacon.example/mcp
 # The helpdesk posts ticket events here. HMAC over the raw body is how we know
 # it is the helpdesk and not someone who guessed the path.
 webhooks:

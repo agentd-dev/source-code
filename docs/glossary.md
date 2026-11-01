@@ -31,7 +31,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 |---|---|
 | **checkpoint** | The durable record of a run's state, written to the store before each step's side effect. A restart resumes from it. See [Workflows: how runs work](workflows.md). |
 | **compaction** | Summarising the oldest part of a conversation when it outgrows the model's window, on the `compaction` role. See [How a turn runs](agent-loop.md). |
-| **company** | A business agentd acts at for one person under the Personal Agent Protocol draft, declared as a `services` entry of `kind: company` (the `companies` build feature, a preview). See [Act at companies for a person](act-at-companies.md). |
+| **company** | A business agentd acts at for one person under the Personal Agent Protocol draft, declared as an entry under `companies` (the `companies` build feature, a preview). See [Act at companies for a person](act-at-companies.md). |
 | **confidence** | The least sureness a decision is acted on with. For a `noul` it is the distance of the probability from 0.5, doubled. An answer under it is *unsure*. See [Models, providers and roles](intelligence.md). |
 | **conversation** | A thread of messages with the agent's root, identified by an A2A `contextId` and owned by the caller who started it. Each message in it starts one turn. See [How a turn runs](agent-loop.md). |
 | **correlate** | A start node that fires a run when a set of related stream events has arrived within a window: a join over events. See [React to changes and events](react-to-events.md). |
@@ -55,7 +55,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | Term | Meaning |
 |---|---|
 | **effort** | How hard a reasoning model thinks: `low`, `medium` or `high`. A model sets a default; a node or `think` call may override it. See [Models, providers and roles](intelligence.md). |
-| **egress** | One of the three capability tags: the tool can move data out or change external state. Also `security.egress`, which with `closed` refuses any destination the service catalog does not list. See [Security model](security.md). |
+| **egress** | One of the three capability tags: the tool can move data out or change external state. Also `security.egress`, which with `closed` refuses any destination the operator's sections do not declare. See [Security model](security.md). |
 | **emit** | A workflow step that appends an event to a declared stream. See [Workflows: how runs work](workflows.md). |
 | **escalate** | Asking an unsure decision once more on the model's `escalate` model and taking that answer as final. See [Models, providers and roles](intelligence.md). |
 | **extension** | An A2A protocol extension agentd declares on its card, such as the events feed or the command extension. See [A2A extensions](a2a-extensions.md). |
@@ -134,7 +134,6 @@ reader who meets a word another page assumes. Configuration keys are in the
 | Term | Meaning |
 |---|---|
 | **sensitive** | One of the three capability tags: the tool reaches private data or privileged systems. See [Security model](security.md). |
-| **service catalog** | `services:`, the named external services a deployment may use, with authoritative tags and a tool ceiling. Under `security.egress: closed` it is the allow-list. See [Harden a deployment](harden.md). |
 | **signal** | A named message delivered to waiting runs or `signal` start nodes, for coordination (`workflow.signal`). Also an operating-system signal such as `SIGTERM`. See [Jobs, daemons and triggers](modes-and-triggers.md). |
 | **skill** | Guidance the model loads on demand, in the Agent Skills format (a folder led by a `SKILL.md`): from an MCP server's Skills extension, a `skills/` or `.agents/skills/` folder, or a `:::skill` directive. A skill grants no tool. See [Agent Skills](interoperability.md#agent-skills). |
 | **start node** | The step that fires a workflow's runs: `once`, `manual`, `loop`, `schedule`, `subscribe`, `signal`, `event`, `stream`, `correlate`, `a2a` or `webhook`. Also called a trigger. See [Jobs, daemons and triggers](modes-and-triggers.md). |

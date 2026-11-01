@@ -247,9 +247,8 @@ A model connection that needs a custom credential header — an `api-key`
 header, say — sends it through its `headers` map, with the value as a secret
 reference. Interactive OAuth logins run once with
 `agentd --login <target>` and refresh on their own; the targets are
-`intelligence`, `intelligence:<provider>`, `mcp:<name>` and `service:<name>`.
-An A2A peer that needs an interactive login takes its credential from a
-`services:` entry. A company entry (`kind: company`, in the `companies`
+`intelligence`, `intelligence:<provider>`, `mcp:<name>`, `a2a:<peer>` and
+`http:<endpoint>`. A company entry (under `companies`, in the `companies`
 preview) takes no `auth:` block: agentd presents what the
 [Personal Agent Protocol](#personal-agent-protocol) defines —
 `private_key_jwt` assertions signed with ES256, DPoP-bound tokens

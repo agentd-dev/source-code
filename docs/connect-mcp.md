@@ -81,19 +81,20 @@ Credentials, `allow`, `ns` and the other per-server keys are set in a file.
 
 ## Declare a server
 
-Each entry under `mcp.servers` is one connection. `name` and either
-`endpoint` or `service` are required; everything else is optional. The
+Each entry under `mcp.servers` is one connection. `name` and `endpoint` are
+required; everything else is optional. The
 [configuration reference](configuration.md) has every key's type and default.
 
 | Key | Use it to |
 |---|---|
 | `name` | Name the server in logs, tool names, `servers:` lists and login targets. Letters, digits, `-` and `_`. |
 | `endpoint` | Give the server's MCP URL, exactly as the server documents it. |
-| `service` | Take the connection from a [service catalog](#share-one-credential-across-servers) entry instead. |
 | `auth`, `oauth`, `headers`, `aauth` | [Authenticate](#authenticate). |
 | `allow`, `exclude`, `ns` | [Choose which tools the agent sees](#choose-which-tools-the-agent-sees). |
 | `tags` | [Mark what the server can do](#mark-what-the-server-can-do) for the trifecta check. |
 | `timeout` | Bound each silence on this connection; see [Set timeouts](#set-timeouts). |
+| `rate`, `breaker` | Pace calls to the server and give its `mcp.tool` steps a default breaker; see [Pace a server and connect it on use](#pace-a-server-and-connect-it-on-use). |
+| `connect` | Dial the server at boot (`boot`, the default) or the first time something needs it (`on_use`). |
 | `tasks` | Let the server answer a long call with an MCP task (`auto`, the default) or not (`off`); see [Long-running tool calls](#long-running-tool-calls). |
 | `events`, `event_grants` | Bind upstream events to streams; see [React to changes and events](react-to-events.md). |
 
@@ -226,8 +227,6 @@ logged in to mcp:tickets — token cached in /home/you/.local/state/agentd/creds
   revokes it at the authorization server, when its metadata lists a
   revocation endpoint. A daemon running at the time stops at its next
   renewal.
-- A server that references a catalog entry caches under `service:<entry>`;
-  `--login mcp:<name>` for it logs in to that entry.
 - `--login` needs the `oauth` build feature, which the release binaries and
   the published image include.
 
@@ -305,8 +304,9 @@ lookup, is tagged `trusted`:
 server. Beside `untrusted_input` it changes nothing. A delegated server
 says the same with `auth.trusted_output`, and a Company entry cannot say
 it at all. Neither can an instruction document: a server it declares
-counts as `untrusted_input` whatever legs it names, unless the
-`services:` entry it names, or whose endpoint it gives, carries your tags. A skill a server serves taints whatever the server is tagged
+counts as `untrusted_input` whatever legs it names, unless its endpoint
+matches one of your `mcp.servers`, whose tags it then carries
+([Approve a server for instruction documents](#approve-a-server-for-instruction-documents)). A skill a server serves taints whatever the server is tagged
 ([Load skills from a server](#load-skills-from-a-server)).
 
 > **Limit.** `tags` is written as a map from a tool pattern to tags, but
@@ -315,11 +315,10 @@ counts as `untrusted_input` whatever legs it names, unless the
 > server entries with `allow` lists. `--mcp-tags name=tag,tag` writes the
 > `"*"` form.
 
-## Share one credential across servers
+## Pace a server and connect it on use
 
-The service catalog names an external service once, with its credential,
-its tags and the widest tool surface any consumer may get. Server entries
-reference it with `service:` and may only narrow it:
+A server entry carries its own pacing and breaker, and says when it is
+dialed:
 
 ```yaml
 agent:
@@ -332,30 +331,58 @@ intelligence:
     smart: {model: gpt-5.1}
   model: smart
 
-services:
-  billing:
-    endpoint: https://billing.internal.example/mcp
-    auth: {kind: static, token: "{{secret:BILLING_MCP_TOKEN}}"}
-    tags: {"*": [sensitive]}
-    allow: [charge_lookup, "invoice_*"]
-
 mcp:
   servers:
-    - {name: money, service: billing, allow: [charge_lookup]}
+    - name: billing
+      endpoint: https://billing.internal.example/mcp
+      auth: {kind: static, token: "{{secret:BILLING_MCP_TOKEN}}"}
+      tags: {"*": [sensitive]}
+      allow: [charge_lookup, "invoice_*"]
+      exclude: [invoice_purge]
+      rate: "60/1m"
+      breaker: {failures: 3, cooldown: 30s}
+    - name: deepwiki
+      endpoint: https://mcp.deepwiki.com/mcp
+      tags: {"*": [untrusted_input]}
+      connect: on_use
 ```
 
-`--validate-config` prints what each consumer ends up with:
+- **`rate`** paces calls to the server in each process. A call that finds
+  the bucket dry fails; an `mcp.tool` step's `retry:` can absorb it.
+- **`breaker`** is the default breaker for every `mcp.tool` step naming the
+  server. A step's own `breaker` wins.
+- **`connect: on_use`** leaves the server undialed at boot. It is dialed, off
+  the loop and with the backoff of a server that was down at boot, the first
+  time a workflow step names it (`mcp.tool`, `mcp.resource`), a resource wait
+  or `subscribe` start uses it, or an instruction document declares it. A
+  step waits for the connection, durably, up to the server's `timeout` (or
+  `mcp.default_timeout`), and fails if it has not connected by then. Once
+  connected it stays connected; its tools are offered to turns from then on.
+  The trifecta check at load counts its tags either way.
 
-```json
-{"allow":["charge_lookup"],"endpoint":"https://billing.internal.example/mcp","event":"config.effective_server","exclude":[],"server":"money","service":"billing","tags":{"*":["sensitive"]}}
-```
+`--validate-config` prints one `config.effective_server` line per server
+with the endpoint, tags and tool ceiling it ended up with.
 
-A referencing entry that restates `endpoint`, `auth` or `headers`, or whose
-`allow` widens the catalog's, is refused. The catalog's tags apply to any
-server whose endpoint matches the entry, referencing or not, and with
-`security.egress: closed` a server that matches no entry is refused.
-[Harden a deployment](harden.md) covers egress control and per-service
-`rate` and `breaker` settings.
+## Approve a server for instruction documents
+
+An instruction document may declare a server with `:::mcp{id=… src=…}`.
+When its `src` matches one of your `mcp.servers` endpoints — the same scheme
+and `host[:port]`, and a path that extends yours on a `/` segment boundary —
+the document's block **is** your server:
+
+- one connection, under your name, with your `auth`, `headers`, `tags` and
+  tool ceiling;
+- the document's `tools=` only narrows your `allow` (a pattern outside it is
+  dropped with a warning), and its `deny` adds to your `exclude`;
+- the document's workflow steps that name its id are pointed at your server;
+- an `on_use` server the document declares is dialed right after the load.
+
+So approving a server for documents is declaring it, usually with
+`connect: on_use` so nothing is dialed until a document asks for it. A
+document's `:::mcp` that matches none of your servers is held as text with a
+`host-policy` warning under `security.egress: closed`, and the load goes on
+without it. Under `egress: open` it is a server of its own, counted
+`untrusted_input`. [Harden a deployment](harden.md) covers closed egress.
 
 ## Set timeouts
 

@@ -138,7 +138,7 @@ Everything else is the operator's. A path on neither list is refused too.
 | `agent.gate_channels` | Where gates are announced. A document never puts a channel on a gate. |
 | `agent.tools`, `tools.overrides` | The tool grant, and re-routing a built-in onto a server. Lists concatenate when merged, so a document could only widen the grant. |
 | `security` | The gates: trifecta, egress, exec, policies, TLS trust, AAuth. |
-| `services` | The catalogue `security.egress: closed` is checked against. |
+| `http`, `companies` | Endpoints `security.egress: closed` is checked against, and the Companies agentd acts at. |
 | `identity` | Who work is done on behalf of. |
 | `a2a.listen`, `.url`, `.tls`, `.bearer`, `.principals`, `.device_grant`, `.cors`, `.push`, `.events`, `.introspection` | Who may talk to this agent, as what, over which socket, and what the listener shows its clients. |
 | `webhooks` | Inbound sockets and the auth on them. |

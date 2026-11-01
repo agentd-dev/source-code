@@ -25,8 +25,9 @@
 # Secrets:
 #   OPENAI_API_KEY           — the model (the biggest drafting budget after
 #                              engineering; content is token-hungry).
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c marketing.yaml)
+#   SEARCH_TOKEN             — the web-search MCP wrapper (Brave/Tavily/Kagi).
+#                              CRM_TOKEN                — the same CRM key sales holds: read/write
+#                              contacts and deals, no exports, no admin.
 #   MKT_REPLY_WEBHOOK_SECRET — the inbound-parse relay's signing secret,
 #                              same pattern as sales' /email/reply (embed
 #                              person_id in the reply-to at send time).
@@ -72,10 +73,15 @@ store:
 mcp:
   servers:
     # The open web: research, competitor pages, social listening.
-    - { name: websearch, service: websearch }
-    # Target accounts and the people at them (same catalog entry as sales).
-    - { name: crm, service: crm }
-
+    - name: websearch
+      endpoint: https://mcp.search.example/mcp
+      auth: { kind: static, token: "{{secret:SEARCH_TOKEN}}" }
+      tags: { "*": [untrusted_input] }
+    # Target accounts and the people at them (the same CRM sales uses).
+    - name: crm
+      endpoint: https://mcp.crm.example/mcp
+      auth: { kind: static, token: "{{secret:CRM_TOKEN}}" }
+      tags: { "*": [sensitive, untrusted_input] }
 # Replies to outreach come back here (the email provider forwards them).
 webhooks:
   listen: http://127.0.0.1:9449

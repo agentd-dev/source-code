@@ -82,8 +82,8 @@ that token itself.
 | the model connection | `intelligence.auth` | `intelligence.token` or `token_file` (a bearer), `intelligence.headers` |
 | a named model provider | `intelligence.providers.<name>.auth` | that provider's `token`, `token_file`, `headers` |
 | an MCP server | `mcp.servers[].auth` | `headers`; `oauth: {token_url, client_id, client_secret, scope}`, a client-credentials shortcut |
-| a service catalog entry | `services.<name>.auth` | `headers` |
 | an A2A peer | `a2a.peers[].auth` | `headers`; `client_cert` and `client_key` for mutual TLS |
+| an HTTP endpoint (`http` steps) | `http.endpoints.<name>.auth` | `headers` |
 
 On a model connection, a credential from `auth:` takes precedence over
 `token`. The `AGENTD_INTELLIGENCE_TOKEN` and `AGENTD_INTELLIGENCE_TOKEN_FILE`
@@ -92,9 +92,9 @@ named provider.
 On an MCP server, `auth:` wins over `oauth:`, and either one turns off AAuth
 signing for that server; static `headers` are sent alongside.
 
-**One credential for many consumers.** A service catalog entry holds the
-credential every server or peer that references it uses, cached once under
-`service:<name>`:
+Each endpoint carries its own credential, and logs in under its own target:
+an MCP server as `mcp:<name>`, a peer as `a2a:<name>`, an HTTP endpoint as
+`http:<name>`.
 
 ```yaml
 agent:
@@ -105,24 +105,22 @@ intelligence:
   model: gpt-5.1
   token: "{{secret:OPENAI_API_KEY}}"
 
-services:
-  crm:
-    endpoint: https://mcp.crm.example.com/mcp
-    tags: { "*": [sensitive] }
-    auth:
-      kind: oauth2
-      grant: device
-      issuer: https://sso.corp.example.com
-      client_id: agentd-cli
-      scopes: [crm.read]
 mcp:
   servers:
-    - { name: crm, service: crm }
+    - name: crm
+      endpoint: https://mcp.crm.example.com/mcp
+      tags: { "*": [sensitive] }
+      auth:
+        kind: oauth2
+        grant: device
+        issuer: https://sso.corp.example.com
+        client_id: agentd-cli
+        scopes: [crm.read]
 ```
 
-A server that references an entry may not restate its endpoint, `auth` or
-`headers`. `agentd --login mcp:crm` and `agentd --login service:crm` log into
-the same cached credential.
+`agentd --login mcp:crm` logs into it. An instruction document's `:::mcp`
+whose `src` matches this endpoint uses this server, and this credential,
+rather than a connection of its own.
 
 ## Static credentials
 
@@ -186,7 +184,7 @@ server's metadata does, trailing slash included or not. Pin `token_url`,
 [agentd's Client ID Metadata Document](#client-id-metadata-document) — and
 either `issuer` or `token_url`; the device grant also needs `issuer` or
 `device_authorization_url`, and the browser grant `issuer` or
-`authorization_url`. An MCP server's block, or an MCP catalog entry's, may
+`authorization_url`. An MCP server's block may
 name none of them: the server names its authorization server. The load
 checks each of these.
 
@@ -206,7 +204,7 @@ the login is not presented there. That issuer is a URL the server chose:
 on the server's own origin it is reached as the server is; anywhere else
 only over HTTPS and through the SSRF guard — no loopback, private or
 link-local address — and, under `security.egress: closed`, only when a
-`services` entry covers it. Its metadata must keep the token, device and
+`http.endpoints` entry covers it. Its metadata must keep the token, device and
 revocation endpoints on its own origin; pin `issuer` to use one that does
 not. Metadata of an issuer you pinned is trusted for the endpoints it
 names, wherever they are (Google's `https://accounts.google.com` names
@@ -214,7 +212,7 @@ names, wherever they are (Google's `https://accounts.google.com` names
 
 **The resource (RFC 8707).** Every authorization, token, refresh and
 client-credentials request names the endpoint the token is for as
-`resource`: on an MCP server or an MCP catalog entry, the server's
+`resource`: on an MCP server, the server's
 `endpoint` in canonical form — scheme and host lowercased, no fragment, no
 trailing `/` — which is what MCP's authorization spec requires whether the
 authorization server supports the parameter or not. `resource: omit` sends
@@ -392,8 +390,8 @@ loopback address, as RFC 8252 §7.3 and OAuth 2.1 have it. A redirect URI is
 first one listed.
 
 **Every endpoint.** The document is the client of any `oauth2` block with no
-`client_id`: an MCP server's, a service entry's, a model connection's or an
-A2A peer's.
+`client_id`: an MCP server's, a model connection's, an A2A peer's or an
+HTTP endpoint's.
 
 The [Personal Agent Protocol preview](act-at-companies.md) keeps a document
 of its own, `security.companies.client`: that protocol holds every redirect
@@ -428,14 +426,9 @@ never printed.
 |---|---|
 | `intelligence` | the top-level model connection's `auth` |
 | `intelligence:<provider>` | `intelligence.providers.<provider>.auth` |
-| `mcp:<name>` | that MCP server's `auth`; a server that references a service logs into `service:<entry>` |
-| `service:<name>` | a service catalog entry's `auth`, shared by every consumer |
-
-An A2A peer can be logged into only through a service entry: give the peer
-`service: <entry>` with a `kind: peer` catalog entry, and log into
-`service:<entry>`. `--login` takes no target for a peer's own `auth` block,
-so an oauth2 `device` or `authorization_code` grant there, or one with no
-`grant`, is refused at load.
+| `mcp:<name>` | that MCP server's `auth` |
+| `a2a:<name>` | that A2A peer's `auth` |
+| `http:<name>` | `http.endpoints.<name>.auth` |
 
 `agentd --logout <target>` deletes the cached credential from the cache,
 then revokes it at the authorization server that issued it, when that
@@ -1312,8 +1305,8 @@ for every outbound TLS dial, in the daemon and its child processes.
 | | `static` token | `static` header | `oauth2` | `aws` | `spiffe` jwt | `spiffe` x509 |
 |---|---|---|---|---|---|---|
 | model connection or provider | yes | refused at load | yes | yes | yes | refused at load |
-| MCP server or service | yes | yes | yes | yes | yes | yes (mutual TLS) |
-| A2A peer | yes | yes | yes, login through a service entry | yes | yes | use `client_cert` and `client_key` |
+| MCP server or HTTP endpoint | yes | yes | yes | yes | yes | yes (mutual TLS) |
+| A2A peer | yes | yes | yes | yes | yes | use `client_cert` and `client_key` |
 
 ## When a credential is missing or refused
 
@@ -1389,7 +1382,7 @@ out of rotation for it, so another endpoint serves meanwhile. The
 | `grant` | `oauth2` | `device` (default), `authorization_code` or `client_credentials` |
 | `scopes` | `oauth2` | requested scopes |
 | `audience` | `oauth2` | `audience` parameter sent with the device authorization request and the client-credentials grant, for authorization servers that want one |
-| `resource` | `oauth2` | RFC 8707 `resource` on every authorization, token, refresh and client-credentials request: `auto` (the endpoint, canonical), `omit` or a URI; unset, `auto` on an MCP server or MCP catalog entry and `omit` elsewhere |
+| `resource` | `oauth2` | RFC 8707 `resource` on every authorization, token, refresh and client-credentials request: `auto` (the endpoint, canonical), `omit` or a URI; unset, `auto` on an MCP server and `omit` elsewhere |
 | `region` | `aws` | AWS region (required) |
 | `service` | `aws` | signing service name, such as `bedrock` or `execute-api` (required) |
 | `source` | `aws` | `env` (default), `static`, `imds`, `irsa` or `sso` |

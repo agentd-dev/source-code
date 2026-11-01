@@ -19,8 +19,8 @@
 #
 # Secrets:
 #   OPENAI_API_KEY        — the model.
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c finance.yaml)
+#   LEDGER_TOKEN          — billing + the books; explicitly NOT payouts or
+#                           bank/transfer endpoints: agents record money, never MOVE it.
 #   STRIPE_WEBHOOK_SECRET — ⚠ the one integration nuance in this file:
 #                           Stripe's real Stripe-Signature header is
 #                           `t=<ts>,v1=HMAC(ts + "." + body)` — a scheme
@@ -70,8 +70,10 @@ store:
 mcp:
   servers:
     # Billing + the books (read/write invoices, ledger entries, subscriptions).
-    - { name: ledger, service: ledger }
-
+    - name: ledger
+      endpoint: https://mcp.billing.example/mcp
+      auth: { kind: static, token: "{{secret:LEDGER_TOKEN}}" }
+      tags: { "*": [sensitive] }
 webhooks:
   listen: http://127.0.0.1:9446
   default_auth:

@@ -18,8 +18,8 @@
 #
 # Secrets:
 #   OPENAI_API_KEY        — the model.
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c engineering.yaml)
+#   GITHUB_TOKEN          — a fine-grained PAT or App token scoped to THIS
+#                           repo, contents:rw + pull_requests:rw; NOT repo-admin, NOT org.
 #   GITHUB_WEBHOOK_SECRET — the secret on the repo webhook
 #                           (Settings → Webhooks, event: "Workflow runs",
 #                           content-type JSON). GitHub signs sha256 HMAC of
@@ -65,10 +65,13 @@ store:
 
 mcp:
   servers:
-    # The catalog's exclude (delete_*/admin_*) is authoritative: the fix loop
-    # gets code and PRs, never org administration.
-    - { name: github, service: github }
-
+    # The exclude (delete_*/admin_*) keeps the destructive verbs out: the fix
+    # loop gets code and PRs, never org administration.
+    - name: github
+      endpoint: https://mcp.github.example/mcp
+      auth: { kind: static, token: "{{secret:GITHUB_TOKEN}}" }
+      tags: { "*": [sensitive] }
+      exclude: ["delete_*", "admin_*"]
 # GitHub Actions posts run conclusions here.
 webhooks:
   listen: http://127.0.0.1:9442

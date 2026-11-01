@@ -202,7 +202,7 @@ the runtime's data. `agentd --context-template` prints the built-in one, and
    narrowed `agent.tools.internal` refuses.
 2. `## Instruction`: the standing policy from `agent.instruction`.
 3. The per-turn slot: the knowledge block, or a step's loaded skills.
-4. `## Workflows`, `## Services`, `## Streams`, `## Subagent templates`:
+4. `## Workflows`, `## Endpoints`, `## Streams`, `## Subagent templates`:
    everything derived from configuration.
 5. The skills catalogue, then the bodies of skills loaded on this
    conversation; a server's skill inside a block that names its server and

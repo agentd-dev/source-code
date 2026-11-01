@@ -20,8 +20,10 @@
 #
 # Secrets:
 #   OPENAI_API_KEY       — the model.
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c sre.yaml)
+#   INFRA_TOKEN          — the most dangerous credential in the company: scope
+#                          it to exactly the verbs the `allow` below names and nothing wider (a broad
+#                          token behind a narrow filter is still a broad token if the server changes).
+#                          STATUSPAGE_TOKEN     — incident create/update/resolve on ONE page.
 #   ALERT_WEBHOOK_SECRET — set the same value on the monitoring stack's
 #                          webhook config. Alertmanager cannot sign; put
 #                          this desk's routes behind your ingress and have
@@ -79,12 +81,18 @@ store:
 
 mcp:
   servers:
-    # Dashboards + the safe remediation verbs. The catalog's ceiling IS the
+    # Dashboards + the safe remediation verbs. The `allow` ceiling IS the
     # safe set (reads + restart/scale/rollback) — destructive verbs are
-    # absent from the whole fleet, not merely discouraged here.
-    - { name: infra, service: infra }
-    - { name: statuspage, service: statuspage }
-
+    # never registered, not merely discouraged.
+    - name: infra
+      endpoint: https://mcp.infra.beacon.example/mcp
+      auth: { kind: static, token: "{{secret:INFRA_TOKEN}}" }
+      tags: { "*": [sensitive] }
+      allow: ["get_*", "list_*", "query_*", "restart_service", "scale_pool", "rollback_deploy"]
+    - name: statuspage
+      endpoint: https://mcp.statuspage.example/mcp
+      auth: { kind: static, token: "{{secret:STATUSPAGE_TOKEN}}" }
+      tags: { "*": [egress] }
 webhooks:
   listen: http://127.0.0.1:9444
   default_auth:

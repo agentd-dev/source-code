@@ -26,7 +26,7 @@ agentd — acts there for one person, whom the protocol calls the User.
 
 | Term | Meaning |
 |---|---|
-| Company | A business that publishes the discovery document. In agentd, a `services` entry of `kind: company`. |
+| Company | A business that publishes the discovery document. In agentd, an entry under `companies`. |
 | User | The one person the instance acts for at every company: `security.companies.user`. |
 | Client identity | Who agentd is to every company: a `client_id` that is the HTTPS URL of a metadata document, and a key set of public keys. |
 | User ID | A random ID agentd gives the User at each company, one per company. It names nothing about the person. |
@@ -72,7 +72,7 @@ exit code `2`:
 
 ```text
 {"event":"config.invalid","msg":"security.companies needs the `companies` feature (build with --features companies)"}
-{"event":"config.invalid","msg":"services.shop: `kind: company` needs the `companies` feature (build with --features companies)"}
+{"event":"config.invalid","msg":"companies needs the `companies` feature (build with --features companies)"}
 ```
 
 ## Set it up
@@ -105,9 +105,8 @@ security:
       name: Dana's agent
     seal_key: "{{secret:AGENTD_COMPANY_SEAL}}"
 
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://shop.example.com
     sign_in: [device]
     scopes: ["poppy:read", "poppy:write"]
@@ -305,9 +304,8 @@ security:
       serve: true
     seal_key: "{{secret:AGENTD_COMPANY_SEAL}}"
 
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://shop.example.com
     sign_in: [direct, device]
     scopes: ["poppy:read", "poppy:write"]
@@ -445,7 +443,7 @@ Each MCP server the company lists becomes a server named after the entry,
 with every tool registered as `<server>.<tool>`: `shop.search`,
 `shop.order_status`. A company that lists several servers needs
 `mcp_names`, which names each one by its URL. `allow`, `exclude` and `rate`
-on the entry shape them as they shape any service's tools.
+on the entry shape them as they shape any MCP server's tools.
 
 A workflow calls them with `tool` steps. An `mcp.tool` or `mcp.resource`
 step, a resource wait or a `subscribe` start that names a company's server
@@ -504,9 +502,8 @@ security:
     seal_key: "{{secret:AGENTD_COMPANY_SEAL}}"
     context: {locale: en-US, time_zone: America/Los_Angeles}
 
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://shop.example.com
     interfaces: [mcp, agent, openapi]
     sign_in: [device]
@@ -704,9 +701,8 @@ security:
         expires: 2027-06-30T00:00:00Z
         uses: 3
 
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://shop.example.com
     sign_in: [device]
     scopes: ["poppy:read", "poppy:write"]
@@ -807,10 +803,10 @@ gap.
 
 | You see | It means | Do this |
 |---|---|---|
-| `` `kind: company` needs the `companies` feature `` at load | a binary built without it, as every release binary is until the next release | [build with the feature](#get-a-binary-with-the-feature) |
-| `security.companies.client is required with a kind: company entry` | no identity | set `client.id` and `client.name` |
+| `` `companies` needs the `companies` feature `` at load | a binary built without it, as every release binary is until the next release | [build with the feature](#get-a-binary-with-the-feature) |
+| `security.companies.client is required with a companies entry` | no identity | set `client.id` and `client.name` |
 | `store.kind none forgets every User ID …` | a store that keeps nothing | use the file store, or `mcp` or `http` with a `seal_key` |
-| `services.shop.sign_in needs security.companies.seal_key` | a sign-in with nowhere sealed to keep its token | add a `seal_key` |
+| `companies.shop.sign_in needs security.companies.seal_key` | a sign-in with nowhere sealed to keep its token | add a `seal_key` |
 | `company.identity.unpublished` (error) | the documents at `client.id` or the key set's URL are not what this configuration prints | print and publish them again; every company waits until they match |
 | `company.signer.unavailable` (warn, error) | the external signer that holds the seal key does not answer | start the signer; every company waits for it, and no User is started over |
 | `company.seal_key.mismatch` (error) | the seal key opens none of the store's records, or was removed, or the store was sealed under the other custody | restore the key, or the custody; or send the [`company.user_id.reset` command op](a2a-reference.md#command-ops) as the operator for each company, which starts the User over there |
@@ -869,7 +865,7 @@ lists every `company.*` event and the `agent_company_*` metrics.
 ## Next steps
 
 - [Configuration reference](configuration.md#companies) — every
-  `kind: company` and `security.companies` key.
+  `companies` and `security.companies` key.
 - [Human in the loop](human-in-the-loop.md#company-gates) — the gates a
   company opens, and who may answer them.
 - [Security model](security.md#companies) — what holds, and what does not.

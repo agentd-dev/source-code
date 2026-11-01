@@ -290,6 +290,7 @@ updates to it.
 |---|---|---|
 | `a2a.push.enabled` | `false` | accept registrations and deliver; off, registration is `-32003` and the card says `pushNotifications: false` |
 | `a2a.push.allow_private` | `false` | permit webhook targets on private and loopback addresses |
+| `a2a.push.allow` | `[]` | push targets beyond the peers' endpoints; under `security.egress: closed` a target must match a peer's endpoint or an entry here |
 
 **Registration.** The config takes `url` (required), `token` and
 `authentication {scheme, credentials}`. A config registered without an `id`
@@ -477,10 +478,10 @@ op answers with a Task whose `<taskId>.result` artifact carries the result.
 | `auth.device.deny` | task | operator | device grant on | `user_code`, or `all: true` |
 | `auth.sessions` | message | operator | a TCP listener | none |
 | `auth.sessions.revoke` | task | operator | a TCP listener | `sid`, `name`, or `all: true` |
-| `company.status` | message | operator | a `kind: company` entry | none |
-| `company.user_id.reset` | task | operator | a `kind: company` entry | `company` |
-| `company.sign_in` | task | operator | a `kind: company` entry | `company`; `account`, `scopes`, `new_account` |
-| `company.sign_out` | task | operator | a `kind: company` entry | `company`; `account` |
+| `company.status` | message | operator | a `companies` entry | none |
+| `company.user_id.reset` | task | operator | a `companies` entry | `company` |
+| `company.sign_in` | task | operator | a `companies` entry | `company`; `account`, `scopes`, `new_account` |
+| `company.sign_out` | task | operator | a `companies` entry | `company`; `account` |
 
 Arguments before a semicolon are required. "A grant" means no role reaches
 the op by default and a principal needs a grant naming it. The operator
@@ -638,6 +639,7 @@ path is also a flag (`--a2a-<path>`) and an environment variable
 | `a2a.introspection.enabled` | `false` | reload; `admin.set` | serve the introspection ops and audit events on the feed |
 | `a2a.push.enabled` | `false` | reload | accept webhook registrations and deliver |
 | `a2a.push.allow_private` | `false` | reload | permit private and loopback webhook targets |
+| `a2a.push.allow` | `[]` | reload | push targets admitted under `security.egress: closed` beyond the peers' endpoints |
 | `a2a.peers` | `[]` | reload | agents this instance dials |
 | `a2a.resource` | none | restart | the resource identifier inbound access tokens are issued for, their `aud`: a canonical URI on the listener's origin; needs `a2a.inbound_tokens` |
 | `a2a.inbound_tokens` | `[]` | restart | the enterprise authorization servers whose JWT access tokens (RFC 9068) name a caller; needs a TCP listener and `a2a.resource`, and the `a2a` and `oauth` features |
@@ -655,7 +657,8 @@ certificates are required is fixed at startup.
 | `auth` | a credential provider: `kind: static`, `oauth2` or `spiffe` ([Outbound credentials](authentication.md)); `aws` is refused |
 | `headers` | extra request headers; a credential-shaped header must be a secret reference |
 | `client_cert`, `client_key` | an mTLS client identity; set together |
-| `service` | a `services:` entry of `kind: peer` that supplies endpoint, auth and tags |
+| `rate` | pacing of sends to the peer, per process |
+| `timeout` | the per-request timeout to the peer |
 
 `security.tls_ca` adds a trust anchor for every outbound TLS connection,
 peers included.

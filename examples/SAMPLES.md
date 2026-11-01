@@ -109,9 +109,8 @@ agentd -c ./my-agent.yaml -c examples/mcp-servers.fragment.json
 ```
 
 `--config` is repeatable and merges left to right (RFC 7396, later files win per
-leaf), which is what makes a shared server list a real deployment pattern:
-`examples/startup/` uses the same shape for its service catalogue. The file is
-a fragment, not a whole document.
+leaf), which is what makes a shared server list a real deployment pattern.
+A later file's list replaces an earlier one's whole. The file is a fragment, not a whole document.
 
 Each server has a `name`, a remote `endpoint` (an `https://host/mcp`
 Streamable-HTTP URL that agentd CONNECTS to — it spawns no process), optional auth

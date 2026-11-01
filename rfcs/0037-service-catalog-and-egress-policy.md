@@ -1,6 +1,7 @@
 # RFC 0037: Service catalog and egress policy
 
 **Status:** Phases A + B implemented — A: the `services:` catalog, `service:` references with narrowing, the unconditional tag floor, `closed` egress over MCP dials + A2A push targets, catalog inheritance into RFC 0036 children, `agentd login service:<name>`, effective-surface output in `--validate-config`; B: all four entry kinds (`mcp`/`intelligence`/`peer`/`http` — kind-filtered matching), `a2a.peers[].service` references, `closed` coverage of intelligence endpoints/peers/the `http` step (+ its `methods:` ceiling)/the HTTP store, per-entry `breaker:` defaults, in-process pacing extended to turn-worker and subagent processes, and `examples/startup/services.yaml` as the reference deployment. Phase C stays contingent — see the implementation notes
+**Superseded by:** RFC 0055 §3 (the `services:` catalogue is removed; each section owns its endpoints; the egress policy stays, re-pointed)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-08-23
 **Part of:** the configuration surface (RFC 0030); hardens the trifecta gate's inputs (RFC 0012 §3); credentials ride RFC 0031; the recommended posture for template-bearing deployments (RFC 0036 §8).

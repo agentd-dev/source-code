@@ -34,8 +34,10 @@
 #   OPENAI_API_KEY        — this desk's own text model (SMS + wrap-ups).
 #                           The VOICE model's key lives in the bridge, not
 #                           here — agentd never touches audio or that key.
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c support-l1.yaml)
+#   TWILIO_TOKEN          — scoped to messages on THIS number; the `allow`
+#                           ceiling below strips everything but send/get/list, a second fence.
+#                           VOICEBRIDGE_TOKEN     — the bearer you mint for the voice bridge's
+#                           control surface.
 #   TWILIO_WEBHOOK_SECRET — ⚠ Twilio's real X-Twilio-Signature is
 #                           HMAC-SHA1 over URL + sorted form params — not
 #                           agentd's raw-body sha256. Same fix as Stripe
@@ -92,12 +94,18 @@ store:
 mcp:
   servers:
     # Twilio: inbound texts arrive as webhooks below; send_sms goes out here.
-    # The catalog ceiling strips everything but send/get/list.
-    - { name: twilio, service: twilio }
+    # The `allow` ceiling strips everything but send/get/list.
+    - name: twilio
+      endpoint: https://mcp.twilio.example/mcp
+      auth: { kind: static, token: "{{secret:TWILIO_TOKEN}}" }
+      tags: { "*": [untrusted_input, egress] }
+      allow: [send_sms, get_message, list_messages]
     # The voice bridge's control surface: what the OpenAI realtime session is
     # doing, plus say/transfer/hangup verbs for steering a live call.
-    - { name: voicebridge, service: voicebridge }
-
+    - name: voicebridge
+      endpoint: https://mcp.voice.beacon.example/mcp
+      auth: { kind: static, token: "{{secret:VOICEBRIDGE_TOKEN}}" }
+      tags: { "*": [untrusted_input, egress] }
 webhooks:
   listen: http://127.0.0.1:9450
   default_auth:

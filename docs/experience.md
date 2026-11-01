@@ -38,7 +38,7 @@ agentd -c app.yaml --validate-config
 a typo names its own file and lists what the object does accept:
 
 ```text
-agentd: config file prod.yaml parse error: unknown field `url`, expected one of `name`, `endpoint`, `service`, `ns`, `headers`, `tags`, `allow`, `exclude`, `aauth`, `oauth`, `auth`, `timeout`, `events`, `event_grants`
+agentd: config file prod.yaml parse error: unknown field `url`, expected one of `name`, `endpoint`, `ns`, `headers`, `tags`, `allow`, `exclude`, `aauth`, `oauth`, `auth`, `timeout`, `rate`, `breaker`, `connect`, `events`, `event_grants`
 ```
 
 Workflows get the same treatment. Each node kind has a closed field list,

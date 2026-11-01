@@ -202,39 +202,43 @@ tool that does egress or reads secrets is invisible to the check.
 > says "audited", but an allowed trifecta proceeds silently and the only trace
 > is the configuration value.
 
-## The service catalog and closed egress
+## Operator endpoints and closed egress
 
-Tags being configuration leaves one hole: the author of a config, or of a
+Tags being configuration leaves one hole: an instruction document, or a
 subagent template, could point a server at the billing system and not write
 `sensitive`. The check would then reason soundly from a false premise. The
-`services:` catalog closes it. An entry binds an endpoint to authoritative
-tags, and any MCP declaration whose endpoint matches the entry gets those tags
-unioned in before the check runs, whether it references the entry or restates
-the endpoint inline. Under-tagging a catalogued endpoint is impossible rather
-than undetected. An entry also carries a tool ceiling (`allow`, `exclude`)
-that a consumer can narrow and never widen, and the one shared credential its
-consumers use.
+operator's own declarations close it. A document's server whose endpoint
+matches an operator `mcp.servers` endpoint **is** that operator server: one
+connection, under the operator's name, with the operator's credential, tags
+and tool ceiling. The document's `tools=` or `allow` can only narrow the
+operator's `allow`, never widen it, and its `deny` adds to the operator's
+`exclude`. Under-tagging an endpoint the operator declared is impossible
+rather than undetected ([Servers a document declares](configuration.md#servers-a-document-declares)).
 
-`security.egress: closed` turns the catalog from an authority into an
-allow-list. Every outbound dial agentd makes from configuration must then
-match an entry of the right `kind`, matched on scheme, host and a path prefix
-that ends on a segment boundary:
+`security.egress: closed` turns the operator's sections into an allow-list.
+Every outbound destination agentd reaches must then be declared in the
+section of its kind, matched on scheme, `host[:port]` and a path prefix that
+ends on a segment boundary:
 
-| Surface | Entry kind | Checked |
+| Surface | Must match | Checked |
 |---|---|---|
-| MCP servers, a subagent template's servers | `mcp` | at load, and again before each dial |
-| model endpoints, every `intelligence.providers` entry | `intelligence` | at load |
-| A2A peers | `peer` | at load |
-| HTTP store, workflow `url:` references | `http` | at load |
-| the `http` step | `http` | literal URLs at load; every URL again at the dial, where a matching entry's `methods` list is a ceiling |
-| stream `forward` webhook targets | `http` | at the forward; a refusal logs `stream.forward.refused` |
-| A2A push targets a caller registers | `http` | at registration |
-| `agent.instruction` from `url:` or `oci:` | `http` | before the fetch |
+| MCP servers, a document's or a subagent template's servers | an `mcp.servers` endpoint | at load, and again before each dial |
+| model endpoints, every `intelligence.providers` entry | an `intelligence` endpoint or provider | at load |
+| A2A peers | an `a2a.peers` endpoint | at load |
+| A2A push targets a caller registers | an `a2a.peers` endpoint or an `a2a.push.allow` entry | at registration |
+| HTTP store, workflow and instruction `url:` references, skills fetched by `src` | an `http.endpoints` entry | at load, or before the fetch |
+| the `http` step | an `http.endpoints` entry | literal URLs at load; every URL again at the dial, where the entry's `methods` list is a ceiling |
+| stream `forward` webhook targets | an `http.endpoints` entry | at the forward; a refusal logs `stream.forward.refused` |
+| `agent.instruction` from `url:` or `oci:` | an `http.endpoints` entry | before the fetch |
+| Companies | a `companies` entry | at load |
 
-An instance child inherits the closed setting. The built-in `mock:` model
-endpoint opens no socket and is exempt. There is deliberately no in-config
-exception list: the way to allow an endpoint is to catalog it, which is the
-reviewable event it should be.
+A document's `:::mcp` (or `:::agent`) that matches no operator entry is not
+activated under `closed`: it is held as text with a `host-policy` warning, and
+the load goes on. A document cannot add to the operator's sections under
+`closed`. An instance child inherits the closed setting. The built-in `mock:`
+model endpoint opens no socket and is exempt. There is deliberately no
+in-config exception list: the way to allow an endpoint is to declare it in its
+section, which is the reviewable event it should be.
 
 What closed egress does not bind:
 
@@ -244,7 +248,7 @@ What closed egress does not bind:
   and STS endpoints, the AAuth Agent Provider and Person Server.
 - Anything a compromised MCP server, or a command the `exec` runner starts,
   reaches on its own. Network policy at the host or cluster stays
-  complementary; the catalog is what makes those rules derivable.
+  complementary; the operator's sections are what make those rules derivable.
 
 ## Outside input that arrives through streams
 
@@ -886,11 +890,11 @@ Validation refuses an inline credential in three shapes:
   `security.aauth.enroll_token` and each MCP server's `oauth.client_secret`.
   Set from the environment or a flag, these may be inline.
 - **Every `auth:` block's `token`, `value` and `client_secret`**, on a model
-  connection, a provider, an MCP server, a service entry or an A2A peer.
+  connection, a provider, an MCP server, an A2A peer or an HTTP endpoint.
 - **Header keys that look like credentials** (`authorization`, `api-key`,
   `x-api-key`, `token`, `password`, `secret`, or a name ending in `-token`,
   `_token`, `-key` or `_key`) with an inline value, across model connection
-  and provider headers, MCP server and service headers, A2A peer headers, the
+  and provider headers, MCP server headers, A2A peer headers, HTTP endpoint headers, the
   HTTP store's headers and workflow reference headers.
 
 > **Limit.** The header check reads the key name, not the value: a bearer
@@ -1063,7 +1067,8 @@ something other than the operator's own endpoint list:
 
 - an authorization server an MCP server's RFC 9728 metadata names off the
   server's own origin, and the endpoints that server's metadata names: HTTPS
-  only, and under `security.egress: closed` only inside the catalog.
+  only, and under `security.egress: closed` only when an `http.endpoints`
+  entry covers it.
 
 Model, MCP, configured A2A peer and operator-configured OAuth traffic is not
 classified, because those endpoints come from operator configuration. A model
@@ -1131,7 +1136,7 @@ of its files.
 A build without the `sign` feature cannot check a signature, so a configured
 pin is a startup refusal there rather than a silent pass. The release binaries
 include `sign`. Under `security.egress: closed`, the `url:` and `oci:` fetch
-must match a catalog entry before agentd dials it.
+must match an `http.endpoints` entry before agentd dials it.
 [Write and ship instruction documents](instruction-documents.md) shows how to
 sign, pin and encrypt documents.
 
@@ -1717,9 +1722,8 @@ What holds:
   §5.14.1 amends it).
 - **Documents cannot vouch for a server.** A server any of them declares
   counts as `untrusted_input` beside the legs it names, in the check and at
-  runtime, unless the operator's `kind: mcp` catalog entry it names with
-  `service:`, or whose endpoint it gives, declares tags; `trusted` on it is
-  refused. A document can make a server look more dangerous than the
+  runtime, unless its endpoint matches an operator `mcp.servers` entry, whose
+  tags it then carries; `trusted` on it is refused. A document can make a server look more dangerous than the
   operator did, never less.
 
 - **Workers under a uid of their own.** With `spawn.uid` and `spawn.gid`

@@ -13,8 +13,9 @@
 #
 # Secrets:
 #   OPENAI_API_KEY — the model.
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c qa.yaml)
+#   STAGING_TOKEN — the staging driver's bearer. Scope it to the STAGING
+#                   environment only: a driver that can reach production is an incident
+#                   waiting for a typo.
 #
 # MCP contract — `staging` server: a browser/API driver pointed at the
 # staging deployment (a Playwright-MCP, or a thin wrapper over your API
@@ -54,8 +55,10 @@ store:
 mcp:
   servers:
     # A browser/API driver pointed at staging.
-    - { name: staging, service: staging }
-
+    - name: staging
+      endpoint: https://mcp.staging.beacon.example/mcp
+      auth: { kind: static, token: "{{secret:STAGING_TOKEN}}" }
+      tags: { "*": [sensitive] }
 a2a:
   listen: http://127.0.0.1:8443
   events:

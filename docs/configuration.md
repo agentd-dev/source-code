@@ -435,8 +435,9 @@ nothing more.
 | `intelligence.headers` | map | `{}` | live · op | Extra request headers. A credential-shaped header needs a reference. |
 | `intelligence.auth` | object | — | live · op | A credential provider; see [Credentials](#credentials). Refused at load when the connection cannot send it as a bearer: a `static` credential under a `header` other than `Authorization` (put that in `intelligence.headers`), or a SPIFFE `x509` SVID. Needs the `oauth` build feature, which release binaries carry. |
 | `intelligence.timeout` | duration | `120s` | live · doc | The ceiling on one call. |
+| `intelligence.rate` | rate | — | live · op | Pacing of model calls on this connection, per process: a call waits for a token. |
 | `intelligence.structured_output` | `auto \| prompt` | `auto` | live · doc | How a call whose answer has a JSON Schema is asked: natively where the dialect and schema allow, or in the prompt alone for a server that refuses a response format. The answer is validated either way. `prompt` is refused on a `decisions` provider. |
-| `intelligence.providers.<name>` | object | — | live · op | A further connection: `endpoints`, `dialect`, `token`, `token_file`, `headers`, `auth`, `timeout`, `structured_output`. Egress-checked like `intelligence.endpoints`. |
+| `intelligence.providers.<name>` | object | — | live · op | A further connection: `endpoints`, `dialect`, `token`, `token_file`, `headers`, `auth`, `timeout`, `rate`, `structured_output`. Under `security.egress: closed` the connections declared here and at the top level are the only model endpoints agentd posts to. |
 
 Where a request goes:
 
@@ -518,19 +519,20 @@ The how-to, with the exit codes and gauges each choice produces, is
 
 The `auth` block is the same wherever it appears: `intelligence.auth`,
 `intelligence.providers.<name>.auth`, `mcp.servers[].auth`,
-`services.<name>.auth` and `a2a.peers[].auth`. One mechanism per endpoint,
+`a2a.peers[].auth` and `http.endpoints.<name>.auth`. One mechanism per endpoint,
 named by `auth.kind`.
 
 | Mechanism | Required fields | Optional fields |
 |---|---|---|
 | `static` | `token` (a bearer), or `header` + `value` | — |
-| `oauth2` | `client_id`, or `security.client` and `issuer`; `token_url` or `issuer` — on an MCP server or an MCP catalog entry neither, the server's RFC 9728 metadata naming it; for `grant: device`, `device_authorization_url` or `issuer` (or neither, on an MCP server); for `grant: client_credentials` with a `client_id`, `client_secret` or `client_auth: {method: private_key_jwt}` | `grant` (`device` default, `authorization_code`, `client_credentials`), `scopes`, `audience`, `resource` (`auto`, `omit` or a URI; unset, `auto` on an MCP server or MCP catalog entry, `omit` elsewhere), `authorization_url`, `client_auth` (`method`: `private_key_jwt` default with `key`, `kid`, `assertion_aud`; `client_secret_basic`; `client_secret_post`; with no `client_id`, `assertion_aud` only) |
+| `oauth2` | `client_id`, or `security.client` and `issuer`; `token_url` or `issuer` — on an MCP server neither, the server's RFC 9728 metadata naming it; for `grant: device`, `device_authorization_url` or `issuer` (or neither, on an MCP server); for `grant: client_credentials` with a `client_id`, `client_secret` or `client_auth: {method: private_key_jwt}` | `grant` (`device` default, `authorization_code`, `client_credentials`), `scopes`, `audience`, `resource` (`auto`, `omit` or a URI; unset, `auto` on an MCP server, `omit` elsewhere), `authorization_url`, `client_auth` (`method`: `private_key_jwt` default with `key`, `kid`, `assertion_aud`; `client_secret_basic`; `client_secret_post`; with no `client_id`, `assertion_aud` only) |
 | `aws` | `region`, `service` (for example `bedrock`); for `source: sso`, `sso_start_url`, `account_id`, `role_name` | `source` (`env` default, `static`, `imds`, `irsa`, `sso`) |
 | `spiffe` | for `svid: jwt` (the default), `jwt_svid_file`; for `svid: x509`, `svid_file` + `key_file` | `audience` |
 
 `token`, `value`, `client_secret` and `client_auth.key` must be references in a file. Interactive
 grants are completed with `agentd --login <target>`, where the target is
-`intelligence`, `intelligence:<provider>`, `mcp:<name>` or `service:<name>`.
+`intelligence`, `intelligence:<provider>`, `mcp:<name>`, `a2a:<peer>` or
+`http:<endpoint>`.
 `kind: oauth2`, and any `auth` block on an MCP server, need the `oauth`
 feature. An `oauth2` block with no `client_id` presents agentd's
 [Client ID Metadata Document](authentication.md#client-id-metadata-document)
@@ -546,14 +548,16 @@ live · doc, except where a row says op.
 |---|---|---|---|
 | `mcp.default_timeout` | duration | `60s` | Per-call timeout for a server that sets none. |
 | `mcp.servers[].name` | string | required | Unique; `code` is reserved for code-registered tools. |
-| `mcp.servers[].endpoint` | URL | required unless `service` | `https://host[:port][/path]`, or a loopback `http://`. Reached over Streamable HTTP; agentd spawns no process. |
-| `mcp.servers[].service` | string | — | A `services:` entry to inherit endpoint, credential and tags from. `endpoint`, `auth` and `headers` beside it are refused. |
+| `mcp.servers[].endpoint` | URL | required | `https://host[:port][/path]`, or a loopback `http://`. Reached over Streamable HTTP; agentd spawns no process. Also the match base for an instruction document's servers ([Servers a document declares](#servers-a-document-declares)). |
 | `mcp.servers[].headers` | map | `{}` | Extra headers. A credential-shaped one needs a reference. Headers the MCP client sets itself (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, `Mcp-Param-*`, `Mcp-Session-Id`, `Last-Event-ID`) are refused. |
-| `mcp.servers[].tags` | map: glob → list of `untrusted_input \| sensitive \| egress \| trusted` | `{}` | Capability tags for the Rule of Two. The union applies to every tool of the server. An untagged server counts as `untrusted_input`, in the check and at runtime: its results taint the work that reads them. `trusted` is no leg: it marks a server whose results are not outside text, and changes nothing beside `untrusted_input`. Refused on a delegated server (`auth.trusted_output` says it there) and in an instruction document, whose servers count as `untrusted_input` unless a `services:` entry with tags vouches for them. |
+| `mcp.servers[].tags` | map: glob → list of `untrusted_input \| sensitive \| egress \| trusted` | `{}` | Capability tags for the Rule of Two. The union applies to every tool of the server. An untagged server counts as `untrusted_input`, in the check and at runtime: its results taint the work that reads them. `trusted` is no leg: it marks a server whose results are not outside text, and changes nothing beside `untrusted_input`. Refused on a delegated server (`auth.trusted_output` says it there) and in an instruction document, whose servers count as `untrusted_input` unless they are an operator server ([Servers a document declares](#servers-a-document-declares)), whose tags they carry. |
 | `mcp.servers[].ns` | string | — | A namespace prefix: tools register as `<ns>.<tool>`. |
 | `mcp.servers[].allow` | list of globs | all | Admit only the advertised tools that match. |
 | `mcp.servers[].exclude` | list of globs | `[]` | Never admit these; beats `allow`. |
-| `mcp.servers[].timeout` | duration | `mcp.default_timeout` | Per-call timeout for this server. |
+| `mcp.servers[].timeout` | duration | `mcp.default_timeout` | Per-call timeout for this server; for a `connect: on_use` server, also how long a step waits for it to connect. |
+| `mcp.servers[].rate` | rate | — | Pacing of calls to this server, per process. A call that finds the bucket dry fails; a workflow step's `retry:` can absorb it. |
+| `mcp.servers[].breaker` | `{failures, cooldown}` | — | The default breaker for `mcp.tool` steps naming this server. A step's own `breaker` wins. |
+| `mcp.servers[].connect` | `boot \| on_use` | `boot` | When the server is dialed. `boot` dials it at startup. `on_use` dials it the first time something needs it: a workflow step naming it (`mcp.tool`, `mcp.resource`), a resource wait or `subscribe` start on it, or an instruction document that declares it. Once connected it stays connected. See [Connecting on use](#connecting-on-use). |
 | `mcp.servers[].tasks` | `auto \| off` | `auto` | Whether the server may answer a long tool call with an MCP task (SEP-2663). `auto` declares the extension on 2026-07-28 connections, on the calls that have a time limit (a turn's, a workflow step's, a store adapter's); `off` never does, so the server answers every call inline. See [Long-running tool calls](connect-mcp.md#long-running-tool-calls). |
 | `mcp.servers[].auth` | object | — | A credential provider; see [Credentials](#credentials). With `grant: id_jag` — or `grant: token_exchange`, for a server behind the person's own IdP — the server is reached with an enrolled person's grant or a caller's own token, by the supervisor alone; its fields are under [Enterprise-managed authorization](authentication.md#enterprise-managed-authorization), restart · op, and a served document may set none of them. Needs `xaa`. |
 | `mcp.servers[].oauth` | `{client_id, client_secret, token_url, scope}` | — | An OAuth client-credentials shortcut. Needs `oauth`. |
@@ -565,6 +569,68 @@ live · doc, except where a row says op.
 down at startup is dialed again in the background and joins when it answers.
 The how-to is [Connect MCP servers](connect-mcp.md); protocol support is
 [MCP support reference](mcp-reference.md).
+
+```yaml
+# fragment: under mcp:
+servers:
+  - name: billing
+    endpoint: https://billing.internal/mcp
+    auth: {kind: static, token: "{{secret:BILLING_MCP_TOKEN}}"}
+    headers: {X-Env: prod}
+    tags: {"*": [sensitive]}
+    allow: [charge_lookup, "invoice_*"]
+    exclude: [invoice_purge]
+    rate: "60/1m"
+    breaker: {failures: 3, cooldown: 30s}
+    timeout: 30s
+  - name: deepwiki
+    endpoint: https://mcp.deepwiki.com/mcp
+    tags: {"*": [untrusted_input]}
+    connect: on_use
+```
+
+### Connecting on use
+
+A `connect: on_use` server is not dialed at boot. It is dialed off the loop,
+with the backoff of a server that was down at boot, the first time something
+needs it:
+
+- a workflow step that names it (`mcp.tool`, `mcp.resource`, with
+  `server: <name>`). The step waits, durably like a rate wait, until the
+  server connects, and fails if it has not connected within the server's
+  `timeout` (or `mcp.default_timeout`);
+- a `wait {on: resource}` or a `subscribe` start on it;
+- an instruction document that declares it: it is dialed right after the
+  load, and its tools reach the turns after it connects.
+
+Once connected it stays connected. Its tools are offered to a turn only once
+it is connected. The lethal-trifecta check at load counts its tags whether it
+is connected yet or not, so approving it is judged at load, not at first use.
+
+### Servers a document declares
+
+An instruction document's `:::mcp{id=… src=…}`, or an `mcp.servers` entry in
+its `:::config`, whose `src` or `endpoint` matches an operator
+`mcp.servers` endpoint **is** that operator server. A URL matches when its
+scheme and `host[:port]` are the operator endpoint's and its path extends the
+operator endpoint's path on a `/` segment boundary
+(`https://mcp.deepwiki.com/mcp` matches `https://mcp.deepwiki.com/mcp` and
+`https://mcp.deepwiki.com/mcp/x`, not `https://mcp.deepwiki.com/mcpx`).
+
+- There is one connection, under the operator's name, with the operator's
+  `auth`, `headers`, `tags` and tool ceiling.
+- The document's `tools=` or `allow` only narrows the server's `allow`: a
+  pattern outside the operator's ceiling is dropped with a warning. Its
+  `deny` or `exclude` adds to the operator's `exclude`.
+- The document's workflow steps that name the document's id are pointed at
+  the operator's server name.
+- An `on_use` server a document declares is dialed right after the load.
+
+A document server that matches no operator server is held as text with a
+`host-policy` warning under `security.egress: closed`; the load is not
+refused. Under `egress: open` it is a server of its own, counted
+`untrusted_input`. A document's `:::agent`, or an `a2a.peers` entry in its
+`:::config`, follows the same rule against the operator's `a2a.peers`.
 
 ### MCP Events
 
@@ -611,61 +677,81 @@ no `webhooks.tls.client_ca`, and a credential on the server. The how-to is
       rate: "30/1m"
 ```
 
-## services
+## http
 
-The service catalog: the external services this deployment may use, named once.
-All `services` paths are live · op.
+The plain-HTTP endpoints agentd may reach: the `http` workflow step, and,
+under `security.egress: closed`, every other HTTP request agentd makes that is
+not MCP, a model or A2A. Needs no build feature. All `http` paths are
+live · op.
 
 | Path | Type | Default | What it does |
 |---|---|---|---|
-| `services.<name>.kind` | `mcp \| intelligence \| peer \| http \| company` | `mcp` | The surface the entry serves. Matching is by kind. `company` needs the `companies` feature; see [Companies](#companies). |
-| `services.<name>.endpoint` | URL | required | The connection URL, and the match base (scheme, authority and path prefix on segment boundaries). |
-| `services.<name>.auth`, `.headers`, `.timeout` | — | — | Connection settings consumers inherit. |
-| `services.<name>.tags` | map | `{}` | Authoritative tags, unioned into every server whose endpoint matches, referencing or not. `trusted` is refused on a `kind: company` entry. |
-| `services.<name>.allow` | list of globs | all | The tool ceiling; a consumer may only narrow it. |
-| `services.<name>.exclude` | list of globs | `[]` | Never admitted, for every consumer. |
-| `services.<name>.rate` | rate | — | Pacing toward the service, shared by every consumer in each process. |
-| `services.<name>.methods` | list | any | `kind: http` only: the methods `http` steps may use. |
-| `services.<name>.breaker` | `{failures, cooldown}` | — | `kind: mcp` only: the default breaker for `mcp.tool` steps against it. |
-| `services.<name>.hosts` | list of host globs | the endpoint's host, the document's `organization.domain`, the subdomains of both, the issuer's host | `kind: company` only: every URL the Company's documents name must be on one of these hosts (`example.com`, `*.example.com`), and its host a plain one — no userinfo, and no `\`, which a browser reads as `/`. |
-| `services.<name>.allow_private` | bool | `false` | `kind: company` only: admit loopback, private and link-local addresses. |
-| `services.<name>.interfaces` | list of `mcp \| agent \| openapi` | `[mcp]` | `kind: company` only: the Company's interfaces agentd uses — its MCP servers, its agent (conversations, and the stream `company.<name>`), its OpenAPI APIs. See [A Company's agent and its APIs](#a-companys-agent-and-its-apis). |
-| `services.<name>.mcp_names` | map of an MCP API `url` to a server name | — | `kind: company` only: names the Company's MCP servers when it lists more than one. A company entry whose `interfaces` lack `mcp` refuses it, and `rate`, `allow` and `exclude` with it: they shape only the Company's MCP servers. |
-| `services.<name>.privacy` | `strict \| standard` | `strict` | `kind: company` only: under `strict` a Company sees none of agentd's correlators. Its calls carry their idempotency key keyed under the (User, Company) pair's secret and a trace of their own per unit of work and Company — no other `agent/*` `_meta` key, no `tracestate` — and the handshake and tool list carry no trace context and no `clientInfo.title`. `standard` sends agentd's usual correlators, the instance label and the process trace included, and is logged at boot (`company.privacy.standard`). |
-| `services.<name>.sign_in` | list of `device \| direct` | `[]` | `kind: company` only: the sign-in types agentd may start with the User, the first the Company offers taken. `direct` needs `security.companies.client.serve`. `mediated` is refused: the User's password would pass through a gate, whose answer agentd keeps in the task's history and hands to the model. Needs `security.companies.seal_key` and `scopes`. |
-| `services.<name>.scopes` | list of scopes | `[]` | `kind: company` only: the most account scopes agentd asks the User for there. A sign-in asks for what is needed within these and what its type grants; a held Account Token is used for no more, and one that grants none of these — or any, once the entry lists no `sign_in` — is not used: requests there are signed out, and the token is kept until the User signs out. |
-| `services.<name>.api_allow` | list of `METHOD /path-template` | none | `kind: company` only: the OpenAPI operations agentd may call there, each as the description's `paths` names it (`GET /orders/{order_id}`; a parameter matches another of any name). An operation outside it, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, named from its entry ([operation tools](#a-companys-operation-tools)). An operation listed twice, or two entries that make one tool name, are refused. Needs `openapi` in `interfaces`. |
-| `services.<name>.api_names` | map of an OpenAPI API `url` to a server name | — | `kind: company` only: names the server a Company's operation tools are named under, by the URL its OpenAPI API is listed at. Without it the server is named after the entry, or `<entry>_api` when the entry's own MCP server has that name, which needs the Company to list one OpenAPI API. Needs `openapi` in `interfaces` and an operation in `api_allow`. |
-| `services.<name>.context` | `{locale, time_zone, share_availability}` | inherits | `kind: company` only: what this Company's conversations share of the User's situation, each field over `security.companies.context`. Needs `agent` in `interfaces`. |
+| `http.endpoints.<name>.endpoint` | URL | required | The base URL, and the match base: a request matches when its scheme and `host[:port]` are the endpoint's and its path extends the endpoint's path on a `/` segment boundary. |
+| `http.endpoints.<name>.auth` | object | — | A credential provider; see [Credentials](#credentials). An interactive grant logs in with `agentd --login http:<name>`. |
+| `http.endpoints.<name>.headers` | map | `{}` | Headers sent on every request to it, under a step's own. A credential-shaped one needs a reference. |
+| `http.endpoints.<name>.methods` | list of methods | any | The methods `http` steps may use against it. |
+| `http.endpoints.<name>.rate` | rate | — | Pacing of requests to it, per process. |
+| `http.endpoints.<name>.timeout` | duration | the step's default | The default timeout of a request to it; a step's own `timeout` wins. |
 
-With `security.egress: closed`, every MCP dial, intelligence endpoint
-(top-level and providers; `mock:` aside), A2A peer, `http` step, HTTP store,
-workflow URL and A2A push target must match an entry of its kind.
-`observability.otel.endpoint` is the one destination it does not cover.
-`--validate-config` prints each consumer's effective endpoint, tool lists and
-tags.
+An `http` step uses the entry its URL matches: the `methods` ceiling, the
+entry's headers under the step's own, its `auth`, its `timeout` default and
+its `rate`. A step may name the entry with `endpoint`; `url` may then be a
+path relative to the entry's endpoint.
 
 ```yaml
-services:
-  billing:
-    endpoint: https://billing.internal/mcp
-    auth: {kind: static, token: "{{secret:BILLING_MCP_TOKEN}}"}
-    tags: {"*": [sensitive]}
-    allow: [charge_lookup, "invoice_*"]
-    rate: "60/1m"
-mcp:
-  servers:
-    - {name: money, service: billing, allow: [charge_lookup]}
-security:
-  egress: closed
+http:
+  endpoints:
+    github:
+      endpoint: https://raw.githubusercontent.com
+      auth: {kind: static, token: "{{secret:GITHUB_TOKEN}}"}
+      headers: {Accept: text/plain}
+      methods: [GET]
+      rate: "30/1m"
+      timeout: 20s
+workflows:
+  - name: readme
+    steps:
+      s: {kind: manual}
+      get: {kind: http, depends_on: [s], endpoint: github, url: /owner/repo/main/README.md}
+      f: {kind: finish, depends_on: [get]}
 ```
 
-Under `closed`, an intelligence endpoint needs a `kind: intelligence` entry of
-its own. The hardening guide is [Harden a deployment](harden.md).
+With `security.egress: closed`, an `http` step, a workflow or instruction
+document fetched by `url:`, a skill fetched by `src`, `store.http` and a
+stream forward each need a matching `http.endpoints` entry. How each kind of
+destination is checked is [Security model](security.md#operator-endpoints-and-closed-egress); the
+hardening guide is [Harden a deployment](harden.md).
 
-### Companies
+## companies
 
-A `kind: company` entry declares a Company agentd acts at for its one User,
+The Companies agentd acts at for its one User. Each entry is a name and its
+settings. Needs the `companies` feature, which release binaries carry. All
+`companies` paths are live · op, but adding, removing or changing an entry is
+a restart.
+
+| Path | Type | Default | What it does |
+|---|---|---|---|
+| `companies.<name>.endpoint` | URL | required | `https://<host>`, the domain whose `/.well-known/poppy.json` is read. A path is refused. |
+| `companies.<name>.tags` | map | `{"*": [untrusted_input, egress]}` | Trifecta tags for the Company's tools. `trusted` is refused. |
+| `companies.<name>.allow` | list of globs | all | The tool ceiling over the Company's MCP servers. |
+| `companies.<name>.exclude` | list of globs | `[]` | Never admitted. |
+| `companies.<name>.rate` | rate | — | Pacing of calls to the Company's MCP servers, per process. |
+| `companies.<name>.timeout` | duration | — | The ceiling on one request to the Company. |
+| `companies.<name>.hosts` | list of host globs | the endpoint's host, the document's `organization.domain`, the subdomains of both, the issuer's host | Every URL the Company's documents name must be on one of these hosts (`example.com`, `*.example.com`), and its host a plain one — no userinfo, and no `\`, which a browser reads as `/`. |
+| `companies.<name>.allow_private` | bool | `false` | Admit loopback, private and link-local addresses. |
+| `companies.<name>.interfaces` | list of `mcp \| agent \| openapi` | `[mcp]` | The Company's interfaces agentd uses — its MCP servers, its agent (conversations, and the stream `company.<name>`), its OpenAPI APIs. See [A Company's agent and its APIs](#a-companys-agent-and-its-apis). |
+| `companies.<name>.mcp_names` | map of an MCP API `url` to a server name | — | Names the Company's MCP servers when it lists more than one. An entry whose `interfaces` lack `mcp` refuses it, and `rate`, `allow` and `exclude` with it: they shape only the Company's MCP servers. |
+| `companies.<name>.privacy` | `strict \| standard` | `strict` | Under `strict` a Company sees none of agentd's correlators. Its calls carry their idempotency key keyed under the (User, Company) pair's secret and a trace of their own per unit of work and Company — no other `agent/*` `_meta` key, no `tracestate` — and the handshake and tool list carry no trace context and no `clientInfo.title`. `standard` sends agentd's usual correlators, the instance label and the process trace included, and is logged at boot (`company.privacy.standard`). |
+| `companies.<name>.sign_in` | list of `device \| direct` | `[]` | The sign-in types agentd may start with the User, the first the Company offers taken. `direct` needs `security.companies.client.serve`. `mediated` is refused: the User's password would pass through a gate, whose answer agentd keeps in the task's history and hands to the model. Needs `security.companies.seal_key` and `scopes`. |
+| `companies.<name>.scopes` | list of scopes | `[]` | The most account scopes agentd asks the User for there. A sign-in asks for what is needed within these and what its type grants; a held Account Token is used for no more, and one that grants none of these — or any, once the entry lists no `sign_in` — is not used: requests there are signed out, and the token is kept until the User signs out. |
+| `companies.<name>.api_allow` | list of `METHOD /path-template` | none | The OpenAPI operations agentd may call there, each as the description's `paths` names it (`GET /orders/{order_id}`; a parameter matches another of any name). An operation outside it, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, named from its entry ([operation tools](#a-companys-operation-tools)). An operation listed twice, or two entries that make one tool name, are refused. Needs `openapi` in `interfaces`. |
+| `companies.<name>.api_names` | map of an OpenAPI API `url` to a server name | — | Names the server a Company's operation tools are named under, by the URL its OpenAPI API is listed at. Without it the server is named after the entry, or `<entry>_api` when the entry's own MCP server has that name, which needs the Company to list one OpenAPI API. Needs `openapi` in `interfaces` and an operation in `api_allow`. |
+| `companies.<name>.context` | `{locale, time_zone, share_availability}` | inherits | What this Company's conversations share of the User's situation, each field over `security.companies.context`. Needs `agent` in `interfaces`. |
+
+With `security.egress: closed`, every Company agentd reaches is a
+`companies` entry.
+
+A `companies` entry declares a Company agentd acts at for its one User,
 under the Personal Agent Protocol draft agentd is pinned to
 ([RFC 0047](../rfcs/0047-acting-at-companies-for-a-person.md); the
 `companies` feature, which release binaries carry). `endpoint` is
@@ -716,7 +802,7 @@ to eight accounts at one Company, each named by a label a sign-in gives it
 Token and a Session of its own; the label never reaches the Company
 ([Several accounts](act-at-companies.md#several-accounts)).
 
-#### A Company's agent and its APIs
+### A Company's agent and its APIs
 
 An entry whose `interfaces` list `agent` talks with the Company's agent, in the
 one conversation protocol the draft defines, `poppy`; one that lists
@@ -814,9 +900,8 @@ security:
   companies:
     context: {locale: en-US, time_zone: America/Los_Angeles}
     limits: {conversations: 8}
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://example.com
     interfaces: [agent, openapi]
     api_allow: ["GET /orders/{order_id}", "POST /orders/{order_id}/exchanges"]
@@ -831,7 +916,7 @@ workflows:
       f: {kind: finish, depends_on: [ask, order], status: completed}
 ```
 
-#### A Company's operation tools
+### A Company's operation tools
 
 Each operation `api_allow` lists that the Company's description declares is
 a tool of its own (RFC 0047 §9, P5a), offered once the description is read —
@@ -893,9 +978,8 @@ the supervisor, a subagent granted the server handed their definitions.
 
 ```yaml
 # fragment: a Company's MCP server, and the tools of its API's operations
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://example.com
     interfaces: [mcp, openapi]
     api_allow: ["GET /orders/{order_id}", "POST /orders/{order_id}/exchanges"]
@@ -910,7 +994,7 @@ workflows:
       f: {kind: finish, depends_on: [read], status: completed}
 ```
 
-#### A Company's operations
+### A Company's operations
 
 With `security.companies.client.extensions: [operations]` the client metadata
 document lists the draft's Operations extension, version 1, and a Company may
@@ -985,16 +1069,15 @@ security:
         when: "terms.price_difference.currency == 'USD' && double(terms.price_difference.amount) <= 20.0"
         expires: 2026-12-31T00:00:00Z
         uses: 3
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://example.com
 ```
 
-A company entry refuses `auth`, `headers`, `methods` and `breaker`: the
-protocol defines how agentd authenticates there. Its `tags` default to
-`{"*": [untrusted_input, egress]}`. Adding, removing or changing a company
-entry is a restart (`config.reload.restart_required`). It needs
+A company entry takes no `auth` or `headers`: the protocol defines how agentd
+authenticates there. Its `tags` default to `{"*": [untrusted_input, egress]}`.
+Adding, removing or changing a company entry is a restart
+(`config.reload.restart_required`). It needs
 `security.companies.client`, and a store that keeps the User ID: `store.kind`
 `none` and `memory` are refused, and a remote store (`mcp`, `http`) needs
 `security.companies.seal_key`. Once the store's User IDs are sealed, every
@@ -1011,9 +1094,8 @@ security:
     client:
       id: https://agent.example/companies/client.json
       name: Dana's agent
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://example.com
     hosts: ["example.com", "*.example.com"]
     allow: ["search*", "order_*"]
@@ -1024,9 +1106,8 @@ services:
 security:
   companies:
     seal_key: "{{secret-file:/run/secrets/agentd-company-seal}}"
-services:
+companies:
   shop:
-    kind: company
     endpoint: https://example.com
     sign_in: [device]
     scopes: ["poppy:read", "poppy:write"]
@@ -1069,12 +1150,15 @@ The template language:
 | `{{! comment }}` | comment |
 
 An expression is a path first and CEL second. Bare paths (`{{instance}}`,
-`{{#each services}}`) work in any build; anything more needs the `cel`
+`{{#each endpoints}}`) work in any build; anything more needs the `cel`
 feature, with two helpers CEL lacks: `take(list, n)` and `join(list, sep)`.
 The data names are `instance`, `instruction`, `agents_md`, `workflows`,
-`services`, `streams`, `templates`, `skills`, `peers`, `signals`, `memory`
-and `tools.internal`. `agents_md` is the list of `agent.workspace`'s
-AGENTS.md files, root first, each `{path, text}`.
+`endpoints`, `egress_closed`, `streams`, `templates`, `skills`, `peers`,
+`signals`, `memory` and `tools.internal`. `agents_md` is the list of
+`agent.workspace`'s AGENTS.md files, root first, each `{path, text}`.
+`endpoints` is the operator's `mcp.servers`, `a2a.peers` and
+`http.endpoints`, each `{name, kind, tags, tags_text, tools, tools_text,
+rate}`, where `kind` is `mcp`, `peer` or `http`.
 
 ```yaml
 # fragment: under context:
@@ -1082,9 +1166,9 @@ template: |
   You are {{instance}}. {{#if egress_closed}}Egress is closed.{{/if}}
   ## Instruction
   {{instruction}}
-  {{#if services}}
-  ## Services
-  {{#each take(services, 16)}}- {{this.name}}{{#if this.tags}} [{{join(this.tags, ", ")}}]{{/if}}
+  {{#if endpoints}}
+  ## Endpoints
+  {{#each take(endpoints, 16)}}- {{this.name}} ({{this.kind}}){{#if this.tags}} [{{join(this.tags, ", ")}}]{{/if}}
   {{/each}}{{/if}}
 templates:
   minimal: "You are {{instance}}: {{instruction}}"
@@ -1257,6 +1341,7 @@ is [A2A API reference](a2a-reference.md).
 | `a2a.introspection.enabled` | bool | `false` | live · op | Serve the operator introspection ops (transcripts, step detail, the log ring). `admin.set` can change it at runtime. |
 | `a2a.push.enabled` | bool | `false` | live · op | Accept push-notification configs and deliver task updates to them. |
 | `a2a.push.allow_private` | bool | `false` | live · op | Permit push targets on private or loopback addresses. |
+| `a2a.push.allow` | list of URLs | `[]` | live · op | Push targets agentd may deliver to beyond its peers. Under `security.egress: closed` a push target must match a peer's endpoint or an entry here (scheme, `host[:port]`, path prefix on a segment boundary). |
 | `a2a.resource` | URI | — | restart · op | The resource identifier enterprise access tokens are issued for (their `aud`), canonical, on the listener's origin; its RFC 9728 metadata is served under it. Needs `a2a.inbound_tokens`. |
 | `a2a.inbound_tokens[]` | list | `[]` | restart · op | The authorization servers whose JWT access tokens (RFC 9068) name a caller: `{issuer, name?, profile?, audiences?, jwks_uri?, algs?, typ?, subject_claim?, tenant_claim?, clients, require_user_token?, max_token_age?, max_chain_depth?, flow?, scopes_to_skills?}`. A TCP listener and `a2a.resource` only. Needs `a2a` and `oauth` ([Enterprise access tokens](a2a.md#enterprise-access-tokens); every field in the [A2A API reference](a2a-reference.md#listener-settings)). |
 
@@ -1317,10 +1402,11 @@ listener.
 | Path | Type | Default | Class | What it does |
 |---|---|---|---|---|
 | `a2a.peers[].name` | string | required | live · doc | The peer's name, unique. |
-| `a2a.peers[].endpoint` | `https://`, loopback `http://`, or `unix:///path` | required unless `service` | live · doc | Where the peer listens. |
-| `a2a.peers[].service` | string | — | live · doc | A `kind: peer` service entry to inherit from. |
+| `a2a.peers[].endpoint` | `https://`, loopback `http://`, or `unix:///path` | required | live · doc | Where the peer listens. Also the match base for a document's peers, as for [servers a document declares](#servers-a-document-declares). |
 | `a2a.peers[].headers` | map | `{}` | live · doc | Extra headers; credentials as references. |
-| `a2a.peers[].auth` | object | — | live · doc | A credential provider. |
+| `a2a.peers[].auth` | object | — | live · doc | A credential provider. An interactive grant logs in with `agentd --login a2a:<name>`. |
+| `a2a.peers[].rate` | rate | — | live · op | Pacing of sends to this peer, per process. |
+| `a2a.peers[].timeout` | duration | — | live · op | The per-request timeout to this peer. |
 | `a2a.peers[].client_cert`, `.client_key` | paths | — | live · doc | A client certificate for an mTLS peer. |
 
 The how-to is [Connect agents over A2A](connect-agents.md).
@@ -1522,7 +1608,7 @@ reload swaps whole or not at all ([Reload classes](#reload-classes)).
 | Path | Type | Default | What it does |
 |---|---|---|---|
 | `security.allow_trifecta` | bool | `false` | Downgrade the lethal-trifecta refusals to an audited warning. Refused from a discovered config. |
-| `security.egress` | `open \| closed` | `open` | `closed` refuses any outbound destination with no matching `services:` entry. |
+| `security.egress` | `open \| closed` | `open` | `closed` refuses any outbound destination the operator's sections do not declare: an MCP dial outside `mcp.servers`, a model endpoint outside `intelligence`, a peer or push target outside `a2a.peers` and `a2a.push.allow`, any other HTTP request outside `http.endpoints`, a Company outside `companies`. `observability.otel.endpoint` is the one exception. |
 | `security.tls_ca` | path | the bundled roots only | Extra PEM CA certificates trusted for every outbound `https://` dial, added to the bundled roots. Needs `tls`. |
 | `security.workflows.immutable` | bool | `false` | Refuse `workflow.create`, `update` and `delete` at runtime. |
 | `security.policies[]` | list | `[]` | Ordered verdicts on a tool call; the first match wins, no match is allow. |
@@ -1704,7 +1790,7 @@ refuses the reload with `config.reload.restart_required`:
   `liveness_interval`
 - a per-person operator's `a2a.principals` rule, added, removed or changed,
   while a delegation is configured
-- a `services` entry of `kind: company`, added, removed or changed
+- a `companies` entry, added, removed or changed
 - an `mcp.servers` entry of `grant: id_jag` or `token_exchange`, added,
   removed or changed
 
@@ -1716,7 +1802,7 @@ Every other path is applied live, as follows:
 | `intelligence.routes` | Read as each turn is launched; a turn routed to a model the reload removed runs on `roles.turn`. |
 | `agent.instruction` | Re-read, through the servers the reload would run on, and its machinery folded again. A resource that cannot be read refuses the reload. |
 | `agent.workspace` | Its AGENTS.md files read again; the next turn's prompt carries them. A file the load cannot take refuses the reload. |
-| `mcp.servers` | Added or changed servers are dialed beside the running set; unchanged ones keep their connection; removed ones disconnect when the reload applies. A server is unchanged only when everything its dial reads is (endpoint, headers, `auth`, `oauth`, `aauth`, `service`, the service's `rate`, `timeout`), so a rotated credential re-dials it and a tags-only change does not. |
+| `mcp.servers` | Added or changed servers are dialed beside the running set; unchanged ones keep their connection; removed ones disconnect when the reload applies. A server is unchanged only when everything its dial reads is (endpoint, headers, `auth`, `oauth`, `aauth`, `rate`, `timeout`), so a rotated credential re-dials it and a tags-only change does not. An added or changed `connect: on_use` server nothing has needed yet is not dialed by the reload. |
 | `tools`, `knowledge`, `search`, `skills` | The tool registry is rebuilt; the skills sources are listed again and both skills folders read again. A context keeps the skill bodies it loaded of the skills the new catalogue holds; a server's skill whose source was removed, or no longer admits it, is unloaded (`skills.unloaded`). |
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |
 | `a2a.principals` | Recompiled and swapped into the live listener, so a demotion or a rotated `bearer_ref` applies to the next request. |
@@ -1791,7 +1877,7 @@ inline.
 | `a2a.principals[].match.bearer_ref` | `config file: a2a.principals[0].match.bearer_ref carries an inline credential; …` |
 | a webhook verifier's `bearer`, `header.equals` and `hmac.secret`: `webhooks.default_auth`, and the `auth` of every `webhook` start and webhook wait | `config file: workflows[0].steps.hook.auth.hmac.secret carries an inline credential; …` |
 | every `auth.token`, `auth.client_secret`, `auth.value`, `auth.client_auth.key` | `<where>: auth.token carries an inline credential; use a {{secret:…}} reference` |
-| a credential-shaped header (`Authorization` and similar) in `intelligence.headers`, a provider's, an MCP server's, a peer's or `store.http.headers` | `intelligence.headers['authorization'] looks like a credential but has an inline value; …` |
+| a credential-shaped header (`Authorization` and similar) in `intelligence.headers`, a provider's, an MCP server's, a peer's, an `http.endpoints` entry's or `store.http.headers` | `intelligence.headers['authorization'] looks like a credential but has an inline value; …` |
 
 Credential values never reach the logs; `--effective-config` shows them as
 `"<redacted>"` and a reference as written.

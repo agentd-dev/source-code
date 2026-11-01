@@ -522,9 +522,9 @@ instruction over MCP:
 - **An allow-list.** `argv[0]` matched exactly: `git, go, gofmt, ls, cat,
   grep, sed, rm`. No shell (`bash -c` is not on the list), no package
   manager, no network tool.
-- **No egress beyond the model.** `security.egress: closed` with a catalogue
-  of two: the model and the mirror; any other destination agentd would dial
-  is refused at load. The demo's handbook declares no server of its own.
+- **No egress beyond the model.** `security.egress: closed`, and the config
+  declares two endpoints: the model and the mirror; any other destination
+  agentd would dial is refused at load. The demo's handbook declares no server of its own.
   What a command may reach is the host's to decide: `GOPROXY=off` and
   `GOTOOLCHAIN=local` keep `go` off the network, and no allowed program
   opens a connection.
@@ -595,13 +595,17 @@ asks DeepWiki and writes `docs/deps/<dep>.html` with `exec` (`mkdir`, then
 agentd -c examples/demos/coder.yaml -c examples/demos/coder.release.yaml 2> >(tee "$AGENTD_DEMO_HOME/coder.log" >&2)
 ```
 
-`coder.release.yaml` adds DeepWiki and `raw.githubusercontent.com` to the services
-catalogue (egress stays closed), and `mkdir` and `tee` to the commands `exec`
-may run, and sets `security.allow_trifecta: true`: DeepWiki's answers are
+`coder.release.yaml` declares DeepWiki as an MCP server with
+`connect: on_use` and `raw.githubusercontent.com` as an `http.endpoints`
+entry (egress stays closed), adds `mkdir` and `tee` to the commands `exec` may
+run, and sets `security.allow_trifecta: true`: DeepWiki's answers are
 untrusted text and `exec` writes the repository and runs `git`, so without it
-agentd refuses the release as a lethal trifecta. A server the catalogue does not name refuses the release's reload
-whole, and the running agent keeps what it had; a skill on an uncatalogued
-host is left out with a warning.
+agentd refuses the trifecta at start. DeepWiki is not dialed until the
+handbook's `:::mcp` names its endpoint; that block then is the operator's
+server, with its tags, and its `tools=` narrows the server's tools. A
+document server that matches no declared server is held as text with a
+`host-policy` warning and the reload goes on without it; a skill on an
+undeclared host is left out with a warning.
 
 ## Demo (e): a home that follows instructions
 

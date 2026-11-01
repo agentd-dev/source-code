@@ -259,10 +259,9 @@ usually are not:
 - **An MCP server for each integration.** The helpdesk, GitHub, the CRM,
   billing, email, a social cross-poster, web search, Twilio, your logs. These
   are the hands; agentd ships no tools of its own, so every capability is a
-  declared, tagged, auditable dependency. Each integration is declared once in
-  a shared service catalog with its endpoint, credential and authoritative
-  tags. Where a server offers more verbs than a role needs, the catalog narrows
-  it: `allow: [get_*, list_*, query_*, restart_service, scale_pool,
+  declared, tagged, auditable dependency. Each role declares the servers it
+  uses, with their endpoint, credential and tags. Where a server offers more
+  verbs than a role needs, the entry narrows it: `allow: [get_*, list_*, query_*, restart_service, scale_pool,
   rollback_deploy]` on the SRE's infrastructure server, so the destructive
   verbs are absent, not discouraged. ([Connect MCP servers](connect-mcp.md))
 - **A place to run.** Eleven small processes on one box is fine; state is files
@@ -319,7 +318,7 @@ written in YAML you can diff.
 - [`examples/startup/`](../examples/startup/README.md) — the eleven
   configurations, each validated against the binary, annotated inline.
 - [Use cases](use-cases.md) — each mechanism here as a shape of its own.
-- [Security model](security.md) — the Rule of Two, tags and the service
-  catalog.
+- [Security model](security.md) — the Rule of Two, tags and closed
+  egress.
 - [The hiring example](../examples/hiring/README.md) — the same split at two
   instances instead of eleven, with mTLS between them.

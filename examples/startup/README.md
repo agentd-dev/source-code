@@ -53,7 +53,7 @@ flowchart TD
 | **Signals** | the incident run parks on `resolved/<alert_id>` until the all-clear webhook fires it (`sre`); each sales deal parks on `reply/<lead_id>` between cadence touches; marketing threads park on `mkt-reply/<person_id>`. A `wait {on: signal}` is durable — restarts don't lose a 10-day wait — and a deadline is an expected branch: `on_timeout: <step>` routes escalation (`sre` pages the CTO, `marketing` closes the file). The webhook→signal relays are ONE FIELD on the webhook start (`signal: "resolved/{{ body.alert_id }}"`). |
 | **Workflows** | everywhere; the richest DAGs are `engineering/fix-bug` (agent → CI signal → switch → QA delegate), `finance/dunning` (delegate → durable sleep → check → switch → human gate), `sales/deal` (a month-long run per deal). |
 | **Event streams** | `support/escalations` decouples triage from follow-through; `sre/incidents` replays every incident through the postmortem desk exactly once; `finance/ledger` is the journal the monthly close reads; `outbox/sent` is the audit ledger of everything the company ever said. |
-| **MCP servers + the service catalog** | one per integration, declared ONCE in [`services.yaml`](services.yaml) (RFC 0037) with its endpoint, shared credential, **authoritative trifecta tags** and tool ceiling (infra's `allow:` names the safe verbs only); each desk holds a two-line `service:` reference it can only narrow. |
+| **MCP servers** | one per integration, declared in the desk that uses it, with its endpoint, credential, **trifecta tags** and tool ceiling (infra's `allow:` names the safe verbs only; github's `exclude:` drops the destructive ones). Each desk's file holds only its own servers, so its trifecta check sees exactly what it can reach. |
 | **Typed A2A commands** | every cross-desk call a schema can hold uses `command:` + `args:` — the wire DataPart the receiving `a2a` start matches on, checked against its declared `schema:` at the listener (a malformed bug report is refused synchronously, naming the field). Judgment asks (the chief of staff standup questions) stay prose on purpose. |
 | **Durable queues** | the content calendar is a `memory.push`/`memory.shift` array — the daily slot pops one item as a data step, no model call; `human.asked` events turn every waiting approval into an email through the outbox (`finance/gate-notifier`). |
 | **Conversational experience** | every instance sets `a2a.events.enabled` — `agentd-tui --endpoint http://127.0.0.1:<port>` opens a chat with that colleague. The chief-of-staff's `cos.brief` command answers "what's happening?" with live answers from every desk. |
@@ -113,20 +113,18 @@ unplugged.
 | support-l1 | 8450 | 9450 |
 | support-backoffice | 8451 | — |
 
-## Secrets, services, and what each must be able to do
+## Secrets, servers, and what each must be able to do
 
-**[`services.yaml`](services.yaml) is the machine-checkable inventory.** One
-catalog entry per external service — endpoint, the ONE shared credential
-(an env var behind `{{secret:NAME}}`, resolved at startup, redacted in
-logs), the authoritative trifecta tags no desk can under-declare, and the
-tool ceiling no desk can widen. Reviewing what this company can touch means
-reading that one file; rotating a credential is a one-line diff there. What
-stays per-desk: `OPENAI_API_KEY` and each desk's daily token budget (the
-payroll), the webhook signing secrets (`*_WEBHOOK_SECRET` — they belong to
-the desks' inbound routes, not to outbound services), and each header's MCP
-tool contract (what the workflows rely on the server exposing). Uncomment
-`security: { egress: closed }` to turn the catalog from authority into
-allow-list — every uncatalogued dial then refuses at startup.
+**Each desk's `mcp.servers` is its machine-checkable inventory.** Every
+server entry carries its endpoint, its credential (an env var behind
+`{{secret:NAME}}`, resolved at startup, redacted in logs), its trifecta tags
+and its tool ceiling. Reviewing what a desk can touch means reading its
+`mcp:` block; each desk header lists the secrets it needs and how narrow each
+token must be. A server two desks share (the CRM, for sales and marketing) is
+declared in both, the same way. Uncomment `security: { egress: closed }` in
+a desk to turn its sections into an allow-list: every MCP dial must then
+match one of its `mcp.servers`, every model call its `intelligence`
+endpoint, every peer its `a2a.peers`, and anything else refuses.
 
 **The webhook-signature caveat, once:** agentd verifies a generic HMAC of the
 raw body against a named header. GitHub's `X-Hub-Signature-256` matches that
@@ -140,15 +138,14 @@ not noise.
 
 ## Running it
 
-Each desk is one instance; every launch layers the shared catalog first
-(`services.yaml` merges in front — RFC 7396, later files win per leaf).
-Export the secrets the catalog and desk headers name, then:
+Each desk is one instance and one file. Export the secrets the desk headers
+name, then:
 
 ```console
 $ cd examples/startup
 $ for f in support engineering qa sre sales finance outbox chief-of-staff \
            marketing support-l1 support-backoffice; do
-    agentd -c services.yaml -c "$f.yaml" &
+    agentd -c "$f.yaml" &
   done
 ```
 
@@ -172,7 +169,7 @@ without a provider:
 ```console
 $ export ALERT_WEBHOOK_SECRET=dry-run-secret
 $ AGENTD_INTELLIGENCE=mock:final agentd \
-    -c examples/startup/services.yaml -c examples/startup/sre.yaml
+    -c examples/startup/sre.yaml
 $ body='{"alert_id":"a1","service":"probes","severity":"critical"}'
 $ sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$ALERT_WEBHOOK_SECRET" -r | cut -d' ' -f1)
 $ curl -X POST 127.0.0.1:9444/alerts/firing -H "X-Alert-Signature: sha256=$sig" -d "$body"
@@ -185,8 +182,7 @@ Every config validates against the binary:
 
 ```console
 $ cd examples/startup
-$ for f in *.yaml; do [ "$f" = services.yaml ] && continue; \
-    agentd --validate-config -c services.yaml -c "$f" || echo "$f"; done
+$ for f in *.yaml; do agentd --validate-config -c "$f" || echo "$f"; done
 ```
 
 ## What is deliberately simplified

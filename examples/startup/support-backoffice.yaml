@@ -20,8 +20,10 @@
 #
 # Secrets:
 #   OPENAI_API_KEY — the model (small budget: lookups are short turns).
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c support-backoffice.yaml)
+#   ACCOUNTS_TOKEN — READ-ONLY: account mutations have no path through any
+#                    desk; the `allow` ceilings below make the contract structural.
+#                    LOGS_TOKEN     — query-only, scoped to the product's log streams, ideally
+#                    with a per-query time-range cap.
 #
 # MCP contract — `accounts`: lookup by phone/email/id → {plan, standing,
 # region, created}; recent billing events. The `allow:` list pins it to
@@ -64,12 +66,19 @@ store:
 mcp:
   servers:
     # Customer accounts: identity, plan, billing status, monitors. The
-    # catalog ceilings keep BOTH read-only by construction.
-    - { name: accounts, service: accounts }
+    # `allow` ceilings keep BOTH read-only by construction.
+    - name: accounts
+      endpoint: https://mcp.accounts.beacon.example/mcp
+      auth: { kind: static, token: "{{secret:ACCOUNTS_TOKEN}}" }
+      tags: { "*": [sensitive] }
+      allow: ["get_*", "list_*", "search_*"]
     # The service-log search plane ("the special MCP"): per-customer probe
     # history, alert evaluations, delivery attempts.
-    - { name: logs, service: logs }
-
+    - name: logs
+      endpoint: https://mcp.logs.beacon.example/mcp
+      auth: { kind: static, token: "{{secret:LOGS_TOKEN}}" }
+      tags: { "*": [sensitive] }
+      allow: ["query_*", "tail_*", "get_*"]
 a2a:
   listen: http://127.0.0.1:8451
   events:

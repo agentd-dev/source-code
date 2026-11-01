@@ -525,36 +525,35 @@ when it does not fit. A provider takes the same key, and
 `structured_output: prompt` on a `decisions` provider is refused, because a
 decision endpoint is sent no schema.
 
-## Closed egress
+## Pace calls and close egress
 
-Under `security.egress: closed`, every endpoint of every connection must
-match a `kind: intelligence` entry in the service catalog. An endpoint
-matches an entry whose endpoint is its origin or a prefix of it:
+`rate` on a connection paces its model calls in each process: a call waits
+for a token. The connections you declare under `intelligence` and
+`intelligence.providers` are the model endpoints agentd posts to; under
+`security.egress: closed` they are the only ones, and nothing else declares
+a model endpoint for it.
 
 ```yaml
 security:
   egress: closed
 
-services:
-  openai:     {kind: intelligence, endpoint: "https://api.openai.com"}
-  anthropic:  {kind: intelligence, endpoint: "https://api.anthropic.com"}
-
 intelligence:
   endpoints: https://api.openai.com/v1/chat/completions
   token: "{{secret:OPENAI_API_KEY}}"
+  rate: "120/1m"
   providers:
     anthropic:
       endpoints: https://api.anthropic.com
       dialect: anthropic
       token: "{{secret:ANTHROPIC_API_KEY}}"
+      rate: "60/1m"
   models:
     smart: {model: gpt-5.1}
     deep:  {model: claude-opus-5-5, provider: anthropic, kind: reasoning}
   roles: {turn: smart, think: deep}
 ```
 
-An uncatalogued endpoint is refused at load and the message names it. See
-[Harden a deployment](harden.md) for the rest of the egress policy.
+See [Harden a deployment](harden.md) for the rest of the egress policy.
 
 ## Change models without a restart
 

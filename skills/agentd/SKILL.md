@@ -128,13 +128,18 @@ security:
 Start read-only and widen. Adding `bash` grants everything — a deliberate
 operator decision, never a default.
 
-**The service catalog** — past a handful of servers, name each external
-service ONCE in `services:` (endpoint, one shared credential, authoritative
-trifecta tags, a tool ceiling) and reference it: `mcp.servers: [{name: money,
-service: billing, allow: [charge_lookup]}]`. Consumers may only narrow;
-catalog tags apply to any matching endpoint even inline (no tag-laundering);
-`security.egress: closed` refuses any uncatalogued dial. One
-`agentd --login service:billing` serves every consumer.
+**Endpoints live in the section that uses them** — MCP servers in
+`mcp.servers` (endpoint, credential, trifecta tags, `allow`/`exclude`
+ceiling, `rate`, `breaker`, `connect: boot | on_use`), models in
+`intelligence` (+ `providers`, each with `rate`), peers in `a2a.peers`
+(`rate`, `timeout`), plain HTTP in `http.endpoints` (`methods`, `rate`;
+an `http` step names one with `endpoint:`), Companies in `companies`. An
+instruction document's `:::mcp` whose `src` matches an operator server IS
+that server (operator's tags and ceiling; the document's `tools=` only
+narrows), so a document cannot launder tags. `security.egress: closed`
+refuses any destination its section does not declare; a document's
+unmatched `:::mcp` is held as text with a `host-policy` warning. Log in
+with `agentd --login mcp:<name>` (or `a2a:<peer>`, `http:<endpoint>`).
 
 **Subagent templates** — declare what a worker looks like in
 `subagents.templates` (the model instantiates by name and fills declared,
@@ -147,7 +152,7 @@ workflows and store, an A2A peer over a unix socket, retired by
 
 **The system prompt is a template** — `agentd --context-template` prints the
 built-in one, written in a two-block language (`{{#if}}`, `{{#each}}`,
-interpolation) over the agent's environment (services, workflows, peers,
+interpolation) over the agent's environment (endpoints, workflows, peers,
 signals, memory, granted tools). Override it with `context.template`, name
 alternates in `context.templates` for a node to pick with
 `context: {template: <name>}`. Expressions are a path first and CEL second,

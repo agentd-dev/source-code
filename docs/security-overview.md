@@ -113,11 +113,15 @@ Three mechanisms keep outside text away from a context that could act on it:
 
 ## Egress control
 
-A `services:` catalog binds each external endpoint to authoritative tags and a
-tool ceiling. Under `security.egress: closed` the catalog becomes an
-allow-list: an MCP server, model provider, A2A peer, `http` step target or
-other outbound URL that matches no entry is refused at load, or at execution
-when it is templated. URLs a model or a workflow can influence pass through an
+Each endpoint is declared in the section that uses it: MCP servers under
+`mcp.servers` with their tags and tool ceiling, models under `intelligence`,
+peers under `a2a.peers`, plain HTTP under `http.endpoints`, Companies under
+`companies`. An instruction document's server whose endpoint matches an
+operator server is that server, with the operator's tags and ceiling. Under
+`security.egress: closed` the operator's sections become an allow-list: an MCP
+server, model provider, A2A peer, `http` step target or other outbound URL
+that matches no entry of its section is refused at load, or at execution when
+it is templated. URLs a model or a workflow can influence pass through an
 SSRF guard that refuses private, loopback and cloud-metadata addresses and
 dials only the address it checked. A workflow's `http` step follows no
 redirects.
@@ -129,21 +133,15 @@ intelligence:
   endpoints: https://api.openai.com/v1/chat/completions
   model: gpt-5.1
   token: "{{secret:OPENAI_API_KEY}}"
-services:
-  openai: {kind: intelligence, endpoint: https://api.openai.com/v1/chat/completions}
-  crm:
-    kind: mcp
-    endpoint: https://mcp-crm.example.com/mcp
-    tags: {"*": [sensitive]}
-    allow: ["get_*", "search_*", "update_note"]
-  mail:
-    kind: mcp
-    endpoint: https://mcp-mail.example.com/mcp
-    tags: {"*": [egress]}
 mcp:
   servers:
-    - {name: crm, service: crm}
-    - {name: mail, service: mail}
+    - name: crm
+      endpoint: https://mcp-crm.example.com/mcp
+      tags: {"*": [sensitive]}
+      allow: ["get_*", "search_*", "update_note"]
+    - name: mail
+      endpoint: https://mcp-mail.example.com/mcp
+      tags: {"*": [egress]}
 a2a:
   listen: http://127.0.0.1:8420
   bearer: "{{secret:A2A_BEARER}}"
@@ -156,7 +154,7 @@ security:
       on_timeout: deny
 ```
 
-Every outbound endpoint here is catalogued, the CRM's destructive verbs are
+Every outbound endpoint here is declared, the CRM's destructive verbs are
 absent rather than discouraged, and every call to an `egress` tool waits for a
 person's approval.
 

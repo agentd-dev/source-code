@@ -7,10 +7,11 @@
 #     --intelligence mock:file:examples/demos/mock/coder.json --intelligence-token ""
 #
 # The server list is restated with `instruction-md` pointing at the stand-in
-# (no sign-in), and the stand-in is catalogued for egress: closed. The local
-# copies of the handbook (instruction/payments-handbook-v1.md, -v2.md) are
-# the demo handbook without and with the test rule. Releasing v2 is
-# copying -v2.md over the served file.
+# (no sign-in); being an `mcp.servers` endpoint is what admits the stand-in
+# under egress: closed. The local copies of the handbook
+# (instruction/payments-handbook-v1.md, -v2.md) are the demo handbook
+# without and with the test rule. Releasing v2 is copying -v2.md over the
+# served file.
 
 mcp:
   servers:
@@ -19,6 +20,3 @@ mcp:
       # agentd's, not the model's: none of its tools is offered (coder.yaml).
       allow: []
       tags: {"*": [trusted]}
-
-services:
-  registry-standin: {kind: mcp, endpoint: "${REGISTRY_MCP_URL:-http://127.0.0.1:8733/mcp}"}

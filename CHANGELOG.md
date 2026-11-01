@@ -48,6 +48,41 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   it no more. agentd's configuration YAML reader, which lived in it, is back
   in `agentd-core` (`config::yaml`), unchanged. The spec drift check holds
   the SDK's registry to the pinned specification's `registry.json`.
+- Each section owns its endpoints (RFC 0055 §3, phase 1). The `services:`
+  catalogue is removed, and the schema refuses the key like any unknown one.
+  Each kind moved to the section that uses it: `kind: mcp` to
+  `mcp.servers[]` (which gains `rate`, `breaker` and `connect: boot |
+  on_use`), `kind: intelligence` to `intelligence` and
+  `intelligence.providers.<name>` (each gains `rate`), `kind: peer` to
+  `a2a.peers[]` (which gains `rate` and `timeout`), `kind: http` to the new
+  `http.endpoints.<name>` (`endpoint`, `auth`, `headers`, `methods`, `rate`,
+  `timeout`; an `http` step uses the entry its URL matches, or names it with
+  `endpoint:` and a relative `url`), and `kind: company` to the new
+  top-level `companies.<name>`, every field as it was, without `kind`.
+  `service:` on `mcp.servers[]` and `a2a.peers[]` is removed: an entry
+  carries its own endpoint, credential, tags and ceiling. A `connect: on_use`
+  server is dialed the first time a step, a resource wait, a `subscribe`
+  start or an instruction document needs it; a step waits for it up to the
+  server's `timeout`, and the trifecta check counts it at load. An instruction
+  document's `:::mcp` (or `:::config` server) whose `src` matches an operator
+  `mcp.servers` endpoint is that server — one connection, the operator's
+  name, credential, tags and ceiling, the document's `tools=` only narrowing
+  it — and a document's `:::agent` the same against `a2a.peers`; one that
+  matches nothing is held as text with a `host-policy` warning under
+  `egress: closed`, and is its own `untrusted_input` server under `open`.
+  `security.egress: closed` checks each destination against its own
+  section: MCP against `mcp.servers`, models against `intelligence`, peers
+  against `a2a.peers`, A2A push targets against `a2a.peers` and the new
+  `a2a.push.allow`, every other HTTP request (`http` steps, documents and
+  skills fetched by URL, `store.http`, stream forwards) against
+  `http.endpoints`, Companies against `companies`;
+  `observability.otel.endpoint` stays the one exception. The prompt
+  template's `{{services}}` is `{{endpoints}}` (`{name, kind, tags,
+  tags_text, tools, tools_text, rate}` over `mcp.servers`, `a2a.peers` and
+  `http.endpoints`), and the built-in template's "Services" section is
+  "Endpoints". `agentd --login` takes `a2a:<peer>` and `http:<endpoint>`;
+  `service:<name>` is gone. `examples/startup/services.yaml` is gone: each
+  desk declares its own servers.
 
 **Security.**
 

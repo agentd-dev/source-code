@@ -41,15 +41,10 @@ agent:
 #
 # A model carries the wire model name and its context window; it names no
 # `provider:`, so its calls go to `intelligence.endpoints`, with the
-# credential configured there.
-services:
-  gateway:
-    kind: intelligence
-    endpoint: https://api.openai.com/v1
-    rate: "120/1m"
-
+# credential configured there. `rate` paces the calls on that connection.
 intelligence:
   endpoints: ["https://api.openai.com/v1/chat/completions"]
+  rate: "120/1m"
   token: "{{secret:OPENAI_API_KEY}}"
   models:
     quick: { model: gpt-5.1-mini, window: 128000 }

@@ -459,12 +459,6 @@ agent:
 intelligence:
   endpoints: "mock:final"   # the built-in test endpoint
 
-services:
-  research:
-    kind: peer
-    endpoint: https://research.example.com:8443
-    auth: { kind: static, token: "{{secret:RESEARCH_TOKEN}}" }
-
 a2a:
   peers:
     # A bearer token the peer's operator gave you.
@@ -489,17 +483,26 @@ a2a:
       client_cert: /run/spire/svid.pem
       client_key: /run/spire/key.pem
 
-    # Endpoint, credential and tags from the service catalog.
+    # A person's OAuth login, completed once with
+    # `agentd --login a2a:research`; paced and bounded.
     - name: research
-      service: research
+      endpoint: https://research.example.com:8443
+      auth:
+        kind: oauth2
+        grant: device
+        issuer: https://sso.example.com
+        client_id: agentd-coordinator
+      rate: "30/1m"
+      timeout: 30s
 ```
 
-A peer that references a catalog entry inherits its endpoint and credential
-and does not restate them. [Outbound credentials](authentication.md) covers
-every `auth` kind; `kind: aws` is not accepted for peers. A credential a
-person logs in for, an oauth2 `device` or `authorization_code` grant, goes
-on a `kind: peer` service entry, logged into with
-`agentd --login service:<entry>`: on the peer itself it is refused at load.
+[Outbound credentials](authentication.md) covers every `auth` kind;
+`kind: aws` is not accepted for peers. A credential a person logs in for, an
+oauth2 `device` or `authorization_code` grant, is completed once with
+`agentd --login a2a:<peer>`. `rate` paces sends to the peer in each process,
+and `timeout` bounds each request to it. Under `security.egress: closed` a
+peer must be one of these entries, and an instruction document's `:::agent`
+whose endpoint matches one is that peer.
 For a one-off run,
 `--a2a-peer reviewer=https://reviewer.example.com:8443` adds a peer from the
 command line.

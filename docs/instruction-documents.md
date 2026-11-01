@@ -82,7 +82,11 @@ Save it as `agent.md`. What each part does:
   the reason to the rule before it. `${sla}` takes the parameter's declared
   default.
 - `:::mcp` declares an MCP server: agentd adds it to `mcp.servers` under its
-  `id`, dials `src`, and registers only the `tools` it lists. The inline
+  `id`, dials `src`, and registers only the `tools` it lists. When `src`
+  matches one of the operator's `mcp.servers` endpoints, the block is that
+  server instead: the operator's name, credential and tags, with `tools`
+  narrowing its tool list
+  ([Servers a document declares](configuration.md#servers-a-document-declares)). The inline
   `:mcp[ticket index]{ref=#tickets}` refers to it from the prose.
 - `:::context` is reference material for the model.
 - `:::skill` with a body and no `src` adds a skill to the agent's catalogue
@@ -328,8 +332,8 @@ take one source each. Settings and the source compose:
 
 A `url:` source is a plain `GET` with no credential. A document that needs
 authentication belongs behind an MCP server or in an OCI registry. Under
-`security.egress: closed`, a `url:` or `oci:` source must match a `services:`
-entry of `kind: http`, or the load is refused.
+`security.egress: closed`, a `url:` or `oci:` source must match an
+`http.endpoints` entry, or the load is refused.
 
 ## Follow updates
 
@@ -678,7 +682,7 @@ on an update the running text stays.
 | An `::include` or `extends` in the document | agentd delivers the document as read; what it composes is not loaded. | Inline the text, or serve the document from a registry that resolves it. |
 | A misspelled grant in `document_capabilities` | It grants nothing. | Use `identity` or `interface`. |
 | A trust pin's key file path is wrong | The pin cannot be enforced; under `warn` the document loads unverified. | `unenforceable: refuse`. |
-| A document's `:::mcp` server | It counts as `untrusted_input`: what it answers taints the work that reads it. `trusted` on it is refused. | Catalog the server under `services:` with its tags, and name it with `service:` in a `:::config` server entry. |
+| A document's `:::mcp` server | It counts as `untrusted_input`: what it answers taints the work that reads it. `trusted` on it is refused. | Declare the server in the operator's `mcp.servers` with its tags (`connect: on_use` dials it only when needed). The document's `:::mcp` whose `src` matches that endpoint is then the operator's server, with its tags. |
 | An `instruction/workflow` step a host does not run | `--validate-config` refuses the workflow, naming the step (an `event` start on an event agentd does not raise, a `wait` with no `on`). | Use the node forms in [the node registry](node-registry.md). |
 
 ## Next steps
@@ -689,5 +693,5 @@ on an update the running text stays.
   configuration boundary, explained.
 - [Author workflows](author-workflows.md): what a `:::workflow` body can
   contain.
-- [Harden a deployment](harden.md): closed egress, the service catalogue and
-  the other gates a document cannot relax.
+- [Harden a deployment](harden.md): closed egress, the operator's endpoints
+  and the other gates a document cannot relax.

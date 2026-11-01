@@ -20,8 +20,11 @@
 # Secrets:
 #   OPENAI_API_KEY — tiny budget on purpose: this desk formats and refuses,
 #                    it does not compose.
-#   (MCP endpoints, credentials, tags and tool ceilings for this desk live in
-#   services.yaml — the shared catalog. Launch: agentd -c services.yaml -c outbox.yaml)
+#   EMAIL_TOKEN  — transactional email (Postmark/Resend/SES): a sending
+#                  domain with SPF+DKIM; inbound parse forwards replies to the sales /
+#                  marketing reply routes with the lead/person id echoed back.
+#                  SOCIAL_TOKEN — one cross-poster (Buffer/Typefully/Postiz…) key: one
+#                  aggregator key beats four platform OAuth dances.
 #
 # MCP contract — `email`: send(to, subject, body[, reply_to]) → message id.
 # Idempotent by content hash or client message id (the a2a commands arrive
@@ -58,12 +61,17 @@ store:
 
 mcp:
   servers:
-    - { name: email, service: email }
+    - name: email
+      endpoint: https://mcp.email.example/mcp
+      auth: { kind: static, token: "{{secret:EMAIL_TOKEN}}" }
+      tags: { "*": [egress] }
     # One cross-posting server for the social channels marketing writes for:
     # blog, LinkedIn, X, Instagram. The `channel` field of `outbox.post`
     # picks the network.
-    - { name: social, service: social }
-
+    - name: social
+      endpoint: https://mcp.social.example/mcp
+      auth: { kind: static, token: "{{secret:SOCIAL_TOKEN}}" }
+      tags: { "*": [egress] }
 a2a:
   listen: http://127.0.0.1:8447
   events:

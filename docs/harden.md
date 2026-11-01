@@ -13,7 +13,7 @@ configuration refuses the dangerous shapes at load, before any side effect.
 |---|---|
 | [Run agentd in a sandbox](#run-agentd-in-a-sandbox) with an egress policy and resource limits | agentd has no in-binary sandbox |
 | [Tag every MCP server](#tag-every-mcp-server), one server per tag profile | the Rule of Two judges servers by their tags |
-| [Catalog every service and close egress](#catalog-every-service-and-close-egress) | tags become a floor and the endpoint list an allow-list |
+| [Declare every endpoint and close egress](#declare-every-endpoint-and-close-egress) | the operator's tags bind documents, and the declared endpoints become an allow-list |
 | [Keep outside input away from the actors](#keep-outside-input-away-from-the-actors) | a run that reads a stream is judged with everything it can reach |
 | [Put policies on risky calls](#put-policies-on-risky-calls) | a verdict on the call and its arguments |
 | [Keep approvals with people](#keep-approvals-with-people) | an approval is the operator's decision, not the agent's |
@@ -30,7 +30,7 @@ configuration refuses the dangerous shapes at load, before any side effect.
 
 This is an issue-triage agent that reads a public tracker and its docs,
 labels issues and comments on them. It holds two legs of the trifecta
-(`untrusted_input` and `egress`), dials only catalogued endpoints, asks a
+(`untrusted_input` and `egress`), dials only the endpoints it declares, asks a
 person before it posts a comment, names the model any approval judge would
 run on, serves people over TLS with the device grant, and keeps an audit
 trail.
@@ -53,23 +53,18 @@ intelligence:
     turn: smart
     approve: smart
 
-services:
-  openai:
-    kind: intelligence
-    endpoint: https://api.openai.com/v1/chat/completions
-  tracker:
-    endpoint: https://mcp.tracker.example.com/mcp
-    tags: { "*": [untrusted_input, egress] }
-    auth: { kind: static, token: "{{secret:TRACKER_TOKEN}}" }
-    allow: ["get_*", "list_*", "search_*", "add_comment", "set_labels"]
-  docs:
-    endpoint: https://mcp.docs.example.com/mcp
-    tags: { "*": [untrusted_input] }
-
 mcp:
   servers:
-    - { name: tracker, service: tracker, ns: tracker }
-    - { name: docs, service: docs, ns: docs }
+    - name: tracker
+      ns: tracker
+      endpoint: https://mcp.tracker.example.com/mcp
+      tags: { "*": [untrusted_input, egress] }
+      auth: { kind: static, token: "{{secret:TRACKER_TOKEN}}" }
+      allow: ["get_*", "list_*", "search_*", "add_comment", "set_labels"]
+    - name: docs
+      ns: docs
+      endpoint: https://mcp.docs.example.com/mcp
+      tags: { "*": [untrusted_input] }
 
 security:
   egress: closed
@@ -120,8 +115,7 @@ The last line of the output is the verdict:
 ```
 
 Before it, one `config.effective_server` line per MCP server shows the
-endpoint, tags and tool ceiling each server ended up with after the catalog
-was applied. The TLS files are read when the listener starts, not at
+endpoint, tags and tool ceiling each server ended up with. The TLS files are read when the listener starts, not at
 validation.
 
 ## Run agentd in a sandbox
@@ -183,33 +177,35 @@ instance instead.
 one). Those per-tool tags reach [policies](#put-policies-on-risky-calls), not
 the load-time check.
 
-## Catalog every service and close egress
+## Declare every endpoint and close egress
 
-Put every external service in `services:`, with its endpoint, its tags, its
-one credential and its tool ceiling, and have servers reference entries by
-`service:`. Then set `security.egress: closed`.
+Declare every endpoint in the section that uses it: MCP servers under
+`mcp.servers` (with their tags, credential and tool ceiling), models under
+`intelligence` and `intelligence.providers`, peers under `a2a.peers`, plain
+HTTP under `http.endpoints`, Companies under `companies`. Then set
+`security.egress: closed`.
 
-The catalog makes tags a floor. Any MCP declaration whose endpoint matches an
-entry gets the entry's tags added before the Rule-of-Two check, including one
-an instruction document or a subagent template declares inline, so nobody can
-under-tag a catalogued system. The entry's `allow` and `exclude` are a
-ceiling a consumer can narrow and never widen.
+The operator's servers bind documents. An instruction document's server
+whose endpoint matches an `mcp.servers` endpoint is that server: the
+operator's tags, credential and tool ceiling apply, and the document's
+`tools=` can narrow the ceiling, never widen it. Nobody can under-tag a
+system the operator declared by restating its URL in a document.
 
-Closed egress makes the catalog an allow-list. Every endpoint agentd dials
-from configuration must match an entry of its kind: `mcp` for MCP servers,
-`intelligence` for model endpoints and every provider, `peer` for A2A peers,
-and `http` for `http` steps, stream `forward` targets, workflow `url:`
-references, the HTTP store, A2A push targets and an instruction fetched by
-`url:` or `oci:`. A literal endpoint is judged at load. Every `http` step URL
-is checked again at the dial, where a matching entry's `methods` list is also
-a ceiling.
+Closed egress makes the declared endpoints an allow-list, each kind checked
+against its own section: an MCP dial against `mcp.servers`, a model endpoint
+against `intelligence`, a peer against `a2a.peers`, an A2A push target
+against `a2a.peers` and `a2a.push.allow`, and every other HTTP request —
+`http` steps, stream `forward` targets, workflow and instruction `url:`
+references, skills fetched by `src`, the HTTP store, an instruction fetched
+by `url:` or `oci:` — against `http.endpoints`. A literal endpoint is judged
+at load. Every `http` step URL is checked again at the dial, where the
+matching entry's `methods` list is also a ceiling. A document's `:::mcp`
+that matches no operator server is held as text with a `host-policy`
+warning; it is never dialed.
 
-The trap is the model endpoint: it needs an `intelligence` entry like any
-other destination, or the load refuses it.
-
-```text
-{"event":"config.invalid","msg":"security.egress is closed and intelligence endpoint (https://api.openai.com/v1/chat/completions) matches no `kind: intelligence` services: catalog entry — catalog the endpoint to allow it"}
-```
+Keep a server you rarely need declared with `connect: on_use`: it is approved
+and counted in the trifecta check at load, and dialed only when a step or a
+document first needs it.
 
 Closed egress does not cover `observability.otel.endpoint` (the load warns),
 or credential plumbing: OAuth token and discovery endpoints, AWS metadata and
@@ -557,7 +553,7 @@ An unsigned document under a pin is refused before anything reads it:
 agentd: config file agentd.yaml: agent.instruction: the instruction carries no front-matter `signature:`, but 1 pinned publisher(s) are configured — an unsigned document is not from a pinned publisher (§7.6)
 ```
 
-Under `egress: closed`, the registry must match an `http` catalog entry
+Under `egress: closed`, the registry must match an `http.endpoints` entry
 before agentd fetches the artifact. The pull happens at load, so the OCI
 sample above needs the registry reachable to validate.
 [Write and ship instruction documents](instruction-documents.md) shows how to

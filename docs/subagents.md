@@ -338,7 +338,7 @@ An instance child is the same binary started with a configuration file the
 parent composes. The parent writes the template's machinery, the delivered
 prose with its parameters, its own intelligence section (without its budget,
 its routes or any inline token, and with the template's `model` and
-`budget`), its service catalogue, egress posture and TLS trust, its AAuth
+`budget`), the endpoints it declares, its egress posture and TLS trust, its AAuth
 provider and key file, a store, and an A2A listener on a unix socket in the
 child's own directory. Model credentials reach the child through the
 environment, never the file, and the child loads the AAuth key without ever
@@ -467,7 +467,7 @@ fragment that writes operator-only configuration is refused, and so are a
 child's own `a2a`, `intelligence`, `store` and `lifecycle` sections (the
 parent composes those), MCP Events bindings and grants, and webhook starts or
 waits (a child has no webhook listener). Its MCP servers are checked against
-the parent's service catalogue and egress posture, and must not compose the
+the parent's `mcp.servers` and egress posture, and must not compose the
 trifecta. These checks run when the parent loads. The child validates the
 composed file again at spawn, and that is where the template's workflow steps
 are checked. [Instruction documents](directives.md) explains the boundary.

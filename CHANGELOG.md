@@ -65,6 +65,21 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Added.**
 
+- A document an MCP registry serves (`agent.instruction: instruction://…`)
+  now applies its machinery: its `:::mcp` servers, inline skills, workflows
+  and `:::config`. Before, only its text was kept, and nothing it declared
+  applied, not even after a restart. The first read at startup runs the
+  staged reload (`trigger: instruction`), which folds the document with the
+  same checks a fetched file gets: the §7.8 wire floor, every operator-only
+  refusal, its servers untrusted unless the catalogue vouches. Every later
+  reload folds the document last read, so a `SIGHUP` keeps its servers.
+  A re-delivered version whose machinery differs applies at once by default.
+  The new operator-only `agent.instruction.machinery: reload` makes it wait
+  for the next reload (`instruction.machinery.pending`). A text-only edit is
+  adopted live, as before. `instruction.machinery.applied` names the servers
+  and skills added and removed.
+- The built-in HTTP mock MCP server's `mock.serve_document` replaces the
+  document `instruction://ins_live…` reads as, for e2e tests.
 - The OpenAI Responses API dialect (`POST /v1/responses`), for OpenAI's
   newest models, which take function tools only there: gpt-5.6-sol on
   `/v1/chat/completions` answered every call that carried tools with a

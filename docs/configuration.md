@@ -77,7 +77,7 @@ The short environment name is read under the same `AGENTD_` prefix.
 | `--instruction` | `agent.instruction` | `AGENTD_INSTRUCTION` |
 | `--instruction.text`, `.file`, `.dir`, `.url`, `.oci`, `.mcp` | `agent.instruction.<source>` | — |
 | `--instruction.glob`, `--instruction.order` | `agent.instruction.dir.glob`, `.dir.order` | — |
-| `--instruction.refresh`, `--instruction.unavailable` | `agent.instruction.refresh`, `.unavailable` | — |
+| `--instruction.refresh`, `--instruction.unavailable`, `--instruction.machinery` | `agent.instruction.refresh`, `.unavailable`, `.machinery` | — |
 | `--prompt` | `agent.prompt` | `AGENTD_PROMPT` |
 | `--prompt.text`, `.file`, `.dir`, `.url`, `.oci` | `agent.prompt.<source>` | — |
 | `--prompt.glob`, `--prompt.order` | `agent.prompt.dir.glob`, `.dir.order` | — |
@@ -343,6 +343,7 @@ form that names the source.
 | `agent.instruction.mcp` | URI, or `{server, resource, events}` | — | live · op | A resource a configured MCP server serves, read and subscribed. `server` picks the server to ask; `events` names MCP Events types whose occurrences re-read the instruction (needs `mcp-events`). |
 | `agent.instruction.refresh` | `auto \| off \|` duration | `auto` | live · op | How often to re-read the source. |
 | `agent.instruction.unavailable` | `auto \| keep \| freeze \| drain \| exit` | `auto` | live · op | What to do when the source stops answering after startup. |
+| `agent.instruction.machinery` | `live \| reload` | `live` | live · op | When a served (`mcp:`) document's changed servers, skills, workflows and `:::config` apply: as the version arrives (`live`), or at the next reload (`reload`, logged as `instruction.machinery.pending`). The first read at startup always applies them. See [directives](directives.md#how-an-edit-reaches-a-running-agent). |
 | `agent.instruction.unenforceable` | `warn \| refuse \| ignore` | `warn` | live · op | What a `trust` pin that names no key file means at load (its author keys are `instruction://` URIs, or none). `refuse` is exit 2. A key file that cannot be read is always exit 2. |
 | `agent.instruction.decrypt.keys` | list of paths | `[]` | live · op | Recipient key files for an encrypted envelope (age v1 or JWE): an `AGE-SECRET-KEY-1…` identity, 64 hex characters, or base64. Needs `decrypt`. |
 | `agent.instruction.decrypt.passphrase` | secret | — | live · op | The passphrase for an age scrypt envelope. |

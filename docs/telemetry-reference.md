@@ -349,7 +349,7 @@ Company that verifies while its token endpoint refuses has not recovered.
 | `config.invalid` | error | `error` | A validation error at startup. |
 | `config.reload.invalid` | warn | `error`, `trigger` | A reload candidate failed validation or staging; nothing changed. |
 | `config.reload.restart_required` | warn | `paths`, `trigger` | A reload touched restart-only `paths`; nothing changed. |
-| `config.reloaded` | info | `changed`, `trigger` | A reload was applied. `changed` lists what moved, or `["nothing"]`. |
+| `config.reloaded` | info | `changed`, `trigger` | A reload was applied. `changed` lists what moved, or `["nothing"]`. `trigger` is `sighup`, `watch`, or `instruction` (a served document's machinery). |
 | `config.warning` | warn | `warning` | A non-fatal finding at load or reload. |
 | `config.watch.armed` | info | `dir`, `glob`, `path` | The `lifecycle.watch_config` watch is set on a directory. |
 | `config.watch.error` | warn | `dir`, `err`, `errno`, `path`, `target` | The watch failed and stopped; `SIGHUP` still reloads. |
@@ -531,6 +531,8 @@ its `jti`.
 | `instruction.binding.reported` | info | `binding_id`, `version_id` |  |
 | `instruction.event` | info | `event_type`, `server` |  |
 | `instruction.loaded` | info | `bytes`, `dir`, `files`, `glob`, `layer_digest`, `manifest_digest`, `order`, `resolution`, `server`, `uri`, `version`, `version_id` | The instruction was read. |
+| `instruction.machinery.applied` | info | `servers_added`, `servers_removed`, `skills_added`, `skills_removed`, `version` | A reload applied a served document's changed machinery; the lists are names, `version` its registry version id. |
+| `instruction.machinery.pending` | warn | `note`, `uri`, `version_id` | Under `agent.instruction.machinery: reload`, a re-delivered version's machinery changed; it applies at the next reload. Said once per version. |
 | `instruction.reread.fail` | warn | `err`, `reason`, `server`, `uri` |  |
 | `instruction.subscribe.fail` | warn | `err`, `server`, `uri` |  |
 | `instruction.subscribe.unsupported` | info | `server`, `uri` |  |

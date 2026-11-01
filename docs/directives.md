@@ -259,7 +259,29 @@ registry notifies agentd or is polled. A `SIGHUP` reloads from any source.
 Two things change at different times. A re-read of an OCI or registry source
 updates the delivered text, which is what the model reads from its next turn.
 What a document declares maps onto configuration at load, so a new or changed
-block applies on a reload or a restart, never on a poll.
+block applies through a reload, which applies whole or is refused with
+nothing changed.
+
+A registry source (`mcp:` or `instruction://`) is read through an MCP server,
+which is not connected yet when the configuration loads. Its first read at
+startup therefore runs that reload once (`config.reloaded` with
+`trigger: instruction`), and the document's servers, skills, workflows and
+`:::config` apply then, as a file's do at load. Every later reload, including
+a `SIGHUP`, folds the document last read, so it never drops what the document
+declared. When a re-delivered version declares something different (a text
+edit alone does not count), `agent.instruction.machinery` decides when it
+applies:
+
+- `live`, the default: the reload runs as the version arrives.
+- `reload`: agentd logs `instruction.machinery.pending` once for the version,
+  and the change applies at the next reload or restart.
+
+Either way, `instruction.machinery.applied` names the servers and skills
+that were added and removed. A refused reload logs `config.reload.invalid`
+or `config.reload.restart_required`, and the running machinery stays. A
+document's `:::config` that sets a restart-only setting is refused this way
+even at startup, because the configuration loaded before the document was
+read.
 
 On each reload, agentd reads the document again and compares each embedded
 workflow with the running one by content hash:
@@ -284,6 +306,7 @@ the new text.
 Settings a document writes keep their reload class. A document that changes
 a restart-only setting, such as `store.kind`, `lifecycle.run_until` or
 `agent.name`, needs a restart for it to apply, exactly as a config file would.
+A registry document cannot set one at all (see above).
 
 ## What an instruction document is not
 

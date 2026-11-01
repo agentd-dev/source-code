@@ -223,7 +223,7 @@ skip.
 | `ema/loopback-caller-gets-no-delegation` | a delegated server on a loopback listener with no verifier is refused at load; with one, the operator a bearer names is not the enrolled person, and its run is no_delegation |
 | `ema/timed-out-gate-never-judged` | a consent gate nobody answers denies at its deadline, with ask_human_fallback auto, and no judge is spawned |
 | `ema/approved-write-end-to-end` | a delegated create_issue gates; --delegation-approve, bound to the gate's nonce and arguments, makes the call; --delegation-deny refuses one without making it |
-| `ema/document-may-not-delegate` | a :::!mcp fragment declaring grant id_jag, or referencing a reserved supervisor-only secret by any spelling of it, is refused — in the agent's instruction and through a subagent template |
+| `ema/document-may-not-delegate` | a :::mcp fragment declaring grant id_jag, or referencing a reserved supervisor-only secret by any spelling of it, is refused — in the agent's instruction and through a subagent template |
 | `ema/another-principals-work-mints-nothing` | work for anyone but the enrolled person — the bare operator in a conversation of the person's — mints nothing under the person's grant and is no_delegation |
 | `ema/egress-from-delegated-data-gates` | a workflow's own http POST of what a delegated read returned waits for the person: denied, nothing is sent; approved, it is sent as they saw it |
 | `ema/rotation-kept-when-the-id-jag-is-refused` | with a rotating IdP, the refresh token an exchange answers with is kept even when its ID-JAG fails a check: another server still mints, and the grant survives |

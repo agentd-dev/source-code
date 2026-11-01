@@ -115,6 +115,10 @@ A step names the server where it is used, with no `mcp.servers` entry:
   connection takes its `auth`, `headers`, `tags` and tool ceiling.
 - `mcp.resource` and `wait {on: resource}` take the same `registry`,
   `server` and `version` fields.
+- A server a step (or the model's `mcp.registry.connect`) made stays across
+  a reload while its registry still approves it; an applied reload whose
+  registries no longer do drops it (`mcp.registry.server.dropped`). A
+  refused reload changes nothing, so it drops nothing.
 
 There is no search node: a workflow names its servers. To sign in or warm a
 server up ahead of the step that needs it, call a cheap tool on it in an

@@ -468,6 +468,83 @@ fn a_documents_wrong_src_refuses_only_the_documents_block() {
     let _ = std::fs::remove_file(&cfg);
 }
 
+/// A registry server a step made stays made across a reload that is
+/// refused — even one whose registries no longer approve it, which an
+/// applied reload would drop — and a reload that then applies keeps it.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_refused_reload_keeps_the_registry_servers_made_at_run_time() {
+    let mock = common::spawn_mock_mcp("mock://unused", false);
+    let reg = Registry::start();
+    reg.publish(
+        record("io.acme/kb", "1.0.0", &format!("{}/mcp", mock.uri())),
+        "active",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg("");
+    // The step that makes the server at run time, by registry and name; the
+    // reloads below no longer name it.
+    let make = "  - name: make\n    steps:\n      s: {kind: once}\n      c: {kind: mcp.tool, depends_on: [s], registry: official, server: io.acme/kb, tool: mock.ops}\n      f: {kind: finish, depends_on: [c], status: completed}\n";
+    let write = |globs: &str, intel: &str, make: &str| {
+        std::fs::write(
+            &cfg,
+            format!(
+                "agent: {{name: reg}}\n{intel}{}mcp:\n  registries:\n    - {{name: official, url: \"{}\", servers: [{globs}], allow_private: true, refresh: 1s}}\nworkflows:\n  - name: hold\n    steps:\n      s: {{kind: signal, name: never}}\n      f: {{kind: finish, depends_on: [s]}}\n{make}lifecycle: {{run_until: auto}}\nobservability: {{log_level: info}}\n",
+                store(&dir),
+                reg.base
+            ),
+        )
+        .unwrap();
+    };
+    write("\"io.acme/*\"", "", make);
+    let d = Daemon::start(&cfg);
+    d.wait_for("the made server's call", |l| run_done(l, "make").is_some());
+    assert_eq!(calls(&mock), 1);
+    // Not approved any more, and refused once staged: a model token file
+    // that cannot be read.
+    write(
+        "\"io.other/*\"",
+        &format!(
+            "intelligence: {{endpoints: \"http://127.0.0.1:1\", model: mock, token_file: {}}}\n",
+            dir.path().join("no-token").display()
+        ),
+        "",
+    );
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
+    let log = d.wait_for("the refused reload", |l| {
+        !events(l, "config.reload.invalid").is_empty()
+    });
+    assert!(
+        events(&log, "config.reload.invalid")
+            .iter()
+            .any(|e| e["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("token_file"))),
+        "refused once staged:\n{log}"
+    );
+    assert!(
+        events(&log, "mcp.registry.server.dropped").is_empty(),
+        "a refused reload drops nothing:\n{log}"
+    );
+    // Approved again, applied: the made server is still carried.
+    write("\"io.acme/*\"", "", "");
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
+    let log = d.wait_for("the applied reload", |l| {
+        !events(l, "config.reloaded").is_empty()
+    });
+    assert!(
+        events(&log, "mcp.registry.server.dropped").is_empty(),
+        "{log}"
+    );
+    assert!(
+        !events(&log, "mcp.disconnect")
+            .iter()
+            .any(|e| e["server"] == "official/io.acme/kb"),
+        "the made server and its connection are kept:\n{log}"
+    );
+    let _ = std::fs::remove_file(&cfg);
+}
+
 /// What agentd must not dial is refused, said, and fails the step that
 /// names it; a deprecated record connects and warns.
 #[test]

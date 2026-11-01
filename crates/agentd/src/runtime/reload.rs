@@ -161,8 +161,9 @@ impl Runtime {
         // The registry servers made at runtime (a step's, the model's
         // `mcp.registry.connect`) stay while their registry still approves
         // them (RFC 0055 §4.2).
+        // Kept only once the reload commits.
         let mut new_settings = loaded.settings;
-        self.keep_made_registry_servers(&mut new_settings);
+        let kept_made = self.keep_made_registry_servers(&mut new_settings);
         let old = std::mem::replace(&mut self.settings, new_settings);
         let staged = match self.stage_reload(&old) {
             Ok(staged) => staged,
@@ -171,6 +172,7 @@ impl Runtime {
                 return Err(ReloadRefused::Invalid(errs));
             }
         };
+        self.commit_made_registry_servers(kept_made);
         self.settings_doc = loaded.doc;
         crate::sec::harden::set_reserved(self.settings.supervisor_only_env());
         crate::sec::harden::set_passthrough(self.settings.spawn.env_passthrough.clone());

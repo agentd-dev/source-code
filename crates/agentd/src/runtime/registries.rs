@@ -41,6 +41,15 @@ pub(crate) struct State {
     pub document_refused: BTreeMap<String, String>,
 }
 
+/// What [`Runtime::keep_made_registry_servers`] carried into a reload's
+/// settings, to apply when it commits.
+#[derive(Default)]
+pub(crate) struct KeptMade {
+    pub made: BTreeMap<String, crate::config::settings::McpServer>,
+    /// Each made server the new settings' registries no longer approve.
+    pub dropped: Vec<Value>,
+}
+
 /// A connected registry server.
 #[derive(Debug, Clone)]
 pub(crate) struct Live {
@@ -424,29 +433,41 @@ impl Runtime {
     }
 
     /// Carry the registry servers made at run time into `new` settings a
-    /// reload loads, each one its registry there still approves.
+    /// reload loads, each one its registry there still approves. Nothing of
+    /// the running state moves: what comes back is applied by
+    /// [`Self::commit_made_registry_servers`] once the reload commits, so a
+    /// refused reload keeps every server it would have dropped.
     pub(crate) fn keep_made_registry_servers(
-        &mut self,
+        &self,
         new: &mut crate::config::settings::Settings,
-    ) {
-        let made = std::mem::take(&mut self.registries.made);
-        for (name, srv) in made {
-            if new.mcp.servers.iter().any(|s| s.name == name) {
+    ) -> KeptMade {
+        let mut kept = KeptMade::default();
+        for (name, srv) in &self.registries.made {
+            if new.mcp.servers.iter().any(|s| &s.name == name) {
                 continue;
             }
             let (Some(r), Some(server)) = (srv.registry.clone(), srv.server.clone()) else {
                 continue;
             };
-            match registries::implicit_server(new, &name, &r, &server, srv.version.as_deref()) {
+            match registries::implicit_server(new, name, &r, &server, srv.version.as_deref()) {
                 Ok(s) => {
                     new.mcp.servers.push(s.clone());
-                    self.registries.made.insert(name, s);
+                    kept.made.insert(name.clone(), s);
                 }
-                Err(e) => self.log.info(
-                    "mcp.registry.server.dropped",
-                    json!({"name": name, "registry": r, "server": server, "reason": e}),
-                ),
+                Err(e) => kept
+                    .dropped
+                    .push(json!({"name": name, "registry": r, "server": server, "reason": e})),
             }
+        }
+        kept
+    }
+
+    /// The reload `kept` was made for committed: the made servers are those
+    /// it kept, and each one it dropped is said.
+    pub(crate) fn commit_made_registry_servers(&mut self, kept: KeptMade) {
+        self.registries.made = kept.made;
+        for d in kept.dropped {
+            self.log.info("mcp.registry.server.dropped", d);
         }
     }
 

@@ -40,6 +40,39 @@ function lines(text: string): string[] {
 }
 
 /**
+ * One line word-wrapped to `width` columns, the break's space dropped. Ink's
+ * own wrap keeps it, so a continuation after a line that filled the column
+ * started with a space and was one column too wide: the terminal wrapped it
+ * again and the frame lost a character and a row. A word longer than the
+ * width is broken.
+ */
+export function wrapLine(line: string, width: number): string[] {
+  const w = Math.max(1, width);
+  const out: string[] = [];
+  let cur = '';
+  for (const word of line.split(' ')) {
+    let rest = word;
+    while ([...rest].length > w) {
+      if (cur !== '') {
+        out.push(cur);
+        cur = '';
+      }
+      const cps = [...rest];
+      out.push(cps.slice(0, w).join(''));
+      rest = cps.slice(w).join('');
+    }
+    if (cur === '') cur = rest;
+    else if ([...cur].length + 1 + [...rest].length <= w) cur += ' ' + rest;
+    else {
+      out.push(cur);
+      cur = rest;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+/**
  * A block of text with a one-character mark in the gutter: the mark on the
  * first line, blanks under it, so wrapped/multi-line bodies stay indented.
  */
@@ -48,8 +81,13 @@ function Marked({
   markColor,
   color,
   dim,
+  width,
   children,
 }: {
+  /** The text column's width, when the terminal's is known: measured beside
+   * the gutter, a flex-grown column is judged wider than it is drawn, and a
+   * wrapped line then loses its first character to the row before it. */
+  width?: number;
   mark: string;
   markColor: string;
   color?: string;
@@ -61,9 +99,9 @@ function Marked({
       <Box width={GUTTER} flexShrink={0}>
         <Text color={markColor}>{mark}</Text>
       </Box>
-      <Box flexDirection="column" flexGrow={1}>
-        {lines(children).map((l, i) => (
-          <Text key={i} color={color} dimColor={dim} wrap="wrap">
+      <Box flexDirection="column" flexGrow={width === undefined ? 1 : 0} flexShrink={0} width={width}>
+        {(width === undefined ? lines(children) : lines(children).flatMap((l) => wrapLine(l, width))).map((l, i) => (
+          <Text key={i} color={color} dimColor={dim} wrap={width === undefined ? 'wrap' : 'truncate-end'}>
             {l === '' ? ' ' : l}
           </Text>
         ))}
@@ -84,6 +122,7 @@ function waitHint(e: TranscriptEntry, gate: string | undefined): string | undefi
 }
 
 function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?: string }): React.JSX.Element {
+  const textWidth = columns === undefined ? undefined : Math.max(1, columns - GUTTER);
   switch (e.kind) {
     case 'user': {
       // Inverse: the user's own words, in the terminal's own idiom for
@@ -113,11 +152,11 @@ function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?
       return (
         <Box flexDirection="column" marginTop={1}>
           {e.authRequired ? (
-            <Marked mark="⚿" markColor={theme.warn} color={theme.warn}>
+            <Marked mark="⚿" markColor={theme.warn} color={theme.warn} width={textWidth}>
               {e.text}
             </Marked>
           ) : (
-            <Marked mark="●" markColor={theme.agent}>
+            <Marked mark="●" markColor={theme.agent} width={textWidth}>
               {e.text}
             </Marked>
           )}
@@ -139,14 +178,14 @@ function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?
     }
     case 'command':
       return (
-        <Marked mark="▸" markColor={theme.command} color={theme.command}>
+        <Marked mark="▸" markColor={theme.command} color={theme.command} width={textWidth}>
           {e.text + (e.principal && e.principal !== 'operator' ? ` (${e.principal})` : '')}
         </Marked>
       );
     case 'error':
       return (
         <Box flexDirection="column" marginTop={1}>
-          <Marked mark="✗" markColor={theme.error} color={theme.error}>
+          <Marked mark="✗" markColor={theme.error} color={theme.error} width={textWidth}>
             {e.text}
           </Marked>
           {e.ms !== undefined ? (
@@ -158,7 +197,7 @@ function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?
       );
     default:
       return (
-        <Marked mark="·" markColor={theme.dim} dim>
+        <Marked mark="·" markColor={theme.dim} dim width={textWidth}>
           {e.text}
         </Marked>
       );
@@ -190,10 +229,9 @@ export interface TranscriptProps {
  * newline is a row, plus the blank separator line the spaced kinds carry.
  */
 function heightOf(e: TranscriptEntry, columns: number): number {
-  const width = Math.max(20, columns - GUTTER - 1);
-  const body = e.text
-    .split('\n')
-    .reduce((n, line) => n + Math.max(1, Math.ceil(line.length / width)), 0);
+  // The rows Marked draws: the same wrap, at the same width.
+  const width = Math.max(1, columns - GUTTER);
+  const body = lines(e.text).reduce((n, line) => n + wrapLine(line, width).length, 0);
   const spacer = e.kind === 'user' || e.kind === 'agent' || e.kind === 'error' ? 1 : 0;
   const hint = e.kind === 'agent' && e.inputRequired ? 1 : 0;
   return body + spacer + hint;

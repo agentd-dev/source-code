@@ -444,3 +444,26 @@ test('the composer box holds input that wraps in a narrow pane', async () => {
     app.unmount();
   }
 });
+
+// A reply wrapped in a narrow pane: each row fits the column and none starts
+// with the break's space. Ink's own wrap kept that space, so the row after
+// one that filled the column was a column too wide; the terminal wrapped it
+// again and the frame lost a character and a row.
+test('wrapLine fits each row to the column and drops the break space', async () => {
+  const { wrapLine } = await import('../dist/tui/parts/transcript.js');
+  const reply =
+    'information earlier. **You have 60 days from the statement date to dispute a charge.** Before we discuss the charge, your identity must be confirmed';
+  for (const width of [30, 35, 37, 38]) {
+    const rows = wrapLine(reply, width);
+    for (const r of rows) {
+      assert.ok([...r].length <= width, `${JSON.stringify(r)} is wider than ${width}`);
+      assert.doesNotMatch(r, /^ /, `${JSON.stringify(r)} starts with the break's space`);
+    }
+    assert.equal(rows.join(' '), reply, `nothing is lost at ${width}`);
+  }
+  // "dispute a charge.** Before we discuss" fills 37 exactly; the next row starts at "the".
+  assert.ok(wrapLine(reply, 37).includes('dispute a charge.** Before we discuss'));
+  // A word longer than the column is broken, not overflowed.
+  assert.deepEqual(wrapLine('abcdefghij', 4), ['abcd', 'efgh', 'ij']);
+  assert.deepEqual(wrapLine('', 10), ['']);
+});

@@ -165,15 +165,28 @@ export function MultilineInput({
   ignoreVertical = false,
   placeholder,
 }: MultilineInputProps): React.JSX.Element {
+  // Keys can arrive faster than React re-renders (a fast typist, `tmux
+  // send-keys`): each must edit the state the key before it left, not the
+  // props of the last render, or every key but the last is lost and Enter
+  // sends what was there before. `live` is that state; a change from the
+  // parent (history, a suggestion, a clear after sending) replaces it.
+  const live = React.useRef({ value, cursor });
+  const seen = React.useRef({ value, cursor });
+  if (seen.current.value !== value || seen.current.cursor !== cursor) {
+    seen.current = { value, cursor };
+    live.current = { value, cursor };
+  }
   useInput(
     (input, key) => {
       if (ignoreVertical && (key.upArrow || key.downArrow)) return;
-      const r = applyKey({ value, cursor }, input, key as EditKey);
+      const was = live.current;
+      const r = applyKey(was, input, key as EditKey);
       if (r.history && onHistory) {
         onHistory(r.history);
         return;
       }
-      if (r.state.value !== value || r.state.cursor !== cursor) onChange(r.state);
+      live.current = r.state;
+      if (r.state.value !== was.value || r.state.cursor !== was.cursor) onChange(r.state);
       if (r.submit) onSubmit(r.state.value);
     },
     { isActive },

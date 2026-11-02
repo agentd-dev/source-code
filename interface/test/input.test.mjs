@@ -93,3 +93,28 @@ test('control chords and empty input never corrupt the buffer', () => {
   const wild = applyKey({ value: 'abc', cursor: 99 }, 'd', {});
   assert.equal(wild.state.value, 'abcd');
 });
+
+test('keys that arrive before a re-render all land, and Enter sends them all', async () => {
+  const React = (await import('react')).default;
+  const { render } = await import('ink-testing-library');
+  const { MultilineInput } = await import('../dist/tui/parts/input.js');
+  const sent = [];
+  function Host() {
+    const [s, set] = React.useState({ value: '', cursor: 0 });
+    return React.createElement(MultilineInput, {
+      value: s.value,
+      cursor: s.cursor,
+      onChange: set,
+      onSubmit: (v) => sent.push(v),
+    });
+  }
+  const r = render(React.createElement(Host));
+  await new Promise((ok) => setTimeout(ok, 20));
+  // One keystroke per write, with no render between them: what a fast
+  // typist or `tmux send-keys` delivers.
+  for (const ch of '#01 ok') r.stdin.write(ch);
+  r.stdin.write('\r');
+  await new Promise((ok) => setTimeout(ok, 50));
+  r.unmount();
+  assert.deepEqual(sent, ['#01 ok']);
+});

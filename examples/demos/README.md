@@ -421,6 +421,11 @@ examples/demos/support-tmux.sh
 tmux attach -t support
 ```
 
+`SUPPORT_COLS`, `SUPPORT_ROWS` and `SUPPORT_WATCH_ROWS` set another size
+(defaults 120, 32 and 8). At `SUPPORT_COLS=150 SUPPORT_ROWS=44` each column
+is about 49x34, so a reply as long as the disclosure shows from its first
+line; in 39x22 the TUI shows its end.
+
 ```text
 ┌ chat · :8430 ──────┬ voice · :8431 ──────┬ email · :8432 ──────┐
 │ agentd-tui, 39x22  │ agentd-tui, 40x22   │ agentd-tui, 39x22   │

@@ -33,8 +33,14 @@ struct Run {
     log: String,
 }
 
-/// Boot the real daemon against the mock registry and capture its log.
+/// Boot the real daemon against the mock registry and capture its log, to
+/// `proc.ready` (or its exit).
 fn boot(instruction: &str, sources: Value) -> Run {
+    boot_until(instruction, sources, |log| log.contains("proc.ready"))
+}
+
+/// [`boot`], capturing the log until `done` holds for it (or the daemon exits).
+fn boot_until(instruction: &str, sources: Value, done: impl Fn(&str) -> bool) -> Run {
     let mock = common::spawn_mock_mcp("mock://watched", false);
     let cfg = json!({
         "agent": {"name": "reg-consumer", "preflight": "never",
@@ -59,15 +65,12 @@ fn boot(instruction: &str, sources: Value) -> Run {
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         let log = std::fs::read_to_string(&err_path).unwrap_or_default();
-        if log.contains("proc.ready")
-            || log.contains("proc.exit")
-            || child.try_wait().is_ok_and(|s| s.is_some())
-        {
+        if done(&log) || log.contains("proc.exit") || child.try_wait().is_ok_and(|s| s.is_some()) {
             break;
         }
         if Instant::now() > deadline {
             let _ = child.kill();
-            panic!("daemon neither became ready nor exited:\n{log}");
+            panic!("daemon neither got there nor exited:\n{log}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -88,7 +91,12 @@ fn event(log: &str, name: &str) -> Option<Value> {
 
 #[test]
 fn a_registry_read_captures_its_version_and_reports_the_binding() {
-    let r = boot("instruction://ins_mock@stable", json!([]));
+    // To the machinery's apply: with `agent.instruction.machinery: live` (the
+    // default) the served document's workflow joins the running config through
+    // the staged reload, after startup.
+    let r = boot_until("instruction://ins_mock@stable", json!([]), |log| {
+        log.contains("instruction.machinery.applied")
+    });
     let loaded = event(&r.log, "instruction.loaded")
         .unwrap_or_else(|| panic!("no instruction.loaded:\n{}", r.log));
     assert_eq!(
@@ -129,18 +137,18 @@ fn a_registry_read_captures_its_version_and_reports_the_binding() {
         "startup completed:\n{}",
         r.log
     );
-    // BOUNDARY, asserted so it cannot change silently: a registry document
-    // resolved at RUNTIME contributes its DELIVERED TEXT only — its machinery
-    // does not join the runtime config, because config folding happens at
-    // LOAD (the `oci://` path folds for exactly that reason). So the workflow
-    // this document declares is acknowledged to the model but not armed here.
-    assert!(
-        !r.log.contains("workflow.loaded") || !r.log.contains("mock-drain"),
-        "runtime-resolved registry machinery is not expected to arm; if this \
-         now folds, the boundary changed and this test should assert the new \
-         behaviour:\n{}",
-        r.log
-    );
+    // A registry document resolved at RUNTIME arms its machinery live: the
+    // workflow it declares is loaded beside the operator's, in one staged
+    // reload attributed to the instruction.
+    let armed = r
+        .log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .any(|v| v["event"] == "workflow.loaded" && v["name"] == "mock-drain");
+    assert!(armed, "the document's workflow is armed live:\n{}", r.log);
+    let reloaded =
+        event(&r.log, "config.reloaded").unwrap_or_else(|| panic!("no staged reload:\n{}", r.log));
+    assert_eq!(reloaded["trigger"], "instruction", "{reloaded}");
 }
 
 /// The binding's target as the registry takes it: a URI with no ref follows

@@ -17,16 +17,18 @@
 #   agentd -c examples/demos/home.yaml
 #
 # What the document declares and what this file declares. The document names
-# the thermostat and the air conditioner (:::mcp, at https://home.example/…),
-# the home agent (::agent) and the hot-afternoon workflow. Read from a
-# registry, as here, agentd delivers the document's TEXT and activates none
-# of its connected objects or workflows: those fold into configuration only
-# when the document is loaded from a file, a URL or an OCI artifact (and a
-# document from the wire never declares a peer at all). So this file
-# declares them, under the document's own names — `thermostat`, `aircon`,
-# `home` — on 127.0.0.1, and nothing needs home.example to resolve. The
-# workflow below is the document's hot-afternoon, made runnable: a filter on
-# the start, arguments on the calls, and Nataliia's gate addressed to her.
+# the thermostat and the air conditioner (:::mcp), the home agent (::agent)
+# and the hot-afternoon workflow. Its machinery applies live
+# (`agent.instruction.machinery: live`, the default), and this file declares
+# the same objects under the document's own names — `thermostat`, `aircon`,
+# `home` — on 127.0.0.1. A document's server or peer whose endpoint matches
+# one here IS that one, with this file's tags and ceiling; one under a name
+# used here at another endpoint (https://home.example/…, say) is held as
+# text, and this file's stands. The workflow below is the document's
+# hot-afternoon, made runnable — a filter on the start, arguments on the
+# calls, and Nataliia's gate addressed to her — and, under the same name, it
+# stands over the document's, which is held as text (`config.warning`, a
+# host-policy note). Nothing needs home.example to resolve.
 #
 # Placeholders (environment; defaults in brackets):
 #   HOME_INSTRUCTION_URI   [instruction://ins_01M69H2WEK2P005WHYHJJMYM4A@latest]

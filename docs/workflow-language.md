@@ -215,7 +215,7 @@ deadline, 4 for an unreachable model, 1 otherwise. The full table is in
 | `input is taken as written`, `input.to: …` | an `input` that is templated, or addressed to someone who could never see the gate |
 | `skills is a list of skill references` | a `skills:` entry that is not a non-empty string |
 | `concurrency.scope: key needs a \`key:\` template` | `scope: key` without `key` |
-| `workflow "x" is defined twice — by … and by …` | two sources define one name |
+| `workflow "x" is defined twice — by … and by …` | two sources define one name (an instruction document's workflow under an operator's inline name is held as text with a warning instead) |
 | `a schedule needs \`cron\`, \`every\` or \`at\`` | a schedule that could never fire |
 | `parallel 16 exceeds limits.workflow.fan_out (8)` | a fan-out over the ceiling |
 | `on_unsure: escalate, but its model (smart) names no \`escalate\` model` | nothing to escalate to |

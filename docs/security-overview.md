@@ -117,7 +117,9 @@ Each endpoint is declared in the section that uses it: MCP servers under
 `mcp.servers` with their tags and tool ceiling, models under `intelligence`,
 peers under `a2a.peers`, plain HTTP under `http.endpoints`, Companies under
 `companies`. An instruction document's server whose endpoint matches an
-operator server is that server, with the operator's tags and ceiling. Under
+operator server is that server, with the operator's tags and ceiling; one
+under an operator's name at another endpoint is held as text, so a document
+can neither re-point nor shadow an operator's server. Under
 `security.egress: closed` the operator's sections become an allow-list: an MCP
 server, model provider, A2A peer, `http` step target or other outbound URL
 that matches no entry of its section is refused at load, or at execution when

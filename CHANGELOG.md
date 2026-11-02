@@ -9,6 +9,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 **Fixed.**
 
+- A served instruction document's machinery no longer refuses the
+  operator's whole live apply over a name. A document's MCP server or A2A
+  peer under a name the operator already uses, at another endpoint, and a
+  document's workflow under a name the operator's inline `workflows` uses,
+  are held as text: the operator's stands, a `host-policy` warning names
+  each, and the rest of the document's machinery applies. On 1.21.0 the
+  first live apply of the home and month-end close demo kits was refused
+  (`duplicate server name 'erp'`, `workflow "hot-afternoon" is defined
+  twice`), so their documents' machinery never applied; a publisher could
+  block any consumer's live apply by choosing a name. A server whose
+  endpoint matches the operator's is still that server, and a document
+  still never re-points one.
+
 - A Company whose discovery document says a `protocol_version` other than
   `0.1` is refused (`company.refused`, `reason: protocol_version`), naming
   the version. agentd refused only another major, and used a newer minor —

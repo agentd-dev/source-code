@@ -448,3 +448,85 @@ fn a_changed_instruction_starts_a_turn_under_think_and_only_then() {
         }
     }
 }
+
+/// The operator already declares the server a served document names, at the
+/// same endpoint, as the demo kits do: the document's server IS the operator's
+/// (RFC 0055 §3.1), so the first live apply folds into it and is no
+/// duplicate.
+#[test]
+fn a_served_server_the_operator_declares_is_the_operators() {
+    let registry = common::spawn_mock_mcp("mock://unused", false);
+    let one = common::spawn_mock_mcp("mock://unused", false);
+    serve(&registry, &document(&[block("one", &one, "tone")]));
+    let mut cfg = config(&registry, None);
+    cfg["mcp"]["servers"].as_array_mut().unwrap().push(
+        json!({"name": "one", "endpoint": format!("{}/mcp", one.uri()),
+                     "ns": "one", "allow": ["mock.ops"], "tags": {"*": ["trusted"]}}),
+    );
+    cfg["vars"] = json!({"doc": URI});
+    cfg["agent"]["instruction"]["mcp"]["resource"] = json!("{{config.doc}}");
+    let mut d = boot(cfg);
+    let first = applied(&mut d, 0);
+    let log = d.log();
+    assert!(
+        events(&log, "config.reload.invalid").is_empty(),
+        "the first apply was refused:\n{log}"
+    );
+    let _ = first;
+    wait_calls(
+        &one,
+        1,
+        "the operator's server one called by the document's workflow",
+        &d,
+    );
+}
+
+/// The demo kits' case: the operator declares, under the document's names, a
+/// server at another endpoint and its own workflow. The operator's stand,
+/// the document's blocks are held as text, said, and the live apply is not
+/// refused — the rest of the document's machinery (its skill) joins.
+#[test]
+fn the_operators_names_stand_over_a_served_documents_and_the_apply_goes_on() {
+    let registry = common::spawn_mock_mcp("mock://unused", false);
+    let one = common::spawn_mock_mcp("mock://unused", false);
+    let elsewhere = common::spawn_mock_mcp("mock://unused", false);
+    serve(&registry, &document(&[block("one", &elsewhere, "tone")]));
+    let mut cfg = config(&registry, None);
+    cfg["mcp"]["servers"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": "one", "endpoint": format!("{}/mcp", one.uri())}));
+    cfg["workflows"].as_array_mut().unwrap().push(json!({
+        "name": "ping-one", "steps": {
+            "s": {"kind": "schedule", "every": "200ms"},
+            "c": {"kind": "mcp.tool", "depends_on": ["s"], "server": "one", "tool": "mock.ops"},
+            "f": {"kind": "finish", "depends_on": ["c"], "status": "completed"}}}));
+    let mut d = boot(cfg);
+    let first = applied(&mut d, 0);
+    let log = d.log();
+    assert!(
+        events(&log, "config.reload.invalid").is_empty(),
+        "the apply was refused:\n{log}"
+    );
+    assert_eq!(names(&first["skills_added"]), ["tone"], "{first}");
+    for held in ["mcp server \"one\"", "workflow \"ping-one\""] {
+        assert!(
+            events(&log, "config.warning").iter().any(|w| w["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains(held) && w.contains("operator's stands"))),
+            "{held} is said to be held:\n{log}"
+        );
+    }
+    // The operator's server is the one called; the document's endpoint never.
+    wait_calls(
+        &one,
+        1,
+        "the operator's server one called by its own workflow",
+        &d,
+    );
+    assert_eq!(
+        calls(&elsewhere),
+        0,
+        "the document's endpoint was dialed:\n{log}"
+    );
+}

@@ -166,8 +166,8 @@ the instruction's :::config writes intelligence.endpoints — operator configura
 | A workflow with a `webhook` start or a `wait {on: webhook}` needs the `interface` grant, however the document writes it, including workflows it references by `file:`, `url:`, `uri:` or `dir:`. | `… opens an inbound route on the operator's webhook listener — a served document may open one only under the interface grant` |
 | The fragment merges under the operator's configuration. | At every key, a config file, environment variable or flag wins. |
 | A turn model the operator names wins, in either spelling (`intelligence.model`, `intelligence.roles.turn`). | The document's is dropped. A warning names a spelling the operator did not write. |
-| MCP servers a document declares are added to the operator's list. | A name the operator already uses is refused: `duplicate server name`. |
-| Two definitions of one workflow name, from any two sources, are refused. | The message names the workflow and both sources. |
+| A document's MCP server or A2A peer whose endpoint matches an operator's is that server or peer; one that matches none is added (under `security.egress: open`). | One under a name the operator already uses, at another endpoint, is held as text: the operator's stands, a `host-policy` warning names it, and the document's steps naming it reach the operator's. |
+| A document's workflow under a name the operator's inline `workflows` already uses is held as text. | The operator's definition stands, a `host-policy` warning names it, and the rest of the document's machinery applies. Two definitions of one name from any other two sources are refused, naming the workflow and both. |
 | A subagent template's blocks face the same boundary. | It also may not write `a2a`, `intelligence`, `store` or `lifecycle`, which the parent composes for the child. |
 
 ## Instruction source settings

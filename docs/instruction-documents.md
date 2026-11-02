@@ -149,7 +149,8 @@ diagnostic's code. A warning is said and the document loads. The common ones:
 | `:::config` setting `intelligence.endpoints` | `the instruction's :::config writes intelligence.endpoints — operator configuration is not a document's to set` | Move the key to the operator's config. |
 | `:::config` setting `document_capabilities` | `a config block may not write document_capabilities` (`self-grant`) | Grants are the operator's. |
 | `::agent{…}` without the grant | a warning: `agent "x" is not activated: needs the identity grant (host-policy)` | Grant it; see [Grant what a document may use](#grant-what-a-document-may-use). |
-| `:::mcp{id=fs …}` when the operator has a server `fs` | `mcp.servers[]: duplicate server name 'fs'` | Rename it. A document adds servers; it never re-points one. |
+| `:::mcp{id=fs …}` when the operator has a server `fs` at another endpoint | a warning: `mcp server "fs" (…) is not activated: the operator's mcp.servers has a server of that name at another endpoint, and the operator's stands` (`host-policy`) | Nothing, if the operator's `fs` is meant; otherwise rename the block. A document adds servers; it never re-points one. |
+| `:::workflow{id=w …}` when the operator defines a workflow `w` | a warning: `workflow "w" is not activated: the operator defines a workflow of that name, and the operator's stands` (`host-policy`) | Nothing, if the operator's `w` is meant; otherwise rename the block. |
 
 A block written in the older `:::!kind` form is not `instruction/1` syntax.
 The document is refused, naming each such line with the SDK's

@@ -96,6 +96,9 @@ store:
 
 mcp:
   servers:
+    # The document's `erp` (:::mcp, at https://erp.example/mcp), under its
+    # name. This one stands: the document's block, at another endpoint, is
+    # held as text, and its steps naming `erp` reach this server.
     - name: erp
       endpoint: "${ERP_MCP_URL:-http://127.0.0.1:8702/mcp}"
       ns: erp

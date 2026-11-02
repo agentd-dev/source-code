@@ -426,6 +426,7 @@ fn a_served_documents_agents_need_a_pinned_publisher_that_attests_them() {
 
 /// An org chart: `alpha` with `beta` nested in it, a report. Each agent's
 /// own `once` workflow, no team workflow at all.
+#[cfg(feature = "hot-reload")]
 fn org(reports: &[&str]) -> String {
     let nested: String = reports
         .iter()
@@ -550,6 +551,7 @@ fn on_compose_starts_an_org_chart_and_a_report_a_reload_adds() {
 /// Three agents, each written under the document's `tone` parameter, so a
 /// new `tone` recomposes all three. `beta` has a skill named like an
 /// instruction.md id.
+#[cfg(feature = "hot-reload")]
 fn team_in(tone: &str, beta_flat: bool) -> String {
     let wf = |id: &str| {
         format!(

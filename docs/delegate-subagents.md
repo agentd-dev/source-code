@@ -1020,7 +1020,7 @@ the principal that spawned it.
 | `subagent.send` | `handle`, `message` | `{ok, handle}` for a warm child, which queues the message; an instance child receives it over A2A and the reply adds `delivery: "async"` |
 | `subagent.kill` | `handle`, optional `reason` | `{ok, handle}`; flat children only |
 | `subagent.retire` | `handle` | `{ok, handle, status: "retiring"}`; instance children only |
-| `subagent.list` | none | `{subagents: [...]}`: handle, mode, status, the first 80 characters of the instruction, created |
+| `subagent.list` | none | `{subagents: [...]}`: handle, mode, status, the first 80 characters of the instruction, created, and for a templated child its template, tier and `reports_to` |
 
 Over A2A, `subagent.send`, `subagent.kill` and `subagent.status` are command
 operations, each held to the caller's grants, and an introspection read

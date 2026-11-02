@@ -167,7 +167,8 @@ impl Runtime {
                 ToolOutcome::Ready(
                     json!({"subagents": self.subagents.values()
                         .filter(|s| acting.as_ref().is_none_or(|p| super::reactor::may_act_on(p, s.principal.as_deref())))
-                        .map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "instruction": s.instruction.chars().take(80).collect::<String>(), "created": s.created})).collect::<Vec<_>>()}),
+                        .map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "instruction": s.instruction.chars().take(80).collect::<String>(), "created": s.created,
+                            "template": s.template, "tier": s.tier, "reports_to": s.reports_to})).collect::<Vec<_>>()}),
                     false,
                 )
             }

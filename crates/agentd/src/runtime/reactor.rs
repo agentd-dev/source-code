@@ -2510,7 +2510,7 @@ impl Runtime {
             "workflows": self.workflows.values().map(|w| json!({"name": w.name, "hash": w.hash, "armed": w.armed, "starts": w.start_steps().iter().map(|s| s.kind.clone()).collect::<Vec<_>>()})).collect::<Vec<_>>(),
             "runs": self.runs.values().map(RunState::summary).collect::<Vec<_>>(),
             "conversations": self.conversation_views(),
-            "subagents": self.subagents.values().map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "template": s.template, "tier": s.tier, "pid": s.pid, "retire_at": s.retire_at})).collect::<Vec<_>>(),
+            "subagents": self.subagents.values().map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "template": s.template, "tier": s.tier, "reports_to": s.reports_to, "pid": s.pid, "retire_at": s.retire_at})).collect::<Vec<_>>(),
             "children": self.children.status(),
             "timers": self.timers.status(),
             "inbox_pending": self.inbox_queue.len(),

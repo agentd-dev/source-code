@@ -447,7 +447,10 @@ fn org(reports: &[&str]) -> String {
          {nested}:::::\n\n\
          :::workflow{{id=also dialect=\"instruction/workflow\"}}\n\
          name: also\nsteps: {{ s: {{ kind: once }}, run: {{ kind: subagent, depends_on: [s], template: beta }}, \
-         f: {{ kind: finish, depends_on: [run], status: completed, output: \"{{{{steps.run.output.handle}}}}\" }} }}\n:::\n"
+         ls: {{ kind: tool, depends_on: [run], name: subagent.list, args: {{}} }}, \
+         st: {{ kind: tool, depends_on: [ls], name: status, args: {{}} }}, \
+         f: {{ kind: finish, depends_on: [st], status: completed, \
+         output: \"{{{{steps.run.output.handle}}}} {{{{steps.ls.output.subagents}}}} {{{{steps.st.output.subagents}}}}\" }} }}\n:::\n"
     )
 }
 
@@ -522,7 +525,14 @@ fn on_compose_starts_an_org_chart_and_a_report_a_reload_adds() {
         .find(|e| e["workflow"] == "also")
         .unwrap();
     assert_eq!(also["status"], "completed", "{also}");
-    assert_eq!(also["output"], d.handles("beta")[0].as_str(), "{also}");
+    let out = also["output"].as_str().unwrap();
+    assert!(
+        out.starts_with(&format!("{} ", d.handles("beta")[0])),
+        "{also}"
+    );
+    // Both listers name each child's reporting line: `subagent.list`, and
+    // the status document a client adopts on connect or resync.
+    assert_eq!(out.matches(r#""reports_to":"alpha""#).count(), 2, "{also}");
     assert_eq!(
         events(&log, "subagent.template.already_live").len(),
         1,

@@ -133,10 +133,12 @@ routes, and checks egress and the trifecta over the child's servers.
 ### 3.6 Skills travel
 
 A template's inline `:::skill` blocks reach its instance child: the parent
-writes each as `<name>/SKILL.md` in the child's directory and composes the
-child's `skills.dir` to it (`runtime/instances.rs`, `compose_instance_doc`).
-Before this RFC they were stripped from the child's text and lost, for every
-instance template.
+composes them as the child's `skills.inline` (operator-only), each under its
+own id — an instruction.md id such as `web.search`, checked at template
+compile to be one segment (`runtime/instances.rs`, `compose_instance_doc`).
+Not as a skills folder: an Agent Skills folder name allows only `a-z`, `0-9`
+and `-`. Before this RFC they were stripped from the child's text and lost,
+for every instance template.
 
 ### 3.7 Reporting lines
 
@@ -194,7 +196,8 @@ child of an operator template is:
   burst allows.
 - **What it runs on.** `subagents.defaults` (its model) and the parent's
   `intelligence` section, minus its budget, routes and inline tokens.
-- **What it reaches.** Its servers are its own `:::mcp` blocks, untrusted
+- **What it reaches.** Its servers are its own `:::mcp` blocks — a flat,
+  prose-only agent has none (`servers: []`), never the parent's — untrusted
   unless they are the operator's (`untrust_template_servers`), adopted as the
   operator's server with its credential and ceiling when they match one
   (`adopt_operator_servers`), held to `security.egress` and the trifecta. It
@@ -230,6 +233,14 @@ agent too: a child of a wire document whose machinery names a secret or
 writes `a2a.peers` refuses the document (`wire_floor_effects`, at fold and
 again at compile).
 
+What "attests" means for a registry read (`mcp:`) depends on the pin. With
+`reader` pinned, the read's delivery signature is checked too, and the
+families the document may use are author ∩ delivery ∩ `max_capabilities`
+(and the grant). Without `reader`, only the author signature is checked —
+the delivery signature is not consulted, since there is no reader key to
+check it against — and the families are author ∩ `max_capabilities` (and the
+grant).
+
 Every path a wire document takes agrees. The load folds a fetched `url:` or
 `oci:` document with its verified attestation (`Folding::attested`); a
 registry document (`mcp:`) folds as a `RegistryDocument` carrying the
@@ -253,6 +264,17 @@ live instance child follows its template (`Runtime::recompose_children`):
   channels and fields; where in its document an agent stands, and who it
   reports to, are not. A report added under a manager is cut out of the
   manager's text (§3.7), so the manager's composition does not change.
+  - The respawn replaces its predecessor: the instance ceilings do not count
+    it (no breadth, no `total`, no rate token). They bound new agents, and a
+    recompose is the same agent composed again — a change to the document's
+    front-matter `parameters` recomposes every agent written under them.
+  - What can still refuse it is asked before the old child is retired:
+    pressure that sheds new work, and params the new template refuses. One
+    that would refuse keeps the old child running, logged as
+    `subagent.template.recompose_refused` with the reason.
+  - A template that is no longer a singleton, or no longer an instance child
+    (an agent that turned prose-only), is retired and not started again
+    (`subagent.template.retired`, with the reason).
 - **Changed composition, not a singleton:** the child keeps the composition
   it was spawned with until it retires.
 - **Added:** the template is spawnable from the next spawn, and under
@@ -280,7 +302,8 @@ A spawn of a document agent whose singleton is live — started on compose,
 or by a workflow that also spawns it — is answered with the live one
 (`{handle, …, already_live: true}`) and logged as
 `subagent.template.already_live`, before the ceilings the live one already
-counts against: no second child, no failed step. An operator template's
+counts against: no second child, no failed step. A child that is retiring —
+being recomposed — is not answered so. An operator template's
 singleton is still refused, as before.
 
 The rule applies to every template, the operator's and a document's. It

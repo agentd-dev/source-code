@@ -1252,6 +1252,7 @@ mentions `{{agents_md}}` while `agent.workspace` is set. How a turn uses it is
 | `skills.sources[].filter` | string | — | live · op | One skill name, or a prefix ending in `*`: the server's skills to take. |
 | `skills.sources[].dynamic` | `refuse \| allow` | `refuse` | live · op | Load a skill whose content is `dynamic`, which cannot be verified. |
 | `skills.dir` | path | `skills/` beside the config, when it holds a skill | live · op | A folder of `<name>/SKILL.md` skills, the user scope. A folder that cannot be read refuses the configuration. |
+| `skills.inline` | list of `{name, description, when_to_use, body}` | `[]` | live · op | Skills given as text, `name` an instruction.md id (`web.search`). How a parent composes an instance child's `:::skill` blocks; an operator may write it too. |
 | `skills.reference_prefix` | string | `@skill:` | live · doc | How a text references a skill. |
 | `skills.max_loaded` | int | `8` | live · doc | Skills loaded into a context at once. |
 | `skills.max_bytes` | int | `32768` | live · doc | The most text a skill body or file puts into context; the rest is cut. |

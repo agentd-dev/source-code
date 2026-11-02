@@ -149,21 +149,39 @@ impl Runtime {
         tname: &str,
         args: &Value,
     ) -> ToolOutcome {
+        self.instance_spawn(caller, tname, args, false)
+    }
+
+    /// [`Runtime::instance_run`], or — `replacing` — the start of a
+    /// recomposed singleton in place of its retired predecessor: the same
+    /// agent, composed again, which the instance ceilings (breadth, total,
+    /// rate) do not count a second time. They bound new agents.
+    fn instance_spawn(
+        &mut self,
+        caller: &super::tools::ToolCaller,
+        tname: &str,
+        args: &Value,
+        replacing: bool,
+    ) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
         // A document's agent is the one agent of its name (RFC 0056): a spawn
         // that finds it live — started on compose, or by another workflow —
         // is answered with that one, said, rather than refused. Before the
-        // ceilings, which the live one already counts against.
-        if self
-            .settings
-            .subagents
-            .templates
-            .get(tname)
-            .is_some_and(|t| t.singleton && t.document.is_some())
-            && let Some(s) = self
+        // ceilings, which the live one already counts against. Not one that
+        // is retiring: a recompose is replacing it.
+        if !replacing
+            && self
+                .settings
                 .subagents
-                .values()
-                .find(|s| s.template.as_deref() == Some(tname) && !is_terminal_status(&s.status))
+                .templates
+                .get(tname)
+                .is_some_and(|t| t.singleton && t.document.is_some())
+            && let Some(s) = self.subagents.values().find(|s| {
+                s.template.as_deref() == Some(tname)
+                    && !is_terminal_status(&s.status)
+                    && s.retiring_since.is_none()
+                    && s.status != "retiring"
+            })
         {
             let handle = s.handle.clone();
             let socket = s.socket.clone();
@@ -187,7 +205,7 @@ impl Runtime {
             .count() as u32;
         let il = &self.settings.limits.subagents.instances;
         let breadth = il.breadth.unwrap_or(2);
-        if live >= breadth {
+        if !replacing && live >= breadth {
             crate::obs::metrics::record_refusal("breadth");
             return err(format!(
                 "subagent.run refused: {live} instance children live (limits.subagents.instances.breadth = {breadth})"
@@ -199,13 +217,13 @@ impl Runtime {
             .values()
             .filter(|s| s.tier.as_deref() == Some("instance"))
             .count();
-        if lifetime >= total {
+        if !replacing && lifetime >= total {
             crate::obs::metrics::record_refusal("total");
             return err(format!(
                 "subagent.run refused: {lifetime} instance children spawned (limits.subagents.instances.total = {total})"
             ));
         }
-        if !self.instance_bucket_take() {
+        if !replacing && !self.instance_bucket_take() {
             crate::obs::metrics::record_refusal("rate");
             return err(
                 "subagent.run refused: instance spawn rate exceeded (limits.subagents.instances.rate)"
@@ -225,7 +243,11 @@ impl Runtime {
         let Some(t) = compiled.get(tname) else {
             return err(format!("subagent.run: no template '{tname}'"));
         };
-        debug_assert_eq!(t.tier, Tier::Instance);
+        if t.tier != Tier::Instance {
+            return err(format!(
+                "subagent.run: template '{tname}' is not an instance-tier template"
+            ));
+        }
         if t.spec.singleton
             && let Some(s) = self
                 .subagents
@@ -553,44 +575,23 @@ impl Runtime {
             }
         }
         // The template's own skills (`:::skill` with a body): the prose the
-        // child reads no longer carries them, so they travel as a folder of
-        // `<name>/SKILL.md` in its directory, the child's `skills.dir` — a
-        // section no template writes (`OPERATOR_ONLY`), the parent's to
-        // compose.
+        // child reads no longer carries them, so they travel as the child's
+        // `skills.inline` — a section no template writes (`OPERATOR_ONLY`),
+        // the parent's to compose — with the names the template gave them
+        // (`config::templates` checked each is one segment). A param folds
+        // into the text, never into a name.
         if !t.skills.is_empty() {
-            let folder = dir.join("skills");
-            for sk in &t.skills {
-                // A skill's name is its directory's (agentskills.io): one
-                // path segment, the author's, never a param's.
-                let name = sk.name.clone();
-                if name.is_empty()
-                    || !name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                {
-                    return Err(format!(
-                        "skill {name:?}: a child's skill is named by one path segment of letters, digits and dashes"
-                    ));
-                }
-                let mut description = fold_params(&sk.description, params);
-                if description.trim().is_empty() {
-                    description.clone_from(&name);
-                }
-                if let Some(when) = &sk.when_to_use {
-                    description = format!("{description} Use when: {}.", fold_params(when, params));
-                }
-                let text = format!(
-                    "---\nname: {}\ndescription: {}\n---\n{}\n",
-                    json!(name),
-                    json!(description),
-                    fold_params(&sk.body, params)
-                );
-                let at = folder.join(&name);
-                std::fs::create_dir_all(&at)
-                    .and_then(|()| std::fs::write(at.join("SKILL.md"), text))
-                    .map_err(|e| format!("skill {name:?}: write {}: {e}", at.display()))?;
-            }
-            doc["skills"] = json!({"dir": folder.display().to_string()});
+            let inline: Vec<Value> = t
+                .skills
+                .iter()
+                .map(|sk| {
+                    json!({"name": sk.name,
+                           "description": fold_params(&sk.description, params),
+                           "when_to_use": sk.when_to_use.as_deref().map(|w| fold_params(w, params)),
+                           "body": fold_params(&sk.body, params)})
+                })
+                .collect();
+            doc["skills"] = json!({"inline": inline});
         }
         // Parent-owned composition: store, listener, lifecycle, security.
         doc["store"] = if durable {
@@ -1112,7 +1113,36 @@ impl Runtime {
                         );
                     }
                 }
+                // No longer a singleton instance child: nothing composes the
+                // one it was, so it is retired and not started again.
+                Some(now)
+                    if was.spec.singleton
+                        && !now.same_composition(was)
+                        && (now.tier != Tier::Instance || !now.spec.singleton) =>
+                {
+                    let why = if now.tier != Tier::Instance {
+                        "its template is no longer an instance child"
+                    } else {
+                        "its template is no longer a singleton"
+                    };
+                    if self.retire_instance(&handle, why) {
+                        self.subagent_log(&handle).info(
+                            "subagent.template.retired",
+                            json!({"template": tname, "handle": handle, "why": why}),
+                        );
+                    }
+                }
                 Some(now) if was.spec.singleton && !now.same_composition(was) => {
+                    // What can refuse the new composition is asked before the
+                    // old child goes: one that cannot start keeps it.
+                    if let Err(why) = self.recompose_refusal(&handle, now) {
+                        self.subagent_log(&handle).warn(
+                            "subagent.template.recompose_refused",
+                            json!({"template": tname, "handle": handle, "why": why,
+                                   "note": "the running child keeps its composition"}),
+                        );
+                        continue;
+                    }
                     if self.retire_instance(&handle, "its template was recomposed") {
                         self.recomposing.insert(handle.clone(), tname.clone());
                         self.subagent_log(&handle).info(
@@ -1125,6 +1155,27 @@ impl Runtime {
                 Some(_) => {}
             }
         }
+    }
+
+    /// Why the live child `handle` could not be started again from the new
+    /// composition `now`, asked before it is retired: pressure that sheds new
+    /// work, or params it was spawned with that the new template refuses. The
+    /// instance ceilings are not asked: a respawn replaces its predecessor.
+    fn recompose_refusal(&self, handle: &str, now: &CompiledTemplate) -> Result<(), String> {
+        if self.pressure.shedding() {
+            return Err(format!(
+                "{} pressure (shedding new work)",
+                self.pressure.cause()
+            ));
+        }
+        let given = self
+            .subagents
+            .get(handle)
+            .and_then(|s| s.spawn_args.as_ref())
+            .and_then(|a| a.get("params"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        validate_params(&now.spec.params, &given).map(|_| ())
     }
 
     /// Start a recomposed singleton again: the template `tname`, as it is
@@ -1145,7 +1196,24 @@ impl Runtime {
             ..Default::default()
         };
         let carries = rec.carries.clone();
-        match self.instance_run(&caller, tname, &args) {
+        // A reload in between may have made it something else: start it
+        // again only as the singleton instance child it was.
+        let still = compile_templates(&self.settings)
+            .ok()
+            .and_then(|c| {
+                c.get(tname)
+                    .map(|t| t.tier == Tier::Instance && t.spec.singleton)
+            })
+            .unwrap_or(false);
+        if !still {
+            self.subagent_log(was).info(
+                "subagent.template.retired",
+                json!({"template": tname, "handle": was,
+                       "why": "its template is no longer a singleton instance child"}),
+            );
+            return;
+        }
+        match self.instance_spawn(&caller, tname, &args, true) {
             ToolOutcome::Ready(v, false) => {
                 let handle = v["handle"].as_str().unwrap_or_default().to_string();
                 if let Some(s) = self.subagents.get_mut(&handle) {

@@ -65,10 +65,17 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   new one with the params it was spawned with
   (`subagent.template.recomposed`, `subagent.template.respawned`). This holds
   for every template; before, a reload changed no live child, and removing a
-  singleton template left its child running without its peer alias.
+  singleton template left its child running without its peer alias. The
+  respawn replaces its predecessor and is not counted against the instance
+  ceilings; one that pressure or the new params would refuse keeps the old
+  child running (`subagent.template.recompose_refused`), and a template that
+  is no longer a singleton instance child is retired, not respawned. A flat,
+  prose-only document agent is given no server of the parent's.
 - **An instance template's skills reach its child.** Its inline `:::skill`
-  blocks are written into the child's directory as `<name>/SKILL.md` and
-  composed as the child's `skills.dir`; they were stripped and lost.
+  blocks are composed as the child's `skills.inline`, a new operator-only
+  setting of skills given as text, under their instruction.md ids
+  (`web.search` included, checked at template compile); they were stripped
+  and lost.
 
 ## v1.21.1 — the operator's names stand, and only Personal Agent Protocol 0.1 is spoken
 

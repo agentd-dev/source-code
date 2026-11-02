@@ -5988,6 +5988,33 @@
           "description": "a local folder of <name>/SKILL.md skills (Agent Skills, the user scope); `skills/` beside the config is adopted when this is unset, and `.agents/skills/` beside the config is read as the project scope",
           "type": "string"
         },
+        "inline": {
+          "description": "skills given as text: how a parent composes an instance child's `:::skill` blocks, which its prose no longer carries. Operator-only",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "body": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "name": {
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                "type": "string"
+              },
+              "when_to_use": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "body"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
         "max_bytes": {
           "minimum": 1,
           "type": "integer"

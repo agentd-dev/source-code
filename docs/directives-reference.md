@@ -120,7 +120,10 @@ refuses the document, as it refuses any template (an instance child has no
 listener).
 
 A verified author signature caps the grant to the capabilities it attests;
-it never widens it.
+it never widens it. For a registry read with `reader` pinned, the delivery
+signature is checked too, and the grant is capped to author ∩ delivery ∩
+`max_capabilities`; without `reader`, to author ∩ `max_capabilities`, and
+the delivery signature is not checked.
 
 ## Configuration a document may write
 

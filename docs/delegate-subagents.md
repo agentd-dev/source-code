@@ -810,9 +810,14 @@ child whose template the reload removed is retired, and the parent logs
 composition changed (its prose, machinery, skills or fields) is retired,
 logged as `subagent.template.recomposed`, and started again from the new
 template once it has exited, with the params it was spawned with, logged as
-`subagent.template.respawned` (or `subagent.template.respawn_failed`, with
-the refusal, when the ceilings or the new params refuse it). Other children
-of a changed template keep the composition they were spawned with until they
+`subagent.template.respawned`. The new child replaces the old one, so the
+instance ceilings (breadth, total, rate) do not count it again. What could
+still refuse it, pressure or params the new template refuses, is checked
+before the old child is retired: the old child then keeps running, and the
+parent logs `subagent.template.recompose_refused`. A template that is no
+longer a singleton, or whose agent became prose-only, retires its child and
+does not start another (`subagent.template.retired`). Other children of a
+changed template keep the composition they were spawned with until they
 retire.
 
 ## A document's own agents
@@ -992,7 +997,7 @@ own definition changed.
   not used, and a flat template's `:::skill` block is stripped from the
   worker's text. Put what the worker needs in its instruction or `context`.
   An instance template's `:::skill` blocks reach the child as its own
-  skills, a `<name>/SKILL.md` folder in its directory.
+  skills, composed as its `skills.inline` under the ids the template gave them.
 - **A changed `once` workflow runs again.** A reload starts the `once` start
   of a definition it installed new or replaced. Under `policy: always`, or
   once `store.retention.runs` has evicted the earlier run, a team-spawning

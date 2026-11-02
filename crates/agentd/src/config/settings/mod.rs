@@ -1364,6 +1364,9 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // become prompt text. The caps on the loader are the document's.
     "skills.dir",
     "skills.sources",
+    // Skills given as text, which a parent composes into a child: a
+    // document writes its own as `:::skill` blocks.
+    "skills.inline",
 ];
 
 /// Whether `path` is at or under one of `list`'s entries.
@@ -1592,7 +1595,13 @@ fn document_agent_templates(
         let instance = !child.config.is_empty() || !child.workflows.is_empty();
         out.push(DocumentTemplate {
             name: a.id.clone(),
-            entry: json!({"instruction": a.instruction, "singleton": instance}),
+            // A flat agent is a worker given only its own servers: it has
+            // none (RFC 0056 §4.2), not every one of the parent's.
+            entry: if instance {
+                json!({"instruction": a.instruction, "singleton": true})
+            } else {
+                json!({"instruction": a.instruction, "servers": []})
+            },
             origin: DocumentAgentOrigin {
                 over_the_wire,
                 line: a.line,
@@ -4836,6 +4845,11 @@ pub struct Skills {
     /// `skills/` beside the config is adopted automatically when this is
     /// unset and the folder holds a skill.
     pub dir: Option<String>,
+    /// Skills given as text: how a parent composes an instance child's
+    /// `:::skill` blocks (`runtime::instances`), whose ids are
+    /// instruction.md ids (`web.search`), not Agent Skills folder names.
+    /// The operator's, as a folder is.
+    pub inline: Vec<InlineSkillConfig>,
     pub reference_prefix: Option<String>,
     pub max_loaded: Option<u32>,
     pub max_bytes: Option<u64>,
@@ -4845,6 +4859,43 @@ pub struct Skills {
     /// read, never the working directory alone.
     #[serde(skip)]
     pub project_dir: Option<String>,
+}
+
+/// One `skills.inline` entry.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InlineSkillConfig {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub when_to_use: Option<String>,
+    pub body: String,
+}
+
+impl InlineSkillConfig {
+    /// The catalogue's skill: text the operator gave, nothing fetched.
+    pub fn skill(&self) -> crate::config::idoc::InlineSkill {
+        crate::config::idoc::InlineSkill {
+            name: self.name.clone(),
+            description: self.description.clone(),
+            when_to_use: self.when_to_use.clone(),
+            body: self.body.clone(),
+            fetched_from: None,
+        }
+    }
+}
+
+/// Whether `name` is a skill id a child's skills may carry: an instruction.md
+/// id (`^[A-Za-z0-9][A-Za-z0-9._-]*$`) — one segment, so never `.`, `..` or
+/// a path.
+pub fn skill_id_ok(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -10505,6 +10556,17 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             }
         }
     }
+    for (i, sk) in s.skills.inline.iter().enumerate() {
+        if !skill_id_ok(&sk.name) {
+            err(
+                &mut d,
+                format!(
+                    "skills.inline[{i}].name {:?}: a skill is named by an instruction.md id (letters, digits, `.`, `_`, `-`, starting with a letter or digit)",
+                    sk.name
+                ),
+            );
+        }
+    }
     // A server's skill may say to run anything. With the local runner on,
     // nothing would stand between that text and the host, and agentd has no
     // per-skill approval to ask for (RFC 0051 D4).
@@ -12238,6 +12300,7 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     // the rule's content does.
     "security.policies",
     "skills.dir",
+    "skills.inline",
     "skills.max_bytes",
     "skills.max_loaded",
     "skills.reference_prefix",
@@ -12708,6 +12771,7 @@ mod tests {
                             json!([{"uri": "instruction://x", "publisher": "https://pub.example"}])
                         }
                         "skills.sources" => json!([{"server": "s"}]),
+                        "skills.inline" => json!([{"name": "web.search", "body": "b"}]),
                         "security.policies" => {
                             json!([{"match": {"tool": "fs.*"}, "action": "deny"}])
                         }
@@ -19342,6 +19406,9 @@ mod document_agent_tests {
         assert_eq!(origin.title.as_deref(), Some("Support lead"));
         let scribe = &s.subagents.templates["scribe"];
         assert!(!scribe.singleton);
+        // A flat agent is given no server of the parent's.
+        assert_eq!(scribe.servers, Some(Vec::new()));
+        assert_eq!(support.servers, None);
         // The parent got none of the agent's server, skill or workflow.
         assert!(s.mcp.servers.is_empty(), "{:?}", s.mcp.servers);
         assert!(s.agent.inline_skills.is_empty());

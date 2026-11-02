@@ -546,3 +546,130 @@ fn on_compose_starts_an_org_chart_and_a_report_a_reload_adds() {
     assert_eq!(d.handles("alpha").len(), 1, "{log}");
     assert_eq!(d.handles("beta").len(), 1, "{log}");
 }
+
+/// Three agents, each written under the document's `tone` parameter, so a
+/// new `tone` recomposes all three. `beta` has a skill named like an
+/// instruction.md id.
+fn team_in(tone: &str, beta_flat: bool) -> String {
+    let wf = |id: &str| {
+        format!(
+            ":::workflow{{id={id}-up dialect=\"instruction/workflow\"}}\nname: {id}-up\n\
+             steps: {{ s: {{ kind: once }}, f: {{ kind: finish, depends_on: [s], status: completed }} }}\n:::\n"
+        )
+    };
+    let beta = if beta_flat {
+        "::::agent{id=beta}\nYou are beta, in a ${tone} voice.\n::::\n".to_string()
+    } else {
+        format!(
+            "::::agent{{id=beta}}\nYou are beta, in a ${{tone}} voice.\n\n\
+             :::skill{{id=web.search title=\"Web search\"}}\nSearch the web.\n:::\n\n{}::::\n",
+            wf("beta")
+        )
+    };
+    format!(
+        "---\nspec: \"1\"\nparameters:\n  tone: {{ type: string, default: {tone} }}\n---\n# Team\n\n\
+         ::::agent{{id=alpha}}\nYou are alpha, in a ${{tone}} voice.\n\n{}::::\n\n{beta}\n\
+         ::::agent{{id=gamma}}\nYou are gamma, in a ${{tone}} voice.\n\n{}::::\n",
+        wf("alpha"),
+        wf("gamma")
+    )
+}
+
+/// The instance ceilings left at their defaults — total 8 and rate `4/1h` —
+/// with breadth raised to the three agents: two reloads that recompose all
+/// three respawn six times, and every one is live afterwards. A respawn
+/// replaces its predecessor; the ceilings bound new agents.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn recomposes_past_the_default_total_and_rate_keep_the_team_live() {
+    let extra = "subagents: { document_agents: { start: on_compose } }\n\
+        limits: { subagents: { instances: { breadth: 3 } } }\n\
+        workflows:\n  - name: tick\n    steps:\n      every: { kind: schedule, every: 1h }\n      \
+        done: { kind: finish, depends_on: [every], status: completed }\n";
+    let mut d = Daemon::boot_with(&team_in("warm", false), "drained", extra);
+    d.wait_for("the team to start", |d| {
+        ["alpha", "beta", "gamma"]
+            .iter()
+            .all(|t| d.handles(t).len() == 1)
+    });
+    // `beta`'s skill reached its child under its own name.
+    let beta = d.handles("beta")[0].clone();
+    d.wait_for("beta's skills", |d| {
+        d.child_log(&beta).contains("web.search")
+    });
+    for (round, tone) in [(1, "plain"), (2, "technical")] {
+        std::fs::write(format!("{}/team.md", d.dir), team_in(tone, false)).unwrap();
+        d.sighup();
+        d.wait_for("all three to be respawned", |d| {
+            events(&d.log(), "subagent.template.respawned").len() == 3 * round
+        });
+    }
+    let log = d.log();
+    assert!(
+        events(&log, "subagent.template.respawn_failed").is_empty(),
+        "{log}"
+    );
+    assert!(
+        events(&log, "subagent.template.recompose_refused").is_empty(),
+        "{log}"
+    );
+    // The last child of each is the one running, and runs its own workflow.
+    for t in ["alpha", "beta", "gamma"] {
+        let hs = d.handles(t);
+        assert_eq!(hs.len(), 3, "{t}: {log}");
+        let last = hs.last().unwrap().clone();
+        d.wait_for("the last child's own workflow", |d| {
+            d.child_ran(&last, &format!("{t}-up"))
+        });
+        let exited = events(&d.log(), "instance.exited");
+        assert!(
+            !exited.iter().any(|e| e["handle"] == last.as_str()),
+            "{t} {last} is live: {log}"
+        );
+    }
+}
+
+/// A singleton whose agent becomes prose-only — a flat worker, no longer an
+/// instance child — is retired and not started again (it was respawned as an
+/// instance, and a debug build panicked).
+#[cfg(feature = "hot-reload")]
+#[test]
+fn an_agent_that_turns_flat_is_retired_not_respawned() {
+    let extra = "subagents: { document_agents: { start: on_compose } }\n\
+        limits: { subagents: { instances: { breadth: 3 } } }\n\
+        workflows:\n  - name: tick\n    steps:\n      every: { kind: schedule, every: 1h }\n      \
+        done: { kind: finish, depends_on: [every], status: completed }\n";
+    let mut d = Daemon::boot_with(&team_in("warm", false), "drained", extra);
+    d.wait_for("the team to start", |d| {
+        ["alpha", "beta", "gamma"]
+            .iter()
+            .all(|t| d.handles(t).len() == 1)
+    });
+    let beta = d.handles("beta")[0].clone();
+    std::fs::write(format!("{}/team.md", d.dir), team_in("warm", true)).unwrap();
+    d.sighup();
+    d.wait_for("beta to retire", |d| {
+        events(&d.log(), "instance.exited")
+            .iter()
+            .any(|e| e["handle"] == beta.as_str() && e["status"] == "retired")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    let log = d.log();
+    let retired = events(&log, "subagent.template.retired");
+    assert!(
+        retired.iter().any(|e| e["template"] == "beta"
+            && e["why"]
+                .as_str()
+                .is_some_and(|w| w.contains("no longer an instance"))),
+        "{log}"
+    );
+    assert!(
+        events(&log, "subagent.template.respawned").is_empty(),
+        "{log}"
+    );
+    assert_eq!(d.handles("beta").len(), 1, "{log}");
+    assert!(
+        d.child.try_wait().unwrap().is_none(),
+        "the parent still runs: {log}"
+    );
+}

@@ -146,6 +146,20 @@ pub(crate) fn build(
                    "skills": settings.agent.inline_skills.iter().map(|s| json!({"name": s.name})).collect::<Vec<_>>()}),
         ));
     }
+    // Skills given as text (`skills.inline`): an instance child's own, which
+    // its parent composed, or the operator's.
+    if !settings.skills.inline.is_empty() {
+        let inline: Vec<crate::config::idoc::InlineSkill> =
+            settings.skills.inline.iter().map(|s| s.skill()).collect();
+        for c in cat.add_inline(&inline) {
+            notes.push(Note::warn("skills.collision", c.event()));
+        }
+        notes.push(Note::info(
+            "skills.discovered",
+            json!({"origin": "configuration", "count": inline.len(),
+                   "skills": inline.iter().map(|s| json!({"name": s.name})).collect::<Vec<_>>()}),
+        ));
+    }
     for c in cat.shared_names() {
         notes.push(Note::warn("skills.collision", c.event()));
     }

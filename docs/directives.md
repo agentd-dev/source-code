@@ -187,7 +187,11 @@ flowchart LR
 
 The source ceiling is `max_capabilities` on the source's trust pin. A
 signature that attests fewer than the operator granted narrows the set. A
-folder of signed documents is capped by its narrowest file.
+folder of signed documents is capped by its narrowest file. For a registry
+read, the delivery signature is checked only when the pin names a
+`reader`: then the set is grant ∩ author ∩ delivery ∩ `max_capabilities`;
+without a `reader` it is grant ∩ author ∩ `max_capabilities`, and the
+delivery signature is not checked.
 
 A document that arrived over the wire (`url:`, `oci:`, `mcp:`) never uses
 `identity`, whatever the grant: its A2A agents stay text. Nor may it reach a

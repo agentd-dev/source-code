@@ -327,9 +327,10 @@ fn runs_itself(attrs: &instruction_md::types::Attrs) -> bool {
 
 /// `body`, whose first line is the parent's line `first`, with the parent's
 /// line ranges `cuts` taken out — and with them the blank lines a cut leaves
-/// doubled, and the blank lines it leaves at the end — so the text is the
-/// same however many nested blocks stood where. Returns the text and the
-/// parent's line of each line kept.
+/// doubled. With cuts or without, blank lines at the start and the end go
+/// and the text ends in one newline, so it is the same however many nested
+/// blocks stood where, none included. Returns the text and the parent's line
+/// of each line kept.
 fn cut_lines(body: &str, first: usize, cuts: &[(usize, usize)]) -> (String, Vec<usize>) {
     let mut kept: Vec<(usize, &str)> = Vec::new();
     let mut after_cut = false;
@@ -340,16 +341,17 @@ fn cut_lines(body: &str, first: usize, cuts: &[(usize, usize)]) -> (String, Vec<
             continue;
         }
         let blank = line.trim().is_empty();
-        if after_cut && blank && kept.last().is_none_or(|(_, l)| l.trim().is_empty()) {
+        if blank
+            && (kept.is_empty()
+                || (after_cut && kept.last().is_some_and(|(_, l)| l.trim().is_empty())))
+        {
             continue;
         }
         after_cut = after_cut && blank;
         kept.push((at, line));
     }
-    if !cuts.is_empty() {
-        while kept.last().is_some_and(|(_, l)| l.trim().is_empty()) {
-            kept.pop();
-        }
+    while kept.last().is_some_and(|(_, l)| l.trim().is_empty()) {
+        kept.pop();
     }
     let mut text: String = kept.iter().map(|(_, l)| *l).collect::<Vec<_>>().join("\n");
     text.push('\n');
@@ -1469,6 +1471,26 @@ mod tests {
             by("moderator").in_parent("line 1: x"),
             "agent \"moderator\": line 13: x"
         );
+    }
+
+    /// A manager's FIRST report, added, leaves its instruction byte for byte
+    /// as it was with none: blank lines are normalized with cuts or without.
+    #[test]
+    fn a_first_report_leaves_its_managers_text_byte_identical() {
+        let alone = "---\nspec: \"1\"\n---\n:::::agent{id=cmo}\nYou run marketing.\n\n:::::\n";
+        let with = "---\nspec: \"1\"\n---\n:::::agent{id=cmo}\nYou run marketing.\n\n\
+            ::::agent{id=writer}\nYou write.\n::::\n\n:::::\n";
+        let cmo = |doc: &str| {
+            extract(doc, &agents())
+                .unwrap()
+                .agents
+                .into_iter()
+                .find(|a| a.id == "cmo")
+                .unwrap()
+                .instruction
+        };
+        assert_eq!(cmo(alone).as_bytes(), cmo(with).as_bytes());
+        assert_eq!(cmo(alone), "You run marketing.\n");
     }
 
     /// A report added under a manager leaves the manager's instruction as it

@@ -380,6 +380,16 @@ fn compile_one(
                 }
             }
             errs.extend(validate_instance_machinery(name, &ex, s));
+            // Its skills reach the child under their own names
+            // (`skills.inline`): each one an instruction.md id, one segment.
+            for sk in &ex.skills {
+                if !settings::skill_id_ok(&sk.name) {
+                    errs.push(at(format!(
+                        "skill {:?}: a skill is named by an instruction.md id (letters, digits, `.`, `_`, `-`, starting with a letter or digit)",
+                        sk.name
+                    )));
+                }
+            }
         }
     }
 
@@ -1218,6 +1228,24 @@ mod tests {
         // The same agent in a document the operator supplied is the
         // operator's text, and compiles.
         compile_templates(&document_template(body, false)).unwrap();
+    }
+
+    /// An instance template's skill keeps its instruction.md id, dots
+    /// included; the id is checked here, at compile, to be one segment.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a_skill_named_like_web_search_compiles() {
+        let body = "Search.\n\n:::skill{id=web.search title=\"Web search\"}\nSearch the web.\n:::\n\n\
+            :::workflow{id=w dialect=instruction/workflow}\nname: w\n\
+            steps: {s: {kind: once}, f: {kind: finish, depends_on: [s], status: completed}}\n:::\n";
+        let c = compile_templates(&document_template(body, false)).unwrap();
+        assert_eq!(c["agent"].skills[0].name, "web.search");
+        for bad in [".", "..", "a/b", "../x", ".hidden", ""] {
+            assert!(!settings::skill_id_ok(bad), "{bad:?}");
+        }
+        for good in ["web.search", "triage", "a_b-c.d", "Web9"] {
+            assert!(settings::skill_id_ok(good), "{good:?}");
+        }
     }
 
     /// Where an agent stands in its document is not its composition; its

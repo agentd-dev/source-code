@@ -274,6 +274,12 @@ fn top_level_properties(
         json!({ "type": "object", "additionalProperties": false, "properties": {
                 "sources": { "type": "array", "items": { "$ref": "#/$defs/SkillSource" } },
                 "dir": { "type": "string", "description": "a local folder of <name>/SKILL.md skills (Agent Skills, the user scope); `skills/` beside the config is adopted when this is unset, and `.agents/skills/` beside the config is read as the project scope" },
+                "inline": { "type": "array", "description": "skills given as text: how a parent composes an instance child's `:::skill` blocks, which its prose no longer carries. Operator-only", "items": {
+                    "type": "object", "additionalProperties": false, "required": ["name", "body"], "properties": {
+                        "name": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$" },
+                        "description": { "type": "string" },
+                        "when_to_use": { "type": "string" },
+                        "body": { "type": "string" } } } },
                 "reference_prefix": { "type": "string" },
                 "max_loaded": { "type": "integer", "minimum": 1 },
                 "max_bytes": { "type": "integer", "minimum": 1 } } }),

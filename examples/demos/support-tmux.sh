@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # The on-camera layout for demo (c): the three channels' TUIs side by side,
 # and under them one pane with each agent's `instruction.applied` as it is
-# logged, all in a fixed 120x32 tmux window.
+# logged, in a fixed-size tmux window: 120x32 by default, or the size in
+# SUPPORT_COLS x SUPPORT_ROWS, with SUPPORT_WATCH_ROWS rows (default 8) for
+# the log pane. A taller window lets a long reply show from its first line.
 #
 #   . examples/demos/env.sh
 #   examples/demos/support-tmux.sh          # then: tmux attach -t support
@@ -28,24 +30,29 @@ if [ -z "${TUI:-}" ]; then
   if command -v agentd-tui >/dev/null; then TUI=agentd-tui; else TUI="node $ROOT/interface/dist/tui/cli.js"; fi
 fi
 SESSION="${SESSION:-support}"
+COLS="${SUPPORT_COLS:-120}"
+ROWS="${SUPPORT_ROWS:-32}"
+WATCH_ROWS="${SUPPORT_WATCH_ROWS:-8}"
+# Three columns split the width; two cells go to the borders between them.
+col=$(( (COLS - 2) / 3 ))
 tui() { echo "$TUI --endpoint http://127.0.0.1:$1 --bearer-file $TOKEN"; }
 logs="chat=$AGENTD_DEMO_HOME/support-chat.log voice=$AGENTD_DEMO_HOME/support-voice.log email=$AGENTD_DEMO_HOME/support-email.log"
 
 tmux kill-session -t "$SESSION" 2>/dev/null || true
-chat=$(tmux new-session -d -P -F '#{pane_id}' -s "$SESSION" -x 120 -y 32 "$(tui 8430)")
+chat=$(tmux new-session -d -P -F '#{pane_id}' -s "$SESSION" -x "$COLS" -y "$ROWS" "$(tui 8430)")
 tmux set-option -t "$SESSION" window-size manual
-tmux resize-window -t "$SESSION" -x 120 -y 32
+tmux resize-window -t "$SESSION" -x "$COLS" -y "$ROWS"
 tmux set-option -t "$SESSION" status off
 tmux set-option -t "$SESSION" pane-border-status top
 tmux set-option -t "$SESSION" pane-border-format ' #{pane_title} '
-watch=$(tmux split-window -P -F '#{pane_id}' -t "$chat" -v -l 8 \
+watch=$(tmux split-window -P -F '#{pane_id}' -t "$chat" -v -l "$WATCH_ROWS" \
   "node $HERE/standins/watch.mjs --events instruction.applied $logs")
-voice=$(tmux split-window -P -F '#{pane_id}' -t "$chat" -h -l 80 "$(tui 8431)")
-email=$(tmux split-window -P -F '#{pane_id}' -t "$voice" -h -l 39 "$(tui 8432)")
+voice=$(tmux split-window -P -F '#{pane_id}' -t "$chat" -h -l $(( COLS - col - 1 )) "$(tui 8431)")
+email=$(tmux split-window -P -F '#{pane_id}' -t "$voice" -h -l "$col" "$(tui 8432)")
 tmux select-pane -t "$chat" -T 'chat · 127.0.0.1:8430'
 tmux select-pane -t "$voice" -T 'voice · 127.0.0.1:8431'
 tmux select-pane -t "$email" -T 'email · 127.0.0.1:8432'
 tmux select-pane -t "$watch" -T 'instruction.applied, as each agent logs it'
 tmux select-pane -t "$chat"
-echo "tmux session '$SESSION' is ready (120x32): tmux attach -t $SESSION"
+echo "tmux session '$SESSION' is ready (${COLS}x${ROWS}): tmux attach -t $SESSION"
 echo "panes: chat=$chat voice=$voice email=$email watch=$watch"

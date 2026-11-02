@@ -30,6 +30,7 @@ use crate::config::templates::{
 use crate::state::now_ms;
 use crate::supervisor::reap::Reaped;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// Extra grace past the child's own drain window before SIGKILL.
@@ -360,6 +361,10 @@ impl Runtime {
             created: now_ms(),
             updated: now_ms(),
             payload: None,
+            // What it was spawned with — params a spawn already checked name
+            // no secret — so a reload that recomposes its template starts
+            // the next one as this one was (`Runtime::recompose_children`).
+            spawn_args: Some(json!({"params": params, "mode": mode, "durable": durable})),
             trace: Some(trace.clone()),
             template: Some(tname.to_string()),
             tier: Some("instance".into()),
@@ -513,6 +518,46 @@ impl Runtime {
                     }
                 }));
             }
+        }
+        // The template's own skills (`:::skill` with a body): the prose the
+        // child reads no longer carries them, so they travel as a folder of
+        // `<name>/SKILL.md` in its directory, the child's `skills.dir` — a
+        // section no template writes (`OPERATOR_ONLY`), the parent's to
+        // compose.
+        if !t.skills.is_empty() {
+            let folder = dir.join("skills");
+            for sk in &t.skills {
+                // A skill's name is its directory's (agentskills.io): one
+                // path segment, the author's, never a param's.
+                let name = sk.name.clone();
+                if name.is_empty()
+                    || !name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
+                    return Err(format!(
+                        "skill {name:?}: a child's skill is named by one path segment of letters, digits and dashes"
+                    ));
+                }
+                let mut description = fold_params(&sk.description, params);
+                if description.trim().is_empty() {
+                    description.clone_from(&name);
+                }
+                if let Some(when) = &sk.when_to_use {
+                    description = format!("{description} Use when: {}.", fold_params(when, params));
+                }
+                let text = format!(
+                    "---\nname: {}\ndescription: {}\n---\n{}\n",
+                    json!(name),
+                    json!(description),
+                    fold_params(&sk.body, params)
+                );
+                let at = folder.join(&name);
+                std::fs::create_dir_all(&at)
+                    .and_then(|()| std::fs::write(at.join("SKILL.md"), text))
+                    .map_err(|e| format!("skill {name:?}: write {}: {e}", at.display()))?;
+            }
+            doc["skills"] = json!({"dir": folder.display().to_string()});
         }
         // Parent-owned composition: store, listener, lifecycle, security.
         doc["store"] = if durable {
@@ -912,7 +957,133 @@ impl Runtime {
         }
         self.subagent_log(&handle).info("instance.exited", exited);
         self.persist_subagent(&handle);
+        if let Some(tname) = self.recomposing.remove(&handle) {
+            self.respawn_recomposed(&handle, &tname);
+        }
         true
+    }
+
+    /// One line per template the instruction document defined (RFC 0056),
+    /// `names` or all of them: the team as it is composed, before any of it
+    /// is spawned.
+    pub(crate) fn log_document_templates(
+        &self,
+        names: Option<&std::collections::BTreeSet<String>>,
+    ) {
+        let Ok(compiled) = compile_templates(&self.settings) else {
+            return;
+        };
+        for (name, t) in &compiled {
+            if t.spec.document.is_none() || names.is_some_and(|n| !n.contains(name)) {
+                continue;
+            }
+            let servers: Vec<&str> = t
+                .fragment
+                .pointer("/mcp/servers")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s.get("name").and_then(Value::as_str))
+                .collect();
+            let workflows: Vec<&str> = t
+                .workflows
+                .iter()
+                .filter_map(|w| w.get("name").and_then(Value::as_str))
+                .collect();
+            let skills: Vec<&str> = t.skills.iter().map(|s| s.name.as_str()).collect();
+            let origin = t.spec.document.as_ref();
+            self.log.info(
+                "subagent.template.composed",
+                json!({"template": name, "origin": "document",
+                       "line": origin.map(|o| o.line), "title": origin.and_then(|o| o.title.clone()),
+                       "tier": t.tier.as_str(), "singleton": t.spec.singleton,
+                       "servers": servers, "workflows": workflows, "skills": skills}),
+            );
+        }
+    }
+
+    /// A reload's live instance children, held to the templates it installed
+    /// (`old` → `new`, both compiled): a child whose template is gone is
+    /// retired; a singleton whose template's composition changed is retired
+    /// and started again from the new one once it has exited, with what it
+    /// was spawned with. A child of a template that did not change keeps
+    /// running. One rule for every template, the operator's and a document's.
+    pub(crate) fn recompose_children(
+        &mut self,
+        old: &BTreeMap<String, CompiledTemplate>,
+        new: &BTreeMap<String, CompiledTemplate>,
+    ) {
+        let live: Vec<(String, String)> = self
+            .subagents
+            .values()
+            .filter(|s| s.tier.as_deref() == Some("instance") && !is_terminal_status(&s.status))
+            .filter_map(|s| Some((s.handle.clone(), s.template.clone()?)))
+            .collect();
+        for (handle, tname) in live {
+            let Some(was) = old.get(&tname) else {
+                continue;
+            };
+            match new.get(&tname) {
+                None => {
+                    if self.retire_instance(&handle, "its template was removed") {
+                        self.subagent_log(&handle).info(
+                            "subagent.template.retired",
+                            json!({"template": tname, "handle": handle, "why": "removed"}),
+                        );
+                    }
+                }
+                Some(now) if was.spec.singleton && !now.same_composition(was) => {
+                    if self.retire_instance(&handle, "its template was recomposed") {
+                        self.recomposing.insert(handle.clone(), tname.clone());
+                        self.subagent_log(&handle).info(
+                            "subagent.template.recomposed",
+                            json!({"template": tname, "handle": handle, "why": "changed",
+                                   "note": "the child is retired, and started again from the new composition once it exits"}),
+                        );
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// Start a recomposed singleton again: the template `tname`, as it is
+    /// now, with what the retired child `was` was spawned with, for the
+    /// principal it worked for and carrying what it carried. Detached: no
+    /// call waits on it.
+    fn respawn_recomposed(&mut self, was: &str, tname: &str) {
+        if self.draining {
+            return;
+        }
+        let Some(rec) = self.subagents.get(was) else {
+            return;
+        };
+        let mut args = rec.spawn_args.clone().unwrap_or_else(|| json!({}));
+        args["mode"] = json!("detached");
+        let caller = super::tools::ToolCaller {
+            principal: rec.principal.clone(),
+            ..Default::default()
+        };
+        let carries = rec.carries.clone();
+        match self.instance_run(&caller, tname, &args) {
+            ToolOutcome::Ready(v, false) => {
+                let handle = v["handle"].as_str().unwrap_or_default().to_string();
+                if let Some(s) = self.subagents.get_mut(&handle) {
+                    s.carries = carries;
+                    s.dirty = true;
+                }
+                self.persist_subagent(&handle);
+                self.subagent_log(&handle).info(
+                    "subagent.template.respawned",
+                    json!({"template": tname, "handle": handle, "was": was}),
+                );
+            }
+            ToolOutcome::Ready(e, _) => self.subagent_log(was).warn(
+                "subagent.template.respawn_failed",
+                json!({"template": tname, "was": was, "error": e}),
+            ),
+            ToolOutcome::Deferred(_) | ToolOutcome::Executing => {}
+        }
     }
 
     /// The directory the child `handle` was composed in, from its record.

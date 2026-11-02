@@ -54,6 +54,25 @@ pub struct CompiledTemplate {
     pub gate_channels: crate::config::humans::GateChannels,
 }
 
+impl CompiledTemplate {
+    /// Whether a child composed from `other` is composed as one from this
+    /// template is: the same tier, prose, machinery, skills, channels and
+    /// fields. Where in its document an agent stands is not its composition.
+    pub fn same_composition(&self, other: &CompiledTemplate) -> bool {
+        let spec = |t: &CompiledTemplate| SubagentTemplate {
+            document: None,
+            ..t.spec.clone()
+        };
+        self.tier == other.tier
+            && self.cleaned == other.cleaned
+            && self.fragment == other.fragment
+            && self.workflows == other.workflows
+            && self.skills == other.skills
+            && self.gate_channels == other.gate_channels
+            && spec(self) == spec(other)
+    }
+}
+
 /// Sections the PARENT composes for a child (`compose_instance_doc`), on top of
 /// the boundary every served document faces.
 ///
@@ -99,11 +118,23 @@ fn compile_one(
     if t.instruction.trim().is_empty() {
         return Err(vec![at("instruction must be non-empty".into())]);
     }
-    // Read and mapped once, at boot, on the operator-authored surface, with
-    // every grant, as the operator's own text — and its `human` steps
+    // Read and mapped once, at boot. An operator's template is the
+    // operator's own text, with every grant but `agents`: a child defines no
+    // children of its own, so an agent written in it stays text. A document's
+    // agent (RFC 0056) is the document's, with no grant at all — no route,
+    // no peer, no agent of its own — and, when the document arrived over the
+    // wire, held to the §7.8 floor below. Either way its `human` steps
     // addressed to its own people are the operators', as the agent's own
     // document's are (`config::humans`).
-    let mut ex = match idoc::extract(&t.instruction, &idoc::all_families()) {
+    let families = match &t.document {
+        Some(_) => Default::default(),
+        None => {
+            let mut all = idoc::all_families();
+            all.remove(idoc::AGENTS);
+            all
+        }
+    };
+    let mut ex = match idoc::extract(&t.instruction, &families) {
         Ok(mut ex) => {
             crate::config::humans::address_document_gates(&ex.people, &mut ex.workflows);
             ex
@@ -112,6 +143,15 @@ fn compile_one(
             return Err(es.iter().map(|e| at(format!("{e} ({})", e.code))).collect());
         }
     };
+    if t.document.as_ref().is_some_and(|d| d.over_the_wire) {
+        let reached = idoc::wire_floor_effects(&ex);
+        if !reached.is_empty() {
+            return Err(vec![at(format!(
+                "the document that defines this agent arrived over the wire, and its machinery {} — a fetched document reaches no identity or credential (§7.8)",
+                reached.join(" and ")
+            ))]);
+        }
+    }
     let gate_channels = crate::config::humans::GateChannels::new();
     // The servers the machinery declares are untrusted unless they are the
     // operator's, whose tags they then count at: judged so here, and by the
@@ -1124,5 +1164,77 @@ mod tests {
         );
         let e = compile_templates(&s).unwrap_err();
         assert!(e.iter().any(|m| m.contains("fixed signal")), "{e:?}");
+    }
+
+    /// A template the instruction document defined (RFC 0056).
+    fn document_template(instruction: &str, over_the_wire: bool) -> Settings {
+        let mut s = settings_with("    agent:\n      instruction: placeholder\n");
+        let t = s.subagents.templates.get_mut("agent").unwrap();
+        t.instruction = instruction.to_string();
+        t.document = Some(settings::DocumentAgentOrigin {
+            over_the_wire,
+            line: 1,
+            title: None,
+        });
+        s
+    }
+
+    /// A document's agent is compiled with no grant: an A2A agent or an
+    /// agent of its own in it stays text — the grant the parent document had
+    /// is not the child's.
+    #[test]
+    fn a_document_agent_is_compiled_with_no_grants() {
+        let s = document_template(
+            "Do the work.\n\n::agent{id=peer protocol=a2a endpoint=\"https://p.example\"}\n\n\
+             ::::agent{id=grandchild}\nNested.\n::::\n",
+            false,
+        );
+        let c = compile_templates(&s).unwrap();
+        let t = &c["agent"];
+        assert_eq!(t.tier, Tier::Flat, "nothing activated: {:?}", t.fragment);
+        assert!(t.fragment.get("a2a").is_none(), "{:?}", t.fragment);
+        assert!(t.cleaned.contains("Nested."), "{}", t.cleaned);
+        // An operator's template keeps its grants, but `agents`: a child
+        // defines no children.
+        let mut s = settings_with("    op:\n      instruction: placeholder\n");
+        s.subagents.templates.get_mut("op").unwrap().instruction =
+            "Do it.\n\n::::agent{id=grandchild}\nNested.\n::::\n".into();
+        let c = compile_templates(&s).unwrap();
+        assert_eq!(c["op"].tier, Tier::Flat);
+    }
+
+    /// A document that arrived over the wire gets no credential through its
+    /// agent either: a secret the agent's machinery names refuses it.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a_wire_document_agent_naming_a_secret_is_refused() {
+        let body = "Call home.\n\n:::config{id=c dialect=\"agentd/config\"}\n\
+            mcp:\n  servers:\n    - {name: s, endpoint: \"https://s.example/mcp\", headers: {Authorization: \"Bearer {{secret:TOKEN}}\"}}\n:::\n";
+        let e = compile_templates(&document_template(body, true)).unwrap_err();
+        assert!(e.iter().any(|m| m.contains("names a secret")), "{e:?}");
+        // The same agent in a document the operator supplied is the
+        // operator's text, and compiles.
+        compile_templates(&document_template(body, false)).unwrap();
+    }
+
+    /// Where an agent stands in its document is not its composition; its
+    /// prose is.
+    #[test]
+    fn a_composition_is_its_prose_and_machinery_not_its_line() {
+        let a = compile_templates(&document_template("Do it.", false)).unwrap();
+        let mut moved = document_template("Do it.", false);
+        moved
+            .subagents
+            .templates
+            .get_mut("agent")
+            .unwrap()
+            .document
+            .as_mut()
+            .unwrap()
+            .line = 40;
+        let b = compile_templates(&moved).unwrap();
+        assert!(a["agent"].same_composition(&b["agent"]));
+        let c = compile_templates(&document_template("Do it now.", false)).unwrap();
+        assert!(!a["agent"].same_composition(&c["agent"]));
     }
 }

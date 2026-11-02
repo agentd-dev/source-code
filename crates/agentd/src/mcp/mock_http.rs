@@ -196,9 +196,10 @@ struct State {
     /// reads with, made while the server stays up.
     edition: AtomicU64,
     /// The document `mock.serve_document` last set, and how many times it was
-    /// set: what `instruction://ins_live…` reads as, raw and unsigned, under
-    /// the versionId `ver_live_<n>`.
-    served: Mutex<Option<(u64, String)>>,
+    /// set: what `instruction://ins_live…` reads as, raw, under the versionId
+    /// `ver_live_<n>` — unsigned, or, when the call named `capabilities`,
+    /// with an author signature of the mock publisher's attesting them.
+    served: Mutex<Option<ServedDocument>>,
     /// The server-to-client streams open now, which `mock.tools_changed`
     /// writes to.
     open: Mutex<Vec<Open>>,
@@ -786,9 +787,12 @@ fn handle_request(req: Request, http: &Http, state: &State) -> (Response, bool) 
             // feature is built, so the consumer's §7.6 verification — and its
             // fail-closed refusals — have coverage with no live gateway.
             if asked.starts_with(LIVE_DOCUMENT)
-                && let Some((n, text)) = lock(&state.served).clone()
+                && let Some((n, text, caps)) = lock(&state.served).clone()
             {
-                return (Response::ok(req.id, live_read(&asked, n, &text)), false);
+                return (
+                    Response::ok(req.id, live_read(&asked, n, &text, caps.as_deref())),
+                    false,
+                );
             }
             if asked.starts_with("instruction://") {
                 return (Response::ok(req.id, registry_read(&asked)), false);
@@ -1057,9 +1061,16 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            // `capabilities`: sign it as the mock publisher, attesting them.
+            let caps = args.get("capabilities").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            });
             let mut served = lock(&state.served);
-            let n = served.as_ref().map_or(0, |(n, _)| *n) + 1;
-            *served = Some((n, text));
+            let n = served.as_ref().map_or(0, |(n, ..)| *n) + 1;
+            *served = Some((n, text, caps));
             eprintln!("MOCK_SERVE_DOCUMENT {n}");
             tool_ok(req.id, json!({"ok": true, "version": n}))
         }
@@ -1752,20 +1763,61 @@ fn write_json(stream: &mut TcpStream, status: u16, payload: &Value, session: Opt
 /// The resource a test's own document is served at (`mock.serve_document`).
 const LIVE_DOCUMENT: &str = "instruction://ins_live";
 
-/// `resources/read` for the document a test serves: raw, unsigned, with the
-/// alignment metadata a registry stamps.
-fn live_read(uri: &str, n: u64, text: &str) -> Value {
+/// A document `mock.serve_document` set: how many times one was set, its
+/// text, and the families its author signature attests, when it is signed.
+type ServedDocument = (u64, String, Option<Vec<String>>);
+
+/// `resources/read` for the document a test serves: raw, with the alignment
+/// metadata a registry stamps — unsigned, or, given `caps`, with the mock
+/// publisher's author signature attesting them (no delivery attestation: a
+/// consumer that pins no `reader` checks the author's alone).
+fn live_read(uri: &str, n: u64, text: &str, caps: Option<&[String]>) -> Value {
     let digest = instruction_md::digest(text.as_bytes());
-    json!({"contents": [{"uri": uri, "mimeType": "text/markdown; variant=instruction", "text": text,
-    "_meta": {
+    let version_id = format!("ver_live_{n}");
+    let mut meta = json!({
         "md.instruction/canonical": LIVE_DOCUMENT,
-        "md.instruction/versionId": format!("ver_live_{n}"),
+        "md.instruction/versionId": version_id,
         "md.instruction/revision": n,
         "md.instruction/spec": "1",
         "md.instruction/resolution": "raw",
         "md.instruction/digest": digest,
         "md.instruction/deliveredDigest": digest,
-    }}]})
+    });
+    if let Some(author) = caps.and_then(|c| mock_live_signature(text, &version_id, c)) {
+        meta["md.instruction/publisher"] = json!(MOCK_PUBLISHER);
+        meta["md.instruction/signature"] = json!(author);
+        meta["md.instruction/kid"] = json!(MOCK_PUBLISHER_KID);
+        meta["md.instruction/signatureKeyState"] = json!("active");
+    }
+    json!({"contents": [{"uri": uri, "mimeType": "text/markdown; variant=instruction", "text": text,
+    "_meta": meta}]})
+}
+
+/// The mock publisher's author signature over a document a test serves,
+/// for `instruction://ins_live`, attesting `caps`.
+#[cfg(feature = "sign")]
+fn mock_live_signature(text: &str, version_id: &str, caps: &[String]) -> Option<String> {
+    use crate::config::attest::{Claims, sign_kid};
+    let author = Claims {
+        spec: crate::config::attest::SPEC_CLAIM.into(),
+        typ: "author".into(),
+        doc: LIVE_DOCUMENT.into(),
+        version: version_id.into(),
+        digest: crate::config::attest::author_digest(text.as_bytes()),
+        capabilities: caps.to_vec(),
+        publisher: MOCK_PUBLISHER.into(),
+        iat: 1,
+        exp: u64::MAX / 2,
+        aud: None,
+        manifest: None,
+        author: None,
+    };
+    let key = crate::aauth::AgentKey::from_seed(&MOCK_SIGN_SEED).ok()?;
+    sign_kid(&key, &author, Some(MOCK_PUBLISHER_KID)).ok()
+}
+#[cfg(not(feature = "sign"))]
+fn mock_live_signature(_text: &str, _version_id: &str, _caps: &[String]) -> Option<String> {
+    None
 }
 
 /// The document this mock's registry serves. `REGISTRY_VERSION` moves when the

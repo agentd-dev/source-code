@@ -63,8 +63,10 @@ text. What agentd adds, as the host, is what some blocks *become*:
 - **Connected objects** declare who and what the document involves:
   `::person`, `:::mcp`, `::agent`, `:::skill`, `::tool`. agentd turns an MCP
   server into an `mcp.servers` entry, an A2A agent into an `a2a.peers` entry
-  (under the `identity` grant), an inline skill into a catalogue skill, and
-  lets a workflow's `human` step address a person the document declares.
+  (under the `identity` grant), an agent it runs itself into a subagent
+  template (under the `agents` grant), an inline skill into a catalogue
+  skill, and lets a workflow's `human` step address a person the document
+  declares.
 - **Runtime blocks** carry a structured body in a named dialect:
   `:::workflow{dialect="instruction/workflow"}` becomes a workflow, and
   `:::config{dialect="agentd/config"}` the document's configuration
@@ -104,8 +106,9 @@ what it says. That one rule carries the security story.
 |---|---|
 | The operator's `agent.instruction`: inline text, a file, a folder | Runs it. It is configuration the operator wrote. |
 | A document fetched at load from a source the operator named (`url:`, `oci:`) | Runs it, capped by the grant, the source's ceiling and what the author's signature attested. |
-| A document an MCP server serves (`mcp:`) | Delivers its agent text; never activates its blocks. It is read at runtime, after configuration is built. |
+| A document an MCP server serves (`mcp:`) | Delivers its agent text. It is read at runtime, after configuration is built, so its blocks join the configuration through a reload, capped as a fetched document's are (`agent.instruction.machinery`). |
 | A subagent template's instruction | Runs it under the same boundary as the agent's own document. It also refuses the sections the parent composes for the child: `a2a`, `intelligence`, `store` and `lifecycle`. |
+| The body of an agent the document defines (`::::agent` with no `protocol`, under the `agents` grant) | Runs it in the child, as a template's instruction, with no grant of its own; from a document that arrived over the wire, held to the §7.8 floor too. |
 | Conversation, A2A messages, tool results, webhook bodies | Never parsed. Executing definitions found in untrusted text would be prompt injection as a feature, so this is not configurable. |
 | Skill bodies an MCP server serves | Not parsed. Their fences reach the model as text. |
 
@@ -122,9 +125,12 @@ it, when it is finished, how loud its log is. Everything else belongs to the
 operator: the grants, where the instruction comes from and who may sign it,
 the security gates and the endpoints the deployment may reach, the listeners and their
 credentials, where model calls go and with which credential, the model that
-answers approvals, subagent templates, and where state lives. A path on
-neither list is refused, so a setting nobody has classified stays the
-operator's. A test holds both lists to the generated configuration schema.
+answers approvals, subagent templates and their limits, and where state
+lives. A path on neither list is refused, so a setting nobody has classified
+stays the operator's. A test holds both lists to the generated configuration
+schema. A document still defines the agents agentd runs for it, through
+their own channel and under the `agents` grant ([below](#grants-what-a-document-may-activate)):
+a `:::config` writes no `subagents` setting.
 
 Three more rules close the gaps an allow-list by path leaves open:
 
@@ -158,11 +164,15 @@ posture.
 ## Grants: what a document may activate
 
 The guidance and the blocks every document may use — `:::mcp`, `:::workflow`,
-`:::config`, `:::skill`, `::person` — need no grant. Two grants, named in
+`:::config`, `:::skill`, `::person` — need no grant. Three grants, named in
 `agent.document_capabilities`, admit more: `identity` admits a document's A2A
-agents (`::agent` → `a2a.peers`), and `interface` a workflow that opens a
-route on the operator's webhook listener. A connected object outside the
-grant stays text, said. The grant is restart-only: a reload cannot widen it.
+agents (`::agent` → `a2a.peers`), `interface` a workflow that opens a route
+on the operator's webhook listener, and `agents` the agents the document
+defines for agentd to run (`::::agent` with no `protocol` → a subagent
+template; see
+[Delegate work to subagents](delegate-subagents.md#a-documents-own-agents)).
+A connected object outside the grant stays text, said. The grant is
+restart-only: a reload cannot widen it.
 
 A signature caps the grant and never widens it. What a document may activate
 is the intersection of four sets:
@@ -181,7 +191,10 @@ folder of signed documents is capped by its narrowest file.
 
 A document that arrived over the wire (`url:`, `oci:`, `mcp:`) never uses
 `identity`, whatever the grant: its A2A agents stay text. Nor may it reach a
-peer or a credential through a `:::config` block.
+peer or a credential through a `:::config` block, or through the machinery
+of an agent it defines. It uses `agents` only when it verified against a
+pinned publisher (`agent.instruction.trust`) and the author's signature
+attests `agents`; an unpinned or unsigned document's agents stay text.
 
 ## What the model reads
 
@@ -360,9 +373,10 @@ The decisions behind this page are recorded in
 and directives),
 [RFC 0039](../rfcs/0039-instruction-document-blocks.md) (block kinds),
 [RFC 0040](../rfcs/0040-instruction-from-oci-registry.md) (OCI sources),
-[RFC 0041](../rfcs/0041-encrypted-instruction-documents.md) (encryption) and
+[RFC 0041](../rfcs/0041-encrypted-instruction-documents.md) (encryption),
 [RFC 0042](../rfcs/0042-document-configuration-boundary.md) (the
-configuration boundary).
+configuration boundary) and
+[RFC 0056](../rfcs/0056-a-documents-own-agents.md) (a document's own agents).
 
 ## Next steps
 

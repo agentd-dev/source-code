@@ -898,6 +898,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         drain_forced: false,
         drain_instances: Default::default(),
         respawn_waits: Default::default(),
+        recomposing: Default::default(),
         private_instances: None,
         instance_doors: Default::default(),
         instances_metered_at: 0,
@@ -1141,6 +1142,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     for f in &rt.settings.agent.skill_fetches {
         log.info("skills.fetched", f.clone());
     }
+    // The agents it defines, as composed: the team, before any is spawned.
+    rt.log_document_templates(None);
 
     if let Err(errs) = rt.load_workflows() {
         for e in &errs {
@@ -1919,15 +1922,17 @@ fn deliver_served(
     if let Some(caps) = &attested {
         granted.retain(|g| caps.contains(g));
     }
-    let ex = crate::config::idoc::extract_from_wire(&raw, &granted).map_err(|errs| {
-        format!(
-            "instruction no longer folds: {}",
-            errs.iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("; ")
-        )
-    })?;
+    let ex = crate::config::idoc::extract_from_wire(&raw, &granted, attested.as_deref()).map_err(
+        |errs| {
+            format!(
+                "instruction no longer folds: {}",
+                errs.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        },
+    )?;
     let machinery = crate::config::idoc::machinery_digest(&ex).map(|digest| ServedMachinery {
         document: crate::config::settings::RegistryDocument {
             uri: res.to_string(),
@@ -2021,7 +2026,11 @@ impl Runtime {
                         .filter(|c| attested.as_ref().is_none_or(|a| a.contains(c)))
                         .cloned()
                         .collect();
-                    match crate::config::idoc::extract_from_wire(&raw, &granted) {
+                    match crate::config::idoc::extract_from_wire(
+                        &raw,
+                        &granted,
+                        attested.as_deref(),
+                    ) {
                         Ok(ex) => ex.cleaned,
                         Err(errs) => {
                             return Err(format!(

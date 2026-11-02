@@ -532,7 +532,7 @@ its `jti`.
 | `instruction.binding.reported` | info | `binding_id`, `version_id` |  |
 | `instruction.event` | info | `event_type`, `server` |  |
 | `instruction.loaded` | info | `bytes`, `dir`, `files`, `glob`, `layer_digest`, `manifest_digest`, `order`, `resolution`, `server`, `uri`, `version`, `version_id` | The instruction was read. |
-| `instruction.machinery.applied` | info | `servers_added`, `servers_removed`, `skills_added`, `skills_removed`, `version` | A reload applied a served document's changed machinery; the lists are names, `version` its registry version id. |
+| `instruction.machinery.applied` | info | `agents_added`, `agents_removed`, `servers_added`, `servers_removed`, `skills_added`, `skills_removed`, `version` | A reload applied a served document's changed machinery; the lists are names (`agents_*` the agents it defines, RFC 0056), `version` its registry version id. |
 | `instruction.machinery.pending` | warn | `note`, `uri`, `version_id` | Under `agent.instruction.machinery: reload`, a re-delivered version's machinery changed; it applies at the next reload. Said once per version. |
 | `instruction.reread.fail` | warn | `err`, `reason`, `server`, `uri` |  |
 | `instruction.subscribe.fail` | warn | `err`, `server`, `uri` |  |
@@ -927,6 +927,11 @@ an instruction's by `origin: instruction` and `name`.
 | `subagent.result` | info | `err`, `handle`, `status`, `tokens` | A subagent reported its result. `cancelled` for a `sync` one a drain stopped with the turn waiting on it, which asks for it again when it replays, and for one `subagent.kill` stopped, with the kill's reason as `err`, however it ended. |
 | `subagent.spawn` | info | `cpu_seconds`, `depth`, `handle`, `memory_bytes`, `mode`, `node`, `pid`, `priority`, `servers` | A subagent process started. |
 | `subagent.swap_intel` | info | `endpoint_change` |  |
+| `subagent.template.composed` | info | `line`, `origin`, `servers`, `singleton`, `skills`, `template`, `tier`, `title`, `workflows` | A template the instruction document defined (`origin: document`, RFC 0056) as it is composed: at load, and when a reload added or changed it. `line` is the document line the agent opens on; `servers`, `workflows` and `skills` are its own, by name. |
+| `subagent.template.recomposed` | info | `handle`, `note`, `template`, `why` | A reload changed the composition of a live singleton's template: the child is retired and started again from the new template once it exits. |
+| `subagent.template.respawn_failed` | warn | `error`, `template`, `was` | A recomposed singleton could not be started again: `error` is the spawn's refusal; `was` the retired child. |
+| `subagent.template.respawned` | info | `handle`, `template`, `was` | A recomposed singleton started again from its new template; `was` the child it replaces. |
+| `subagent.template.retired` | info | `handle`, `template`, `why` | A reload removed the template of a live instance child, which is retired. |
 | `subagent.turn` | info | `handle`, `status` |  |
 
 ### timer

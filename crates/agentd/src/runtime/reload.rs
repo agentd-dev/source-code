@@ -198,11 +198,14 @@ impl Runtime {
                 added_removed(&document_servers(&old), &document_servers(&self.settings));
             let (skills_added, skills_removed) =
                 added_removed(&document_skills(&old), &document_skills(&self.settings));
+            let (agents_added, agents_removed) =
+                added_removed(&document_agents(&old), &document_agents(&self.settings));
             self.log.info(
                 "instruction.machinery.applied",
                 json!({"version": folded.and_then(|(_, v)| v),
                        "servers_added": servers_added, "servers_removed": servers_removed,
-                       "skills_added": skills_added, "skills_removed": skills_removed}),
+                       "skills_added": skills_added, "skills_removed": skills_removed,
+                       "agents_added": agents_added, "agents_removed": agents_removed}),
             );
         }
         Ok(changed)
@@ -1170,6 +1173,25 @@ impl Runtime {
             );
             changed.push("a2a.cors.origins");
         }
+        // The live instance children follow the templates now in force: a
+        // removed template's are retired, and a singleton whose template's
+        // composition moved — a document agent edited, say — is retired and
+        // started again from the new one (RFC 0056). The templates validated
+        // at load, so both sets compile.
+        if !old.subagents.templates.is_empty() || !new.subagents.templates.is_empty() {
+            let was = crate::config::templates::compile_templates(old).unwrap_or_default();
+            let now = crate::config::templates::compile_templates(&new).unwrap_or_default();
+            let moved: std::collections::BTreeSet<String> = now
+                .iter()
+                .filter(|(n, t)| was.get(*n).is_none_or(|w| !w.same_composition(t)))
+                .map(|(n, _)| n.clone())
+                .collect();
+            self.log_document_templates(Some(&moved));
+            self.recompose_children(&was, &now);
+            if old.subagents != new.subagents {
+                changed.push("subagents");
+            }
+        }
         if changed.is_empty() {
             changed.push("nothing");
         }
@@ -1379,6 +1401,16 @@ fn document_servers(s: &cfg::Settings) -> std::collections::BTreeSet<String> {
         .flatten()
         .filter_map(|v| v.get("name").and_then(serde_json::Value::as_str))
         .map(str::to_string)
+        .collect()
+}
+
+/// The agents an instruction document defined (RFC 0056), by name.
+fn document_agents(s: &cfg::Settings) -> std::collections::BTreeSet<String> {
+    s.subagents
+        .templates
+        .iter()
+        .filter(|(_, t)| t.document.is_some())
+        .map(|(n, _)| n.clone())
         .collect()
 }
 

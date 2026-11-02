@@ -165,7 +165,7 @@ correct; for an operator-only path there is nothing left to concatenate.
 | `a2a.listen`, `.tls`, `.bearer`, `.principals`, `.push`, `.conversation_ttl` | who may call THIS agent, as what, over which socket. Enumerated rather than taken as a section, because `a2a.peers` sits inside it and is the document's — so a field added here later lands unclassified, which is the point |
 | `interface`, `webhooks` | the human control plane; inbound sockets and their auth |
 | `intelligence.endpoints`, `.token`, `.token_file`, `.headers`, `.auth` | where the conversation goes and the credential it goes with |
-| `subagents` | a whole child agent — its own source, grants and identity |
+| `subagents` | a whole child agent — its own source, grants and identity. *A document defines the agents agentd runs for it through their own channel, `::::agent` under the `agents` grant, never through `:::config`: see [RFC 0056](0056-a-documents-own-agents.md).* |
 | `store.file`, `.http`, `.mcp`, `.audit`, `.retention` | WHERE state lives — a path on the host, or a remote the deployment must be willing to reach — and the audit record |
 | `lifecycle.drain_timeout`, `.exit_code_map`, `.run_id`, `.watch_config` | the orchestration contract: what an orchestrator sees, and whether the process watches its own config file |
 | `observability.log_content`, `.audit`, `.otel`, `.metrics_addr`, `.health_file`, `.report_file`, `.events_ring`, `.traceparent` | `log_content` puts conversation TEXT into the operator's log pipeline; `otel.endpoint` is the one egress `closed` deliberately does not cover; the rest name sockets and files |

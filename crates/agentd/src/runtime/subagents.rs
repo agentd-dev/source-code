@@ -595,6 +595,7 @@ impl Runtime {
             created: now_ms(),
             updated: now_ms(),
             payload: Some(secret_free_payload(&payload)),
+            spawn_args: None,
             trace: Some(trace.clone()),
             template: tmeta.as_ref().map(|(n, _)| n.clone()),
             tier: tmeta.as_ref().map(|(_, t)| t.clone()),

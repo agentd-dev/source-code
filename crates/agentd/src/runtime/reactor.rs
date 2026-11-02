@@ -358,6 +358,11 @@ pub struct SubagentRecord {
     /// The payload (secret-free) for restore re-spawn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<Value>,
+    /// Instance tier: what the child was spawned with (`params`, `mode`,
+    /// `durable`; params name no secret), which a reload that recomposes its
+    /// template starts the next one with (`Runtime::recompose_children`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_args: Option<Value>,
     /// The span that spawned this child — the step's, the turn's, the run's:
     /// what the child's trace descends from, handed down again when it is
     /// restored, and what the supervisor's lines about it carry.
@@ -684,6 +689,10 @@ pub struct Runtime {
     /// process still holds their state, each respawned once it lets go
     /// (`runtime::instances`).
     pub(crate) respawn_waits: BTreeMap<String, super::instances::RespawnWait>,
+    /// Singleton instance children a reload retired because their template's
+    /// composition changed, by handle, with the template each is started
+    /// again from once it exits (`Runtime::recompose_children`).
+    pub(crate) recomposing: BTreeMap<String, String>,
     /// The directory of this process's own that its non-durable instance
     /// children live in, made at the first of them and removed with the
     /// runtime (`runtime::instances`).

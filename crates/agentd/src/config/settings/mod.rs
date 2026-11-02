@@ -1337,9 +1337,11 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // already; which models preflight may move a turn onto, message by
     // message, is the operator's choice, as the approver is (RFC 0046 §7).
     "intelligence.routes",
-    // A whole child agent — its own instruction source, grants and identity.
-    // A document REFERENCES a template (`:::agent template=…`, the `compose`
-    // family); defining one is the operator's.
+    // A whole child agent — its own instruction source, grants, limits and
+    // identity — is the operator's to configure. A document defines the
+    // agents agentd runs for it through their own channel, `::::agent`
+    // under the `agents` grant (RFC 0056), which writes an instruction and
+    // nothing else; a `:::config` writes none of this section.
     "subagents",
     // What every child process is started with beyond its allow-listed
     // environment (RFC 0044 §5.13): a document that set it could hand its
@@ -1492,6 +1494,140 @@ struct DocumentFold {
     skill_fetches: Vec<Value>,
     /// What became of the document's servers and peers.
     servers: FoldedServers,
+    /// The agents it defines, as the templates they become (RFC 0056).
+    agents: Vec<DocumentTemplate>,
+}
+
+/// An agent a served document defines, as the `subagents.templates` entry it
+/// becomes (RFC 0056): its instruction is the agent's body, and it is a
+/// singleton when its machinery makes it an instance child.
+#[derive(Debug, Clone, PartialEq)]
+struct DocumentTemplate {
+    name: String,
+    /// The entry as the loader types it: `{instruction, singleton}`.
+    entry: Value,
+    origin: DocumentAgentOrigin,
+}
+
+/// Where a document agent's template came from — DERIVED, never a config
+/// key (RFC 0056). Its presence is what makes a template the document's:
+/// compiled with no grants, and held to the §7.8 floor when the document
+/// arrived over the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentAgentOrigin {
+    /// The document arrived over the wire (`url:`, `oci:`, `mcp:`).
+    pub over_the_wire: bool,
+    /// The document's line the agent opens on.
+    pub line: usize,
+    pub title: Option<String>,
+}
+
+/// The templates a document's agents become (RFC 0056). One the operator's
+/// `subagents.templates` names is held as text, the operator's standing; an
+/// agent whose own instruction does not read is a refusal of the document,
+/// and so, from the wire, is one whose machinery reaches the §7.8 floor. What
+/// is said about an agent's instruction is said at the document's line.
+fn document_agent_templates(
+    ex: &mut crate::config::idoc::Extraction,
+    operator: &Value,
+    over_the_wire: bool,
+    source: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<DocumentTemplate>, String> {
+    let mut out = Vec::new();
+    for a in std::mem::take(&mut ex.agents) {
+        if operator
+            .pointer("/subagents/templates")
+            .and_then(Value::as_object)
+            .is_some_and(|t| t.contains_key(&a.id))
+        {
+            ex.declarations
+                .entry("agent".into())
+                .or_default()
+                .push(json!({"id": a.id, "title": a.title, "line": a.line}));
+            warnings.push(format!(
+                "agent.instruction: line {}: agent {:?} is not activated: the operator's subagents.templates has a template of that name, and the operator's stands — the document's block stays text (host-policy)",
+                a.line, a.id
+            ));
+            continue;
+        }
+        let child =
+            crate::config::idoc::extract(&a.instruction, &Default::default()).map_err(|errs| {
+                format!(
+                    "{source}: agent.instruction:\n  {}",
+                    errs.iter()
+                        .map(|e| a.in_parent(&format!("{e} ({})", e.code)))
+                        .collect::<Vec<_>>()
+                        .join("\n  ")
+                )
+            })?;
+        warnings.extend(
+            child
+                .warnings
+                .iter()
+                .map(|w| format!("agent.instruction: {}", a.in_parent(w))),
+        );
+        let reached = if over_the_wire {
+            crate::config::idoc::wire_floor_effects(&child)
+        } else {
+            Vec::new()
+        };
+        if !reached.is_empty() {
+            return Err(format!(
+                "{source}: the instruction arrived over the wire and its agent {:?} (line {}) {} — a fetched document reaches no identity or credential (§7.8); declare it in the operator's configuration",
+                a.id,
+                a.line,
+                reached.join(" and ")
+            ));
+        }
+        // The tier follows from the machinery (`config::templates`): an
+        // instance child is the one live agent of its name, which a
+        // workflow's `a2a.send` reaches by that name.
+        let instance = !child.config.is_empty() || !child.workflows.is_empty();
+        out.push(DocumentTemplate {
+            name: a.id.clone(),
+            entry: json!({"instruction": a.instruction, "singleton": instance}),
+            origin: DocumentAgentOrigin {
+                over_the_wire,
+                line: a.line,
+                title: a.title.clone(),
+            },
+        });
+    }
+    // The operator's ceilings hold: a team larger than they allow is said.
+    let instances = out
+        .iter()
+        .filter(|t| t.entry["singleton"] == json!(true))
+        .count() as u64;
+    let limit = |key: &str| operator.pointer(&format!("/limits/subagents/instances/{key}"));
+    // The rate's burst (`4/1h` → 4) is how many may start at once.
+    let rate = limit("rate").and_then(Value::as_str).unwrap_or("4/1h");
+    let burst = rate
+        .split_once('/')
+        .and_then(|(n, _)| n.trim().parse::<u64>().ok());
+    for (key, cap, shown) in [
+        (
+            "breadth",
+            limit("breadth").and_then(Value::as_u64).or(Some(2)),
+            None,
+        ),
+        (
+            "total",
+            limit("total").and_then(Value::as_u64).or(Some(8)),
+            None,
+        ),
+        ("rate", burst, Some(rate)),
+    ] {
+        if let Some(cap) = cap
+            && instances > cap
+        {
+            warnings.push(format!(
+                "agent.instruction: the document defines {instances} agents that run as instance children, and limits.subagents.instances.{key} is {}: a spawn past it is refused",
+                shown.map_or_else(|| cap.to_string(), str::to_string)
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// The document a load folds, and how it came ([`fold_instruction_document`]).
@@ -1554,6 +1690,7 @@ fn fold_instruction_document(
             crate::config::idoc::Admission {
                 granted: &granted,
                 over_the_wire,
+                attested,
             },
         )?;
         crate::config::humans::address_document_gates(&ex.people, &mut ex.workflows);
@@ -1590,6 +1727,7 @@ fn fold_instruction_document(
         "workflows": ex.workflows.len(),
         "skills": ex.skills.len(),
         "people": ex.people.len(),
+        "agents": ex.agents.len(),
         "not_activated": ex.declarations.values().map(Vec::len).sum::<usize>(),
     });
     // The SDK's warnings and agentd's host-policy diagnostics:
@@ -1701,6 +1839,10 @@ fn fold_instruction_document(
             .iter()
             .map(|w| format!("agent.instruction: {w}")),
     );
+    // The agents it defines join the operator's templates through their own
+    // channel — `subagents` stays operator configuration a `:::config` may
+    // not write — and the operator's names stand (RFC 0056).
+    let agents = document_agent_templates(&mut ex, doc, over_the_wire, source, warnings)?;
     if let Some(o) = doc.as_object_mut() {
         if fragment.contains_key("intelligence") {
             let operator = o.get("intelligence").cloned().unwrap_or(json!({}));
@@ -1741,6 +1883,7 @@ fn fold_instruction_document(
         workflows,
         skill_fetches,
         servers,
+        agents,
     })
 }
 
@@ -4887,6 +5030,12 @@ pub struct SubagentTemplate {
     /// on BOTH sides and a parent A2A listener.
     #[serde(default)]
     pub mirror_streams: Option<Vec<String>>,
+    /// Set when the instruction document defined this template — one of its
+    /// agents (RFC 0056) — DERIVED, never a config key. Such a template is
+    /// compiled with no grants, and to the §7.8 floor when the document
+    /// arrived over the wire (`config::templates`).
+    #[serde(skip)]
+    pub document: Option<DocumentAgentOrigin>,
 }
 
 /// One declared template parameter — the only hole a spawn may fill.
@@ -6561,6 +6710,7 @@ impl Settings {
         let mut document_grants = std::collections::BTreeSet::new();
         let mut skill_fetches = Vec::new();
         let mut folded_servers = FoldedServers::default();
+        let mut document_agents: Vec<DocumentTemplate> = Vec::new();
         // The document whose machinery folds: the instruction itself — an
         // instruction/1 document, read by the instruction.md SDK, the ONLY
         // surface extraction runs on (conversation text is never parsed) —
@@ -6616,6 +6766,7 @@ impl Settings {
             document_workflows = f.workflows;
             skill_fetches = f.skill_fetches;
             folded_servers = f.servers;
+            document_agents = f.agents;
             idoc_extraction = Some(f.extraction);
         }
         // `agent.prompt` is a document too — a one-shot task is as likely to
@@ -6707,8 +6858,35 @@ impl Settings {
                 }
             }
         }
+        // The agents the instruction document defines (RFC 0056) join the
+        // templates only now, past the loop above: an agent's instruction is
+        // its body, the document's own text, so no `file:` or `url:` it might
+        // spell is resolved on its behalf — the operator's disk is never read
+        // for a document.
+        let mut document_origins = BTreeMap::new();
+        if !document_agents.is_empty()
+            && let Some(o) = doc.as_object_mut()
+        {
+            let subagents = o.entry("subagents").or_insert_with(|| json!({}));
+            if let Some(s) = subagents.as_object_mut()
+                && let Some(templates) = s
+                    .entry("templates")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+            {
+                for t in document_agents {
+                    templates.insert(t.name.clone(), t.entry);
+                    document_origins.insert(t.name, t.origin);
+                }
+            }
+        }
         let mut settings: Settings =
             serde_json::from_value(doc).map_err(|e| format!("{source} parse error: {e}"))?;
+        for (name, origin) in document_origins {
+            if let Some(t) = settings.subagents.templates.get_mut(&name) {
+                t.document = Some(origin);
+            }
+        }
         // Workflows were spliced into the document before deserialization, so
         // they are already in `settings`; carry the skills and the extended-
         // family declarations across.
@@ -18991,6 +19169,246 @@ mod registry_document_tests {
         assert_eq!(
             s.agent.instruction_spec.machinery,
             InstructionMachinery::Reload
+        );
+    }
+
+    const TEAM: &str = "---\nspec: \"1\"\n---\n# Served\n\n\
+        ::::agent{id=support title=\"Support\"}\nAnswer tickets.\n\n\
+        :::workflow{id=queue dialect=\"instruction/workflow\"}\n\
+        name: queue\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s]}\n:::\n\
+        ::::\n";
+
+    /// A served document's agents run only when a pinned publisher verified
+    /// it and its author attested `agents` — as the runtime's reads of the
+    /// same document admit them (`runtime::deliver_served`).
+    #[test]
+    fn a_served_documents_agents_need_a_pin_that_attests_them() {
+        let mut doc = operator();
+        doc["agent"]["document_capabilities"] = json!(["agents"]);
+        for attested in [None, Some(vec!["compute".to_string()])] {
+            let s = Settings::from_document_with(
+                doc.clone(),
+                MERGED_DOCUMENT,
+                Some(&RegistryDocument {
+                    attested: attested.clone(),
+                    ..served(TEAM)
+                }),
+            )
+            .unwrap();
+            assert!(s.subagents.templates.is_empty(), "{attested:?}");
+            assert!(
+                s.agent
+                    .instruction_warnings
+                    .iter()
+                    .any(|w| w.contains("\"support\"") && w.contains("over the wire")),
+                "{:?}",
+                s.agent.instruction_warnings
+            );
+            // The runtime's read says the same.
+            let ex = crate::config::idoc::extract_from_wire(
+                TEAM,
+                &["agents".to_string()].into(),
+                attested.as_deref(),
+            )
+            .unwrap();
+            assert!(ex.agents.is_empty());
+        }
+        let s = Settings::from_document_with(
+            doc,
+            MERGED_DOCUMENT,
+            Some(&RegistryDocument {
+                attested: Some(vec!["agents".into()]),
+                ..served(TEAM)
+            }),
+        )
+        .unwrap();
+        let t = &s.subagents.templates["support"];
+        assert!(t.singleton);
+        assert!(t.document.as_ref().is_some_and(|d| d.over_the_wire));
+        // An instance-tier child needs the `a2a` build feature.
+        #[cfg(feature = "a2a")]
+        let compiled = crate::config::templates::compile_templates(&s).unwrap();
+        #[cfg(feature = "a2a")]
+        assert_eq!(
+            compiled["support"].tier,
+            crate::config::templates::Tier::Instance
+        );
+    }
+
+    /// From the wire, an agent's machinery reaches no credential: a secret it
+    /// names refuses the document.
+    #[test]
+    fn a_served_agent_that_names_a_secret_is_refused() {
+        let raw = "---\nspec: \"1\"\n---\n# Served\n\n\
+            ::::agent{id=leaky}\nCall home.\n\n\
+            :::config{id=c dialect=\"agentd/config\"}\nmcp:\n  servers:\n    - {name: s, endpoint: \"https://s.example/mcp\", headers: {Authorization: \"Bearer {{secret:TOKEN}}\"}}\n:::\n\
+            ::::\n";
+        let mut doc = operator();
+        doc["agent"]["document_capabilities"] = json!(["agents"]);
+        let e = Settings::from_document_with(
+            doc,
+            MERGED_DOCUMENT,
+            Some(&RegistryDocument {
+                attested: Some(vec!["agents".into()]),
+                ..served(raw)
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("\"leaky\"") && e.contains("names a secret"),
+            "{e}"
+        );
+    }
+}
+
+/// The agents an operator's own document defines (RFC 0056).
+#[cfg(test)]
+mod document_agent_tests {
+    use super::*;
+
+    fn operator(instruction: &str) -> Value {
+        json!({
+            "agent": {"name": "co", "instruction": instruction, "document_capabilities": ["agents"]},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "store": {"kind": "memory"},
+        })
+    }
+
+    const TEAM: &str = "---\nspec: \"1\"\n---\n# The company\n\nRun it.\n\n\
+        ::::agent{id=support title=\"Support lead\"}\nYou answer tickets.\n\n\
+        :::mcp{id=desk title=\"Desk\" src=\"https://desk.example/mcp\"}\nTickets.\n:::\n\n\
+        :::skill{id=triage title=\"Triage\" trigger=\"a new ticket\"}\nRead it all.\n:::\n\n\
+        :::workflow{id=queue dialect=\"instruction/workflow\"}\n\
+        name: queue\nsteps:\n  s: {kind: once}\n  f: {kind: finish, depends_on: [s]}\n:::\n\
+        ::::\n\n\
+        ::::agent{id=scribe}\nWrite the minutes.\n::::\n";
+
+    /// Each agent becomes a template of its name, its body the instruction:
+    /// an instance child (a singleton) when it carries machinery, a flat
+    /// worker when it is prose. Nothing inside an agent lands on the parent.
+    #[test]
+    fn a_documents_agents_become_templates_and_their_blocks_stay_theirs() {
+        let s = Settings::from_document(operator(TEAM), MERGED_DOCUMENT).unwrap();
+        let support = &s.subagents.templates["support"];
+        assert!(support.singleton);
+        assert!(support.instruction.starts_with("You answer tickets."));
+        let origin = support.document.as_ref().expect("the document's");
+        assert!(!origin.over_the_wire);
+        assert_eq!(origin.title.as_deref(), Some("Support lead"));
+        let scribe = &s.subagents.templates["scribe"];
+        assert!(!scribe.singleton);
+        // The parent got none of the agent's server, skill or workflow.
+        assert!(s.mcp.servers.is_empty(), "{:?}", s.mcp.servers);
+        assert!(s.agent.inline_skills.is_empty());
+        assert!(s.workflows.is_empty(), "{:?}", s.workflows);
+        assert_eq!(s.agent.instruction_read.as_ref().unwrap()["agents"], 2);
+        // An instance-tier child needs the `a2a` build feature.
+        #[cfg(feature = "a2a")]
+        {
+            let compiled = crate::config::templates::compile_templates(&s).unwrap();
+            assert_eq!(
+                compiled["support"].tier,
+                crate::config::templates::Tier::Instance
+            );
+            assert_eq!(compiled["support"].workflows[0]["name"], "queue");
+            assert_eq!(compiled["support"].skills[0].name, "triage");
+            assert_eq!(
+                compiled["scribe"].tier,
+                crate::config::templates::Tier::Flat
+            );
+        }
+    }
+
+    /// Without the grant the agents stay text, said, and are no templates.
+    #[test]
+    fn without_the_grant_a_documents_agents_are_held() {
+        let mut doc = operator(TEAM);
+        doc["agent"]["document_capabilities"] = json!([]);
+        let s = Settings::from_document(doc, MERGED_DOCUMENT).unwrap();
+        assert!(s.subagents.templates.is_empty());
+        assert!(s.mcp.servers.is_empty() && s.workflows.is_empty());
+        assert_eq!(s.agent.document_declarations["agent"].len(), 2);
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .filter(|w| w.contains("agent.document_capabilities: [agents]"))
+                .count()
+                == 2,
+            "{:?}",
+            s.agent.instruction_warnings
+        );
+    }
+
+    /// The operator's template of the same name stands: the document's agent
+    /// is held as text, said, and its other agent applies.
+    #[test]
+    fn the_operators_template_of_the_same_name_stands() {
+        let mut doc = operator(TEAM);
+        doc["subagents"] =
+            json!({"templates": {"support": {"instruction": "The operator's support."}}});
+        let s = Settings::from_document(doc, MERGED_DOCUMENT).unwrap();
+        let support = &s.subagents.templates["support"];
+        assert_eq!(support.instruction, "The operator's support.");
+        assert!(support.document.is_none());
+        assert!(s.subagents.templates["scribe"].document.is_some());
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("\"support\"")
+                    && w.contains("the operator's stands")
+                    && w.contains("host-policy")),
+            "{:?}",
+            s.agent.instruction_warnings
+        );
+    }
+
+    /// An agent's instruction is its body as written, never a source agentd
+    /// reads for it: a body spelling a file path stays that text, and the
+    /// file is not read.
+    #[test]
+    fn an_agents_body_is_never_read_as_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("secret.md");
+        std::fs::write(&secret, "THE OPERATOR'S SECRET NOTES").unwrap();
+        let path = secret.to_string_lossy().to_string();
+        let doc = format!("---\nspec: \"1\"\n---\n# Co\n\n::::agent{{id=reader}}\n{path}\n::::\n");
+        let s = Settings::from_document(operator(&doc), MERGED_DOCUMENT).unwrap();
+        let t = &s.subagents.templates["reader"];
+        assert_eq!(t.instruction.trim(), path);
+        assert!(!t.instruction.contains("SECRET NOTES"));
+    }
+
+    /// A `:::config` still writes no `subagents`: the grant opens the agent
+    /// channel, not the operator's section.
+    #[test]
+    fn a_config_block_still_writes_no_subagents() {
+        let doc = "---\nspec: \"1\"\n---\n# Co\n\n\
+            :::config{id=c dialect=\"agentd/config\"}\nsubagents:\n  templates:\n    x: {instruction: hi}\n:::\n";
+        let e = Settings::from_document(operator(doc), MERGED_DOCUMENT).unwrap_err();
+        assert!(e.contains("subagents.templates"), "{e}");
+    }
+
+    /// A team larger than the operator's instance ceilings is said.
+    #[test]
+    fn a_team_past_the_instance_ceilings_is_said() {
+        let s = Settings::from_document(
+            {
+                let mut d = operator(TEAM);
+                d["limits"] = json!({"subagents": {"instances": {"breadth": 0}}});
+                d
+            },
+            MERGED_DOCUMENT,
+        )
+        .unwrap();
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("limits.subagents.instances.breadth is 0")),
+            "{:?}",
+            s.agent.instruction_warnings
         );
     }
 }

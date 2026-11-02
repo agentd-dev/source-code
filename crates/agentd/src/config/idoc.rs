@@ -11,6 +11,7 @@
 //! |---|---|
 //! | `:::mcp{id src tools allow deny}` | an `mcp.servers` entry: `id` → `name`, `src` → `endpoint`, `tools`/`allow` → `allow`, `deny` → `exclude` (the `agentd/1` export profile's mapping) |
 //! | `::agent{id protocol=a2a endpoint\|src}` | an `a2a.peers` entry named `id`, under the [`IDENTITY`] grant |
+//! | `::::agent{id}` with a body and no `protocol`, `src` or `endpoint` | an agent agentd runs itself: a `subagents.templates` entry named `id` whose instruction is the body, under the [`AGENTS`] grant ([`DocumentAgent`]) |
 //! | `:::workflow{dialect="instruction/workflow"}` | a `workflows[]` entry (the body is the definition, its `name` required) |
 //! | `:::config{dialect="agentd/config"}` | the document's configuration fragment, held to the document boundary downstream |
 //! | `:::skill{id trigger}` with a body and no `src` | an inline skill in the catalogue |
@@ -41,11 +42,16 @@ pub use instruction_md::Document;
 pub const INTERFACE: &str = "interface";
 /// The grant a document needs for its A2A agents to become `a2a.peers`.
 pub const IDENTITY: &str = "identity";
+/// The grant a document needs for the agents it defines to become agentd's
+/// subagents (RFC 0056).
+pub const AGENTS: &str = "agents";
 /// agentd's document grants (`agent.document_capabilities`). instruction/1
 /// grants nothing by itself (§19): these are the host's.
-pub const FAMILIES: &[&str] = &[INTERFACE, IDENTITY];
+pub const FAMILIES: &[&str] = &[INTERFACE, IDENTITY, AGENTS];
 /// The grants a document that arrived over the wire never uses, whatever
-/// the operator granted or its author signed (§7.8).
+/// the operator granted or its author signed (§7.8). `agents` is not one:
+/// over the wire it needs a verified pin whose signature attests it
+/// ([`Admission`]).
 pub const WIRE_FLOOR: &[&str] = &[IDENTITY];
 
 /// Every grant agentd knows.
@@ -251,6 +257,9 @@ pub struct Extraction {
     pub declarations: BTreeMap<String, Vec<Value>>,
     /// The ids of the document's `person` and `role` objects.
     pub people: BTreeSet<String>,
+    /// The agents the document defines for agentd to run (RFC 0056), under
+    /// the [`AGENTS`] grant.
+    pub agents: Vec<DocumentAgent>,
     /// The SDK's warnings and agentd's host-policy diagnostics, each
     /// `line N: message (code)`.
     pub warnings: Vec<String>,
@@ -260,13 +269,51 @@ pub struct Extraction {
 /// format invalidity).
 pub const HOST_POLICY: &str = "host-policy";
 
-/// How a document came: the grants it may use, and whether it arrived over
-/// the wire (a URL, an OCI registry, an MCP server), where the §7.8 floor
-/// holds.
+/// An agent a document defines for agentd to run (RFC 0056): an `agent`
+/// with a body and no `protocol`, `src` or `endpoint`. Its body is its own
+/// instruction document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentAgent {
+    /// Its `id`: the name of the template it becomes.
+    pub id: String,
+    pub title: Option<String>,
+    /// Its instruction document: the body as written, under the parent
+    /// document's declared parameters (front matter) when it has any.
+    pub instruction: String,
+    /// The parent document's line the agent opens on.
+    pub line: usize,
+    /// How many lines [`DocumentAgent::instruction`] carries before the body:
+    /// its line `n` is the parent's line `line + n - header_lines`.
+    pub header_lines: usize,
+}
+
+impl DocumentAgent {
+    /// A diagnostic about the agent's instruction (`line N: …`), named by the
+    /// agent and its line moved to the parent document's.
+    pub fn in_parent(&self, said: &str) -> String {
+        let moved = said
+            .strip_prefix("line ")
+            .and_then(|rest| rest.split_once(':'))
+            .and_then(|(n, rest)| Some((n.parse::<usize>().ok()?, rest)))
+            .map(|(n, rest)| {
+                let at = (self.line + n).saturating_sub(self.header_lines);
+                format!("line {at}:{rest}")
+            });
+        format!("agent {:?}: {}", self.id, moved.as_deref().unwrap_or(said))
+    }
+}
+
+/// How a document came: the grants it may use, whether it arrived over the
+/// wire (a URL, an OCI registry, an MCP server), where the §7.8 floor holds,
+/// and what its author attested when a pinned publisher verified it.
 #[derive(Debug, Clone, Copy)]
 pub struct Admission<'a> {
     pub granted: &'a BTreeSet<String>,
     pub over_the_wire: bool,
+    /// The families its author's signature attests, when it verified against
+    /// a pinned publisher (`agent.instruction.trust`); `None` when nothing
+    /// verified it.
+    pub attested: Option<&'a [String]>,
 }
 
 impl Admission<'_> {
@@ -276,6 +323,26 @@ impl Admission<'_> {
                 "a document that arrived over the wire never uses the `{grant}` grant (§7.8); \
                  declare it in the operator's configuration"
             ));
+        }
+        // Over the wire, the agents a document defines run only when the
+        // publisher the operator pinned stands behind them.
+        if self.over_the_wire && grant == AGENTS {
+            match self.attested {
+                None => {
+                    return Err(format!(
+                        "a document that arrived over the wire uses the `{grant}` grant only \
+                         when it verified against a pinned publisher (`agent.instruction.trust`) \
+                         and its author's signature attests `{grant}`; this one is not verified"
+                    ));
+                }
+                Some(a) if !a.iter().any(|c| c == grant) => {
+                    return Err(format!(
+                        "a document that arrived over the wire uses the `{grant}` grant only \
+                         when its author's signature attests `{grant}`; this one attests {a:?}"
+                    ));
+                }
+                Some(_) => {}
+            }
         }
         if !self.granted.contains(grant) {
             return Err(format!(
@@ -293,20 +360,24 @@ pub fn extract(text: &str, granted: &BTreeSet<String>) -> Result<Extraction, Vec
         Admission {
             granted,
             over_the_wire: false,
+            attested: None,
         },
     )
 }
 
-/// Read and map a document that arrived over the wire (§7.8).
+/// Read and map a document that arrived over the wire (§7.8), with the
+/// families its author attested when a pinned publisher verified it.
 pub fn extract_from_wire(
     text: &str,
     granted: &BTreeSet<String>,
+    attested: Option<&[String]>,
 ) -> Result<Extraction, Vec<Refusal>> {
     fold(
         &parse(text)?,
         Admission {
             granted,
             over_the_wire: true,
+            attested,
         },
     )
 }
@@ -317,6 +388,11 @@ pub fn extract_from_wire(
 /// policy or any other block whose body is guidance. A block that cannot be
 /// mapped refuses the whole document — no partial load; a connected object
 /// agentd will not activate is a warning and stays text.
+///
+/// The blocks inside an `agent` are that agent's, never the document's:
+/// `agent` is no layout container, so `in_layout` leaves them out here, and
+/// an agent agentd runs carries them in its own instruction
+/// ([`DocumentAgent`]).
 pub fn fold(parsed: &Parsed, admission: Admission<'_>) -> Result<Extraction, Vec<Refusal>> {
     let mut f = Folder {
         out: Extraction {
@@ -326,6 +402,7 @@ pub fn fold(parsed: &Parsed, admission: Admission<'_>) -> Result<Extraction, Vec
         },
         errs: Vec::new(),
         admission,
+        parameters: parsed.reading.document.metadata.front.get("parameters"),
     };
     let body = &parsed.reading.document.body;
     for o in instruction_md::connected_objects(body) {
@@ -349,6 +426,9 @@ struct Folder<'a> {
     out: Extraction,
     errs: Vec<Refusal>,
     admission: Admission<'a>,
+    /// The document's declared parameters (its front matter's), which the
+    /// agents it defines are written under too.
+    parameters: Option<&'a Value>,
 }
 
 impl Folder<'_> {
@@ -464,7 +544,12 @@ impl Folder<'_> {
     }
 
     fn agent(&mut self, o: &ConnectedObject<'_>) {
+        // The reader refuses an agent with no `id` (`invalid-attributes`):
+        // the registry requires one.
         let Some(id) = o.id else { return };
+        if o.attr("protocol").is_none() && o.src.is_none() && o.endpoint.is_none() {
+            return self.own_agent(o, id);
+        }
         if o.attr("protocol") != Some("a2a") {
             return self.hold(o, "agentd reaches agents over A2A (`protocol=a2a`)".into());
         }
@@ -496,13 +581,51 @@ impl Folder<'_> {
                     );
                 }
             },
-            // The reader refuses an A2A agent with neither.
-            (None, None) => return,
+            (None, None) => {
+                return self.hold(
+                    o,
+                    "agentd dials an A2A agent at its `endpoint`, or finds it by its Agent Card \
+                     (`src`); this one names neither"
+                        .into(),
+                );
+            }
         };
         let mut peer = Map::new();
         peer.insert("name".into(), id.into());
         peer.insert("endpoint".into(), endpoint.into());
         push(&mut self.out.config, "a2a", "peers").push(Value::Object(peer));
+    }
+
+    /// An agent the document defines for agentd to run (RFC 0056): no
+    /// protocol, no `src`, no `endpoint` — its body is its instruction.
+    fn own_agent(&mut self, o: &ConnectedObject<'_>, id: &str) {
+        if let Err(why) = self.admission.admits(AGENTS) {
+            return self.hold(o, format!("an agent agentd runs itself {why}"));
+        }
+        let body = o.body.unwrap_or_default();
+        if body.trim().is_empty() {
+            return self.hold(
+                o,
+                "an agent agentd runs itself is a container whose body is its instruction \
+                 (`::::agent{id=…} … ::::`); this one has no body"
+                    .into(),
+            );
+        }
+        // Written under the document's parameters, so a `${name}` in its
+        // body reads as it does in the document.
+        let (instruction, header_lines) = match self.parameters {
+            Some(p) if p.as_object().is_some_and(|m| !m.is_empty()) => {
+                (format!("---\nspec: \"1\"\nparameters: {p}\n---\n{body}"), 4)
+            }
+            _ => (body.to_string(), 0),
+        };
+        self.out.agents.push(DocumentAgent {
+            id: id.to_string(),
+            title: o.title.map(str::to_string),
+            instruction,
+            line: o.location.line().unwrap_or(0) as usize,
+            header_lines,
+        });
     }
 
     fn skill(&mut self, o: &ConnectedObject<'_>) {
@@ -700,6 +823,7 @@ pub fn machinery_digest(ex: &Extraction) -> Option<String> {
         && ex.remote_skills.is_empty()
         && ex.declarations.is_empty()
         && ex.people.is_empty()
+        && ex.agents.is_empty()
     {
         return None;
     }
@@ -721,6 +845,9 @@ pub fn machinery_digest(ex: &Extraction) -> Option<String> {
         "skills": skills,
         "declarations": ex.declarations,
         "people": ex.people,
+        "agents": ex.agents.iter().map(|a| {
+            serde_json::json!({"id": a.id, "title": a.title, "instruction": a.instruction})
+        }).collect::<Vec<_>>(),
     });
     Some(instruction_md::digest(all.to_string().as_bytes()))
 }
@@ -798,6 +925,7 @@ mod tests {
                 Admission {
                     granted: &granted,
                     over_the_wire: wire,
+                    attested: None,
                 },
             )
             .unwrap();
@@ -988,5 +1116,147 @@ mod tests {
         )
         .unwrap();
         assert_eq!(wire_floor_effects(&secret), ["names a secret"]);
+    }
+
+    /// A document with one agent agentd runs, whose body carries a server,
+    /// a skill and a workflow of its own.
+    const TEAM: &str = "---\nspec: \"1\"\n---\n# The company\n\n\
+        ::::agent{id=support title=\"Support lead\"}\n\
+        You answer every ticket.\n\n\
+        :::mcp{id=desk title=\"Helpdesk\" src=\"https://desk.example/mcp\"}\nThe tickets.\n:::\n\n\
+        :::skill{id=triage title=\"Triage\" trigger=\"a new ticket\"}\nRead it all.\n:::\n\n\
+        :::workflow{id=queue dialect=\"instruction/workflow\"}\n\
+        name: queue\nsteps:\n  start: {kind: once}\n  done: {kind: finish, depends_on: [start]}\n:::\n\
+        ::::\n";
+
+    fn agents() -> BTreeSet<String> {
+        BTreeSet::from([AGENTS.to_string()])
+    }
+
+    /// Under the grant, the agent is the document's to define: its body is
+    /// its instruction, and nothing inside it lands on the parent.
+    #[test]
+    fn a_granted_agent_is_defined_and_its_blocks_stay_its_own() {
+        let ex = extract(TEAM, &agents()).unwrap();
+        assert_eq!(ex.agents.len(), 1, "{:?}", ex.warnings);
+        let a = &ex.agents[0];
+        assert_eq!(a.id, "support");
+        assert_eq!(a.title.as_deref(), Some("Support lead"));
+        assert_eq!(a.line, 6);
+        assert!(a.instruction.starts_with("You answer every ticket."));
+        assert!(
+            a.instruction.contains(":::mcp{id=desk"),
+            "{}",
+            a.instruction
+        );
+        assert!(a.instruction.contains("name: queue"), "{}", a.instruction);
+        assert!(ex.config.is_empty(), "{:?}", ex.config);
+        assert!(ex.workflows.is_empty(), "{:?}", ex.workflows);
+        assert!(ex.skills.is_empty(), "{:?}", ex.skills);
+        assert!(ex.warnings.is_empty(), "{:?}", ex.warnings);
+        // The body is the agent's own document, and reads as one.
+        let child = extract(&a.instruction, &BTreeSet::new()).unwrap();
+        assert_eq!(child.config["mcp"]["servers"][0]["name"], "desk");
+        assert_eq!(child.workflows[0]["name"], "queue");
+        assert_eq!(child.skills[0].name, "triage");
+    }
+
+    /// Without the grant the agent stays text, said with the grant it
+    /// needs, and its blocks are not the parent's either.
+    #[test]
+    fn an_agent_without_the_grant_is_held_naming_the_grant() {
+        let ex = extract(TEAM, &BTreeSet::from([IDENTITY.to_string()])).unwrap();
+        assert!(ex.agents.is_empty());
+        assert!(ex.config.is_empty() && ex.workflows.is_empty() && ex.skills.is_empty());
+        assert_eq!(ex.declarations["agent"].len(), 1);
+        assert_eq!(ex.warnings.len(), 1, "{:?}", ex.warnings);
+        assert!(
+            ex.warnings[0].contains("\"support\"")
+                && ex.warnings[0].contains("agent.document_capabilities: [agents]")
+                && ex.warnings[0].contains(HOST_POLICY),
+            "{:?}",
+            ex.warnings
+        );
+        assert!(
+            ex.cleaned.contains("You answer every ticket."),
+            "{}",
+            ex.cleaned
+        );
+    }
+
+    /// An agent with no id refuses the document (the reader requires one);
+    /// one with no body has no instruction to run, and says so.
+    #[test]
+    fn an_agent_without_an_id_refuses_and_one_without_a_body_is_said() {
+        let e = extract("::agent{title=\"Nobody\"}\n", &agents()).unwrap_err();
+        assert!(
+            e.iter()
+                .any(|r| r.code == "invalid-attributes" && r.message.contains("id")),
+            "{e:?}"
+        );
+        let ex = extract("::agent{id=empty}\n", &agents()).unwrap();
+        assert!(ex.agents.is_empty());
+        assert_eq!(ex.warnings.len(), 1, "{:?}", ex.warnings);
+        assert!(
+            ex.warnings[0].contains("\"empty\"") && ex.warnings[0].contains("no body"),
+            "{:?}",
+            ex.warnings
+        );
+    }
+
+    /// Over the wire, `agents` needs a pinned publisher's signature that
+    /// attests it: unpinned is refused, attested without it is refused.
+    #[test]
+    fn over_the_wire_an_agent_needs_a_pin_that_attests_agents() {
+        let refused = |attested: Option<&[String]>, why: &str| {
+            let ex = extract_from_wire(TEAM, &agents(), attested).unwrap();
+            assert!(ex.agents.is_empty());
+            assert!(
+                ex.warnings.iter().any(|w| w.contains(why)),
+                "{why}: {:?}",
+                ex.warnings
+            );
+        };
+        refused(None, "is not verified");
+        refused(Some(&["compute".to_string()]), "attests [\"compute\"]");
+        let ex = extract_from_wire(TEAM, &agents(), Some(&[AGENTS.to_string()])).unwrap();
+        assert_eq!(ex.agents.len(), 1, "{:?}", ex.warnings);
+    }
+
+    /// An agent is written under its document's parameters, and what is said
+    /// about its instruction names it, at the parent's line.
+    #[test]
+    fn an_agent_reads_its_documents_parameters_and_reports_at_the_parents_line() {
+        let doc = "---\nspec: \"1\"\nparameters:\n  voice: { type: string, default: warm }\n---\n\
+            ::::agent{id=cmo}\nWrite in a ${voice} voice.\n${missing}\n::::\n";
+        let ex = extract(doc, &agents()).unwrap();
+        let a = &ex.agents[0];
+        assert_eq!(a.line, 6);
+        let child = extract(&a.instruction, &BTreeSet::new()).unwrap();
+        assert!(
+            child.cleaned.contains("Write in a warm voice."),
+            "{}",
+            child.cleaned
+        );
+        let w = child
+            .warnings
+            .iter()
+            .find(|w| w.contains("missing"))
+            .expect("an undeclared parameter is said");
+        assert!(
+            a.in_parent(w).starts_with("agent \"cmo\": line 8:"),
+            "{}",
+            a.in_parent(w)
+        );
+    }
+
+    /// A changed agent moves the machinery digest, so a served document whose
+    /// agents moved is applied.
+    #[test]
+    fn an_agent_moves_the_machinery_digest() {
+        let one = extract(TEAM, &agents()).unwrap();
+        let two = extract(&TEAM.replace("every ticket", "each ticket"), &agents()).unwrap();
+        assert!(machinery_digest(&one).is_some());
+        assert_ne!(machinery_digest(&one), machinery_digest(&two));
     }
 }

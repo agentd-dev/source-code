@@ -44,6 +44,7 @@ whose body is guidance.
 |---|---|---|
 | `:::mcp{id src tools allow deny}` (or `::mcp`) | an `mcp.servers` entry: `id` → `name`, `src` → `endpoint`, `tools` and `allow` → `allow`, `deny` → `exclude` | none |
 | `::agent{id protocol=a2a endpoint binding src}` | an `a2a.peers` entry named `id`: `endpoint`, or the origin of an Agent Card `src` at `/.well-known/agent-card.json` | `identity` |
+| `::::agent{id title}` with a body and no `protocol`, `src` or `endpoint` | a `subagents.templates` entry named `id`: the body is its instruction, read under the document's declared parameters; `singleton: true` when its body carries machinery (an instance child). Its own `:::mcp`, `:::skill`, `:::workflow` and `:::config` are the child's, never the document's | `agents` |
 | `:::workflow{id dialect="instruction/workflow"}` | a `workflows[]` entry; the body is the definition, its `name` required by the language. `agentd/workflow` is the same dialect. | none; `interface` for a route |
 | `:::config{id dialect="agentd/config"}` | the document's configuration fragment, merged under the operator's | none |
 | `:::skill{id title trigger}` with a body, no `src` | an inline skill named `id`: `description` (or `title`) and `trigger` | none |
@@ -62,12 +63,15 @@ unresolved, and is reported as a host-policy diagnostic (§17): a
 
 | Not activated | Why |
 |---|---|
-| `::agent` without the `identity` grant, or from a document that arrived over the wire | the grant, or the §7.8 floor |
+| `::agent{protocol=a2a}` without the `identity` grant, or from a document that arrived over the wire | the grant, or the §7.8 floor |
 | `::agent` with `protocol` other than `a2a`, a `binding` other than `JSONRPC`, or a `tenant` | agentd speaks A2A's JSON-RPC binding and takes the tenant from the card |
-| `::agent` whose `src` is not an Agent Card at `/.well-known/agent-card.json` | agentd finds an agent by its endpoint or that card |
-| `:::mcp` with no `src` (a `registry` or `server` reference) | agentd dials a server by its URL |
+| `::agent` whose `src` is not an Agent Card at `/.well-known/agent-card.json`, or an A2A agent with neither `endpoint` nor `src` | agentd finds an agent by its endpoint or that card |
+| An agent agentd runs itself (no `protocol`, `src` or `endpoint`) without the `agents` grant; from a document that arrived over the wire, one that is not verified against a pinned publisher or whose signature does not attest `agents`; or one with no body | the grant; a wire document's agents run only from a publisher the operator pinned; the body is the agent's instruction |
+| An agent agentd runs itself whose `id` names a template in the operator's `subagents.templates` | the operator's template stands; the rest of the document applies |
+| An agent inside an agent's body | a child defines no agents of its own |
+| `:::mcp` with neither a `src` nor both `registry` and `server` | agentd dials a server by its URL, or by a registry the operator trusts and the server's name there |
 | `:::workflow` or `:::config` in another dialect | agentd runs `instruction/workflow` and reads `agentd/config` |
-| `:::skill` with a `src` | packaged skills come from the configuration's `skills:` |
+| `:::skill` with a `src` that is not a `SKILL.md` on GitHub | packaged skills come from the configuration's `skills:` |
 
 `::tool`, `::service`, `::source`, and every object above, are listed by kind
 under `document.declarations` in `agentd --capabilities`.
@@ -99,12 +103,21 @@ default. `instruction/1` grants nothing by itself; these are agentd's.
 |---|---|
 | `identity` | `::agent` → `a2a.peers` |
 | `interface` | a workflow with a `webhook` start or a `wait {on: webhook}`, however the document writes it |
+| `agents` | `::::agent` with a body and no `protocol` → `subagents.templates` |
 
 A document that arrived over the wire (`url:`, `oci:`, `mcp:`) never uses
 `identity`, whatever the operator granted or the author signed. Nor may it
 write `a2a.peers` through a `:::config`, or name a secret
-(`{{secret:…}}`, `{{secret-file:…}}`) in its configuration or workflows: the
-load is refused, since the secret would go wherever the document points it.
+(`{{secret:…}}`, `{{secret-file:…}}`) in its configuration or workflows, or in
+the machinery of an agent it defines: the load is refused, since the secret
+would go wherever the document points it. It uses `agents` only when it
+verified against a pinned publisher (`agent.instruction.trust`) and the
+author's signature attests `agents`.
+
+An agent's body is compiled as its template's instruction with no grant at
+all: an A2A agent or an agent in it stays text, and a webhook route in it
+refuses the document, as it refuses any template (an instance child has no
+listener).
 
 A verified author signature caps the grant to the capabilities it attests;
 it never widens it.

@@ -361,6 +361,15 @@ makes the residual a documentation requirement, not a silent property.
 child (RFC 0003), sit under the tree-token ceiling, and count against
 `instances.*` caps at one unforgeable chokepoint.
 
+> *Note (2026-11-02):* templates are no longer only operator-authored. Under
+> the operator's `agents` grant, the instruction document defines templates
+> of its own, one per `::::agent` with no `protocol`
+> ([RFC 0056](0056-a-documents-own-agents.md)). They are compiled with no
+> grants, to the §7.8 floor when the document came over the wire, and an
+> operator template of the same name stands; 8.1–8.4 hold for them
+> unchanged. A reload now also recomposes the live instance children of
+> every template (RFC 0056 §5).
+
 ## 9. Phases
 
 - **Phase A** — the `subagents:` section (templates, defaults,

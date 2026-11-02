@@ -5,6 +5,45 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Added.**
+
+- **A document's own agents (RFC 0056).** Under a new operator grant,
+  `agent.document_capabilities: [agents]` (off by default), an instruction
+  document defines the team of agents agentd runs as its subagents. An
+  `agent` with no `protocol`, `src` or `endpoint`, written
+  `::::agent{id=support title="Support lead"} … ::::`, becomes the template
+  `subagents.templates.support`: its body is its instruction, read under the
+  document's declared parameters, with its own `:::mcp`, `:::skill`,
+  `:::workflow` and `:::config`, and it is a `singleton` instance child when
+  the body carries machinery. Nothing inside an agent's body configures the
+  parent. The body is compiled with no grants (an A2A agent or an agent in it
+  stays text), and held to every rule a template is. The operator's ceilings
+  bound the team (`limits.subagents.instances`, `subagents.defaults`, the
+  parent's servers and egress), and the load warns when the document defines
+  more instance agents than they allow. An operator template of the same
+  name stands; the document's agent is held as text with a `host-policy`
+  warning. Over the wire (`url:`, `oci:`, `mcp:`), the agents run only when
+  the document verified against a pinned publisher and the author's
+  signature attests `agents`, and a child whose machinery names a secret
+  refuses the document. Without the grant an agent with no protocol is held,
+  said, naming the grant. A document's workflow spawns its agents with
+  `{kind: subagent, template: <id>}` and reaches a live one by its id with
+  `a2a.send` or `a2a.delegate`; each child runs its own workflows in its own
+  daemon. The parent logs `subagent.template.composed` for each agent at
+  load, and `instruction.read` counts `agents`.
+- **A reload recomposes the live instance children.** A child whose template
+  a reload removed is retired (`subagent.template.retired`); a singleton
+  whose template's composition changed is retired and started again from the
+  new one with the params it was spawned with
+  (`subagent.template.recomposed`, `subagent.template.respawned`). This holds
+  for every template; before, a reload changed no live child, and removing a
+  singleton template left its child running without its peer alias.
+- **An instance template's skills reach its child.** Its inline `:::skill`
+  blocks are written into the child's directory as `<name>/SKILL.md` and
+  composed as the child's `skills.dir`; they were stripped and lost.
+
 ## v1.21.1 — the operator's names stand, and only Personal Agent Protocol 0.1 is spoken
 
 Two fixes, found by running the 1.21.0 demo kits and a Company against

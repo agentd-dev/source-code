@@ -3455,11 +3455,12 @@
           "type": "string"
         },
         "document_capabilities": {
-          "description": "the grants this agent's instruction document may use beyond the default: identity admits its A2A agents (::agent → a2a.peers), interface a workflow that opens an inbound route. Empty admits guidance, :::mcp, :::workflow, :::config, :::skill and ::person. Fail-closed, restart-only.",
+          "description": "the grants this agent's instruction document may use beyond the default: identity admits its A2A agents (::agent → a2a.peers), interface a workflow that opens an inbound route, agents the agents it defines for agentd to run (::::agent with a body and no protocol → subagents.templates; over the wire only from a pinned publisher whose signature attests agents). Empty admits guidance, :::mcp, :::workflow, :::config, :::skill and ::person. Fail-closed, restart-only.",
           "items": {
             "enum": [
               "interface",
-              "identity"
+              "identity",
+              "agents"
             ]
           },
           "type": "array"
@@ -3668,7 +3669,8 @@
                             "identity",
                             "compute",
                             "infra",
-                            "compose"
+                            "compose",
+                            "agents"
                           ]
                         },
                         "type": "array"

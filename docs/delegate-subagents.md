@@ -553,9 +553,11 @@ With only flat templates the validator also prints a warning that
 `a2a.listen` is unset. It concerns instance-tier templates, described next,
 and you can ignore it here.
 
-A served instruction document cannot define templates; `subagents` is
-operator configuration. A document's workflow refers to one by name in a
-`subagent` step:
+`subagents` is operator configuration: a document's `:::config` cannot write
+it. Under the `agents` grant a document defines agents of its own instead
+([A document's own agents](#a-documents-own-agents)). A document's workflow
+refers to a template, the operator's or its own, by name in a `subagent`
+step:
 
 ```markdown
 You run the research desk. When a question needs sources, open a
@@ -802,6 +804,123 @@ record closes `failed` with that pid in its error, and the parent logs
 > with `composes an invalid config`. Spawn each instance template once in a
 > test environment before you rely on it.
 
+When a reload changes the templates, the live instance children follow. A
+child whose template the reload removed is retired, and the parent logs
+`subagent.template.retired`. A `singleton` child whose template's
+composition changed (its prose, machinery, skills or fields) is retired,
+logged as `subagent.template.recomposed`, and started again from the new
+template once it has exited, with the params it was spawned with, logged as
+`subagent.template.respawned` (or `subagent.template.respawn_failed`, with
+the refusal, when the ceilings or the new params refuse it). Other children
+of a changed template keep the composition they were spawned with until they
+retire.
+
+## A document's own agents
+
+An instruction document can define the team of agents agentd runs for it.
+An `agent` written as a container, with no `protocol`, `src` or `endpoint`,
+is an agent agentd runs itself. Its body is its instruction document: prose,
+and its own `:::mcp`, `:::skill`, `:::workflow` and `:::config` blocks.
+
+```markdown
+::::agent{id=support title="Support lead"}
+You answer every customer who writes to support@.
+
+:::mcp{id=support-desk title="Helpdesk" src="https://desk.example.com/mcp" tools="tickets.list,tickets.reply"}
+Every customer conversation. A reply here goes to the customer.
+:::
+
+:::workflow{id=support-queue dialect="instruction/workflow"}
+name: support-queue
+steps:
+  start: {kind: once}
+  open: {kind: mcp.tool, depends_on: [start], server: support-desk, tool: tickets.list}
+  answer: {kind: agent, depends_on: [open], instruction: Answer every open ticket.}
+  done: {kind: finish, depends_on: [answer]}
+:::
+::::
+```
+
+The operator grants it, off by default:
+
+```yaml
+# needs: ./company.md
+agent:
+  name: company
+  instruction: ./company.md
+  document_capabilities: [agents]
+limits:
+  subagents:
+    instances: {breadth: 10, total: 20, rate: "10/1h"}
+intelligence:
+  endpoints: "https://api.openai.com/v1/chat/completions"
+  token: "{{secret:OPENAI_API_KEY}}"
+  model: gpt-5.1
+```
+
+Each agent becomes the template `subagents.templates.<id>`, its body the
+instruction, read under the document's declared parameters, so a `${name}`
+in the body reads as it does in the document. An agent whose body carries
+machinery is an instance-tier child and a `singleton`; one that is only prose
+is a flat worker. The parent logs `subagent.template.composed` for each at
+load, with its tier, servers, workflows and skills, before any is spawned.
+
+- **The blocks are the agent's.** Nothing inside an agent's body configures
+  the parent, whether the agent is admitted or held.
+- **The child has no grants.** Its body is compiled with none, so an A2A
+  agent or an agent written in it stays text. It is held to the boundary
+  every template is held to: no operator configuration, none of the sections
+  the parent composes, no webhook route.
+- **The operator's ceilings hold.** `limits.subagents.instances` (breadth 2,
+  total 8 and `4/1h` by default) and `subagents.defaults` bound the team; the
+  load warns when the document defines more instance agents than they allow.
+  A child's servers are judged against the parent's `mcp.servers` and egress
+  as any template's are. A child gets no A2A peer, and no credential but the
+  ones the parent's own servers and model carry.
+- **The operator's names stand.** An operator template of the same name is
+  used, and the document's agent is held as text with a `host-policy`
+  warning; the rest of the document applies.
+- **Over the wire** (`url:`, `oci:`, `mcp:`), the agents run only when the
+  document verified against a pinned publisher (`agent.instruction.trust`)
+  and the author's signature attests `agents`. A child of such a document
+  names no secret: one that does refuses the document.
+- **Skills travel.** The agent's `:::skill` blocks reach its child as skills
+  of its own.
+
+The document's own workflows start the team. A `subagent` step names an
+agent by its id. An instance agent's spawn is detached, so a `parallel` of
+ten spawns returns at once; once its singleton is live, `a2a.send` and
+`a2a.delegate` reach it by the same name. A prose-only agent is a flat
+worker, spawned in `subagents.defaults.mode` (`sync` unless set). Each child
+runs its own `:::workflow` blocks, a `once` start included, in its own
+daemon.
+
+```markdown
+:::workflow{id=open-the-company dialect=instruction/workflow}
+name: open-the-company
+steps:
+  start: {kind: once}
+  team:
+    kind: parallel
+    depends_on: [start]
+    branches:
+      support: {steps: {run: {kind: subagent, template: support}}}
+      billing: {steps: {run: {kind: subagent, template: billing}}}
+  brief:
+    kind: a2a.delegate
+    depends_on: [team]
+    peer: support
+    command: support.brief
+    retry: {max: 6, backoff: 1s}
+:::
+```
+
+When the document changes, a reload recomposes the team by the rule above:
+a new agent can be spawned, a removed agent's live child is retired, and a
+changed agent's live child is retired and started again from its new body.
+The document's workflow that spawned the team does not run again unless its
+own definition changed.
+
 ## Avoid these traps
 
 - **A missing template is found at spawn.** A step's `template` that names
@@ -819,9 +938,18 @@ record closes `failed` with that pid in its error, and the parent logs
 - **Restarts redo work.** A restored child starts its instruction again, and
   a new spawn after a restart can take a restored record's handle. Make
   delegated work idempotent.
-- **Skills do not reach a child.** A spawn's `skills` is accepted and not
-  used, and a template's `:::skill` block is stripped from the child's text.
-  Put what the child needs in its instruction or `context`.
+- **Skills do not reach a flat child.** A spawn's `skills` is accepted and
+  not used, and a flat template's `:::skill` block is stripped from the
+  worker's text. Put what the worker needs in its instruction or `context`.
+  An instance template's `:::skill` blocks reach the child as its own
+  skills, a `<name>/SKILL.md` folder in its directory.
+- **A changed `once` workflow runs again.** A reload starts the `once` start
+  of a definition it installed new or replaced. Under `policy: always`, or
+  once `store.retention.runs` has evicted the earlier run, a team-spawning
+  workflow whose
+  definition changed spawns again, and a live singleton refuses the spawn.
+  `workflow.resume` and `workflow.create` arm every workflow, with the same
+  effect.
 
 ## The subagent tools
 
@@ -846,7 +974,13 @@ returns one subagent without a task; see the
 
 ## Watch children run
 
-Each child logs to the daemon's log. The events to watch:
+The daemon's log says what happens to each child. A flat child's lines are
+in it. An instance child is a daemon of its own and writes its own log,
+`log` in its directory: its runs and steps are there, not in the parent's.
+What reaches the parent from an instance child is its record (status and
+spend, which the A2A feed and the TUI's subagents screen show), the result
+of a `mode: sync` spawn, and the streams it mirrors (`mirror_streams`). The
+events to watch:
 
 | Event | When |
 |---|---|
@@ -859,6 +993,8 @@ Each child logs to the daemon's log. The events to watch:
 | `intel.swap.sent` | A reload handed running children their model again |
 | `instance.spawn`, `instance.retire`, `instance.exited`, `instance.respawn`, `instance.respawn_wait`, `instance.respawn_failed` | An instance child's lifecycle |
 | `instance.result`, `instance.mirror`, `instance.metered` | A sync result, a mirrored event, a budget charge |
+| `subagent.template.composed` | A template the instruction document defined, at load or when a reload changed it: `template`, `origin`, `line`, `title`, `tier`, `singleton`, `servers`, `workflows`, `skills` |
+| `subagent.template.retired`, `subagent.template.recomposed`, `subagent.template.respawned`, `subagent.template.respawn_failed` | A reload removed or changed a live child's template: `template`, `handle`, `why`; a respawn names the child it replaces (`was`) |
 
 The `agent_subagents_spawned_total` and `agent_subagents_exited_total`
 metrics count every child process, turn and think workers included. Count

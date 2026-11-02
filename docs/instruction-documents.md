@@ -149,6 +149,8 @@ diagnostic's code. A warning is said and the document loads. The common ones:
 | `:::config` setting `intelligence.endpoints` | `the instruction's :::config writes intelligence.endpoints — operator configuration is not a document's to set` | Move the key to the operator's config. |
 | `:::config` setting `document_capabilities` | `a config block may not write document_capabilities` (`self-grant`) | Grants are the operator's. |
 | `::agent{…}` without the grant | a warning: `agent "x" is not activated: needs the identity grant (host-policy)` | Grant it; see [Grant what a document may use](#grant-what-a-document-may-use). |
+| `::::agent{id=x}` with a body and no `protocol`, without the grant | a warning: `agent "x" is not activated: an agent agentd runs itself needs the agents grant (host-policy)` | Grant `agents`; see [A document's own agents](delegate-subagents.md#a-documents-own-agents). |
+| `::::agent{id=x}` when the operator has a template `x` | a warning: `agent "x" is not activated: the operator's subagents.templates has a template of that name, and the operator's stands` (`host-policy`) | Nothing, if the operator's `x` is meant; otherwise rename the agent. |
 | `:::mcp{id=fs …}` when the operator has a server `fs` at another endpoint | a warning: `mcp server "fs" (…) is not activated: the operator's mcp.servers has a server of that name at another endpoint, and the operator's stands` (`host-policy`) | Nothing, if the operator's `fs` is meant; otherwise rename the block. A document adds servers; it never re-points one. |
 | `:::workflow{id=w …}` when the operator defines a workflow `w` | a warning: `workflow "w" is not activated: the operator defines a workflow of that name, and the operator's stands` (`host-policy`) | Nothing, if the operator's `w` is meant; otherwise rename the block. |
 
@@ -439,7 +441,7 @@ registry's signed delivery to this reader:
 ```yaml
 agent:
   name: support-desk
-  document_capabilities: [identity]
+  document_capabilities: [agents]
   instruction:
     mcp:
       server: registry
@@ -451,7 +453,7 @@ agent:
         author_keys: [/etc/agentd/keys/acme-author.pub]
         delivery_keys: [/etc/agentd/keys/registry-delivery.pub]
         reader: "agent://support-desk"
-        max_capabilities: [identity]
+        max_capabilities: [agents]
         freshness: 15m
 intelligence:
   endpoints: "https://api.openai.com/v1/chat/completions"
@@ -468,8 +470,9 @@ With a publisher pinned:
 
 - An unsigned document is refused, as is one signed by another publisher, or
   one whose signature names another document id than the pin.
-- The capabilities the signature attests cap the grant. Here the document's
-  A2A agents activate only if the author attested `identity`.
+- The capabilities the signature attests cap the grant. Here the agents the
+  document defines run only if the author attested `agents`. A document from
+  the wire never uses `identity`, signed or not: its A2A agents stay text.
 - `reader` turns on the delivery check: audience, expiry, the delivered
   digest, and the chain from the delivery's `instruction-resolved/1` manifest
   back to the author's signature.
@@ -589,13 +592,14 @@ so a pinned document verifies after it is decrypted.
 `instruction/1` grants nothing by itself: a declaration states intent, and the
 host decides what it may become. agentd activates, with no grant, the
 guidance and the blocks every document may use: `:::mcp`, `:::workflow`,
-`:::config`, `:::skill` and `::person`. Two grants, named in
+`:::config`, `:::skill` and `::person`. Three grants, named in
 `agent.document_capabilities`, admit more:
 
 | Grant | Admits |
 |---|---|
 | `identity` | `::agent{protocol=a2a …}`: the agent becomes an `a2a.peers` entry a workflow can `a2a.send` to |
 | `interface` | a workflow that opens an inbound route on the operator's webhook listener: a `webhook` start, or a `wait {on: webhook}` |
+| `agents` | `::::agent{id=…} … ::::` with no `protocol`, `src` or `endpoint`: an agent agentd runs itself, as a subagent template whose instruction is the body ([A document's own agents](delegate-subagents.md#a-documents-own-agents)) |
 
 This document declares a person and an A2A agent and addresses a workflow to
 both. Save it as `deploy.md`:
@@ -655,8 +659,10 @@ card; an agent naming another binding or a `tenant` is not activated.
 What agentd will not activate stays in the agent text, unresolved, and is
 reported as a host-policy diagnostic (`config.warning`, code `host-policy`):
 an agent without the grant, a workflow or configuration block in a dialect
-agentd does not run, a skill by `src`, an MCP server named by a registry
-entry rather than a URL. Nothing is removed, and nothing is dropped without a
+agentd does not run, a skill whose `src` is not a `SKILL.md` on GitHub, an
+MCP server named by a registry the operator does not trust. The blocks inside
+an agent's body are that agent's, never the document's, whether the agent
+runs or not. Nothing is removed, and nothing is dropped without a
 word. `::tool`, `::service` and `::source` are recorded under `document` in
 `agentd --capabilities` and activate nothing.
 
@@ -667,7 +673,10 @@ A document that arrives over the wire, from a `url:`, `oci:` or `mcp:` source,
 never uses the `identity` grant, whatever you grant: its A2A agents stay text,
 said. Nor does it reach a peer or a credential through the blocks every
 document may use: a `:::config` that writes `a2a.peers`, or a secret named in
-a header or a step, refuses it. A `url:` or `oci:` document is refused at
+a header or a step, refuses it, in the document or in the body of an agent it
+defines. It uses the `agents` grant only when it verified against a pinned
+publisher and the author's signature attests `agents`; an unpinned or
+unsigned document's agents stay text, said. A `url:` or `oci:` document is refused at
 load, exit `2`; an `mcp:` document when it is read, exit `6` at startup, and
 on an update the running text stays.
 
@@ -681,7 +690,7 @@ on an update the running text stays.
 | The document and the operator both name the turn model | The operator's wins; the document's is dropped. | Name models in the document and leave `--model` unset, or the reverse. |
 | A document changes `store.kind` or `lifecycle.run_until` | The change needs a restart, as in a config file. | Restart after the edit. |
 | An `::include` or `extends` in the document | agentd delivers the document as read; what it composes is not loaded. | Inline the text, or serve the document from a registry that resolves it. |
-| A misspelled grant in `document_capabilities` | It grants nothing. | Use `identity` or `interface`. |
+| A misspelled grant in `document_capabilities` | It grants nothing. | Use `identity`, `interface` or `agents`. |
 | A trust pin's key file path is wrong | The pin cannot be enforced; under `warn` the document loads unverified. | `unenforceable: refuse`. |
 | A document's `:::mcp` server | It counts as `untrusted_input`: what it answers taints the work that reads it. `trusted` on it is refused. | Declare the server in the operator's `mcp.servers` with its tags (`connect: on_use` dials it only when needed). The document's `:::mcp` whose `src` matches that endpoint is then the operator's server, with its tags. |
 | An `instruction/workflow` step a host does not run | `--validate-config` refuses the workflow, naming the step (an `event` start on an event agentd does not raise, a `wait` with no `on`). | Use the node forms in [the node registry](node-registry.md). |

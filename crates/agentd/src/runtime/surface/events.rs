@@ -248,7 +248,17 @@ impl FeedKind {
                 }),
             ),
             FeedKind::Subagent => closed(
-                &["handle", "mode", "status", "tokens", "error", "updated"],
+                &[
+                    "handle",
+                    "mode",
+                    "status",
+                    "tokens",
+                    "error",
+                    "updated",
+                    "template",
+                    "tier",
+                    "reports_to",
+                ],
                 json!({
                     "handle": string(),
                     "mode": string(),
@@ -256,6 +266,11 @@ impl FeedKind {
                     "tokens": count(),
                     "error": string_or_null(),
                     "updated": count(),
+                    // The template it was spawned from, `flat` or
+                    // `instance`, and a document agent's reporting line.
+                    "template": string_or_null(),
+                    "tier": string_or_null(),
+                    "reports_to": string_or_null(),
                 }),
             ),
             // `Children::status`: one OS child.
@@ -868,7 +883,8 @@ mod tests {
             (
                 FeedKind::Subagent,
                 json!({"error": null, "handle": "sub-2", "mode": "sync", "status": "completed",
-                       "tokens": 16, "updated": 1_790_631_625_868u64}),
+                       "tokens": 16, "updated": 1_790_631_625_868u64,
+                       "template": "community", "tier": "instance", "reports_to": "cmo"}),
             ),
             (FeedKind::SubagentRemoved, json!({"id": "sub-2"})),
             (

@@ -33,6 +33,32 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `a2a.send` or `a2a.delegate`; each child runs its own workflows in its own
   daemon. The parent logs `subagent.template.composed` for each agent at
   load, and `instruction.read` counts `agents`.
+- **Reporting lines.** An agent written inside a document agent (the outer
+  fence longer: `:::::agent{id=cmo}` … `::::agent{id=community}` … `::::` …
+  `:::::`) is its own template, composed under the same grant and rules, and
+  labelled `reports_to: cmo`, at any depth. Its block is cut out of its
+  manager's instruction, so adding a report leaves the manager's composition
+  as it was and a reload restarts nothing else. The line is a label only:
+  no tools or peer between the two. It is on `subagent.template.composed`
+  (now with `title`, `reports_to`, and the counts `servers`, `workflows`,
+  `skills` beside `server_names`, `workflow_names`, `skill_names`), on
+  `instance.spawn`, on the child's record, and in the A2A feed's `subagent`
+  items (`template`, `tier`, `reports_to`), which the TUI's subagents screen
+  now shows as columns.
+- **`subagents.document_agents.start: on_compose`** (operator-only,
+  reloadable; default `manual`) starts each instance-tier document agent's
+  singleton at load and whenever a reload adds one, with no workflow, under
+  every instance ceiling: a refused start is logged per agent
+  (`subagent.template.start_refused`) and the others start. A spawn of a
+  document agent whose singleton is live is answered with that one
+  (`already_live: true`, `subagent.template.already_live`) instead of a
+  refusal.
+- **A document agent's references resolve.** `:person[…]{ref=#id}` and
+  `:agent[…]{ref=#id}` naming the document's people and agents read as they
+  do in the document, not `[unresolved]`, and are not warned about. Names in
+  text only: no gate may address them.
+- **`instance.spawn` names the child's directory and log** (`dir`, `log`,
+  absolute), so a viewer tails each child's log without deriving it.
 - **A reload recomposes the live instance children.** A child whose template
   a reload removed is retired (`subagent.template.retired`); a singleton
   whose template's composition changed is retired and started again from the

@@ -537,9 +537,9 @@ screen lists them live:
 ```tui
 # agentd tui — subagents
 agentd 1.21.1 triage-1 debug
-  handle               mode        status      tokens   updated
-▸ sa-review            supervised  running     4120     0s
-  sa-lint              detached    failed      260      0s
+  handle          template    reports to  mode      status    tokens   updated
+▸ sa-review       reviewer    cto         detached  running   4120     0s
+  sa-lint         linter                  detached  failed    260      0s
 ↑/↓ select · enter details · tab next screen
 ● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
 ```
@@ -552,6 +552,8 @@ are:
 agentd 1.21.1 triage-1 debug
 subagent sa-review
 status        running
+template      reviewer
+reports to    cto
 mode          supervised
 attempt       1
 tokens        4120
@@ -573,6 +575,8 @@ m message · k stop · esc/backspace back · tab next screen
 agentd 1.21.1 triage-1 debug
 subagent sa-review
 status        running
+template      reviewer
+reports to    cto
 mode          supervised
 attempt       1
 tokens        4120
@@ -655,13 +659,13 @@ feed
     4 step          {"run":"pipeline-01M0C0","step":"notify","kind":"a2a.send","phase":"start"}
     5 step          {"run":"pipeline-01M0C0","step":"fetch","phase":"done","status":"done","tokens"…
     6 step          {"run":"pipeline-01M0C0","step":"triage","phase":"done","status":"done","tokens…
-    7 subagent      {"handle":"sa-review","mode":"supervised","status":"running","tokens":4120,"upd…
-    8 subagent      {"handle":"sa-lint","mode":"detached","status":"failed","tokens":260,"updated":…
+    7 subagent      {"handle":"sa-review","mode":"detached","status":"running","tokens":4120,"error…
+    8 subagent      {"handle":"sa-lint","mode":"detached","status":"failed","tokens":260,"error":"l…
 runs
 pipeline-01M0C0        running    3/7
   ◐ notify            a2a.send      running
   ● triage            extract       done      1.0s
-  ● fetch             mcp.tool      done      140ms
+  ● fetch             mcp.tool      done      142ms
 subagents / children
 sub sa-review          running    4120 tok
 sub sa-lint            failed     260 tok

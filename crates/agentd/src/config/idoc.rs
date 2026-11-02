@@ -260,6 +260,10 @@ pub struct Extraction {
     /// The agents the document defines for agentd to run (RFC 0056), under
     /// the [`AGENTS`] grant.
     pub agents: Vec<DocumentAgent>,
+    /// The `(id, kind)` of every person, role and agent the document
+    /// declares, wherever it stands: the names its agents' text may refer to
+    /// ([`extract_knowing`]).
+    pub known: Vec<(String, String)>,
     /// The SDK's warnings and agentd's host-policy diagnostics, each
     /// `line N: message (code)`.
     pub warnings: Vec<String>,
@@ -282,9 +286,14 @@ pub struct DocumentAgent {
     pub instruction: String,
     /// The parent document's line the agent opens on.
     pub line: usize,
-    /// How many lines [`DocumentAgent::instruction`] carries before the body:
-    /// its line `n` is the parent's line `line + n - header_lines`.
+    /// The agent it is nested in — its reporting line, a label and nothing
+    /// more — or `None` at the top level.
+    pub reports_to: Option<String>,
+    /// How many lines [`DocumentAgent::instruction`] carries before the body.
     pub header_lines: usize,
+    /// The parent document's line of each body line of the instruction, in
+    /// order: the agents nested in it are cut out, so the two run apart.
+    pub lines: Vec<usize>,
 }
 
 impl DocumentAgent {
@@ -296,11 +305,55 @@ impl DocumentAgent {
             .and_then(|rest| rest.split_once(':'))
             .and_then(|(n, rest)| Some((n.parse::<usize>().ok()?, rest)))
             .map(|(n, rest)| {
-                let at = (self.line + n).saturating_sub(self.header_lines);
+                let at = n
+                    .checked_sub(self.header_lines + 1)
+                    .and_then(|i| self.lines.get(i).copied())
+                    .unwrap_or(self.line);
                 format!("line {at}:{rest}")
             });
         format!("agent {:?}: {}", self.id, moved.as_deref().unwrap_or(said))
     }
+}
+
+/// An `agent` the host runs itself: no `protocol`, `src` or `endpoint`.
+fn runs_itself(attrs: &instruction_md::types::Attrs) -> bool {
+    ["protocol", "src", "endpoint"].iter().all(|k| {
+        attrs
+            .get(*k)
+            .and_then(Value::as_str)
+            .is_none_or(|v| v.trim().is_empty())
+    })
+}
+
+/// `body`, whose first line is the parent's line `first`, with the parent's
+/// line ranges `cuts` taken out — and with them the blank lines a cut leaves
+/// doubled, and the blank lines it leaves at the end — so the text is the
+/// same however many nested blocks stood where. Returns the text and the
+/// parent's line of each line kept.
+fn cut_lines(body: &str, first: usize, cuts: &[(usize, usize)]) -> (String, Vec<usize>) {
+    let mut kept: Vec<(usize, &str)> = Vec::new();
+    let mut after_cut = false;
+    for (i, line) in body.lines().enumerate() {
+        let at = first + i;
+        if cuts.iter().any(|(s, e)| (*s..=*e).contains(&at)) {
+            after_cut = true;
+            continue;
+        }
+        let blank = line.trim().is_empty();
+        if after_cut && blank && kept.last().is_none_or(|(_, l)| l.trim().is_empty()) {
+            continue;
+        }
+        after_cut = after_cut && blank;
+        kept.push((at, line));
+    }
+    if !cuts.is_empty() {
+        while kept.last().is_some_and(|(_, l)| l.trim().is_empty()) {
+            kept.pop();
+        }
+    }
+    let mut text: String = kept.iter().map(|(_, l)| *l).collect::<Vec<_>>().join("\n");
+    text.push('\n');
+    (text, kept.into_iter().map(|(at, _)| at).collect())
 }
 
 /// How a document came: the grants it may use, whether it arrived over the
@@ -365,6 +418,25 @@ pub fn extract(text: &str, granted: &BTreeSet<String>) -> Result<Extraction, Vec
     )
 }
 
+/// [`extract`], for a document agent's instruction: `known` are the
+/// `(id, kind)`s its parent document declares (its people and agents), which
+/// its typed references name as the parent does — in text only.
+pub fn extract_knowing(
+    text: &str,
+    granted: &BTreeSet<String>,
+    known: &[(String, String)],
+) -> Result<Extraction, Vec<Refusal>> {
+    fold_knowing(
+        &parse(text)?,
+        Admission {
+            granted,
+            over_the_wire: false,
+            attested: None,
+        },
+        known,
+    )
+}
+
 /// Read and map a document that arrived over the wire (§7.8), with the
 /// families its author attested when a pinned publisher verified it.
 pub fn extract_from_wire(
@@ -394,20 +466,111 @@ pub fn extract_from_wire(
 /// an agent agentd runs carries them in its own instruction
 /// ([`DocumentAgent`]).
 pub fn fold(parsed: &Parsed, admission: Admission<'_>) -> Result<Extraction, Vec<Refusal>> {
+    fold_knowing(parsed, admission, &[])
+}
+
+/// [`fold`], with `known`: the `(id, kind)`s of objects another document
+/// declares — an agent's parent's people and agents — which a typed reference
+/// to `#id` names as it would in that document: resolved in the agent text,
+/// not `[unresolved]`, and not said as missing. Names in text, nothing more:
+/// a known id is no person a gate may address and no agent to dial.
+fn fold_knowing(
+    parsed: &Parsed,
+    admission: Admission<'_>,
+    known: &[(String, String)],
+) -> Result<Extraction, Vec<Refusal>> {
+    let missing_known = |d: &Diagnostic| {
+        d.code == "reference-optional"
+            && known
+                .iter()
+                .any(|(id, _)| d.message.ends_with(&format!("has the id \"{id}\"")))
+    };
+    let cleaned = if known.is_empty() {
+        parsed.text()
+    } else {
+        let r = &parsed.reading;
+        let mut identities = r.identities.clone();
+        identities.extend(
+            known
+                .iter()
+                .map(|(id, kind)| instruction_md::types::Identity {
+                    id: id.clone(),
+                    kind: kind.clone(),
+                    line: 0,
+                }),
+        );
+        instruction_md::text::to_text(
+            &r.document,
+            &instruction_md::text::TextOptions {
+                params: None,
+                parameters: r.parameters.clone(),
+                use_prose: true,
+                identities: Some(identities),
+                known: None,
+            },
+        )
+    };
+    let body = &parsed.reading.document.body;
+    // The agents nested in an agent, each with the agent it is nested in:
+    // its reporting line. Only through agents and layout — an agent inside
+    // an example is the example's — and only agents the host runs itself
+    // are cut out of the one they report to; any other stays its text.
+    let mut reports: std::collections::HashMap<*const instruction_md::types::Node, String> =
+        Default::default();
+    let mut cuts: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    instruction_md::walk(body, &mut |n, parents| {
+        if n.kind == "agent"
+            && parents
+                .iter()
+                .all(|p| p.kind == "agent" || instruction_md::is_layout(&p.kind))
+            && let Some(manager) = parents
+                .iter()
+                .rev()
+                .find(|p| p.kind == "agent")
+                .and_then(|p| p.attrs.get("id"))
+                .and_then(Value::as_str)
+        {
+            reports.insert(n as *const _, manager.to_string());
+            if runs_itself(&n.attrs)
+                && let Some(r) = n.range
+            {
+                cuts.entry(manager.to_string())
+                    .or_default()
+                    .push((r.start as usize, r.end as usize));
+            }
+        }
+        true
+    });
     let mut f = Folder {
         out: Extraction {
-            cleaned: parsed.text(),
-            warnings: parsed.diagnostics.iter().map(said).collect(),
+            cleaned,
+            warnings: parsed
+                .diagnostics
+                .iter()
+                .filter(|d| !missing_known(d))
+                .map(said)
+                .collect(),
             ..Extraction::default()
         },
         errs: Vec::new(),
         admission,
         parameters: parsed.reading.document.metadata.front.get("parameters"),
+        cuts,
     };
-    let body = &parsed.reading.document.body;
     for o in instruction_md::connected_objects(body) {
+        if matches!(o.kind, "person" | "role" | "agent")
+            && let Some(id) = o.id
+        {
+            f.out.known.push((id.to_string(), o.kind.to_string()));
+        }
         if o.location.in_layout() {
             f.object(&o);
+        } else if o.kind == "agent"
+            && let Some(manager) = reports.get(&(o.node as *const _))
+            && runs_itself(o.attrs)
+            && let Some(id) = o.id
+        {
+            f.own_agent(&o, id, Some(manager));
         }
     }
     for b in instruction_md::configuration_blocks(body) {
@@ -429,6 +592,9 @@ struct Folder<'a> {
     /// The document's declared parameters (its front matter's), which the
     /// agents it defines are written under too.
     parameters: Option<&'a Value>,
+    /// The line ranges of the agents nested in each agent, by the id of the
+    /// one they are nested in: cut out of its instruction.
+    cuts: BTreeMap<String, Vec<(usize, usize)>>,
 }
 
 impl Folder<'_> {
@@ -547,8 +713,8 @@ impl Folder<'_> {
         // The reader refuses an agent with no `id` (`invalid-attributes`):
         // the registry requires one.
         let Some(id) = o.id else { return };
-        if o.attr("protocol").is_none() && o.src.is_none() && o.endpoint.is_none() {
-            return self.own_agent(o, id);
+        if runs_itself(o.attrs) {
+            return self.own_agent(o, id, None);
         }
         if o.attr("protocol") != Some("a2a") {
             return self.hold(o, "agentd reaches agents over A2A (`protocol=a2a`)".into());
@@ -598,11 +764,17 @@ impl Folder<'_> {
 
     /// An agent the document defines for agentd to run (RFC 0056): no
     /// protocol, no `src`, no `endpoint` — its body is its instruction.
-    fn own_agent(&mut self, o: &ConnectedObject<'_>, id: &str) {
+    fn own_agent(&mut self, o: &ConnectedObject<'_>, id: &str, reports_to: Option<&str>) {
         if let Err(why) = self.admission.admits(AGENTS) {
             return self.hold(o, format!("an agent agentd runs itself {why}"));
         }
-        let body = o.body.unwrap_or_default();
+        let line = o.location.line().unwrap_or(0) as usize;
+        // Its text is its own: the agents that report to it are cut out.
+        let (body, lines) = cut_lines(
+            o.body.unwrap_or_default(),
+            line + 1,
+            self.cuts.get(id).map_or(&[][..], Vec::as_slice),
+        );
         if body.trim().is_empty() {
             return self.hold(
                 o,
@@ -617,14 +789,16 @@ impl Folder<'_> {
             Some(p) if p.as_object().is_some_and(|m| !m.is_empty()) => {
                 (format!("---\nspec: \"1\"\nparameters: {p}\n---\n{body}"), 4)
             }
-            _ => (body.to_string(), 0),
+            _ => (body, 0),
         };
         self.out.agents.push(DocumentAgent {
             id: id.to_string(),
             title: o.title.map(str::to_string),
             instruction,
-            line: o.location.line().unwrap_or(0) as usize,
+            line,
+            reports_to: reports_to.map(str::to_string),
             header_lines,
+            lines,
         });
     }
 
@@ -846,7 +1020,8 @@ pub fn machinery_digest(ex: &Extraction) -> Option<String> {
         "declarations": ex.declarations,
         "people": ex.people,
         "agents": ex.agents.iter().map(|a| {
-            serde_json::json!({"id": a.id, "title": a.title, "instruction": a.instruction})
+            serde_json::json!({"id": a.id, "title": a.title, "instruction": a.instruction,
+                               "reports_to": a.reports_to})
         }).collect::<Vec<_>>(),
     });
     Some(instruction_md::digest(all.to_string().as_bytes()))
@@ -1258,5 +1433,115 @@ mod tests {
         let two = extract(&TEAM.replace("every ticket", "each ticket"), &agents()).unwrap();
         assert!(machinery_digest(&one).is_some());
         assert_ne!(machinery_digest(&one), machinery_digest(&two));
+    }
+
+    /// A manager with one report, and the report's own report (depth 2).
+    fn org(extra: &str) -> String {
+        format!(
+            "---\nspec: \"1\"\n---\n# Org\n\n\
+             :::::agent{{id=cmo title=\"Chief marketing officer\"}}\n\
+             You run marketing.\n\n\
+             ::::agent{{id=community title=\"Community lead\"}}\n\
+             You run the forum.\n\n\
+             :::agent{{id=moderator}}\nYou keep the forum civil.\n:::\n\
+             ::::\n{extra}\
+             :::::\n"
+        )
+    }
+
+    /// An agent nested in an agent is its own agent, labelled with the one
+    /// it reports to, and its text is cut out of that one's — at any depth.
+    #[test]
+    fn a_nested_agent_reports_to_its_manager_and_its_text_is_its_own() {
+        let ex = extract(&org(""), &agents()).unwrap();
+        let by = |id: &str| ex.agents.iter().find(|a| a.id == id).unwrap();
+        assert_eq!(ex.agents.len(), 3, "{:?}", ex.warnings);
+        assert_eq!(by("cmo").reports_to, None);
+        assert_eq!(by("community").reports_to.as_deref(), Some("cmo"));
+        assert_eq!(by("moderator").reports_to.as_deref(), Some("community"));
+        assert_eq!(by("cmo").instruction, "You run marketing.\n");
+        assert_eq!(by("community").instruction, "You run the forum.\n");
+        assert_eq!(by("moderator").instruction, "You keep the forum civil.\n");
+        assert!(ex.warnings.is_empty(), "{:?}", ex.warnings);
+        // A report's lines are its own, at the parent's.
+        assert_eq!(by("moderator").line, 12);
+        assert_eq!(
+            by("moderator").in_parent("line 1: x"),
+            "agent \"moderator\": line 13: x"
+        );
+    }
+
+    /// A report added under a manager leaves the manager's instruction as it
+    /// was: the new agent is cut out, and with it the blank line before it.
+    #[test]
+    fn a_report_added_leaves_its_managers_text_as_it_was() {
+        let one = extract(&org(""), &agents()).unwrap();
+        let two = extract(
+            &org("\n::::agent{id=writer title=\"Writer\"}\nYou write.\n::::\n"),
+            &agents(),
+        )
+        .unwrap();
+        let cmo = |ex: &Extraction| ex.agents.iter().find(|a| a.id == "cmo").unwrap().clone();
+        assert_eq!(cmo(&one).instruction, cmo(&two).instruction);
+        let writer = two.agents.iter().find(|a| a.id == "writer").unwrap();
+        assert_eq!(writer.reports_to.as_deref(), Some("cmo"));
+    }
+
+    /// One id twice in a document is the reader's error, nested or not.
+    #[test]
+    fn a_duplicate_agent_id_refuses_the_document() {
+        let e = extract(&org("\n::::agent{id=community}\nAgain.\n::::\n"), &agents()).unwrap_err();
+        assert!(e.iter().any(|r| r.code == "duplicate-id"), "{e:?}");
+    }
+
+    /// An agent's references to its document's people and agents resolve in
+    /// its text — names only — and are not said as missing.
+    #[test]
+    fn an_agents_references_to_its_documents_people_and_agents_resolve() {
+        let doc = "---\nspec: \"1\"\n---\n::person{id=andrii title=\"Andrii\"}\n\n\
+            ::::agent{id=cfo}\nAsk :person[Andrii]{ref=#andrii}; tell the :agent[CTO]{ref=#cto}.\n::::\n\n\
+            ::::agent{id=cto}\nShip it.\n::::\n";
+        let ex = extract(doc, &agents()).unwrap();
+        let cfo = &ex
+            .agents
+            .iter()
+            .find(|a| a.id == "cfo")
+            .unwrap()
+            .instruction;
+        let plain = extract(cfo, &BTreeSet::new()).unwrap();
+        assert!(plain.cleaned.contains("[unresolved]"), "{}", plain.cleaned);
+        assert_eq!(plain.warnings.len(), 2, "{:?}", plain.warnings);
+        let knowing = extract_knowing(cfo, &BTreeSet::new(), &ex.known).unwrap();
+        assert!(
+            !knowing.cleaned.contains("[unresolved]"),
+            "{}",
+            knowing.cleaned
+        );
+        assert!(
+            knowing.cleaned.contains("Andrii (person; #andrii)"),
+            "{}",
+            knowing.cleaned
+        );
+        assert!(knowing.warnings.is_empty(), "{:?}", knowing.warnings);
+        // Names, not people: no gate may address a known id.
+        assert!(knowing.people.is_empty());
+    }
+
+    /// A workflow whose steps are one YAML flow mapping on a line reads as
+    /// the block form does.
+    #[test]
+    fn a_workflow_written_as_one_flow_mapping_reads() {
+        let ex = extract(
+            ":::workflow{id=week dialect=\"instruction/workflow\"}\nname: week\n\
+             steps: { start: { kind: once }, draft: { kind: agent, depends_on: [start], instruction: \"Draft it.\" }, done: { kind: finish, depends_on: [draft] } }\n:::\n",
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        assert!(ex.warnings.is_empty(), "{:?}", ex.warnings);
+        assert_eq!(
+            ex.workflows[0]["steps"]["draft"]["depends_on"],
+            serde_json::json!(["start"])
+        );
+        crate::engine::model::parse_workflow(&ex.workflows[0]).unwrap();
     }
 }

@@ -69,6 +69,11 @@ struct Daemon {
 
 impl Daemon {
     fn boot(doc: &str, run_until: &str) -> Daemon {
+        Daemon::boot_with(doc, run_until, "")
+    }
+
+    /// [`Daemon::boot`] with `extra` appended to the operator's configuration.
+    fn boot_with(doc: &str, run_until: &str, extra: &str) -> Daemon {
         let dir = common::unique_path("doc-agents", "d");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(format!("{dir}/team.md"), doc).unwrap();
@@ -77,7 +82,7 @@ impl Daemon {
              store: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
              intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
              lifecycle: {{ run_until: {run_until}, idle_grace: 1500ms }}\n\
-             observability: {{ log_level: info, log_content: true }}\n"
+             observability: {{ log_level: info, log_content: true }}\n{extra}"
         );
         std::fs::write(format!("{dir}/c.yaml"), cfg).unwrap();
         let err_path = format!("{dir}/parent.log");
@@ -181,7 +186,9 @@ fn a_documents_agents_are_composed_spawned_and_run_their_own_workflows() {
         assert_eq!(e["origin"], "document", "{e}");
         assert_eq!(e["tier"], "instance", "{e}");
         assert_eq!(e["singleton"], true, "{e}");
-        assert_eq!(e["workflows"].as_array().map(Vec::len), Some(2), "{e}");
+        assert_eq!(e["workflows"], 2, "{e}");
+        assert_eq!(e["workflow_names"].as_array().map(Vec::len), Some(2), "{e}");
+        assert!(e["reports_to"].is_null(), "{e}");
     }
     let open: Vec<Value> = events(&log, "run.done")
         .into_iter()
@@ -415,4 +422,127 @@ fn a_served_documents_agents_need_a_pinned_publisher_that_attests_them() {
         }
     }
     let _ = std::fs::remove_file(&key_file);
+}
+
+/// An org chart: `alpha` with `beta` nested in it, a report. Each agent's
+/// own `once` workflow, no team workflow at all.
+fn org(reports: &[&str]) -> String {
+    let nested: String = reports
+        .iter()
+        .map(|id| {
+            format!(
+                "\n::::agent{{id={id} title=\"{id}\"}}\nYou are {id}.\n\n\
+                 :::workflow{{id={id}-up dialect=\"instruction/workflow\"}}\n\
+                 name: {id}-up\nsteps: {{ s: {{ kind: once }}, f: {{ kind: finish, depends_on: [s], status: completed }} }}\n:::\n\
+                 ::::\n"
+            )
+        })
+        .collect();
+    format!(
+        "---\nspec: \"1\"\n---\n# The org\n\n\
+         :::::agent{{id=alpha title=\"Alpha lead\"}}\nYou lead alpha.\n\n\
+         ::::workflow{{id=alpha-up dialect=\"instruction/workflow\"}}\n\
+         name: alpha-up\nsteps: {{ s: {{ kind: once }}, f: {{ kind: finish, depends_on: [s], status: completed }} }}\n::::\n\
+         {nested}:::::\n\n\
+         :::workflow{{id=also dialect=\"instruction/workflow\"}}\n\
+         name: also\nsteps: {{ s: {{ kind: once }}, run: {{ kind: subagent, depends_on: [s], template: beta }}, \
+         f: {{ kind: finish, depends_on: [run], status: completed, output: \"{{{{steps.run.output.handle}}}}\" }} }}\n:::\n"
+    )
+}
+
+/// Under `subagents.document_agents.start: on_compose`, a document's agents
+/// start with no workflow: a manager and its report, each labelled with its
+/// reporting line. A reload that adds a second report starts it alone — the
+/// manager's text has the new report cut out, so its composition did not
+/// change and nothing else restarts.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn on_compose_starts_an_org_chart_and_a_report_a_reload_adds() {
+    let keepalive = "subagents: { document_agents: { start: on_compose } }\n\
+        limits: { subagents: { instances: { breadth: 4, total: 8 } } }\n\
+        workflows:\n  - name: tick\n    steps:\n      every: { kind: schedule, every: 1h }\n      \
+        done: { kind: finish, depends_on: [every], status: completed }\n";
+    let mut d = Daemon::boot_with(&org(&["beta"]), "drained", keepalive);
+    d.wait_for("alpha and beta to start and run their own workflows", |d| {
+        let (a, b) = (d.handles("alpha"), d.handles("beta"));
+        a.len() == 1
+            && b.len() == 1
+            && d.child_ran(&a[0], "alpha-up")
+            && d.child_ran(&b[0], "beta-up")
+    });
+    let log = d.log();
+    let composed = |log: &str, t: &str| {
+        events(log, "subagent.template.composed")
+            .into_iter()
+            .filter(|e| e["template"] == t)
+            .collect::<Vec<_>>()
+    };
+    let beta = &composed(&log, "beta")[0];
+    assert_eq!(beta["reports_to"], "alpha", "{beta}");
+    assert_eq!(beta["title"], "beta", "{beta}");
+    assert_eq!(beta["workflows"], 1, "{beta}");
+    assert_eq!(beta["servers"], 0, "{beta}");
+    assert!(composed(&log, "alpha")[0]["reports_to"].is_null(), "{log}");
+    let spawn = events(&log, "instance.spawn")
+        .into_iter()
+        .find(|e| e["template"] == "beta")
+        .unwrap();
+    assert_eq!(spawn["reports_to"], "alpha", "{spawn}");
+    let child_log = spawn["log"].as_str().unwrap();
+    assert!(std::path::Path::new(child_log).is_absolute(), "{spawn}");
+    assert!(
+        std::fs::read_to_string(child_log)
+            .unwrap()
+            .contains("beta-up"),
+        "{spawn}"
+    );
+    // The manager's instruction is its own: the report's text is not in it.
+    let alpha = d.handles("alpha")[0].clone();
+    let config: Value = serde_json::from_str(
+        &std::fs::read_to_string(format!("{}/config.json", d.child_dir(&alpha))).unwrap(),
+    )
+    .unwrap();
+    let text = config["agent"]["instruction"].as_str().unwrap();
+    assert!(
+        text.contains("You lead alpha.") && !text.contains("You are beta."),
+        "{text}"
+    );
+    assert_eq!(events(&log, "subagent.template.started").len(), 2, "{log}");
+    // The document's own workflow spawning `beta` too is answered with the
+    // live one: said, no second child, no failed step.
+    d.wait_for("the also run to end", |d| {
+        events(&d.log(), "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "also")
+    });
+    let log = d.log();
+    let also = events(&log, "run.done")
+        .into_iter()
+        .find(|e| e["workflow"] == "also")
+        .unwrap();
+    assert_eq!(also["status"], "completed", "{also}");
+    assert_eq!(also["output"], d.handles("beta")[0].as_str(), "{also}");
+    assert_eq!(
+        events(&log, "subagent.template.already_live").len(),
+        1,
+        "{log}"
+    );
+
+    std::fs::write(format!("{}/team.md", d.dir), org(&["beta", "gamma"])).unwrap();
+    d.sighup();
+    d.wait_for("gamma to start and run its own workflow", |d| {
+        let g = d.handles("gamma");
+        g.len() == 1 && d.child_ran(&g[0], "gamma-up")
+    });
+    let log = d.log();
+    assert_eq!(composed(&log, "gamma")[0]["reports_to"], "alpha", "{log}");
+    // Nothing else moved: alpha and beta were neither recomposed nor started
+    // again.
+    assert!(
+        events(&log, "subagent.template.recomposed").is_empty(),
+        "{log}"
+    );
+    assert_eq!(composed(&log, "alpha").len(), 1, "{log}");
+    assert_eq!(d.handles("alpha").len(), 1, "{log}");
+    assert_eq!(d.handles("beta").len(), 1, "{log}");
 }

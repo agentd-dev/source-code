@@ -886,6 +886,56 @@ load, with its tier, servers, workflows and skills, before any is spawned.
   names no secret: one that does refuses the document.
 - **Skills travel.** The agent's `:::skill` blocks reach its child as skills
   of its own.
+- **Names resolve.** A reference in an agent's text to a person or another
+  agent the document declares (`:person[Andrii]{ref=#andrii}`) reads as it
+  does in the document, not `[unresolved]`. It is a name only: the child's
+  `human` steps cannot address that person.
+
+### Reporting lines
+
+An agent written inside another reports to it. Write the outer fence
+longer:
+
+```markdown
+:::::agent{id=cmo title="Chief marketing officer"}
+You make the company known.
+
+::::agent{id=community title="Community lead"}
+You lead the forum.
+::::
+:::::
+```
+
+`community` is its own template, composed exactly as a top-level agent and
+under the same grant, and labelled `reports_to: cmo`. Nesting goes to any
+depth; `reports_to` is the agent it is written in. Each agent's text is its
+own: the report's whole block is cut out of the manager's instruction, so
+adding or removing a report leaves the manager's composition as it was. The
+line is a label, nothing more: the manager gets no tools for its report and
+no peer to it. It is on `subagent.template.composed`, `instance.spawn`, the
+child's record, and the TUI's subagents screen, which lists each child's
+template and who it reports to. A report whose manager is held, by an
+operator template of its name say, keeps its label, and the load says so.
+
+### Start the team with the document
+
+By default a document agent starts when a workflow or the model spawns it.
+The operator can have agentd start them instead:
+
+```yaml
+# fragment: under subagents
+document_agents: {start: on_compose}
+```
+
+With `start: on_compose`, agentd starts each instance-tier document agent's
+singleton at load, once the listeners are up, and each one a reload adds,
+with no workflow. A changed agent is respawned and a removed one retired, as
+any reload does. Every start obeys `limits.subagents.instances`: one refused
+is logged as `subagent.template.start_refused`, and the others still start.
+A workflow that spawns an agent already live gets the live one back
+(`already_live: true`, logged as `subagent.template.already_live`) rather
+than an error. Prose-only agents are workers a step gives a task, and are
+not started.
 
 The document's own workflows start the team. A `subagent` step names an
 agent by its id. An instance agent's spawn is detached, so a `parallel` of
@@ -991,9 +1041,10 @@ events to watch:
 | `subagent.kill.escalated` | A killed child had not stopped at its grace and was signalled: `handle`, `signal` (`SIGTERM`, then `SIGKILL`) |
 | `child.unhealthy` | Liveness tore a child down: `node`, `health` |
 | `intel.swap.sent` | A reload handed running children their model again |
-| `instance.spawn`, `instance.retire`, `instance.exited`, `instance.respawn`, `instance.respawn_wait`, `instance.respawn_failed` | An instance child's lifecycle |
+| `instance.spawn`, `instance.retire`, `instance.exited`, `instance.respawn`, `instance.respawn_wait`, `instance.respawn_failed` | An instance child's lifecycle; `instance.spawn` names its `template`, `reports_to`, and its absolute `dir` and `log` |
 | `instance.result`, `instance.mirror`, `instance.metered` | A sync result, a mirrored event, a budget charge |
-| `subagent.template.composed` | A template the instruction document defined, at load or when a reload changed it: `template`, `origin`, `line`, `title`, `tier`, `singleton`, `servers`, `workflows`, `skills` |
+| `subagent.template.composed` | A template the instruction document defined, at load or when a reload added or changed it: `template`, `title`, `reports_to`, `origin`, `line`, `tier`, `singleton`, the counts `servers`, `workflows`, `skills`, and their names in `server_names`, `workflow_names`, `skill_names` |
+| `subagent.template.started`, `subagent.template.start_refused`, `subagent.template.already_live` | Under `start: on_compose`, a document agent started, or refused by a ceiling (`error`); a spawn that found its singleton live and got it back |
 | `subagent.template.retired`, `subagent.template.recomposed`, `subagent.template.respawned`, `subagent.template.respawn_failed` | A reload removed or changed a live child's template: `template`, `handle`, `why`; a respawn names the child it replaces (`was`) |
 
 The `agent_subagents_spawned_total` and `agent_subagents_exited_total`

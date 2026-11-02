@@ -1136,8 +1136,26 @@
             "mode": {
               "type": "string"
             },
+            "reports_to": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "status": {
               "type": "string"
+            },
+            "template": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tier": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "tokens": {
               "minimum": 0,
@@ -1154,7 +1172,10 @@
             "status",
             "tokens",
             "error",
-            "updated"
+            "updated",
+            "template",
+            "tier",
+            "reports_to"
           ],
           "type": "object"
         },

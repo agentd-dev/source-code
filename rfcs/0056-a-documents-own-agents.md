@@ -50,6 +50,11 @@ its subagents.
    agent's live singleton from its new composition.
 5. **The operator's names stand.** An operator template of the same name is
    used; the document's agent is held as text.
+6. **Reporting lines.** An agent nested in an agent is its own template,
+   labelled `reports_to`, its text cut out of its manager's (§3.7).
+7. **Starting on compose.** Under `subagents.document_agents.start:
+   on_compose` agentd starts the team itself, at load and as a reload adds to
+   it (§5.1).
 
 ## 2. Motivation
 
@@ -116,8 +121,10 @@ A document agent's template is compiled (`templates::compile_one`) with no
 grant families at all: no `interface`, no `identity`, no `agents`. An A2A
 agent or an agent written in its body stays text, and a webhook route in it
 refuses the document as it refuses any template (an instance child has no
-listener). An operator's template keeps every grant but `agents`: a child
-defines no children of its own. Everything RFC 0036 and RFC 0042 hold a
+listener). An agent nested in its body is not the child's: it is a report
+(§3.7), cut out of the body before it is compiled. An operator's template
+keeps every grant but `agents`: a child defines no children of its own.
+Everything RFC 0036 and RFC 0042 hold a
 template to holds: `validate_instance_machinery` refuses operator
 configuration, the sections the parent composes (`a2a`, `intelligence`,
 `store`, `lifecycle`), delegated servers, Events bindings and webhook
@@ -130,6 +137,43 @@ writes each as `<name>/SKILL.md` in the child's directory and composes the
 child's `skills.dir` to it (`runtime/instances.rs`, `compose_instance_doc`).
 Before this RFC they were stripped from the child's text and lost, for every
 instance template.
+
+### 3.7 Reporting lines
+
+An agent written directly inside a document agent — the outer fence longer,
+`:::::agent{id=cmo}` … `::::agent{id=community}` … `::::` … `:::::` — is a
+report. It is its own template, composed exactly as a top-level agent is,
+under the same grant and rules, and labelled `reports_to: <the agent it is
+nested in>` (`DocumentAgent::reports_to`, `DocumentAgentOrigin::reports_to`).
+Nesting has any depth; `reports_to` is the immediate enclosing agent. Only
+layout may stand between the two: an agent inside an example in an agent is
+the example's text.
+
+- **Each agent's text is its own.** A report's whole block is cut out of its
+  manager's body before the manager is compiled (`idoc::cut_lines`), and the
+  blank lines a cut leaves doubled or trailing go with it, so a report added
+  or removed leaves the manager's instruction byte for byte as it was. A
+  reload that adds a report therefore recomposes nothing else (§5).
+- **A label, nothing more.** The manager cannot hand its report work: it has
+  no subagent tools for it and no peer to it. The label is carried on the
+  `subagent.template.composed` and `instance.spawn` events, on the child's
+  record, and in the A2A feed's `subagent` items the TUI shows.
+- **Names.** An id is the document's once: a report sharing an id with any
+  other block refuses the document (the reader's `duplicate-id`). The
+  operator's names stand (§6). A report whose manager is held — an operator
+  template of its name, say — keeps its label, and the load says so.
+
+### 3.8 Names in a child's text
+
+A child's text refers to its document's people and agents
+(`:person[Andrii]{ref=#andrii}`, `:agent[CTO]{ref=#cto}`). Each document
+agent is compiled knowing the `(id, kind)` of every person, role and agent
+its document declares (`DocumentAgentOrigin::known`,
+`idoc::extract_knowing`): such a reference reads as it does in the
+document — `Andrii (person; #andrii)` — not `[unresolved]`, and is not said as
+missing. This changes names in text only: a known person is not one of the
+child's people, so no `human` step of the child's may address it, and a
+known agent is no peer.
 
 ## 4. Security
 
@@ -206,10 +250,38 @@ live instance child follows its template (`Runtime::recompose_children`):
   for the principal it worked for, carrying what it carried, detached
   (`subagent.template.respawned`, or `subagent.template.respawn_failed` with
   the refusal). A composition is the tier, prose, machinery, skills, gate
-  channels and fields; where in its document an agent stands is not.
+  channels and fields; where in its document an agent stands, and who it
+  reports to, are not. A report added under a manager is cut out of the
+  manager's text (§3.7), so the manager's composition does not change.
 - **Changed composition, not a singleton:** the child keeps the composition
   it was spawned with until it retires.
-- **Added:** the template is spawnable from the next spawn.
+- **Added:** the template is spawnable from the next spawn, and under
+  `start: on_compose` it is started (§5.1).
+
+### 5.1 Starting on compose
+
+`subagents.document_agents.start` (operator-only, reloadable): `manual`, the
+default — a workflow or the model spawns a document agent, as any template —
+or `on_compose`: agentd starts each instance-tier document agent's singleton
+when it is composed (`Runtime::start_document_agents`), with no workflow:
+
+- **At load**, once the listeners are up and past the restored children, so
+  a durable child a restart brought back is not started twice.
+- **On reload**, in commit after the re-compose: each document agent the
+  reload added. A changed one is respawned and a removed one retired, as in
+  §5; the rest are left alone.
+
+Each start is an ordinary spawn under every instance ceiling. One refused is
+logged (`subagent.template.start_refused`, with the refusal) and the others
+still start; one started is logged as `subagent.template.started`. A flat,
+prose-only agent is a worker a step gives a task, and is not started.
+
+A spawn of a document agent whose singleton is live — started on compose,
+or by a workflow that also spawns it — is answered with the live one
+(`{handle, …, already_live: true}`) and logged as
+`subagent.template.already_live`, before the ceilings the live one already
+counts against: no second child, no failed step. An operator template's
+singleton is still refused, as before.
 
 The rule applies to every template, the operator's and a document's. It
 closes the gap where removing a singleton template left its child running
@@ -239,6 +311,11 @@ Per the user's rule, the capability fits workflows:
   for a served (`mcp:`) document at the boot reload that folds it. A reload
   arms only definitions it installed new or replaced, so an unchanged
   team-spawning workflow does not spawn again.
+- Under `start: on_compose` the team needs no workflow at all; a document
+  workflow that spawns an agent anyway gets the live one back (§5.1).
+- A reporting line is no workflow edge: a manager reaches its report only
+  as the parent's workflows reach any agent, by its id, and the report's own
+  workflows run in its own daemon.
 
 No new node: spawning, addressing and retiring a child are the existing
 `subagent`, `a2a.send`/`a2a.delegate` and `subagent.retire`.
@@ -246,11 +323,18 @@ No new node: spawning, addressing and retiring a child are the existing
 ## 8. Observability
 
 At load the parent logs one `subagent.template.composed` per document agent:
-its name, `origin: document`, line, title, tier, and its servers, workflows
-and skills. The team is in the log before any of it is spawned. A child's own
-runs and steps are in the child's log (`log` in its directory), not the
-parent's: what reaches the parent is the child's record (status and spend,
-in the status document, the A2A feed and the TUI's subagents screen), a
+`template`, `title` (or null), `reports_to` (null at the top level),
+`origin: document`, `line`, `tier`, `singleton`, and the counts `servers`,
+`workflows` and `skills`, with their names in `server_names`,
+`workflow_names` and `skill_names`. The team is in the log before any of it
+is spawned. `instance.spawn` carries the child's `template`, `handle`, `pid`
+and `reports_to`, and its absolute `dir` and `log`, so a viewer tails a
+child's log without deriving the path.
+
+A child's own runs and steps are in the child's log, not the parent's: what
+reaches the parent is the child's record (`template`, `tier`, `reports_to`,
+status and spend, in the status document, the A2A feed and the TUI's
+subagents screen, which shows the template and the reporting line), a
 `mode: sync` result, and the streams it mirrors.
 
 ## 9. Decisions (the user, 2026-11-02)
@@ -263,6 +347,17 @@ in the status document, the A2A feed and the TUI's subagents screen), a
    signature attests it; it is not in `WIRE_FLOOR`.
 4. **Live re-compose** on reload, as in §5.
 5. **The operator wins on names**, as in v1.21.1.
+
+Phase 2 (the user, 2026-11-02, for a live org-chart demo):
+
+6. **Reporting lines, label only** (§3.7): a nested agent is its own
+   template labelled `reports_to`; its text is cut from its manager's; no new
+   powers; any depth.
+7. **Event and TUI fields** (§8).
+8. **Auto-start:** `subagents.document_agents.start: on_compose`, off by
+   default (§5.1).
+9. **A child's references** to its document's people and agents resolve, as
+   names only (§3.8).
 
 ## 10. Alternatives considered
 
@@ -279,14 +374,16 @@ in the status document, the A2A feed and the TUI's subagents screen), a
 
 ## 11. Limits
 
-- A child's references to the parent's people and sibling agents
-  (`:person[…]{ref=#andrii}`) do not resolve in the child's text, and are
-  said as `reference-optional` warnings at the parent's line. A child's
-  `human` step cannot address the parent document's people.
+- A child's `human` step cannot address its document's people: they are
+  names in its text (§3.8), not its people.
 - A child's `:::skill{src}` is not fetched.
 - A changed definition's `once` start fires again on reload under
   `policy: always`, or once the earlier run was evicted; `workflow.resume` and
   `workflow.create` arm every workflow. A team-spawning workflow that runs
-  again finds its singletons live and fails its spawns.
+  again gets its live document agents back (§5.1); an operator template's
+  live singleton refuses the spawn.
+- `start: on_compose` starts only what a load or a reload composes as new; a
+  reload that only turns it on starts nothing until the next agent is added
+  or the agent restarts.
 - A restart does not recompose: a durable child restored at boot runs its
   stored composition until a reload or its retirement.

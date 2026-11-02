@@ -98,6 +98,20 @@ test('the subagents screen lists live subagents from the feed', async () => {
   ui.unmount();
 });
 
+test('the subagents screen shows a document agent\'s template and reporting line', async () => {
+  const { mirror, ui } = boot();
+  mirror.setConn('ready');
+  mirror.apply({ seq: 1, ts: 10, kind: 'subagent', data: { handle: 'inst-7', mode: 'detached', status: 'running', tokens: 0, error: null, updated: Date.now(), template: 'community', tier: 'instance', reports_to: 'cmo' } });
+  ui.stdin.write('\t');
+  await tick();
+  ui.stdin.write('\t');
+  await tick();
+  const frame = ui.lastFrame();
+  assert.match(frame, /template\s+reports to/);
+  assert.match(frame, /inst-7\s+community\s+cmo\s+detached/);
+  ui.unmount();
+});
+
 test('a cross-client conversation renders: prompt, working, reply', async () => {
   const { mirror, ui } = boot();
   mirror.setConn('ready');

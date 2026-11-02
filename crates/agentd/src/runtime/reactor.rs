@@ -374,6 +374,10 @@ pub struct SubagentRecord {
     pub template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+    /// A document agent's reporting line (RFC 0056): the agent its template
+    /// is nested in. A label only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reports_to: Option<String>,
     /// Instance tier: the child daemon's pid, config path, A2A socket and
     /// (epoch-ms) retire-at deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2701,7 +2705,8 @@ impl Runtime {
                 key: format!("sub:{h}"),
                 kind: "subagent",
                 vis: FeedVis::Operator,
-                data: json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "error": s.error, "updated": s.updated}),
+                data: json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "error": s.error, "updated": s.updated,
+                             "template": s.template, "tier": s.tier, "reports_to": s.reports_to}),
             });
         }
         for c in self.children.status().as_array().into_iter().flatten() {

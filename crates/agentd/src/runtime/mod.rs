@@ -1635,6 +1635,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
             }
         }
     }
+    // The document's agents, under `subagents.document_agents.start:
+    // on_compose`: started once the listeners are up, past the restored
+    // children (a live one is not started twice).
+    rt.start_document_agents(None);
     // Observability serving: the Prometheus `/metrics` surface and the
     // health-file heartbeat a fleet supervisor watches, when configured.
     #[cfg(feature = "metrics")]

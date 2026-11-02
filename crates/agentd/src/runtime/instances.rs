@@ -150,6 +150,33 @@ impl Runtime {
         args: &Value,
     ) -> ToolOutcome {
         let err = |e: String| ToolOutcome::Ready(Value::String(e), true);
+        // A document's agent is the one agent of its name (RFC 0056): a spawn
+        // that finds it live — started on compose, or by another workflow —
+        // is answered with that one, said, rather than refused. Before the
+        // ceilings, which the live one already counts against.
+        if self
+            .settings
+            .subagents
+            .templates
+            .get(tname)
+            .is_some_and(|t| t.singleton && t.document.is_some())
+            && let Some(s) = self
+                .subagents
+                .values()
+                .find(|s| s.template.as_deref() == Some(tname) && !is_terminal_status(&s.status))
+        {
+            let handle = s.handle.clone();
+            let socket = s.socket.clone();
+            self.subagent_log(&handle).info(
+                "subagent.template.already_live",
+                json!({"template": tname, "handle": handle, "requested_by": caller.label()}),
+            );
+            return ToolOutcome::Ready(
+                json!({"handle": handle, "status": "running", "tier": "instance",
+                       "peer": handle, "socket": socket, "already_live": true}),
+                false,
+            );
+        }
         // An instance child is a whole daemon, far heavier than a flat worker,
         // so it is capped under its own `limits.subagents.instances` family
         // rather than sharing the worker budget.
@@ -367,6 +394,7 @@ impl Runtime {
             spawn_args: Some(json!({"params": params, "mode": mode, "durable": durable})),
             trace: Some(trace.clone()),
             template: Some(tname.to_string()),
+            reports_to: t.spec.document.as_ref().and_then(|d| d.reports_to.clone()),
             tier: Some("instance".into()),
             pid: None,
             config_path: Some(config_path.display().to_string()),
@@ -387,7 +415,12 @@ impl Runtime {
                     "instance.spawn",
                     json!({"handle": handle, "template": tname, "pid": pid,
                            "socket": socket, "retire_at": retire_at, "until": until,
-                           "singleton": t.spec.singleton}),
+                           "singleton": t.spec.singleton,
+                           "reports_to": record.reports_to,
+                           // Where it lives, absolute, and the log it writes
+                           // there: a viewer tails it without deriving it.
+                           "dir": std::path::absolute(&dir).unwrap_or_else(|_| dir.clone()).display().to_string(),
+                           "log": std::path::absolute(dir.join("log")).unwrap_or_else(|_| dir.join("log")).display().to_string()}),
                 );
                 self.subagents.insert(handle.clone(), record);
                 self.persist_subagent(&handle);
@@ -996,9 +1029,56 @@ impl Runtime {
                 "subagent.template.composed",
                 json!({"template": name, "origin": "document",
                        "line": origin.map(|o| o.line), "title": origin.and_then(|o| o.title.clone()),
+                       "reports_to": origin.and_then(|o| o.reports_to.clone()),
                        "tier": t.tier.as_str(), "singleton": t.spec.singleton,
-                       "servers": servers, "workflows": workflows, "skills": skills}),
+                       "servers": servers.len(), "workflows": workflows.len(), "skills": skills.len(),
+                       "server_names": servers, "workflow_names": workflows, "skill_names": skills}),
             );
+        }
+    }
+
+    /// Under `subagents.document_agents.start: on_compose`, start the
+    /// singleton of each instance-tier template the instruction document
+    /// defined — `names`, or all of them — that is not live already. Each
+    /// start is an ordinary spawn, under every instance ceiling: one refused
+    /// is said and the others still start. Flat agents are workers a step
+    /// gives a task, and are not started.
+    pub(crate) fn start_document_agents(
+        &mut self,
+        names: Option<&std::collections::BTreeSet<String>>,
+    ) {
+        if self.settings.subagents.document_agents.start
+            != crate::config::settings::DocumentAgentStart::OnCompose
+            || self.draining
+        {
+            return;
+        }
+        let Ok(compiled) = compile_templates(&self.settings) else {
+            return;
+        };
+        for (name, t) in &compiled {
+            if t.spec.document.is_none()
+                || t.tier != Tier::Instance
+                || names.is_some_and(|n| !n.contains(name))
+            {
+                continue;
+            }
+            let reports_to = t.spec.document.as_ref().and_then(|d| d.reports_to.clone());
+            match self.instance_run(&super::tools::ToolCaller::default(), name, &json!({})) {
+                ToolOutcome::Ready(v, false) => {
+                    if v.get("already_live").is_none() {
+                        self.log.info(
+                            "subagent.template.started",
+                            json!({"template": name, "handle": v["handle"], "reports_to": reports_to}),
+                        );
+                    }
+                }
+                ToolOutcome::Ready(e, _) => self.log.warn(
+                    "subagent.template.start_refused",
+                    json!({"template": name, "reports_to": reports_to, "error": e}),
+                ),
+                ToolOutcome::Deferred(_) | ToolOutcome::Executing => {}
+            }
         }
     }
 

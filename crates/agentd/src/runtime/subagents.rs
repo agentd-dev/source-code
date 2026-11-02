@@ -599,6 +599,14 @@ impl Runtime {
             trace: Some(trace.clone()),
             template: tmeta.as_ref().map(|(n, _)| n.clone()),
             tier: tmeta.as_ref().map(|(_, t)| t.clone()),
+            reports_to: tmeta.as_ref().and_then(|(n, _)| {
+                self.settings
+                    .subagents
+                    .templates
+                    .get(n)
+                    .and_then(|t| t.document.as_ref())
+                    .and_then(|d| d.reports_to.clone())
+            }),
             pid: None,
             config_path: None,
             socket: None,

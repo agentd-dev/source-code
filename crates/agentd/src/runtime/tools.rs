@@ -52,7 +52,7 @@ impl ToolCaller {
         crate::delegation::Acting::new(self.principal.as_deref(), self.session.as_deref())
     }
 
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         if let Some(s) = &self.subagent {
             return format!("subagent:{s}");
         }

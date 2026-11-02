@@ -1050,13 +1050,16 @@ fn subagent_get_result() -> Value {
         &["subagent"],
         json!({"subagent": closed(
             &[
-                "handle", "mode", "status", "attempt", "tokens", "instruction",
-                "result", "error", "requested_by", "created", "updated", "node",
+                "handle", "mode", "status", "template", "tier", "reports_to", "attempt", "tokens",
+                "instruction", "result", "error", "requested_by", "created", "updated", "node",
             ],
             json!({
                 "handle": {"type": "string"},
                 "mode": true,
                 "status": true,
+                "template": string_or_null(),
+                "tier": string_or_null(),
+                "reports_to": string_or_null(),
                 "attempt": count(),
                 "tokens": count(),
                 "instruction": true,

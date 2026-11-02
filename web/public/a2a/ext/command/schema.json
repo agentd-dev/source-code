@@ -3373,6 +3373,12 @@
                     "null"
                   ]
                 },
+                "reports_to": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "requested_by": {
                   "type": [
                     "string",
@@ -3381,6 +3387,18 @@
                 },
                 "result": true,
                 "status": true,
+                "template": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tier": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "tokens": {
                   "minimum": 0,
                   "type": "integer"
@@ -3394,6 +3412,9 @@
                 "handle",
                 "mode",
                 "status",
+                "template",
+                "tier",
+                "reports_to",
                 "attempt",
                 "tokens",
                 "instruction",

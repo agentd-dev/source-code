@@ -134,7 +134,10 @@ fn compile_one(
             all
         }
     };
-    let mut ex = match idoc::extract(&t.instruction, &families) {
+    // A document agent's references to its document's people and agents
+    // name them in its text, as they do in the document's.
+    let known = t.document.as_ref().map_or(&[][..], |d| d.known.as_slice());
+    let mut ex = match idoc::extract_knowing(&t.instruction, &families, known) {
         Ok(mut ex) => {
             crate::config::humans::address_document_gates(&ex.people, &mut ex.workflows);
             ex
@@ -1174,7 +1177,7 @@ mod tests {
         t.document = Some(settings::DocumentAgentOrigin {
             over_the_wire,
             line: 1,
-            title: None,
+            ..Default::default()
         });
         s
     }

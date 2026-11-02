@@ -519,7 +519,7 @@ its `jti`.
 | `instance.result` | info | `handle`, `link` | `link`: the span of the child's report. |
 | `instance.retire` | info | `handle`, `pid`, `why` |  |
 | `instance.send` | info, warn | `handle`, `err?` |  |
-| `instance.spawn` | info | `handle`, `pid`, `retire_at`, `singleton`, `socket`, `template`, `until` | An instance-tier subagent started. |
+| `instance.spawn` | info | `dir`, `handle`, `log`, `pid`, `reports_to`, `retire_at`, `singleton`, `socket`, `template`, `until` | An instance-tier subagent started. `dir` is its directory and `log` the log it writes there, both absolute; `reports_to` a document agent's reporting line (RFC 0056), else null. |
 | `instance.spawn.refused` | warn | `reason`, `template` | An instance-tier subagent was refused before anything was created. |
 
 ### instruction
@@ -927,11 +927,14 @@ an instruction's by `origin: instruction` and `name`.
 | `subagent.result` | info | `err`, `handle`, `status`, `tokens` | A subagent reported its result. `cancelled` for a `sync` one a drain stopped with the turn waiting on it, which asks for it again when it replays, and for one `subagent.kill` stopped, with the kill's reason as `err`, however it ended. |
 | `subagent.spawn` | info | `cpu_seconds`, `depth`, `handle`, `memory_bytes`, `mode`, `node`, `pid`, `priority`, `servers` | A subagent process started. |
 | `subagent.swap_intel` | info | `endpoint_change` |  |
-| `subagent.template.composed` | info | `line`, `origin`, `servers`, `singleton`, `skills`, `template`, `tier`, `title`, `workflows` | A template the instruction document defined (`origin: document`, RFC 0056) as it is composed: at load, and when a reload added or changed it. `line` is the document line the agent opens on; `servers`, `workflows` and `skills` are its own, by name. |
+| `subagent.template.already_live` | info | `handle`, `requested_by`, `template` | A spawn of a document agent whose singleton is live, answered with the live one (`already_live: true`) rather than refused: it was started on compose, or by another workflow. |
+| `subagent.template.composed` | info | `line`, `origin`, `reports_to`, `server_names`, `servers`, `singleton`, `skill_names`, `skills`, `template`, `tier`, `title`, `workflow_names`, `workflows` | A template the instruction document defined (`origin: document`, RFC 0056) as it is composed: at load, and when a reload added or changed it. `line` is the document line the agent opens on; `title` its title or null; `reports_to` the agent it is nested in, or null; `servers`, `workflows` and `skills` count its own, named in `server_names`, `workflow_names` and `skill_names`. |
 | `subagent.template.recomposed` | info | `handle`, `note`, `template`, `why` | A reload changed the composition of a live singleton's template: the child is retired and started again from the new template once it exits. |
 | `subagent.template.respawn_failed` | warn | `error`, `template`, `was` | A recomposed singleton could not be started again: `error` is the spawn's refusal; `was` the retired child. |
 | `subagent.template.respawned` | info | `handle`, `template`, `was` | A recomposed singleton started again from its new template; `was` the child it replaces. |
 | `subagent.template.retired` | info | `handle`, `template`, `why` | A reload removed the template of a live instance child, which is retired. |
+| `subagent.template.start_refused` | warn | `error`, `reports_to`, `template` | Under `subagents.document_agents.start: on_compose`, a document agent's start was refused, by an instance ceiling say; the others still start. |
+| `subagent.template.started` | info | `handle`, `reports_to`, `template` | Under `subagents.document_agents.start: on_compose`, a document agent's singleton started: at load, or when a reload added it. |
 | `subagent.turn` | info | `handle`, `status` |  |
 
 ### timer

@@ -6228,6 +6228,20 @@
           },
           "type": "object"
         },
+        "document_agents": {
+          "additionalProperties": false,
+          "description": "the agents the instruction document defines (RFC 0056)",
+          "properties": {
+            "start": {
+              "description": "manual (default): a workflow or the model spawns them; on_compose: each instance agent's singleton starts when it is composed — at startup, and when a reload adds it — within every instance ceiling",
+              "enum": [
+                "manual",
+                "on_compose"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "templates": {
           "additionalProperties": {
             "$ref": "#/$defs/SubagentTemplate"

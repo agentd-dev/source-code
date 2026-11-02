@@ -328,6 +328,8 @@ fn top_level_properties(
                 "description": "subagent templates + spawn policy: operator-declared definitions the model may instantiate, filling declared params only",
                 "properties": {
                 "allow_freeform": { "type": "boolean", "description": "false = templates are the ONLY spawn path (freeform flat-tier instruction spawns are refused); default true" },
+                "document_agents": { "type": "object", "additionalProperties": false, "description": "the agents the instruction document defines (RFC 0056)", "properties": {
+                    "start": { "enum": ["manual", "on_compose"], "description": "manual (default): a workflow or the model spawns them; on_compose: each instance agent's singleton starts when it is composed — at startup, and when a reload adds it — within every instance ceiling" } } },
                 "defaults": { "type": "object", "additionalProperties": false, "description": "applied to every spawn unless overridden at the template or call site", "properties": {
                     "model": { "type": "string" }, "priority": { "enum": ["low", "normal", "high"] },
                     "mode": { "enum": ["sync", "async", "detached", "warm"] },

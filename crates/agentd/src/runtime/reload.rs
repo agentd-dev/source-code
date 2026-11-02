@@ -1188,6 +1188,16 @@ impl Runtime {
                 .collect();
             self.log_document_templates(Some(&moved));
             self.recompose_children(&was, &now);
+            // A document agent the reload added starts now, under
+            // `start: on_compose`; a changed one is respawned above.
+            let added: std::collections::BTreeSet<String> = now
+                .keys()
+                .filter(|n| !was.contains_key(*n))
+                .cloned()
+                .collect();
+            if !added.is_empty() {
+                self.start_document_agents(Some(&added));
+            }
             if old.subagents != new.subagents {
                 changed.push("subagents");
             }

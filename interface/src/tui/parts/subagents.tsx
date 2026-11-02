@@ -55,7 +55,7 @@ export function SubagentList({
   return (
     <Box flexDirection="column">
       <Text color={theme.dim} bold>
-        {`  ${col('handle', 21)}${col('mode', 12)}${col('status', 12)}${col('tokens', 9)}updated`}
+        {`  ${col('handle', 16)}${col('template', 12)}${col('reports to', 12)}${col('mode', 10)}${col('status', 10)}${col('tokens', 9)}updated`}
       </Text>
       {subs.slice(0, 20).map((x, i) => {
         const status = String(x.status ?? '');
@@ -63,10 +63,12 @@ export function SubagentList({
           <Box key={String(x.handle ?? i)} flexDirection="row">
             <Text color={i === selected ? theme.accent : undefined} bold={i === selected}>
               {i === selected ? '▸ ' : '  '}
-              {col(x.handle, 21)}
+              {col(x.handle, 16)}
             </Text>
-            <Text color={theme.dim}>{col(x.mode, 12)}</Text>
-            <Text color={statusColor(status)}>{col(status, 12)}</Text>
+            <Text>{col(x.template ?? '', 12)}</Text>
+            <Text color={theme.dim}>{col(x.reports_to ?? '', 12)}</Text>
+            <Text color={theme.dim}>{col(x.mode, 10)}</Text>
+            <Text color={statusColor(status)}>{col(status, 10)}</Text>
             <Text color={theme.dim}>{col(x.tokens ?? 0, 9)}</Text>
             <Text color={theme.dim}>{x.updated ? ago(Number(x.updated)) : ''}</Text>
           </Box>
@@ -114,6 +116,8 @@ export function SubagentDetail({
       {String(d.status ?? '') !== 'running' ? (
         <Text color={theme.dim}>{'(not running — messaging and stopping apply to a live subagent)'}</Text>
       ) : null}
+      {line('template', d.template ?? summary?.template)}
+      {line('reports to', d.reports_to ?? summary?.reports_to)}
       {line('mode', d.mode)}
       {line('attempt', d.attempt)}
       {line('tokens', d.tokens)}

@@ -1520,6 +1520,11 @@ pub struct DocumentAgentOrigin {
     /// The document's line the agent opens on.
     pub line: usize,
     pub title: Option<String>,
+    /// The agent it is nested in: its reporting line, a label only.
+    pub reports_to: Option<String>,
+    /// The `(id, kind)`s of the people and agents its document declares,
+    /// which its text's references name (`idoc::extract_knowing`).
+    pub known: Vec<(String, String)>,
 }
 
 /// The templates a document's agents become (RFC 0056). One the operator's
@@ -1552,15 +1557,16 @@ fn document_agent_templates(
             continue;
         }
         let child =
-            crate::config::idoc::extract(&a.instruction, &Default::default()).map_err(|errs| {
-                format!(
-                    "{source}: agent.instruction:\n  {}",
-                    errs.iter()
-                        .map(|e| a.in_parent(&format!("{e} ({})", e.code)))
-                        .collect::<Vec<_>>()
-                        .join("\n  ")
-                )
-            })?;
+            crate::config::idoc::extract_knowing(&a.instruction, &Default::default(), &ex.known)
+                .map_err(|errs| {
+                    format!(
+                        "{source}: agent.instruction:\n  {}",
+                        errs.iter()
+                            .map(|e| a.in_parent(&format!("{e} ({})", e.code)))
+                            .collect::<Vec<_>>()
+                            .join("\n  ")
+                    )
+                })?;
         warnings.extend(
             child
                 .warnings
@@ -1591,8 +1597,22 @@ fn document_agent_templates(
                 over_the_wire,
                 line: a.line,
                 title: a.title.clone(),
+                reports_to: a.reports_to.clone(),
+                known: ex.known.clone(),
             },
         });
+    }
+    // A reporting line is a label: one naming an agent that is not
+    // activated stands, said.
+    for t in &out {
+        if let Some(m) = &t.origin.reports_to
+            && !out.iter().any(|o| &o.name == m)
+        {
+            warnings.push(format!(
+                "agent.instruction: line {}: agent {:?} reports to {m:?}, which is not activated; the reporting line stands as a label",
+                t.origin.line, t.name
+            ));
+        }
     }
     // The operator's ceilings hold: a team larger than they allow is said.
     let instances = out
@@ -4948,6 +4968,29 @@ pub struct Subagents {
     /// `:::tools`) spawns an instance-tier child. The tier follows from the
     /// text, so it is never declared twice and cannot disagree with itself.
     pub templates: BTreeMap<String, SubagentTemplate>,
+    /// The agents the instruction document defines (RFC 0056): when they
+    /// start.
+    pub document_agents: DocumentAgents,
+}
+
+/// `subagents.document_agents`: what agentd does with the agents an
+/// instruction document defines, beyond making them templates.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct DocumentAgents {
+    pub start: DocumentAgentStart,
+}
+
+/// When a document agent's singleton starts.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DocumentAgentStart {
+    /// A workflow or the model spawns it, as any template.
+    #[default]
+    Manual,
+    /// agentd starts each instance agent's singleton when it is composed: at
+    /// startup, and when a reload adds it.
+    OnCompose,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -12210,6 +12253,8 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "subagents.allow_freeform",
     "subagents.defaults",
     "subagents.templates",
+    // Read when a load or a reload composes the document's agents (RFC 0056).
+    "subagents.document_agents",
     "tools.disabled",
     "tools.overrides",
     "tools.narrow",
@@ -19410,5 +19455,80 @@ mod document_agent_tests {
             "{:?}",
             s.agent.instruction_warnings
         );
+    }
+
+    const ORG: &str = "---\nspec: \"1\"\n---\n# Org\n\n\
+        :::::agent{id=cmo title=\"CMO\"}\nYou run marketing; ask :agent[community]{ref=#community}.\n\n\
+        ::::agent{id=community title=\"Community lead\"}\nYou run the forum for the :agent[CMO]{ref=#cmo}.\n::::\n\
+        :::::\n";
+
+    /// A report is its own template, labelled with its reporting line and
+    /// knowing its document's agents by name.
+    #[test]
+    fn a_report_is_its_own_template_with_its_reporting_line() {
+        let s = Settings::from_document(operator(ORG), MERGED_DOCUMENT).unwrap();
+        let community = &s.subagents.templates["community"];
+        let origin = community.document.as_ref().unwrap();
+        assert_eq!(origin.reports_to.as_deref(), Some("cmo"));
+        assert!(origin.known.iter().any(|(id, _)| id == "cmo"));
+        let cmo = &s.subagents.templates["cmo"];
+        assert!(
+            !cmo.instruction.contains("You run the forum"),
+            "{}",
+            cmo.instruction
+        );
+        assert!(
+            s.agent.instruction_warnings.is_empty(),
+            "references to the document's agents resolve: {:?}",
+            s.agent.instruction_warnings
+        );
+        let compiled = crate::config::templates::compile_templates(&s).unwrap();
+        assert!(
+            !compiled["community"].cleaned.contains("[unresolved]"),
+            "{}",
+            compiled["community"].cleaned
+        );
+    }
+
+    /// A report whose manager the operator's template of the same name holds
+    /// keeps its label, said.
+    #[test]
+    fn a_report_of_a_held_manager_keeps_its_label() {
+        let mut doc = operator(ORG);
+        doc["subagents"] = json!({"templates": {"cmo": {"instruction": "The operator's CMO."}}});
+        let s = Settings::from_document(doc, MERGED_DOCUMENT).unwrap();
+        let community = &s.subagents.templates["community"];
+        assert_eq!(
+            community.document.as_ref().unwrap().reports_to.as_deref(),
+            Some("cmo")
+        );
+        assert!(
+            s.agent
+                .instruction_warnings
+                .iter()
+                .any(|w| w.contains("\"community\" reports to \"cmo\", which is not activated")),
+            "{:?}",
+            s.agent.instruction_warnings
+        );
+    }
+
+    /// `subagents.document_agents.start` is `manual` unless the operator
+    /// says `on_compose`; nothing else is a value.
+    #[test]
+    fn document_agents_start_is_manual_or_on_compose() {
+        let s = Settings::from_document(operator(TEAM), MERGED_DOCUMENT).unwrap();
+        assert_eq!(
+            s.subagents.document_agents.start,
+            DocumentAgentStart::Manual
+        );
+        let mut doc = operator(TEAM);
+        doc["subagents"] = json!({"document_agents": {"start": "on_compose"}});
+        let s = Settings::from_document(doc.clone(), MERGED_DOCUMENT).unwrap();
+        assert_eq!(
+            s.subagents.document_agents.start,
+            DocumentAgentStart::OnCompose
+        );
+        doc["subagents"] = json!({"document_agents": {"start": "always"}});
+        assert!(Settings::from_document(doc, MERGED_DOCUMENT).is_err());
     }
 }

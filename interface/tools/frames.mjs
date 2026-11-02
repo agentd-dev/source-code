@@ -133,8 +133,8 @@ async function settle(mirror) {
   step('fetch', { phase: 'done', status: 'done', tokens: 0 });
   await tick(900);
   step('triage', { phase: 'done', status: 'done', tokens: 1840 });
-  feed(mirror, 'subagent', { handle: 'sa-review', mode: 'supervised', status: 'running', tokens: 4120, updated: Date.now() });
-  feed(mirror, 'subagent', { handle: 'sa-lint', mode: 'detached', status: 'failed', tokens: 260, updated: Date.now() });
+  feed(mirror, 'subagent', { handle: 'sa-review', mode: 'detached', status: 'running', tokens: 4120, error: null, updated: Date.now(), template: 'reviewer', tier: 'instance', reports_to: 'cto' });
+  feed(mirror, 'subagent', { handle: 'sa-lint', mode: 'detached', status: 'failed', tokens: 260, error: 'lint server refused the connection', updated: Date.now(), template: 'linter', tier: 'instance', reports_to: null });
 }
 
 /** Type a line into the composer and send it. */

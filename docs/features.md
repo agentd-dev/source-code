@@ -167,12 +167,12 @@ The workspace publishes four crates to crates.io. A fifth, the conformance
 suite, is not published and links none of the others: it drives the binary
 from outside.
 
-| Crate | Library name | Version (v1.21.0) | Licence | Owns |
+| Crate | Library name | Version (v1.21.1) | Licence | Owns |
 |---|---|---|---|---|
 | `agentd-net` | `net` | 3.0.0 | AGPL-3.0-only | A blocking HTTP/1.1 and SSE client over any `Read + Write`, unix and TLS connects, the SSRF guard, X.509 field extraction. |
 | `agentd-mcp` | `mcp` | 5.0.0 | AGPL-3.0-only | A blocking MCP client over the official `rmcp` SDK, on agentd's own credentialed Streamable-HTTP socket, plus a raw HTTP listener. |
-| `agentd-core` | `agentd` | 1.21.0 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
-| `agentd-cli` | binary `agentd` | 1.21.0 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |
+| `agentd-core` | `agentd` | 1.21.1 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
+| `agentd-cli` | binary `agentd` | 1.21.1 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |
 | `agentd-conformance` | `agentd_conformance` | 1.8.0 | AGPL-3.0-only | A black-box conformance suite. Not published. |
 
 Each crate's features map onto `agentd-core`'s: `agentd-cli`'s `a2a` turns on

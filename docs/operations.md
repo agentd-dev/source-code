@@ -437,7 +437,7 @@ shortened here):
   "store": "file",
   "store_file": { "defaulted": true, "path": "/root/.local/state/agentd/state" },
   "tools": { "disabled": [], "overrides": [] },
-  "version": "1.21.0",
+  "version": "1.21.1",
   "webhooks": null,
   "workflows": []
 }

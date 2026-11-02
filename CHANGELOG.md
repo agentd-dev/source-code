@@ -5,7 +5,16 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.21.1 — the operator's names stand, and only Personal Agent Protocol 0.1 is spoken
+
+Two fixes, found by running the 1.21.0 demo kits and a Company against
+the release. A served instruction document's live machinery no longer
+fails over a name the operator already uses: the operator's server, peer or
+workflow stands, the document's is held as text, and the rest applies.
+And a Company whose discovery document names a protocol version other than
+0.1 is refused rather than read as 0.1. agentd-core and agentd-cli 1.21.1
+and @agentd-dev/cli 1.21.1; agentd-mcp 5.0.0 and agentd-net 3.0.0 are
+unchanged.
 
 **Fixed.**
 

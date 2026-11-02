@@ -400,3 +400,47 @@ test('fullscreen renders a scroll hint instead of terminal scrollback', async ()
   assert.doesNotMatch(frame, /msg 0\b/, 'older messages are outside the viewport');
   ui.unmount();
 });
+
+// A narrow pane (one column of a side-by-side layout) wraps a long input to
+// several lines: the composer's box must hold every one of them while the
+// text is typed. Ink's real renderer at the pane's width (the testing
+// library always lays out at 100 columns, so it cannot show this).
+test('the composer box holds input that wraps in a narrow pane', async () => {
+  const { render: inkRender } = await import('ink');
+  const { PassThrough } = await import('node:stream');
+  const cols = 39;
+  const rows = 23;
+  const stdout = new PassThrough();
+  Object.assign(stdout, { isTTY: true, columns: cols, rows });
+  let screen = '';
+  stdout.on('data', (d) => (screen += d.toString()));
+  const stdin = new PassThrough();
+  Object.assign(stdin, { isTTY: true, setRawMode() {}, ref() {}, unref() {} });
+  const mirror = new Mirror();
+  const app = inkRender(React.createElement(App, { configured: 'http://127.0.0.1:1', client: {}, mirror, observe: false }), {
+    stdout,
+    stdin,
+    debug: true,
+    exitOnCtrlC: false,
+    patchConsole: false,
+  });
+  try {
+    mirror.setSession(session());
+    mirror.setConn('ready');
+    await tick();
+    stdin.write("Hi, there's a charge on my card I don't recognise and I want to dispute it.");
+    await tick(80);
+    // debug mode writes each whole frame; the last one is what is on screen.
+    // eslint-disable-next-line no-control-regex
+    const frames = screen.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '').split('╭');
+    const last = ('╭' + frames[frames.length - 1]).split('\n');
+    const bottom = last.findIndex((l) => l.includes('╰'));
+    assert.ok(bottom > 1, 'the composer is boxed');
+    const inside = last.slice(1, bottom);
+    assert.ok(inside.length >= 3, `the input wraps to three rows here (${inside.length})`);
+    for (const l of inside) assert.match(l, /^│.*│$/, `every wrapped line sits inside the box: ${JSON.stringify(l)}`);
+    assert.match(last[bottom], /^╰─+╯$/, `the box's bottom edge is whole: ${JSON.stringify(last[bottom])}`);
+  } finally {
+    app.unmount();
+  }
+});

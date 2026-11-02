@@ -21,7 +21,7 @@ import React, {
   useState,
   useSyncExternalStore,
 } from 'react';
-import { Box, Text, useApp, useInput, useStdin, useWindowSize } from 'ink';
+import { Box, Text, measureElement, useApp, useInput, useStdin, useWindowSize, type DOMElement } from 'ink';
 import { MultilineInput, type EditState } from './parts/input.js';
 import {
   AgentdClient,
@@ -299,7 +299,19 @@ export function App(props: AppProps): React.JSX.Element {
   // suggestions, bottom edge — which wraps on narrow terminals). The
   // fullscreen composer is boxed, so it costs its two border rows too; get
   // this wrong and the viewport overflows and clips its own newest message.
-  const composerRows = 1 + (props.fullscreen !== false && isRawModeSupported ? 2 : 0);
+  // The composer grows as its text wraps (a long line in a narrow pane wraps
+  // to several), so its rows are measured from the last render rather than
+  // assumed to be one line — else the body keeps rows the composer needs and
+  // the frame is pushed out of line until the next submit.
+  const composerRef = useRef<DOMElement>(null);
+  const composerFloor = 1 + (props.fullscreen !== false && isRawModeSupported ? 2 : 0);
+  const [composerMeasured, setComposerMeasured] = useState(composerFloor);
+  useEffect(() => {
+    if (!composerRef.current) return;
+    const h = measureElement(composerRef.current).height;
+    if (h > 0 && h !== composerMeasured) setComposerMeasured(h);
+  });
+  const composerRows = screen === 'chat' && isRawModeSupported ? Math.max(composerFloor, composerMeasured) : composerFloor;
   // The gate's options sit between the transcript and the composer, so they
   // cost rows the transcript may not also use — one per option, one for the
   // hint, and one more for the free-text line when `other…` is selected.
@@ -920,7 +932,9 @@ export function App(props: AppProps): React.JSX.Element {
         isRawModeSupported ? (
           <Box flexDirection="column">
             <Box
+              ref={composerRef}
               flexDirection="row"
+              flexShrink={0}
               borderStyle={fullscreen ? 'round' : undefined}
               borderColor={theme.border}
               paddingX={fullscreen ? 1 : 0}
@@ -928,7 +942,10 @@ export function App(props: AppProps): React.JSX.Element {
               <Text color={theme.accent} bold>
                 {'› '}
               </Text>
-              <Box flexGrow={1}>
+              {/* An explicit width: measured beside the prompt, the text's
+                  wrap would be judged at a wider width than it is drawn at,
+                  and a long line would wrap to more rows than its box holds. */}
+              <Box width={Math.max(1, columns - (fullscreen ? 4 : 0) - 2)} flexShrink={0}>
                 <MultilineInput
                   value={input}
                   cursor={cursor}

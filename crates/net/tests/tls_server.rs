@@ -220,7 +220,16 @@ fn from_paths_acceptor_rotates_identity_in_place() {
     roundtrip("ca2.pem").expect_err("CA 2 must not trust identity 1");
 
     // A junk intermediate write (half a rotation) keeps last-good serving.
+    // Its mtime is put back to the one before, as when both writes land in
+    // the same clock tick: the change must still be seen.
+    let before = std::fs::metadata(&cert).unwrap().modified().unwrap();
     std::fs::write(&cert, b"not a pem").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&cert)
+        .unwrap()
+        .set_modified(before)
+        .unwrap();
     acceptor.force_reload_check();
     assert!(
         acceptor.last_reload_error().is_some(),

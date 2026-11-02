@@ -332,7 +332,7 @@ struct ReloadSource {
 
 struct ReloadState {
     checked_at: Instant,
-    mtimes: (SystemTime, SystemTime, Option<SystemTime>),
+    mtimes: (Stamp, Stamp, Option<Stamp>),
     generation: u64,
     last_error: Option<String>,
 }
@@ -376,8 +376,20 @@ fn build_server_config(
     Ok(Arc::new(config))
 }
 
-fn mtime(path: &Path) -> io::Result<SystemTime> {
-    std::fs::metadata(path)?.modified()
+/// What a reload compares to see a file changed: its mtime, its size and
+/// (on Unix) its inode. The mtime alone misses a rewrite that lands in the
+/// same clock tick as the write before it; a different size or a renamed-in
+/// file still shows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp(SystemTime, u64, u64);
+
+fn mtime(path: &Path) -> io::Result<Stamp> {
+    let m = std::fs::metadata(path)?;
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(&m);
+    #[cfg(not(unix))]
+    let ino = 0;
+    Ok(Stamp(m.modified()?, m.len(), ino))
 }
 
 impl TlsAcceptor {

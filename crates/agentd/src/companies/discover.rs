@@ -5,8 +5,9 @@
 //! 1. `GET https://<endpoint host>/.well-known/poppy.json`, with no
 //!    credential, following HTTPS redirects only (at most three), capped at
 //!    100 KiB, a member named twice refused.
-//! 2. A `protocol_version` whose major is not `0` is refused; a newer minor
-//!    is used, its unknown fields ignored.
+//! 2. A `protocol_version` other than `0.1` is refused: before 1.0 each
+//!    version may break the one before, so a newer minor (0.2, 0.3, …) is
+//!    not used as if it were 0.1 (§3.1 from draft 0.2 on).
 //! 3. `organization.domain` must be the host that served the document, after
 //!    the redirects, ignoring ASCII case.
 //! 4. The issuer's RFC 8414 metadata, at the well-known URL with the suffix
@@ -278,13 +279,10 @@ fn verify(entry: &Entry) -> Verification {
         .map_err(|r| Refusal::from_http(company, r))?;
     let poppy = &doc.json;
     let version = string(poppy, "/protocol_version").unwrap_or_default();
-    if version.split('.').next() != Some(wire::PROTOCOL_MAJOR) {
+    if let Some(why) = unsupported_version(version) {
         return Err(Refusal::new(
             "protocol_version",
-            format!(
-                "company {company}: protocol_version {version:?} — agentd uses documents of major version {}",
-                wire::PROTOCOL_MAJOR
-            ),
+            format!("company {company}: protocol_version {version:?} — {why}"),
         ));
     }
     let served_by = host_of(&doc.url).unwrap_or_default();
@@ -810,6 +808,26 @@ impl Discovery {
     }
 }
 
+/// Why agentd does not use a document of `version`, or `None` when it is the
+/// version agentd speaks. Before 1.0 every `major.minor` may break the one
+/// before it, so only [`wire::PROTOCOL_VERSION`] itself is used.
+fn unsupported_version(version: &str) -> Option<String> {
+    if version == wire::PROTOCOL_VERSION {
+        return None;
+    }
+    Some(if version.starts_with("0.") {
+        format!(
+            "agentd speaks version {} of the protocol, and before 1.0 another version is not backward compatible",
+            wire::PROTOCOL_VERSION
+        )
+    } else {
+        format!(
+            "agentd uses documents of version {} only",
+            wire::PROTOCOL_VERSION
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,6 +985,21 @@ mod tests {
         );
         let (v, _) = d.current_with(&|_| Ok(verified("https://as.example", &["https://m/mcp"])));
         assert!(v.is_err(), "suspended stays suspended");
+    }
+
+    /// Only the version agentd speaks is used: before 1.0 a newer minor is
+    /// not backward compatible, so a 0.3 Company is refused, not read as 0.1.
+    #[test]
+    fn only_the_version_agentd_speaks_is_used() {
+        assert_eq!(unsupported_version("0.1"), None);
+        for v in ["0.2", "0.3", "0.10", "1.0", "0", "", "0.1.0", " 0.1"] {
+            assert!(unsupported_version(v).is_some(), "{v:?}");
+        }
+        assert!(
+            unsupported_version("0.3")
+                .unwrap()
+                .contains("not backward compatible")
+        );
     }
 
     #[test]

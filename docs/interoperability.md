@@ -119,7 +119,7 @@ a draft.
 
 | | Support |
 |---|---|
-| Version | draft **0.1**, pinned at the draft repository's commit `95fcbf2`. The draft can change without changing its `protocol_version`, so agentd follows the pinned revision, its JSON Schemas vendored and checked in CI. A discovery document whose major version is not `0` is refused. |
+| Version | draft **0.1**, pinned at the draft repository's commit `95fcbf2`. The draft can change without changing its `protocol_version`, so agentd follows the pinned revision, its JSON Schemas vendored and checked in CI. A discovery document of any other `protocol_version` — 0.2 or 0.3 as much as 1.0 — is refused (`company.refused`, `reason: protocol_version`): before 1.0 each version may break the one before, and the draft says a Personal Agent MUST NOT use a document whose `major.minor` it does not support. |
 | Build | the `companies` build feature, in the release binaries and the image; it does nothing until a configuration declares a company. [Build features and crates](features.md) has the build. |
 | Role | the Personal Agent, for one User per instance. Not the Company and not the Company Agent. |
 | Discovery | `/.well-known/poppy.json`, following HTTPS redirects only; the issuer's RFC 8414 metadata, its `issuer` exact and its `poppy_domains` listing the domain; every URL the documents name held to the entry's `hosts`. |

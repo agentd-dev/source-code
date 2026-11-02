@@ -7,10 +7,11 @@
 //! they live here and nowhere else — an upstream rename is a change to this
 //! one file.
 
-/// The draft's version, `major.minor` (§3.1).
+/// The draft's version, `major.minor` (§3.1), and the only one agentd uses a
+/// document of: before 1.0 each version may break the one before, so a
+/// Personal Agent MUST NOT use a document whose `major.minor` it does not
+/// support (draft 0.2 and later, §3.1).
 pub const PROTOCOL_VERSION: &str = "0.1";
-/// The major version a document must carry for agentd to use it (§3.1).
-pub const PROTOCOL_MAJOR: &str = "0";
 
 /// Where a Company publishes its discovery document (§3).
 pub const DISCOVERY_PATH: &str = "/.well-known/poppy.json";

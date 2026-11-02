@@ -915,6 +915,35 @@ fn a_workflow_reaches_a_company_only_through_its_tools() {
     }
 }
 
+/// A Company whose document says a newer minor (0.3) is refused, naming the
+/// version: before 1.0 it is not backward compatible, so agentd does not use
+/// it as if it were 0.1, and nothing past discovery is asked of it.
+#[test]
+fn a_newer_minor_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = fake(dir.path(), &["newer-minor"], None);
+    let h = host();
+    let s = setup(&h, &f.origin, "", "");
+    let d = start(&s, "newer", &[]);
+    let l = wait_for(&d.log, "the Company refused", |l| {
+        !events(l, "company.refused").is_empty()
+    });
+    let refused = &events(&l, "company.refused")[0];
+    assert_eq!(refused["reason"], "protocol_version", "{refused}");
+    assert!(
+        refused["error"].as_str().unwrap().contains("\"0.3\""),
+        "{refused}"
+    );
+    drop(d);
+    assert!(
+        f.record()
+            .iter()
+            .all(|r| r["path"] == "/.well-known/poppy.json"),
+        "only the discovery document was asked for: {:?}",
+        f.record()
+    );
+}
+
 /// A Company listing two MCP APIs with no `mcp_names` is refused, naming
 /// why; with them, each joins under its name.
 #[test]

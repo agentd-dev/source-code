@@ -254,10 +254,14 @@ pub enum Variant {
     Mcp20250618,
     /// Two MCP servers are listed, at `/mcp` and `/mcp/orders`.
     TwoMcpApis,
+    /// The discovery document says `protocol_version` `0.3`, a newer minor
+    /// that, before 1.0, is not backward compatible with 0.1 (§3.1 from
+    /// draft 0.2 on).
+    NewerMinor,
 }
 
 impl Variant {
-    pub const ALL: [Variant; 12] = [
+    pub const ALL: [Variant; 13] = [
         Variant::IssuerMismatch,
         Variant::NoDomains,
         Variant::NoEs256,
@@ -270,6 +274,7 @@ impl Variant {
         Variant::RetryAfter,
         Variant::Mcp20250618,
         Variant::TwoMcpApis,
+        Variant::NewerMinor,
     ];
 
     /// The name `--variant` takes.
@@ -287,6 +292,7 @@ impl Variant {
             Variant::RetryAfter => "retry-after",
             Variant::Mcp20250618 => "mcp-2025-06-18",
             Variant::TwoMcpApis => "two-mcp-apis",
+            Variant::NewerMinor => "newer-minor",
         }
     }
 
@@ -294,6 +300,9 @@ impl Variant {
         Variant::ALL.into_iter().find(|v| v.name() == name)
     }
 }
+
+/// The `protocol_version` the newer-minor variant serves.
+pub const NEWER_MINOR: &str = "0.3";
 
 /// What the fake serves and how ([`run_with`]).
 #[derive(Debug, Clone, Default)]
@@ -1295,7 +1304,7 @@ impl Company {
             apis.push(json!({"type": wire::API_OPENAPI, "url": self.api_url(), "description": "Orders, exchanges, notes, and the Session a token belongs to"}));
         }
         let doc = json!({
-            "protocol_version": wire::PROTOCOL_VERSION,
+            "protocol_version": if self.has(Variant::NewerMinor) { NEWER_MINOR } else { wire::PROTOCOL_VERSION },
             "organization": {"name": "Fake Company", "domain": DOMAIN},
             "auth": {
                 "issuer": self.issuer(),

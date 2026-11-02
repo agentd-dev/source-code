@@ -5,6 +5,20 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Fixed.**
+
+- A Company whose discovery document says a `protocol_version` other than
+  `0.1` is refused (`company.refused`, `reason: protocol_version`), naming
+  the version. agentd refused only another major, and used a newer minor —
+  a 0.3 Company — as if it were 0.1; from draft 0.2 on, a Personal Agent
+  MUST NOT use a document whose `major.minor` it does not support, since
+  before 1.0 each version may break the one before (0.3 removes
+  `auth.direct`/`auth.device` and the `poppy:read`/`poppy:write` scopes, and
+  requires a `Poppy-Session` on every request). The fake Company's
+  `newer-minor` variant serves 0.3.
+
 ## v1.21.0 — instruction/1 on the official SDK, sections that own their endpoints, and MCP registries
 
 Instruction documents are `instruction/1`, read by the official

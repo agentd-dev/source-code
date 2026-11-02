@@ -72,6 +72,16 @@ export function wrapLine(line: string, width: number): string[] {
   return out;
 }
 
+/** The width a user's block is padded to (one column short of the edge). */
+function userWidth(columns: number | undefined): number {
+  return Math.max(20, (columns ?? 80) - GUTTER - 1);
+}
+
+/** A user's lines wrapped inside the block's one-space padding on each side. */
+function userRows(text: string, width: number): string[] {
+  return lines(text).flatMap((l) => wrapLine(l, width - 2));
+}
+
 /**
  * A block of text with a one-character mark in the gutter: the mark on the
  * first line, blanks under it, so wrapped/multi-line bodies stay indented.
@@ -82,8 +92,11 @@ function Marked({
   color,
   dim,
   width,
+  skip = 0,
   children,
 }: {
+  /** Rows to leave off the top: the viewport's cut of an entry taller than it. */
+  skip?: number;
   /** The text column's width, when the terminal's is known: measured beside
    * the gutter, a flex-grown column is judged wider than it is drawn, and a
    * wrapped line then loses its first character to the row before it. */
@@ -94,13 +107,14 @@ function Marked({
   dim?: boolean;
   children: string;
 }): React.JSX.Element {
+  const rows = (width === undefined ? lines(children) : lines(children).flatMap((l) => wrapLine(l, width))).slice(skip);
   return (
-    <Box flexDirection="row">
+    <Box flexDirection="row" flexShrink={0}>
       <Box width={GUTTER} flexShrink={0}>
         <Text color={markColor}>{mark}</Text>
       </Box>
       <Box flexDirection="column" flexGrow={width === undefined ? 1 : 0} flexShrink={0} width={width}>
-        {(width === undefined ? lines(children) : lines(children).flatMap((l) => wrapLine(l, width))).map((l, i) => (
+        {rows.map((l, i) => (
           <Text key={i} color={color} dimColor={dim} wrap={width === undefined ? 'wrap' : 'truncate-end'}>
             {l === '' ? ' ' : l}
           </Text>
@@ -121,21 +135,36 @@ function waitHint(e: TranscriptEntry, gate: string | undefined): string | undefi
   return e.taskId !== undefined && e.taskId !== gate ? `⏎ answer with #${e.taskId} <reply>` : '⏎ reply to continue';
 }
 
-function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?: string }): React.JSX.Element {
+function Row({
+  e,
+  columns,
+  gate,
+  skip = 0,
+}: {
+  e: TranscriptEntry;
+  columns?: number;
+  gate?: string;
+  /** Rows the viewport cuts off this entry's top (its spacer row first). */
+  skip?: number;
+}): React.JSX.Element {
   const textWidth = columns === undefined ? undefined : Math.max(1, columns - GUTTER);
+  // A spaced kind's blank row above it is the first row a cut takes.
+  const spaced = e.kind === 'user' || e.kind === 'agent' || e.kind === 'error';
+  const top = spaced && skip === 0 ? 1 : 0;
+  const bodySkip = Math.max(0, skip - (spaced ? 1 : 0));
   switch (e.kind) {
     case 'user': {
       // Inverse: the user's own words, in the terminal's own idiom for
       // "selected/mine". Each line is padded so the block reads as a block
       // rather than as ragged highlighted words.
-      const width = Math.max(20, (columns ?? 80) - GUTTER - 1);
+      const width = userWidth(columns);
       return (
-        <Box flexDirection="row" marginTop={1}>
+        <Box flexDirection="row" marginTop={top} flexShrink={0}>
           <Box width={GUTTER} flexShrink={0}>
             <Text color={theme.user}>{'▌'}</Text>
           </Box>
           <Box flexDirection="column" flexGrow={1}>
-            {lines(e.text).map((l, i) => (
+            {userRows(e.text, width).slice(bodySkip).map((l, i) => (
               <Text key={i} color={theme.user} inverse wrap="truncate-end">
                 {` ${l} `.padEnd(width, ' ')}
               </Text>
@@ -150,13 +179,13 @@ function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?
     case 'agent': {
       const hint = waitHint(e, gate);
       return (
-        <Box flexDirection="column" marginTop={1}>
+        <Box flexDirection="column" marginTop={top} flexShrink={0}>
           {e.authRequired ? (
-            <Marked mark="⚿" markColor={theme.warn} color={theme.warn} width={textWidth}>
+            <Marked mark="⚿" markColor={theme.warn} color={theme.warn} width={textWidth} skip={bodySkip}>
               {e.text}
             </Marked>
           ) : (
-            <Marked mark="●" markColor={theme.agent} width={textWidth}>
+            <Marked mark="●" markColor={theme.agent} width={textWidth} skip={bodySkip}>
               {e.text}
             </Marked>
           )}
@@ -178,14 +207,14 @@ function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?
     }
     case 'command':
       return (
-        <Marked mark="▸" markColor={theme.command} color={theme.command} width={textWidth}>
+        <Marked mark="▸" markColor={theme.command} color={theme.command} width={textWidth} skip={bodySkip}>
           {e.text + (e.principal && e.principal !== 'operator' ? ` (${e.principal})` : '')}
         </Marked>
       );
     case 'error':
       return (
-        <Box flexDirection="column" marginTop={1}>
-          <Marked mark="✗" markColor={theme.error} color={theme.error} width={textWidth}>
+        <Box flexDirection="column" marginTop={top} flexShrink={0}>
+          <Marked mark="✗" markColor={theme.error} color={theme.error} width={textWidth} skip={bodySkip}>
             {e.text}
           </Marked>
           {e.ms !== undefined ? (
@@ -197,7 +226,7 @@ function Row({ e, columns, gate }: { e: TranscriptEntry; columns?: number; gate?
       );
     default:
       return (
-        <Marked mark="·" markColor={theme.dim} dim width={textWidth}>
+        <Marked mark="·" markColor={theme.dim} dim width={textWidth} skip={bodySkip}>
           {e.text}
         </Marked>
       );
@@ -225,16 +254,25 @@ export interface TranscriptProps {
 }
 
 /**
- * Roughly how many terminal rows an entry occupies once wrapped — every
- * newline is a row, plus the blank separator line the spaced kinds carry.
+ * The terminal rows an entry occupies, counted as Row draws them: its body
+ * wrapped as Marked wraps it (a user's own lines are truncated, one row
+ * each), the blank row above a spaced kind, and the lines under it — the
+ * answer hint, the settled duration, a non-operator principal.
  */
-function heightOf(e: TranscriptEntry, columns: number): number {
-  // The rows Marked draws: the same wrap, at the same width.
+export function heightOf(e: TranscriptEntry, columns: number): number {
   const width = Math.max(1, columns - GUTTER);
-  const body = lines(e.text).reduce((n, line) => n + wrapLine(line, width).length, 0);
+  const body =
+    e.kind === 'user'
+      ? userRows(e.text, userWidth(columns)).length + (e.principal && e.principal !== 'operator' ? 1 : 0)
+      : lines(e.kind === 'command' && e.principal && e.principal !== 'operator' ? `${e.text} (${e.principal})` : e.text).reduce(
+          (n, line) => n + wrapLine(line, width).length,
+          0,
+        );
   const spacer = e.kind === 'user' || e.kind === 'agent' || e.kind === 'error' ? 1 : 0;
   const hint = e.kind === 'agent' && e.inputRequired ? 1 : 0;
-  return body + spacer + hint;
+  const settled =
+    (e.kind === 'agent' && e.ms !== undefined && !e.inputRequired && !e.authRequired) || (e.kind === 'error' && e.ms !== undefined) ? 1 : 0;
+  return body + spacer + hint + settled;
 }
 
 /**
@@ -245,21 +283,22 @@ function heightOf(e: TranscriptEntry, columns: number): number {
 export function windowEntries(
   entries: TranscriptEntry[],
   { rows, columns, offset }: Viewport,
-): { visible: TranscriptEntry[]; above: number } {
+): { visible: TranscriptEntry[]; above: number; skip: number } {
   const end = Math.max(0, entries.length - offset);
-  const fit = (budget: number): { visible: TranscriptEntry[]; above: number } => {
+  const fit = (budget: number): { visible: TranscriptEntry[]; above: number; skip: number } => {
     const visible: TranscriptEntry[] = [];
     let used = 0;
     let i = end - 1;
     for (; i >= 0; i--) {
       const h = heightOf(entries[i], columns);
-      // The last entry always renders, even if it alone overflows — a window
-      // that fits nothing would be a blank screen.
+      // The newest entry always renders, even if it alone overflows — a
+      // window that fits nothing would be a blank screen. Its top rows are
+      // then cut (`skip`), so what shows is its end, every row of it.
       if (used + h > budget && visible.length > 0) break;
       used += h;
       visible.unshift(entries[i]);
     }
-    return { visible, above: i + 1 };
+    return { visible, above: i + 1, skip: Math.max(0, used - budget) };
   };
   const first = fit(rows);
   // The "↑ N earlier messages" hint occupies a row of the same box, so when it
@@ -272,7 +311,8 @@ export function Transcript({ entries, working, viewport, gate }: TranscriptProps
   // Fullscreen: a windowed viewport, bottom-anchored, clipped — the alternate
   // screen has no scrollback of its own, so the app owns the scroll.
   if (viewport) {
-    const { visible, above } = windowEntries(entries, viewport);
+    // The live "working" row sits in the same box, so it costs a row too.
+    const { visible, above, skip } = windowEntries(entries, { ...viewport, rows: Math.max(1, viewport.rows - (working ? 1 : 0)) });
     return (
       <Box flexDirection="column" height={viewport.rows} overflow="hidden">
         <Box flexGrow={1} />
@@ -282,8 +322,8 @@ export function Transcript({ entries, working, viewport, gate }: TranscriptProps
             {viewport.offset > 0 ? ' · PgDn to follow' : ' · PgUp to scroll'}
           </Text>
         ) : null}
-        {visible.map((e) => (
-          <Row key={e.key} e={e} columns={viewport.columns} gate={gate} />
+        {visible.map((e, i) => (
+          <Row key={e.key} e={e} columns={viewport.columns} gate={gate} skip={i === 0 ? skip : 0} />
         ))}
         {working ? (
           <Text color={theme.accent}>

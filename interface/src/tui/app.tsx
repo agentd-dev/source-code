@@ -303,13 +303,23 @@ export function App(props: AppProps): React.JSX.Element {
   // to several), so its rows are measured from the last render rather than
   // assumed to be one line — else the body keeps rows the composer needs and
   // the frame is pushed out of line until the next submit.
+  // The edges are measured the same way: on a narrow terminal the bottom
+  // edge's items wrap to two or three rows, and a guess that counts fewer
+  // makes the frame taller than the terminal, so rows go unerased.
   const composerRef = useRef<DOMElement>(null);
+  const topRef = useRef<DOMElement>(null);
+  const bottomRef = useRef<DOMElement>(null);
   const composerFloor = 1 + (props.fullscreen !== false && isRawModeSupported ? 2 : 0);
   const [composerMeasured, setComposerMeasured] = useState(composerFloor);
+  const [edgeRows, setEdgeRows] = useState({ top: 1, bottom: 1 });
   useEffect(() => {
-    if (!composerRef.current) return;
-    const h = measureElement(composerRef.current).height;
-    if (h > 0 && h !== composerMeasured) setComposerMeasured(h);
+    if (composerRef.current) {
+      const h = measureElement(composerRef.current).height;
+      if (h > 0 && h !== composerMeasured) setComposerMeasured(h);
+    }
+    const top = topRef.current ? measureElement(topRef.current).height : edgeRows.top;
+    const bottom = bottomRef.current ? measureElement(bottomRef.current).height : edgeRows.bottom;
+    if (top !== edgeRows.top || bottom !== edgeRows.bottom) setEdgeRows({ top, bottom });
   });
   const composerRows = screen === 'chat' && isRawModeSupported ? Math.max(composerFloor, composerMeasured) : composerFloor;
   // The gate's options sit between the transcript and the composer, so they
@@ -322,14 +332,13 @@ export function App(props: AppProps): React.JSX.Element {
   const bodyRows = Math.max(
     3,
     rows -
-      (2 +
+      (edgeRows.top +
+        edgeRows.bottom +
         composerRows +
         promptRows +
         bannerRows +
         (ask ? 1 : 0) +
-        (suggestions.length > 0 ? 1 : 0) +
-        // The bottom edge wraps to a second line only on a narrow terminal.
-        (columns < 100 && layout.bottom.length > 6 ? 1 : 0)),
+        (suggestions.length > 0 ? 1 : 0)),
   );
 
   const submit = useCallback(
@@ -879,7 +888,9 @@ export function App(props: AppProps): React.JSX.Element {
 
   return (
     <Box flexDirection="column" height={fullscreen ? rows : undefined}>
-      <Edge items={top} ctx={chrome} />
+      <Box ref={topRef} flexShrink={0} flexDirection="column">
+        <Edge items={top} ctx={chrome} />
+      </Box>
       {banner ? (
         <Box flexDirection="column" borderStyle="round" borderColor={theme.error} paddingX={1}>
           {banner.map((line, i) => (
@@ -978,7 +989,9 @@ export function App(props: AppProps): React.JSX.Element {
           <Text color={theme.dim}>read-only (no interactive terminal)</Text>
         )
       ) : null}
-      <StatusBar items={bottom} ctx={chrome} />
+      <Box ref={bottomRef} flexShrink={0} flexDirection="column">
+        <StatusBar items={bottom} ctx={chrome} />
+      </Box>
     </Box>
   );
 }

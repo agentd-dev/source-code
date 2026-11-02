@@ -375,6 +375,7 @@ test('fullscreen windows the transcript from the bottom and reports what is abov
   const long = [{ key: 'l', ctx: 'c', ts: 0, kind: 'user', text: 'x'.repeat(300) }, ...entries];
   const wrapped = windowEntries(long, { rows: 4, columns: 40, offset: 20 });
   assert.equal(wrapped.visible.length, 1, 'one 300-char entry fills a 40-col window');
+  assert.equal(wrapped.skip, 6, 'and is cut from its top: 9 wrapped rows and its spacer in a 4-row window');
   // A single entry taller than the window still renders (never a blank screen).
   const huge = windowEntries([{ key: 'h', ctx: 'c', ts: 0, kind: 'user', text: 'y'.repeat(1000) }], { rows: 2, columns: 40, offset: 0 });
   assert.equal(huge.visible.length, 1);
@@ -466,4 +467,68 @@ test('wrapLine fits each row to the column and drops the break space', async () 
   // A word longer than the column is broken, not overflowed.
   assert.deepEqual(wrapLine('abcdefghij', 4), ['abcd', 'efgh', 'ij']);
   assert.deepEqual(wrapLine('', 10), ['']);
+});
+
+// A reply taller than a narrow pane: the window shows its END, every row of
+// it in order, and the frame is exactly the terminal's height — no row lost
+// from the middle, no edge rows the budget forgot.
+test('a reply taller than a narrow pane shows its end, every row in order', async () => {
+  const { render: inkRender } = await import('ink');
+  const { PassThrough } = await import('node:stream');
+  const { wrapLine } = await import('../dist/tui/parts/transcript.js');
+  const reply =
+    'I’m sorry for the confusion. **You have 60 days from the statement date to dispute a charge.**\n\nBefore we discuss the charge, your identity must be confirmed using Harbor Bank’s usual verification questions. I can’t complete that verification here, so please contact the bank through its official app or the number on the back of your card.\n\nNever share your full card number, PIN or a one-time passcode in this chat.\n\nOnce verified, provide the charge’s date, amount and merchant, and explain in your own words what happened. LAST LINE.';
+  const cols = 39;
+  const rows = 22;
+  const stdout = new PassThrough();
+  Object.assign(stdout, { isTTY: true, columns: cols, rows });
+  let screen = '';
+  stdout.on('data', (d) => (screen += d.toString()));
+  const stdin = new PassThrough();
+  Object.assign(stdin, { isTTY: true, setRawMode() {}, ref() {}, unref() {} });
+  const mirror = new Mirror();
+  const client = {
+    async send() {
+      return { task: null, reply: { messageId: 'r1', contextId: 'c1', role: 'ROLE_AGENT', parts: [{ text: reply }] }, messageId: 'u1' };
+    },
+  };
+  const app = inkRender(React.createElement(App, { configured: 'http://127.0.0.1:1', client, mirror, observe: false }), {
+    stdout,
+    stdin,
+    debug: true,
+    exitOnCtrlC: false,
+    patchConsole: false,
+  });
+  try {
+    mirror.setSession(session());
+    mirror.setConn('ready');
+    await tick();
+    stdin.write("Hi, there's a charge on my card I don't recognise and I want to dispute it.");
+    await tick();
+    stdin.write('\r');
+    await tick(150);
+    // eslint-disable-next-line no-control-regex
+    const plain = screen.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, '');
+    const all = plain.split('\n');
+    // debug mode writes whole frames, each starting at the top edge.
+    const start = all.findLastIndex((l) => /^agentd\b/.test(l));
+    const frame = all.slice(start, start + rows);
+    assert.ok(all.length - start >= rows, 'a whole frame was written');
+    for (const l of frame) assert.ok([...l].length <= cols, `${JSON.stringify(l)} is wider than the pane`);
+    const top = frame.findIndex((l) => l.includes('╭'));
+    // Row 0 is the top edge; the transcript runs from row 1 to the composer.
+    const shown = frame
+      .slice(1, top)
+      .map((l) => l.replace(/^[●↑] ?|^ {2}/, ''))
+      .filter((l) => !/earlier message/.test(l));
+    // The reply's own rows, as the transcript wraps them: what is shown is a
+    // contiguous tail of them ending at the last.
+    const want = reply.split('\n').flatMap((l) => wrapLine(l, cols - 2));
+    const body = shown.join('\n').trimStart().split('\n');
+    const tail = want.slice(want.length - body.length);
+    assert.deepEqual(body.map((l) => l.trimEnd()), tail.map((l) => l.trimEnd()));
+    assert.match(body.at(-1), /LAST LINE\./);
+  } finally {
+    app.unmount();
+  }
 });

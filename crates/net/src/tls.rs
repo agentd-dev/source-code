@@ -311,7 +311,9 @@ impl ServerIdentity {
 pub struct TlsAcceptor {
     config: Mutex<Arc<ServerConfig>>,
     client_auth: bool,
-    reload: Option<ReloadSource>,
+    /// Boxed: only a file-backed acceptor has one, and it keeps the
+    /// acceptor small for the enums that hold it.
+    reload: Option<Box<ReloadSource>>,
 }
 
 use std::path::{Path, PathBuf};
@@ -425,7 +427,7 @@ impl TlsAcceptor {
         Ok(TlsAcceptor {
             config: Mutex::new(config),
             client_auth: client_ca.is_some(),
-            reload: Some(ReloadSource {
+            reload: Some(Box::new(ReloadSource {
                 cert: cert.to_path_buf(),
                 key: key.to_path_buf(),
                 client_ca: client_ca.map(Path::to_path_buf),
@@ -435,7 +437,7 @@ impl TlsAcceptor {
                     generation: 0,
                     last_error: None,
                 }),
-            }),
+            })),
         })
     }
 

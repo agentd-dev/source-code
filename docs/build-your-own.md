@@ -8,10 +8,8 @@ an image that runs your workflows and that says, in a way a registry and an
 admission check can read, what it carries.
 
 > **Note.** The builder image, `agentd --build-info` and the image's
-> `dev.agentd.features` label arrive with the next release. Until then,
-> build the builder from a checkout, as [Get the builder
-> image](#get-the-builder-image) shows; the rest of this page works the
-> same with it.
+> `dev.agentd.features` label arrived in v1.21.0. A release before it has
+> none of them.
 
 ## Decide whether you need your own build
 
@@ -194,13 +192,13 @@ pull, for `linux/amd64` and `linux/arm64`.
 
 ### Get the builder image
 
-From the next release the builder image is published as
-`ghcr.io/agentd-dev/agentd-builder` with each release, tagged as the image
-is (the full version, the minor line, the major line and `latest`), signed
-with cosign and carrying an SPDX SBOM attestation.
+The builder image is published as `ghcr.io/agentd-dev/agentd-builder` with
+each release since v1.21.0, tagged as the image is (the full version, the
+minor line, the major line and `latest`), signed with cosign and carrying an
+SPDX SBOM attestation. The `Dockerfile` below pulls it.
 
-Until then, build it from a checkout. It takes about ten minutes, most of it
-compiling the release set into its target directory. A builder built this
+To build it yourself instead, from a checkout: it takes about ten minutes,
+most of it compiling the release set into its target directory. A builder built this
 way is told no release and no commit, so a build in it reports `revision`,
 `source_modified` and `builder` as `null`. The published one names its
 release and its commit.
@@ -306,7 +304,7 @@ that carries the binary:
 ```text
 agentd-build: warning: CI does not test this combination (cel,cron,metrics,mock-models,tls); the nearest tested set is ci.yml's row "--features cron": it adds cel,metrics,mock-models
 agentd-build: cargo build --release --locked --offline -p agentd-cli --features cel,cron,metrics,mock-models
-agentd-build: built agentd 1.20.0 (release, x86_64-unknown-linux-musl)
+agentd-build: built agentd 1.21.0 (release, x86_64-unknown-linux-musl)
   features         cel,cron,metrics,mock-models,tls
   revision         unknown (source modified: unknown)
   builder          unknown
@@ -489,8 +487,8 @@ A builder that old builds nothing. Use the builder of a newer release.
 
 Check the binary, the label and a turn before you ship the image.
 
-**The binary's own answer.** From the next release, `agentd --build-info`
-prints how the binary was built:
+**The binary's own answer.** `agentd --build-info` prints how the binary
+was built:
 
 ```bash
 docker run --rm agentd:invoices --build-info
@@ -512,7 +510,7 @@ docker run --rm agentd:invoices --build-info
   "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
   "source_modified": null,
   "target": "x86_64-unknown-linux-musl",
-  "version": "1.20.0"
+  "version": "1.21.0"
 }
 ```
 
@@ -548,8 +546,8 @@ mock-llm done
 The exit code is `0`. Without `mock-models`, run the turn against your
 provider instead.
 
-**The builder image.** From the next release, verify the builder's
-signature and SBOM before you build with it. They are made by the release
+**The builder image.** Verify the builder's signature and SBOM before you
+build with it. They are made by the release
 workflow, as the image's are:
 
 ```bash
@@ -559,7 +557,7 @@ cosign verify-attestation --type spdxjson ghcr.io/agentd-dev/agentd-builder:late
 
 The identity is the release workflow at a release tag. To accept one
 release only, name it exactly:
-`--certificate-identity https://github.com/agentd-dev/source-code/.github/workflows/release.yml@refs/tags/v1.20.0`.
+`--certificate-identity https://github.com/agentd-dev/source-code/.github/workflows/release.yml@refs/tags/v1.21.0`.
 
 ## Other ways to get agentd
 
@@ -570,7 +568,7 @@ the configuration. Nothing to build, and the image is signed:
 
 ```bash
 curl -fsSL https://agentd.dev/install.sh | sh
-docker run --rm ghcr.io/agentd-dev/agentd:1.20.0 --version
+docker run --rm ghcr.io/agentd-dev/agentd:1.21.0 --version
 ```
 
 [Install](install.md) covers both, and how to verify them.
@@ -581,7 +579,7 @@ BuildKit builds a Git repository by its URL, with no checkout. The
 repository's `Dockerfile` takes the features as a build argument:
 
 ```bash
-docker buildx build --build-arg FEATURES=cel,cron,metrics,mock-models --build-arg BUILD_INFO_FEATURES=cel,cron,metrics,mock-models,tls -t agentd:invoices --load https://github.com/agentd-dev/source-code.git#v1.20.0
+docker buildx build --build-arg FEATURES=cel,cron,metrics,mock-models --build-arg BUILD_INFO_FEATURES=cel,cron,metrics,mock-models,tls -t agentd:invoices --load https://github.com/agentd-dev/source-code.git#v1.21.0
 ```
 
 Use it for a one-off image when you have Docker and nothing else. It
@@ -589,11 +587,11 @@ compiles everything from the start, about five minutes for this feature
 set, and it fetches what it builds from, so it needs the network. It cannot
 check your configuration.
 
-From the next release the `Dockerfile` builds through its builder stage:
-this build refuses a feature outside the allow-list, `exec` among them,
-because it passes no `--allow`; it runs `cargo deny`; and it labels the
-image with `dev.agentd.features`. At v1.20.0 it compiles `FEATURES` as
-given, with none of those, and ignores `BUILD_INFO_FEATURES`.
+The `Dockerfile` builds through its builder stage: this build refuses a
+feature outside the allow-list, `exec` among them, because it passes no
+`--allow`; it runs `cargo deny`; and it labels the image with
+`dev.agentd.features`. Before v1.21.0 it compiled `FEATURES` as given, with
+none of those, and ignored `BUILD_INFO_FEATURES`.
 
 ### Install the published crate
 
@@ -608,7 +606,7 @@ Use it on a workstation or a CI runner that already has Rust. It builds a
 published version only, against the network, into a dynamically linked
 binary for the host. A feature the published crate does not have is
 refused by cargo (`does not have these features`): `companies`, `xaa` and
-`x402` reach the published crate from the next release.
+`x402` are in the published crate since v1.21.0.
 
 ### Build a checkout
 
@@ -659,8 +657,8 @@ to your binary as `Ask::BuildInfo`, and only your crate knows its features.
 
 The times are for a build with `cel`, `cron`, `metrics` and `mock-models` on
 a 16-core amd64 host. The builder image, the allow-list of the repository's
-`Dockerfile` and `--build-info` arrive with the next release; a v1.20.0
-binary does not answer `--build-info`.
+`Dockerfile` and `--build-info` are in v1.21.0 and later; an older binary
+does not answer `--build-info`.
 
 ## Best practices
 

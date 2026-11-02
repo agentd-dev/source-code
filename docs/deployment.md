@@ -251,15 +251,16 @@ WantedBy=multi-user.target
 ## Use the container image
 
 The published image is `ghcr.io/agentd-dev/agentd`, tagged by release
-(`1.20.0`, `1.20`, `1`, `latest`) for amd64 and arm64. It holds one static
-musl binary on `scratch`: no shell, no libc, no package manager. It runs as
+(`1.21.0`, `1.21`, `1`, `latest`) for amd64 and arm64. It holds one static
+musl binary on `scratch`, with `LICENSE` and `NOTICE` under
+`/usr/share/doc/agentd/`: no shell, no libc, no package manager. It runs as
 uid 65532 with `/agentd` as its entrypoint, and it carries the release
 feature set, including the A2A listener, `/metrics` and the probes, cron,
 OTLP export, hot reload and the `mock:` model endpoint. Pin a version or a
 digest in production.
 
-From the next release, the image's `dev.agentd.features` label lists the
-features its binary was built with, as `agentd --build-info` reports them,
+Since v1.21.0, the image's `dev.agentd.features` label lists the features
+its binary was built with, as `agentd --build-info` reports them,
 so you can read them without running the image:
 
 ```bash
@@ -270,7 +271,7 @@ The image is signed with cosign in the release workflow. Verify it before
 you deploy:
 
 ```bash
-cosign verify ghcr.io/agentd-dev/agentd:1.20.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp '^https://github.com/agentd-dev/'
+cosign verify ghcr.io/agentd-dev/agentd:1.21.0 --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-identity-regexp '^https://github.com/agentd-dev/'
 ```
 
 agentd is its own init. It sets itself as the child subreaper and reaps
@@ -288,14 +289,14 @@ the binary will report:
 ```bash
 docker build -t agentd:local .
 docker build --build-arg FEATURES=a2a,metrics,cron,otel,hot-reload,config-watch --build-arg BUILD_INFO_FEATURES=a2a,config-watch,cron,hot-reload,metrics,otel,tls -t agentd:narrow .
-docker buildx build --platform linux/amd64,linux/arm64 -t registry.example.com/agentd:1.20.0 --push .
+docker buildx build --platform linux/amd64,linux/arm64 -t registry.example.com/agentd:1.21.0 --push .
 ```
 
 The image is built `FROM` the Dockerfile's `builder` stage, the source with
 every dependency vendored and `agentd-build`, which refuses a feature
 outside its allow-list and judges the build's dependency graph with
-`cargo deny`. From the next release that stage is published as
-`ghcr.io/agentd-dev/agentd-builder`, so you can build a binary with the
+`cargo deny`. Since v1.21.0 that stage is published as
+`ghcr.io/agentd-dev/agentd-builder` with each release, so you can build a binary with the
 features you choose without the repository; `agentd-build --list` shows
 what it offers.
 
@@ -413,7 +414,7 @@ spec:
         runAsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.20.0
+          image: ghcr.io/agentd-dev/agentd:1.21.0
           args:
             - --instruction.file
             - /etc/agentd/task.md
@@ -478,7 +479,7 @@ spec:
           terminationGracePeriodSeconds: 35
           containers:
             - name: agent
-              image: ghcr.io/agentd-dev/agentd:1.20.0
+              image: ghcr.io/agentd-dev/agentd:1.21.0
               args:
                 - --instruction.file
                 - /etc/agentd/task.md
@@ -532,7 +533,7 @@ spec:
         fsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.20.0
+          image: ghcr.io/agentd-dev/agentd:1.21.0
           args: ["--config", "/etc/agentd/agentd.yaml"]
           env:
             - name: OPENAI_API_KEY
@@ -645,7 +646,7 @@ spec:
         runAsGroup: 65532
       containers:
         - name: agent
-          image: ghcr.io/agentd-dev/agentd:1.20.0
+          image: ghcr.io/agentd-dev/agentd:1.21.0
           args: ["--config", "/etc/agentd/worker.yaml"]
           env:
             - name: AGENTD_POD_NAME

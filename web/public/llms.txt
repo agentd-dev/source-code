@@ -484,8 +484,8 @@ Required fields in **bold**.
 
 ## 11. Build features
 
-Compile-time. `agentd --build-info` (from the next release) prints the
-features this binary was built with, as JSON; `--capabilities` reports the
+Compile-time. `agentd --build-info` (since v1.21.0) prints the features
+this binary was built with, as JSON; `--capabilities` reports the
 *configured* surface, what this binary is set up to do, not its features.
 
 In the release binaries: `a2a`, `metrics`, `cron`, `otel`, `hot-reload`,
@@ -503,8 +503,8 @@ guarded local command runner, which is off at the cargo feature *and* at
 `security.exec.enabled`.
 
 To build only the features a configuration and its workflows need — in the
-builder image (`ghcr.io/agentd-dev/agentd-builder` from the next release,
-`agentd-build --features … --check-config agentd.yaml`), by URL, with cargo
+builder image (`ghcr.io/agentd-dev/agentd-builder`, published with each
+release since v1.21.0, `agentd-build --features … --check-config agentd.yaml`), by URL, with cargo
 or embedded: https://agentd.dev/docs/build-your-own/.
 
 ---

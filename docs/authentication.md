@@ -561,9 +561,7 @@ naming the wait, and a device-login poll waits it out.
 ## Enterprise-managed authorization
 
 **A preview**, in the `xaa` build feature: the release binaries and the
-image carry it from the next release (until then,
-[build a checkout](install.md#build-from-source) with the release set), and
-it acts only once you set `security.experimental.id_jag: true`. ID-JAG is
+image carry it since v1.21.0, and it acts only once you set `security.experimental.id_jag: true`. ID-JAG is
 an IETF draft (draft-ietf-oauth-identity-assertion-authz-grant-04) and MCP's
 Enterprise-Managed Authorization extension is young; agentd follows both as
 they stand ([RFC 0044](../rfcs/0044-enterprise-managed-authorization.md)).

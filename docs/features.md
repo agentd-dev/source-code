@@ -13,7 +13,8 @@ Every release ships static Linux binaries for `x86_64` and `aarch64` (musl,
 static-PIE on `x86_64`), a `SHA256SUMS` file, and a multi-arch OCI image,
 `ghcr.io/agentd-dev/agentd`, signed with cosign (keyless) and carrying an SPDX
 SBOM attestation. The image is `FROM scratch` plus the binary, run as uid
-65532.
+65532. Each archive and the image carry `LICENSE` and `NOTICE` beside the
+binary (in the image, under `/usr/share/doc/agentd/`).
 
 All of them are built with the default feature `tls` plus this list, taken
 from `.github/workflows/release.yml`:
@@ -22,8 +23,8 @@ from `.github/workflows/release.yml`:
 a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402
 ```
 
-`companies`, `xaa` and `x402` reach the release binaries and the image from
-the next release; the latest release is built with the list without them.
+`companies`, `xaa` and `x402` joined the list in v1.21.0; the releases
+before it are built with the list without them.
 
 `mock-models` is the built-in mock model endpoint: `mock:final` and
 `mock:file:<playbook.json>` answer from a script instead of a provider, so you
@@ -166,13 +167,13 @@ The workspace publishes four crates to crates.io. A fifth, the conformance
 suite, is not published and links none of the others: it drives the binary
 from outside.
 
-| Crate | Library name | Version (v1.20.0) | Licence | Owns |
+| Crate | Library name | Version (v1.21.0) | Licence | Owns |
 |---|---|---|---|---|
-| `agentd-net` | `net` | 2.0.0 | AGPL-3.0-only | A blocking HTTP/1.1 and SSE client over any `Read + Write`, unix and TLS connects, the SSRF guard, X.509 field extraction. |
-| `agentd-mcp` | `mcp` | 4.0.0 | AGPL-3.0-only | A blocking MCP client over the official `rmcp` SDK, on agentd's own credentialed Streamable-HTTP socket, plus a raw HTTP listener. |
-| `agentd-core` | `agentd` | 1.20.0 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
-| `agentd-cli` | binary `agentd` | 1.20.0 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |
-| `agentd-conformance` | `agentd_conformance` | 1.7.0 | AGPL-3.0-only | A black-box conformance suite. Not published. |
+| `agentd-net` | `net` | 3.0.0 | AGPL-3.0-only | A blocking HTTP/1.1 and SSE client over any `Read + Write`, unix and TLS connects, the SSRF guard, X.509 field extraction. |
+| `agentd-mcp` | `mcp` | 5.0.0 | AGPL-3.0-only | A blocking MCP client over the official `rmcp` SDK, on agentd's own credentialed Streamable-HTTP socket, plus a raw HTTP listener. |
+| `agentd-core` | `agentd` | 1.21.0 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
+| `agentd-cli` | binary `agentd` | 1.21.0 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |
+| `agentd-conformance` | `agentd_conformance` | 1.8.0 | AGPL-3.0-only | A black-box conformance suite. Not published. |
 
 Each crate's features map onto `agentd-core`'s: `agentd-cli`'s `a2a` turns on
 `agentd-core/a2a`, and so on. `agentd-mcp` and `agentd-net` have one feature
@@ -220,8 +221,8 @@ unique package names from `cargo tree -p agentd-cli -e normal --prefix none`
 The right-hand column leaves out the four workspace crates the command lists.
 `a2a` and `cel` overlap in five crates and `x402` overlaps neither; the other
 fourteen release features add none. Measured with cargo 1.98.0 against the
-committed `Cargo.lock` after v1.20.0, when `companies`, `xaa` and `x402`
-joined the release set (163 crates before). The same count holds for the
+committed `Cargo.lock` of the v1.21.0 release, in which `companies`, `xaa`
+and `x402` joined the release set (163 crates before). The same count holds for the
 `x86_64-unknown-linux-musl` target that ships.
 
 ## Footprint

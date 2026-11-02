@@ -30,7 +30,7 @@ agentd --config-schema | less    # every key, type and default
 agentd --build-info                # the features THIS binary was built with
 ```
 
-`--build-info` (from the next release) matters because features are
+`--build-info` (since v1.21.0) matters because features are
 compile-time: a config using `a2a:` on a binary built without it is a startup
 error, not a silent no-op. `--capabilities` shows what the configuration
 sets up, not the build.

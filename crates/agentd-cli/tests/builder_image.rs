@@ -300,6 +300,53 @@ fn the_official_image_is_built_by_agentd_build() {
 /// BUILD_INFO_FEATURES, the official build refuses unless it is exactly what
 /// the binary reports (`--expect-features`), and its default is held here to
 /// the release set's closure.
+/// The licence and the third-party notices travel with every binary the
+/// release ships: NOTICE carries the CC BY 4.0 attribution for the
+/// instruction.md registries each binary embeds as data, so a tarball or an
+/// image without it redistributes them unattributed.
+#[test]
+fn the_licence_and_notices_ship_with_every_binary() {
+    for f in ["LICENSE", "NOTICE"] {
+        assert!(root().join(f).is_file(), "the repository has no {f}");
+        assert!(
+            !read(".dockerignore").lines().any(|l| l.trim() == f),
+            ".dockerignore keeps {f} out of the build context"
+        );
+    }
+    // The image: from the build stage, the source the binary was built from.
+    let builder = stage("builder");
+    assert!(
+        builder.lines().any(|l| l == "WORKDIR /usr/src/agentd")
+            && builder.lines().any(|l| l == "COPY . ."),
+        "the builder holds the source at /usr/src/agentd"
+    );
+    let runtime = stages().pop().unwrap().1;
+    assert!(
+        runtime.lines().any(|l| l
+            == "COPY --from=build /usr/src/agentd/LICENSE /usr/src/agentd/NOTICE /usr/share/doc/agentd/"),
+        "the image ships LICENSE and NOTICE under /usr/share/doc/agentd/"
+    );
+    // Each tarball: `agentd`, `LICENSE` and `NOTICE`, side by side.
+    let binaries = job(&read(".github/workflows/release.yml"), "binaries");
+    let tar: Vec<&str> = binaries
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("tar czf "))
+        .collect();
+    assert_eq!(tar.len(), 1, "the binaries job packs one tarball: {tar:?}");
+    assert!(
+        tar[0].ends_with(".tar.gz\" agentd LICENSE NOTICE"),
+        "each tarball holds agentd, LICENSE and NOTICE: {}",
+        tar[0]
+    );
+    assert!(
+        binaries
+            .lines()
+            .any(|l| l.trim().starts_with("cp ") && l.ends_with(" LICENSE NOTICE dist/")),
+        "the binaries job copies LICENSE and NOTICE beside the binary"
+    );
+}
+
 #[test]
 fn the_image_is_labelled_with_its_features() {
     let runtime = stages().pop().unwrap().1;

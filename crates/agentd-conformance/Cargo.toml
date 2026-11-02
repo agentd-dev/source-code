@@ -11,7 +11,7 @@
 #   cargo run  -p agentd-conformance      # the same checks → a PASS/FAIL report
 [package]
 name = "agentd-conformance"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Black-box conformance suite for the agent runtime (A2A listener + supervisor + agent loop)"
@@ -37,4 +37,4 @@ libc = "0.2"
 # workspace's graph — no new crate — and the protocol itself, every JWT,
 # proof and request, is written here from the draft, not taken from agentd.
 ring = "0.17"
-net = { package = "agentd-net", path = "../net", version = "2.0.0", features = ["tls"] }
+net = { package = "agentd-net", path = "../net", version = "3.0.0", features = ["tls"] }

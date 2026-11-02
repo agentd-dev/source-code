@@ -13,7 +13,7 @@ you choose.
 > specification's commit `e7a3b4ff47`: over HTTP, MCP and A2A (the a2a-x402
 > extension), with the `exact` scheme on EVM chains (an EIP-3009
 > authorization) and on Solana (an SPL transfer). The release binaries and
-> the image carry it from the next release, in the `x402` build feature, and
+> the image carry it since v1.21.0, in the `x402` build feature, and
 > it pays nothing until you declare a spend policy.
 
 ## What it is
@@ -58,10 +58,9 @@ Use something else when:
 
 ## Get a binary with the feature
 
-The release binaries and the image carry `x402` from the next release, with
-`a2a`, over which the approver answers. Until then, the latest release is
-built without it: [build a checkout](install.md#build-from-source) with the
-release set.
+The release binaries and the image carry `x402` since v1.21.0, with `a2a`,
+over which the approver answers: [install](install.md) a release and it is
+there.
 
 A build from source needs `x402` in its feature list, as the release set has
 it. `x402` brings `oauth` with it, and two crates no other feature uses:

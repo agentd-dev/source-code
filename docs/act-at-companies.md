@@ -13,8 +13,8 @@ action that matters approved by the person.
 > are not backward compatible without changing its version, so this support
 > is a preview: it follows the pinned draft, not the newest one, and agentd
 > says so at load on every configuration that declares a company. The
-> release binaries and the image carry it from the next release, in the
-> `companies` build feature, and it does nothing until you declare a company.
+> release binaries and the image carry it since v1.21.0, in the `companies`
+> build feature, and it does nothing until you declare a company.
 
 ## What it is
 
@@ -58,10 +58,9 @@ Use something else when:
 
 ## Get a binary with the feature
 
-The release binaries and the image carry `companies` from the next release,
-with `a2a` for the gates and for `agentd --login company:<name>`, and `cel`
-for standing permissions. Until then, the latest release is built without it:
-[build a checkout](install.md#build-from-source) with the release set.
+The release binaries and the image carry `companies` since v1.21.0, with
+`a2a` for the gates and for `agentd --login company:<name>`, and `cel` for
+standing permissions: [install](install.md) a release and it is there.
 
 A build from source needs `companies` in its feature list, as the release
 set has it. `companies` brings `oauth` and `tls` with it and adds no crate of
@@ -803,7 +802,7 @@ gap.
 
 | You see | It means | Do this |
 |---|---|---|
-| `` `companies` needs the `companies` feature `` at load | a binary built without it, as every release binary is until the next release | [build with the feature](#get-a-binary-with-the-feature) |
+| `` `companies` needs the `companies` feature `` at load | a binary built without it, as every release binary before v1.21.0 is | [build with the feature](#get-a-binary-with-the-feature) |
 | `security.companies.client is required with a companies entry` | no identity | set `client.id` and `client.name` |
 | `store.kind none forgets every User ID …` | a store that keeps nothing | use the file store, or `mcp` or `http` with a `seal_key` |
 | `companies.shop.sign_in needs security.companies.seal_key` | a sign-in with nowhere sealed to keep its token | add a `seal_key` |

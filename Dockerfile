@@ -226,6 +226,12 @@ LABEL org.opencontainers.image.title="agentd" \
       dev.agentd.features="${BUILD_INFO_FEATURES}"
 
 COPY --from=build /out/agentd /agentd
+# The licence and the third-party notices go with the binary: NOTICE carries
+# the CC BY 4.0 attribution for the instruction.md registries every binary
+# embeds. From the build stage, so they are the source the binary was built
+# from; release.yml packs the same two files into each tarball, and
+# builder_image.rs holds both to it.
+COPY --from=build /usr/src/agentd/LICENSE /usr/src/agentd/NOTICE /usr/share/doc/agentd/
 # Non-root by uid (scratch has no /etc/passwd; the kernel just uses the number).
 # Matches the k8s manifests' runAsUser/runAsGroup 65532 (examples/k8s/).
 USER 65532:65532

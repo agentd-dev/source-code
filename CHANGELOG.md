@@ -5,7 +5,25 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.21.0 — instruction/1 on the official SDK, sections that own their endpoints, and MCP registries
+
+Instruction documents are `instruction/1`, read by the official
+instruction.md Rust SDK, `instruction-md`, from crates.io: its checks, its
+agent text, its digests and its signature verification, with agentd's own
+`agentd-instruction` gone from the workspace. Each section owns its
+endpoints (RFC 0055): the `services:` catalogue is removed, every kind moved
+to the section that uses it, and `http.endpoints` and `companies` are new. An
+`mcp.servers` entry with `connect: on_use` is dialed when first needed and
+signs the person in then, at a gate on the A2A interface; `mcp.registries`
+reads servers from registries on the official MCP Registry API v0.1, held to
+the names the operator approves. An instruction's machinery — its servers,
+skills, workflows and configuration — applies live by default when a new
+version is delivered. agentd is a client of MCP Tasks and of the Skills
+extension. The release binaries and the image carry `companies`, `xaa` and
+`x402`, each inert until configured, and the builder image,
+`ghcr.io/agentd-dev/agentd-builder`, is published with the release; each
+tarball and the image carry `LICENSE` and `NOTICE`. `agentd-mcp` is 5.0.0
+and `agentd-net` 3.0.0.
 
 **Breaking.**
 
@@ -2208,7 +2226,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   (the user's decision): `release.yml`'s `FEATURES`, the `Dockerfile`'s
   default, `deny.toml`'s graph and the CI row of the release set name all
   three. Each does nothing until configured — `companies` without a
-  `services` entry of `kind: company` or `security.companies`, `xaa`
+  `companies` entry or `security.companies`, `xaa`
   without `identity.*` (and a delegated server without
   `security.experimental.id_jag: true`), `x402` without
   `security.payments` — and given a configuration that uses none of them, a
@@ -2223,6 +2241,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   and ID-JAG are drafts, and DPoP, token exchange, CIBA, Enterprise-Managed
   Authorization, x402 and a company's OpenAPI operations are listed without
   a mark.
+- Each release tarball holds `LICENSE` and `NOTICE` beside `agentd`, and
+  the image carries the two under `/usr/share/doc/agentd/`, copied from the
+  source its binary was built from. `NOTICE` carries the CC BY 4.0
+  attribution for the instruction.md registries every binary embeds through
+  `instruction-md`. `builder_image.rs` holds `release.yml`'s packaging and
+  the `Dockerfile`'s runtime stage to both files.
 - **Breaking:** `agentd-mcp`'s `wire::CallToolResult` has a field `meta`,
   the result's `_meta` as the server sent it: x402 over MCP reads a
   payment's settlement there (RFC 0049 §7.1). The struct is not

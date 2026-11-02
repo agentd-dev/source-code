@@ -88,13 +88,17 @@ jobs:
         with:
           tool: cross
       - run: cross build --release --locked -p agentd-cli --target ${{ matrix.target }} --features "$FEATURES"
+      # The licence and the third-party notices go with the binary: NOTICE
+      # carries the CC BY 4.0 attribution for the instruction.md registries
+      # every binary embeds. The image has the same two files under
+      # /usr/share/doc/agentd/; builder_image.rs holds both to them.
       - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/agentd" dist/
+          cp "target/${{ matrix.target }}/release/agentd" LICENSE NOTICE dist/
           cd dist
-          tar czf "agentd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" agentd
-          rm agentd
+          tar czf "agentd-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" agentd LICENSE NOTICE
+          rm agentd LICENSE NOTICE
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*

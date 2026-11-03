@@ -564,7 +564,9 @@ fn packages_only_is_refused_and_deprecated_warns() {
     let cfg = write_cfg(&format!(
         "agent: {{name: reg}}\n{}mcp:\n{}workflows:\n  - name: both\n    steps:\n      s: {{kind: once}}\n      p: {{kind: mcp.tool, depends_on: [s], registry: official, server: io.acme/local, tool: mock.ops, on_error: continue}}\n      o: {{kind: mcp.tool, depends_on: [s], registry: official, server: io.acme/old, tool: mock.ops}}\n      f: {{kind: finish, depends_on: [p, o], status: completed}}\nlifecycle: {{run_until: drained}}\nobservability: {{log_level: info}}\n",
         store(&dir),
-        registries(&reg, "")
+        // A refused record is read again after `refresh`: an hour, so a
+        // slow run can't read it twice and the count below means one read.
+        registries(&reg, "").replace("refresh: 1s", "refresh: 1h")
     ));
     let d = Daemon::start(&cfg);
     let log = d.wait_for("the run", |l| run_done(l, "both").is_some());

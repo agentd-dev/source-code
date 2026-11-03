@@ -5,7 +5,21 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.23.0 — spending controls
+
+Allowances (RFC 0057, agentd's half of instruction.md RFC-0041): what
+agentd may spend, over what period, on whom, and who approves above an
+amount, set once in the operator's configuration and enforced across x402
+payments and a Company's priced operations, counted per allowance and
+calendar period and changed live by a reload. A Company's charges follow
+agentd's own record of each operation, so a Company can't erase or credit
+back what it was paid. Also: a recompose that can't start keeps the
+running agent, a once start never fires twice for one definition,
+`on_compose` turned on by reload starts the composed agents, a moved
+report reports to its new manager, and a registry's binding is made
+though its tool results carry a `resource_link`. agentd-core and
+agentd-cli 1.23.0 and @agentd-dev/cli 1.23.0; agentd-mcp 5.0.0 and
+agentd-net 3.0.1 are unchanged.
 
 **Added.**
 

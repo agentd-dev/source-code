@@ -91,6 +91,13 @@
     "tier": 2
   },
   {
+    "name": "MCP Registry",
+    "version": "v0.1",
+    "full": "The official MCP Registry API v0.1: a server named by its registry record, read when it is first used, approved by the operator",
+    "href": "/docs/mcp-registries/",
+    "tier": 2
+  },
+  {
     "name": "DPoP",
     "version": "RFC 9449",
     "full": "DPoP-bound tokens at companies, and at delegated MCP servers whose metadata advertise them",
@@ -201,6 +208,21 @@
     "version": "v2",
     "full": "x402 v2, paying for an HTTP resource, an MCP tool call or an A2A peer's task with an EIP-3009 authorization on an EVM chain or an SPL transfer on Solana, only within a spend policy the operator declares",
     "href": "/docs/pay-with-x402/",
+    "tier": 2
+  },
+  {
+    "name": "Spending allowances",
+    "version": "RFC-0041",
+    "mark": "draft",
+    "full": "instruction.md RFC-0041 allowances: a most per payment, a budget per period, a count, a window and the payees, with an approver above an amount, enforced across x402 and a Company's priced operations",
+    "href": "/docs/interoperability/#spending-allowances",
+    "tier": 2
+  },
+  {
+    "name": "AP2 · ACP · MPP",
+    "mark": "planned",
+    "full": "Agent Payments Protocol, Agentic Commerce Protocol and Machine Payments Protocol: planned payment rails under the same allowances, not yet supported",
+    "href": "/docs/interoperability/#spending-allowances",
     "tier": 2
   },
   {

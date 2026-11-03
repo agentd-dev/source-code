@@ -26,6 +26,7 @@ agentd over MCP.
 | [MCP Tasks](connect-mcp.md#long-running-tool-calls) | the extension SEP-2663 (`io.modelcontextprotocol/tasks`), on 2026-07-28 connections, as a client: a tool call a server answers with a task is followed to its end — a workflow step's as a durable wait that survives a restart, a model's within the call and then with `mcp.task.get` — polled at the server's interval or pushed on `subscriptions/listen`, cancelled with `tasks/cancel`. `mcp.servers[].tasks: off` refuses a server's tasks. In the release binaries. |
 | [MCP Skills](connect-mcp.md#load-skills-from-a-server) | the extension SEP-2640 (`io.modelcontextprotocol/skills`), on 2026-07-28 connections that declare it, as a client: `skills/list` (every page), `skills/get` for a skill no listing names, `resources/directory/read` where the server declares `directoryRead`. Every file is checked against its entry's `sha256:` digest and size, and `SKILL.md`'s frontmatter against the entry's; a skill is named by its server and URI. In the release binaries. |
 | [Enterprise-Managed Authorization](authentication.md#enterprise-managed-authorization) | the extension `io.modelcontextprotocol/enterprise-managed-authorization`, as a client, on servers of `grant: id_jag`: declared in `initialize`'s capabilities at 2025-11-25 and in every request's `_meta` at 2026-07-28; the server is reached with an access token its authorization server issued for an ID-JAG from the person's IdP, once its RFC 9728 metadata has confirmed the pinned resource and authorization server. A preview: in the release binaries, and a server of `grant: id_jag` needs `security.experimental.id_jag: true`. |
+| [MCP Registry](mcp-registries.md) | the official registry API **v0.1**, as a client: a server is named in `mcp.registries` and its `server.json` record read when it is first used (`GET {url}/v0.1/servers/{name}/versions/{version}`), the endpoint it names dialled with agentd's own credentials. A registry approves nothing by default: the operator lists the names it may serve, and the model searches it only with `discover` turned on. The registry is never an authority for trust. |
 | Authorization | OAuth 2.1 with RFC 9728 protected-resource discovery, and the other outbound schemes [below](#credentials-agentd-can-present). Client registration in the order 2026-07-28 gives: a configured `client_id`, else agentd's [Client ID Metadata Document](authentication.md#client-id-metadata-document) where the authorization server advertises one; dynamic client registration, which that revision deprecates, is not implemented. |
 
 **Not supported:** `sampling` and `roots` (agentd declares no client
@@ -133,7 +134,7 @@ a draft.
 | Tested against | agentd's own fake company, in the conformance suite's `companies` family. Nothing published tests a personal agent. |
 
 **Not supported:** Mediated Sign-In; joining a browser to a Session; several
-Users per instance or several accounts per User at one company; the Company
+Users per instance; the Company
 and Company Agent roles; the push and attachments the draft leaves open; any
 revision of the draft but the pinned one.
 [Act at companies for a person](act-at-companies.md) is the guide, and
@@ -166,6 +167,28 @@ Permit2 and ERC-7710; Solana's address lookup tables and smart wallets; the
 APIs; acting on x402 extensions, which are echoed as received.
 [Pay for things with x402](pay-with-x402.md) is the guide, and
 [RFC 0049](../rfcs/0049-paying-for-things.md) the design.
+
+## Spending allowances
+
+instruction.md's RFC-0041 states the limits a person means for an agent's
+spending once, above the payment protocols: a most per payment, a budget
+per period, a count, a window, the payees, and who approves above an
+amount. agentd enforces them as allowances, across the rails it pays on.
+The RFC is a draft in instruction.md, and its document form is not in the
+specification yet.
+
+| | Support |
+|---|---|
+| Allowances | `security.payments.allowances`, in the operator's configuration: `max`, `budget` per `day`, `week`, `month`, `quarter`, `year` or `once` (UTC calendar periods), `times`, `from` and `until`, `payees`, `approve_above` and its `approver`. Amounts are money in an ISO 4217 currency, counted exactly, per allowance and period, and a change applies on reload. |
+| Rails | [x402](#x402) (an asset is usable when it says which currency it is) and a [Company's priced operations](act-at-companies.md#spending-at-a-company), which the User still approves. |
+| Refusals | a payment past a limit, or under a limit no rail can enforce (`categories`; `rail-cannot-enforce`), is refused, naming the allowance and the limit. |
+| Planned | AP2, ACP with Shared Payment Tokens, and MPP, as further rails under the same allowances. agentd doesn't speak them yet. |
+
+**Not supported:** a document's own wallets and allowances (they wait on the
+specification); converting between currencies; `categories`, which no rail
+agentd pays on can enforce.
+[Allowances](pay-with-x402.md#allowances) is the guide, and
+[RFC 0057](../rfcs/0057-spending-controls.md) the design.
 
 ## Model providers
 

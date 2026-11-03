@@ -66,7 +66,7 @@ function Card({ tag, title, children }) {
    logo or artwork: the names are stated as facts, and the Personal Agent
    Protocol's licence leaves its name and logo out of its grant. A mark says
    what is not settled: `preview` is not in a release binary, `draft` is a
-   specification still in draft. */
+   specification still in draft, `planned` is not supported yet. */
 function Standard({ s }) {
   return (
     <li>

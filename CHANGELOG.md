@@ -5,7 +5,18 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.24.0 — the org chart
+
+Reporting lines in the operator's configuration: `reports_to` and `title`
+on `subagents.templates.<name>` and on `a2a.peers[]`, a label only that
+grants nothing, checked at load (an unknown name, an agent reporting to
+itself, a cycle across templates, peers and a document's own lines), shown
+wherever a document's reporting line already was, and drawn whole as the
+operator's `org` in `status`. A reload moves a line without a restart. The
+operator's names stand across kinds: a document's peer or agent under a
+name the operator gives a template, a peer or `agent.name` is held.
+agentd-core and agentd-cli 1.24.0 and @agentd-dev/cli 1.24.0; agentd-mcp
+5.0.0 and agentd-net 3.0.1 are unchanged.
 
 **Added.**
 

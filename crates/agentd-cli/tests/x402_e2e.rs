@@ -1678,3 +1678,120 @@ fn a_reload_removing_an_allowance_a_step_names_is_refused() {
     assert!(d.events("payment.allowance.removed").is_empty());
     assert!(d.events("config.reloaded").is_empty());
 }
+
+/// The A2A top of a daemon that stays up, serving the operator (`OPS`) and
+/// the user `alice` (`ALICE`).
+#[cfg(all(feature = "x402", feature = "a2a"))]
+fn listening(port: u16) -> String {
+    format!(
+        "lifecycle: {{run_until: drained}}\na2a:\n  listen: \"http://127.0.0.1:{port}\"\n  bearer: \"{{{{secret:OPS}}}}\"\n  principals:\n    - {{id: alice, match: {{bearer_ref: \"{{{{secret:ALICE}}}}\"}}, role: user}}\n"
+    )
+}
+
+/// Review finding 5: the `payment.allowances` tool is the operator's
+/// alone, as the op is: a run the operator starts reads it, a run a user
+/// starts is refused it.
+#[cfg(all(feature = "x402", feature = "a2a"))]
+#[test]
+fn the_payment_allowances_tool_is_the_operators_alone() {
+    let dir = scratch();
+    let payments = under_allowance(dir.path(), "max: \"0.05\", budget: \"1\", per: month");
+    let steps = "      done: {kind: finish, depends_on: [s]}\n  - name: peek\n    steps:\n      m: {kind: manual}\n      left: {kind: tool, name: payment.allowances, depends_on: [m]}\n      f: {kind: finish, depends_on: [left], output: \"{{ steps.left.output }}\"}\n";
+    let (d, addr) = common::spawn_bound(|port| {
+        let cfg = config(dir.path(), &payments, &listening(port), "buy", steps);
+        if !dir.path().join("ops.key").exists() {
+            wallet_address(&cfg);
+        }
+        let d = Daemon::spawn(
+            &cfg,
+            &[("OPS", "ops-bearer-x402"), ("ALICE", "alice-bearer-x402")],
+        );
+        let log = d.log.display().to_string();
+        (d, log)
+    });
+    let peek = |bearer: &str| {
+        let before = d
+            .events("run.done")
+            .into_iter()
+            .filter(|e| e["workflow"] == "peek")
+            .count();
+        let v = common::SendMessage::command("workflow.run", json!({"workflow": "peek"}))
+            .bearer(bearer)
+            .post(&addr);
+        assert!(v.get("error").is_none(), "{v}");
+        d.wait("peek done", |d| {
+            d.events("run.done")
+                .into_iter()
+                .filter(|e| e["workflow"] == "peek")
+                .nth(before)
+        })
+    };
+    let ops = peek("ops-bearer-x402");
+    assert_eq!(ops["status"], "completed", "{ops}");
+    assert!(ops["output"].to_string().contains("allowances"), "{ops}");
+    let alice = peek("alice-bearer-x402");
+    assert_eq!(alice["status"], "failed", "{alice}");
+    assert!(
+        alice["err"].to_string().contains("the operator's alone"),
+        "{alice}"
+    );
+}
+
+/// Review finding 6: an approval landing after a reload named another
+/// approver for the allowance approves nothing — the old approver's yes is
+/// declined, said, and nothing is paid.
+#[cfg(all(feature = "x402", feature = "a2a", feature = "hot-reload"))]
+#[test]
+fn an_answer_from_an_approver_a_reload_replaced_approves_nothing() {
+    let dir = scratch();
+    let m = mock(json!({"price": "30000"}));
+    let payments = under_allowance(
+        dir.path(),
+        "max: \"0.05\", budget: \"1\", per: month, approve_above: \"0.02\", approver: \"user:alice\"",
+    );
+    let steps = format!(
+        "{}      done: {{kind: finish, depends_on: [a]}}\n",
+        drawing("a", "s", &format!("{}/a", m.url), ", on_error: continue"),
+    );
+    let mut path = None;
+    let (d, addr) = common::spawn_bound(|port| {
+        let cfg = config(dir.path(), &payments, &listening(port), "buy", &steps);
+        if !dir.path().join("ops.key").exists() {
+            wallet_address(&cfg);
+        }
+        path = Some(cfg.clone());
+        let d = Daemon::spawn(
+            &cfg,
+            &[("OPS", "ops-bearer-x402"), ("ALICE", "alice-bearer-x402")],
+        );
+        let log = d.log.display().to_string();
+        (d, log)
+    });
+    let cfg = path.unwrap();
+    let asked = d.wait("payment.asked", |d| {
+        d.events("payment.asked").into_iter().next()
+    });
+    let task = asked["task"].as_str().unwrap().to_string();
+    let text = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replace("approver: \"user:alice\"", "approver: operator");
+    std::fs::write(&cfg, text).unwrap();
+    reload(&d);
+    d.wait("payment.allowance.changed", |d| {
+        d.events("payment.allowance.changed").into_iter().next()
+    });
+    let v = common::SendMessage::text("approve")
+        .task(&task)
+        .bearer("alice-bearer-x402")
+        .post(&addr);
+    assert!(v.get("error").is_none(), "{v}");
+    let a = d.step("a");
+    assert!(
+        a["err"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("allowance api's approver is now operator, not user:alice"),
+        "{a}"
+    );
+    assert!(paid(&m).is_empty(), "nothing was paid");
+}

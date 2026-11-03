@@ -1108,17 +1108,39 @@ impl Runtime {
         if let Some(t) = self.tasks.get_mut(task) {
             t.record_inbound(message);
         }
-        let approved = decision == "approve";
-        let note = if approved {
-            format!("approved by {}", principal.id)
-        } else {
-            format!("declined by {}; nothing was paid", principal.id)
+        // The approver as the allowance says now: a reload that named
+        // another, or removed the allowance, leaves the old approver's
+        // answer approving nothing (RFC 0057 §4.4).
+        let stale = g.pending.step_payment.allowance.as_deref().and_then(|aid| {
+            let now = match self.allowance_now(aid) {
+                Err(e) => return Some(e),
+                Ok(a) => a.approver.unwrap_or_else(|| {
+                    self.payments
+                        .as_ref()
+                        .map(|p| p.policy.approver.clone())
+                        .unwrap_or_default()
+                }),
+            };
+            (now != approver).then(|| {
+                format!(
+                    "allowance {aid}'s approver is now {now}, not {approver}: this answer approves nothing"
+                )
+            })
+        });
+        let approved = decision == "approve" && stale.is_none();
+        let note = match (&stale, approved) {
+            (Some(why), _) => format!("declined: {why}; nothing was paid"),
+            (None, true) => format!("approved by {}", principal.id),
+            (None, false) => format!("declined by {}; nothing was paid", principal.id),
         };
         self.close_payment_task(task, crate::a2a::tasks::State::Completed, &note);
         let mut t = base;
         t["by"] = json!(principal.id);
         if let Some(sid) = &principal.session {
             t["sid"] = json!(sid);
+        }
+        if let Some(why) = &stale {
+            t["why"] = json!(why);
         }
         let outcome = if approved { "approved" } else { "declined" };
         self.log
@@ -1145,10 +1167,10 @@ impl Runtime {
                 &step,
                 StepStatus::Failed,
                 None,
-                Some(format!(
-                    "payment declined by {}: nothing was paid",
-                    principal.id
-                )),
+                Some(match &stale {
+                    Some(why) => format!("payment declined: {why}; nothing was paid"),
+                    None => format!("payment declined by {}: nothing was paid", principal.id),
+                }),
                 0,
             );
             self.reject_payment(&run, &step, g.pending.call);

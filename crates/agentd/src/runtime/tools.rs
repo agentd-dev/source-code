@@ -1238,7 +1238,15 @@ impl Runtime {
             // The model is its caller's deputy: it reads what that caller may.
             "status" => ok(self.status_for(caller.principal.as_deref())),
             // ---- allowances: what each has left (RFC 0057 §6), read-only ----
-            "payment.allowances" => ok(self.allowances_value()),
+            // The operator's alone, as the op is: work acting for anyone
+            // else — a user's turn, a run a user started — is refused.
+            "payment.allowances" => match self.acting_principal(caller.principal.as_deref()) {
+                Some(p) if !p.is_operator() => err(format!(
+                    "payment.allowances: the operator's alone, and this work acts for {}",
+                    p.id
+                )),
+                _ => ok(self.allowances_value()),
+            },
             // ---- companies ----
             #[cfg(feature = "companies")]
             "company.status" => ok(self.company_status(false)),

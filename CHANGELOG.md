@@ -5,7 +5,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.22.0 — a document's own agents
+
+An instruction document can now define the team agentd runs: each `agent`
+with no protocol becomes a subagent template, nested agents carry their
+reporting line, `subagents.document_agents.start: on_compose` starts the
+team at load, and a reload recomposes the live children. It is behind a
+new operator grant, `agent.document_capabilities: [agents]`, off by
+default, and over the wire it needs a pinned publisher whose signature
+attests `agents`. Also a run of fixes found by recording the support and
+company demos: the TUI in a narrow pane, keys typed faster than a redraw,
+the subagents screen's reporting line after a resync, and a TLS certificate
+rotation written in the same clock tick. agentd-core and agentd-cli 1.22.0,
+agentd-net 3.0.1 and @agentd-dev/cli 1.22.0; agentd-mcp 5.0.0 is unchanged.
 
 **Added.**
 
@@ -76,6 +88,37 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   setting of skills given as text, under their instruction.md ids
   (`web.search` included, checked at template compile); they were stripped
   and lost.
+
+- **`examples/demos/support-tmux.sh` takes its size** from `SUPPORT_COLS`,
+  `SUPPORT_ROWS` and `SUPPORT_WATCH_ROWS` (defaults 120, 32 and 8).
+
+**Fixed.**
+
+- **The TUI's composer holds a long input in a narrow pane.** The input box
+  is given its width, and the composer's height is measured, so wrapped
+  input no longer overflows into the transcript.
+- **A reply wrapped in a narrow pane keeps every character.** The TUI wraps
+  the transcript itself at the column it draws at; before, a word at a
+  break could lose a character or lead with a space.
+- **A reply taller than the pane shows its end, every row in order.** The
+  transcript's window cuts the oldest wrapped rows of the first entry it
+  shows, measured exactly (user messages, command suffixes, hints and
+  durations included), and the top and bottom bars are measured rather
+  than guessed.
+- **Keys typed faster than a redraw all land, and Enter sends them.** The
+  composer edited the value as of the last render, so keys that arrived
+  before React re-rendered (a fast typist, `tmux send-keys`) overwrote each
+  other and Enter sent what was there before.
+- **The status document and `subagent.list` name each child's reporting
+  line.** The feed's `subagent` items carried `template`, `tier` and
+  `reports_to`; the status document a client adopts on connect or resync
+  left `reports_to` out, and `subagent.list` carried none of them, so the
+  TUI's subagents screen lost its "reports to" column on a resync.
+- **A TLS certificate rotation written in the same clock tick is picked
+  up** (agentd-net 3.0.1). The reloading acceptor compared only the files'
+  mtimes; it now compares mtime, size and inode.
+- **pulldown-cmark 0.13.6** (RUSTSEC-2026-0433), a build-time dependency of
+  the A2A protocol bindings.
 
 ## v1.21.1 — the operator's names stand, and only Personal Agent Protocol 0.1 is spoken
 

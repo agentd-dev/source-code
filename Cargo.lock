@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-cli"
-version = "1.21.1"
+version = "1.22.0"
 dependencies = [
  "agentd-core",
  "instruction-md",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-core"
-version = "1.21.1"
+version = "1.22.0"
 dependencies = [
  "a2a-lf",
  "a2a-pb",
@@ -131,7 +131,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-net"
-version = "3.0.0"
+version = "3.0.1"
 dependencies = [
  "rustls",
  "webpki-roots",

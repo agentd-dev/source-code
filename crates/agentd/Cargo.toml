@@ -6,7 +6,7 @@
 # (and the default `tls`) only.
 [package]
 name = "agentd-core"
-version = "1.21.1"
+version = "1.22.0"
 edition = "2024"
 rust-version = "1.96"
 description = "Minimal, MCP-native agent runtime as a library: the agentic loop, supervisor, workflows, and code-registered tools (the agentd engine)"
@@ -238,7 +238,7 @@ mcp = { package = "agentd-mcp", path = "../mcp", version = "5.0.0" }
 # Shared transport primitives (workspace crate): the HTTP/1.1+SSE client, unix +
 # feature-gated tls connects, SSRF guard. Owns the rustls/webpki deps
 # (agentd's `tls` feature maps to `net/tls`).
-net = { package = "agentd-net", path = "../net", version = "3.0.0" }
+net = { package = "agentd-net", path = "../net", version = "3.0.1" }
 # The one non-negotiable dependency: JSON is the MCP + LLM wire format.
 # Keep all wire types in one module (json/, wire/) so a swap to miniserde
 # stays mechanical (rfcs/0002).

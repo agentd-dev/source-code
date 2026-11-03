@@ -59,7 +59,7 @@ agentd --version
 
 ```text
 /home/you/.cargo/bin/agentd
-agentd 1.21.1
+agentd 1.22.0
 ```
 
 > **Note.** A release binary leaves out `exec`, so it refuses

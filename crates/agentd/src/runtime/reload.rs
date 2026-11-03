@@ -193,7 +193,12 @@ impl Runtime {
         // Read live at every payment and charge (RFC 0057 §4.4): applied
         // once the settings are — a Company charge taken from now on is
         // judged against them.
-        self.spending.set_allowances(self.allowances());
+        if let Err(e) = self.spending.set_allowances(self.allowances()) {
+            // Applied all the same: every allowance now counts as spent in
+            // full, so nothing is paid or charged under one.
+            self.log
+                .error("payment.allowance.unreadable", json!({"err": e}));
+        }
         if self.allowances_reloaded(&old) {
             changed.retain(|c| *c != "nothing");
             changed.push("security.payments.allowances");

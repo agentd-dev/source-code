@@ -291,6 +291,7 @@ and a Company's priced operation ([Spending at a
 Company](act-at-companies.md#spending-at-a-company)) draw on the same one.
 
 ```yaml
+# fragment: added to the spend policy above
 security:
   payments:
     assets:

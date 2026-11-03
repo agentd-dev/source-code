@@ -775,8 +775,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // can charge one.
     let spending = match crate::spending::Spending::open(Arc::clone(&durable)) {
         Ok(s) => {
-            s.set_allowances(crate::spending::Allowance::all(&settings.security.payments));
-            Arc::new(s)
+            match s.set_allowances(crate::spending::Allowance::all(&settings.security.payments)) {
+                Ok(()) => Arc::new(s),
+                Err(e) => {
+                    log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+                    return crate::exit::USAGE;
+                }
+            }
         }
         Err(e) => {
             log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));

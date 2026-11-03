@@ -412,6 +412,10 @@ pub struct Spending {
     /// reload, read under the charges' lock when a Company charge is
     /// taken, so the charge is judged against what is in force then.
     live: Mutex<BTreeMap<String, Allowance>>,
+    /// Whether the charges kept in the store were read: `None` not yet,
+    /// `Some(Err)` they could not be, and nothing under an allowance is paid
+    /// or charged until they are.
+    read: Mutex<Option<Result<(), String>>>,
 }
 
 /// What [`Spending::charge`] did.
@@ -426,8 +430,23 @@ pub enum Charged {
 }
 
 impl Spending {
-    /// Every charge kept in the store, read.
+    /// The ledger of `durable`'s charges, not read yet: an instance that
+    /// declares no allowance never reads it (a store's credential records are
+    /// read only by an instance that uses them). [`Spending::set_allowances`]
+    /// reads it the first time an allowance is in force.
     pub fn open(durable: Arc<Durable>) -> Result<Spending, String> {
+        Ok(Spending {
+            durable,
+            charges: Mutex::new(Charges(BTreeMap::new())),
+            x402: OnceLock::new(),
+            live: Mutex::new(BTreeMap::new()),
+            read: Mutex::new(None),
+        })
+    }
+
+    /// Every charge kept in the store, read into the ledger.
+    fn read_charges(&self) -> Result<(), String> {
+        let durable = &self.durable;
         let list = durable
             .list_prefix(Kind::Cred, PREFIX)
             .map_err(|e| format!("the spending ledger: {e}"))?;
@@ -452,12 +471,8 @@ impl Spending {
             })?;
             charges.insert(c.id(), c);
         }
-        Ok(Spending {
-            durable,
-            charges: Mutex::new(Charges(charges)),
-            x402: OnceLock::new(),
-            live: Mutex::new(BTreeMap::new()),
-        })
+        self.hold().0.extend(charges);
+        Ok(())
     }
 
     /// The x402 ledger, counted beside the charges from here on.
@@ -480,6 +495,16 @@ impl Spending {
         now_ms: u64,
         except: Option<(&str, &str)>,
     ) -> Usage {
+        if !matches!(
+            *self.read.lock().unwrap_or_else(|e| e.into_inner()),
+            Some(Ok(()))
+        ) {
+            // What was spent is not known: nothing more is.
+            return Usage {
+                spent: u128::MAX,
+                payments: u32::MAX,
+            };
+        }
         let since = a.since(now_ms);
         let skip = except.map(|(c, o)| charge_id(c, o));
         let mut u = Usage::default();
@@ -502,16 +527,27 @@ impl Spending {
     }
 
     /// The allowances in force from now on: every reload sets them.
-    pub fn set_allowances(&self, all: BTreeMap<String, Allowance>) {
+    /// The first time one is in force, the charges kept in the store are
+    /// read; an error says they could not be, and until they are, every
+    /// allowance counts as spent in full.
+    pub fn set_allowances(&self, all: BTreeMap<String, Allowance>) -> Result<(), String> {
+        let any = !all.is_empty();
         *self.live.lock().unwrap_or_else(|e| e.into_inner()) = all;
+        if !any {
+            return Ok(());
+        }
+        let mut read = self.read.lock().unwrap_or_else(|e| e.into_inner());
+        if !matches!(*read, Some(Ok(()))) {
+            *read = Some(self.read_charges());
+        }
+        read.clone().unwrap_or(Ok(()))
     }
 
     /// One allowance in force from now on, beside the others.
-    pub fn set_allowance(&self, a: Allowance) {
-        self.live
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(a.id.clone(), a);
+    pub fn set_allowance(&self, a: Allowance) -> Result<(), String> {
+        let mut all = self.live.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        all.insert(a.id.clone(), a);
+        self.set_allowances(all)
     }
 
     /// The allowance `id` as it is in force now, or why there is none.
@@ -1029,7 +1065,7 @@ mod tests {
         a.payees = Some(vec!["shop".into()]);
         let now = crate::state::now_ms();
         let s = Spending::open(durable()).unwrap();
-        s.set_allowance(a.clone());
+        s.set_allowance(a.clone()).unwrap();
         let g = "groceries";
         assert_eq!(
             s.charge(g, "shop", "op1", gbp("50"), now),
@@ -1044,7 +1080,7 @@ mod tests {
         assert_eq!(s.charge(g, "shop", "op2", gbp("1"), now), Ok(Charged::Held));
         assert_eq!(s.charge_of("shop", "op2").unwrap().amount, "100");
         a.max = gbp("300");
-        s.set_allowance(a.clone());
+        s.set_allowance(a.clone()).unwrap();
         let e = s.charge(g, "shop", "op3", gbp("300"), now).unwrap_err();
         assert_eq!(
             e,
@@ -1064,10 +1100,10 @@ mod tests {
         // Judged against the allowance in force, not the one a caller read.
         let mut lower = a.clone();
         lower.max = gbp("10");
-        s.set_allowance(lower);
+        s.set_allowance(lower).unwrap();
         let e = s.charge(g, "shop", "op4", gbp("20"), now).unwrap_err();
         assert!(e[0].contains("max 10 GBP, this payment 20"), "{e:?}");
-        s.set_allowance(a.clone());
+        s.set_allowance(a.clone()).unwrap();
         // agentd's record moving to a final state settles the charge: a
         // succeeded operation's stays counted whatever comes after.
         assert_eq!(
@@ -1090,6 +1126,7 @@ mod tests {
             Some(ChargeState::Confirmed)
         );
         let s = Spending::open(durable()).unwrap();
+        s.set_allowance(a.clone()).unwrap();
         let u = s.usage(&s.hold(), &a, now, None);
         assert_eq!(
             (u.spent, u.payments),

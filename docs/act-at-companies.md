@@ -736,6 +736,7 @@ A company entry can charge its operations to an allowance ([Allowances](pay-with
 in the allowance's currency.
 
 ```yaml
+# fragment: added to a configuration that declares the company
 security:
   payments:
     allowances:

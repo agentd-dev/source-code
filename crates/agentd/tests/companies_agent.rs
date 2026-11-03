@@ -5234,7 +5234,10 @@ fn confirm_charged(
     ct: &agentd::companies::operations::ChargeTerm,
 ) -> Vec<Step> {
     // In force, as the runtime sets it.
-    a.sup.spending().set_allowance(ct.allowance.clone());
+    a.sup
+        .spending()
+        .set_allowance(ct.allowance.clone())
+        .unwrap();
     confirm_in_force(a, id, given, ct)
 }
 
@@ -5556,7 +5559,8 @@ fn a_charge_is_judged_against_the_allowance_in_force() {
     let handed = shopping("100", "100", "");
     a.sup
         .spending()
-        .set_allowance(shopping("10", "100", "").allowance);
+        .set_allowance(shopping("10", "100", "").allowance)
+        .unwrap();
     let id = propose(&a, "itm_1", "stormline-m", "lowered");
     let e = done(&confirm_in_force(&a, &id, None, &handed)).unwrap_err();
     assert!(

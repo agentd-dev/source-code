@@ -25,6 +25,11 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   and a `once` start fires once per definition in a process's life
   (`start.once.skipped` says `fired`). A reload that installs a changed
   definition still fires it, as before.
+- **A reload that turns `subagents.document_agents.start: on_compose` on
+  starts the agents already composed.** It started only agents the same
+  reload added; now it starts every instance-tier document agent whose
+  singleton is not live, under the instance ceilings, and a refused one is
+  logged as `subagent.template.start_refused`.
 
 ## v1.22.0 — a document's own agents
 

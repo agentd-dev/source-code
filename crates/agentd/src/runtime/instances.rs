@@ -1059,6 +1059,13 @@ impl Runtime {
             {
                 continue;
             }
+            // One live already — restored, spawned by a workflow, or being
+            // recomposed — is this agent's singleton: nothing to start.
+            if self.subagents.values().any(|s| {
+                s.template.as_deref() == Some(name.as_str()) && !is_terminal_status(&s.status)
+            }) {
+                continue;
+            }
             let reports_to = t.spec.document.as_ref().and_then(|d| d.reports_to.clone());
             match self.instance_run(&super::tools::ToolCaller::default(), name, &json!({})) {
                 ToolOutcome::Ready(v, false) => {

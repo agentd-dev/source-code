@@ -1513,7 +1513,7 @@ instruction document adds templates of its own under the `agents` grant
 | Path | Type | Default | What it does |
 |---|---|---|---|
 | `subagents.allow_freeform` | bool | `true` | `false` makes templates the only spawn path. |
-| `subagents.document_agents.start` | `manual \| on_compose` | `manual` | When the instruction document's agents start. `manual`: a workflow or the model spawns them. `on_compose`: agentd starts each instance-tier document agent's singleton at load and when a reload adds one, under every `limits.subagents.instances` ceiling; a spawn that finds one live gets it back. See [A document's own agents](delegate-subagents.md#start-the-team-with-the-document). |
+| `subagents.document_agents.start` | `manual \| on_compose` | `manual` | When the instruction document's agents start. `manual`: a workflow or the model spawns them. `on_compose`: agentd starts each instance-tier document agent's singleton at load, when a reload adds one, and, for every one not live, when a reload turns `on_compose` on, under every `limits.subagents.instances` ceiling; a spawn that finds one live gets it back. See [A document's own agents](delegate-subagents.md#start-the-team-with-the-document). |
 | `subagents.defaults.model` | string | `roles.turn` | The model a spawn runs on. |
 | `subagents.defaults.mode` | `sync \| async \| detached \| warm` | `sync` | How the parent waits. |
 | `subagents.defaults.priority` | `low \| normal \| high` | `normal` | Contention weight. |

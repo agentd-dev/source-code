@@ -1189,14 +1189,24 @@ impl Runtime {
             self.log_document_templates(Some(&moved));
             self.recompose_children(&was, &now);
             // A document agent the reload added starts now, under
-            // `start: on_compose`; a changed one is respawned above.
-            let added: std::collections::BTreeSet<String> = now
-                .keys()
-                .filter(|n| !was.contains_key(*n))
-                .cloned()
-                .collect();
-            if !added.is_empty() {
-                self.start_document_agents(Some(&added));
+            // `start: on_compose`; a changed one is respawned above. A
+            // reload that turns `on_compose` on starts every one whose
+            // singleton is not live, the ones composed before it included.
+            let on = |s: &crate::config::settings::Settings| {
+                s.subagents.document_agents.start
+                    == crate::config::settings::DocumentAgentStart::OnCompose
+            };
+            if on(&new) && !on(old) {
+                self.start_document_agents(None);
+            } else {
+                let added: std::collections::BTreeSet<String> = now
+                    .keys()
+                    .filter(|n| !was.contains_key(*n))
+                    .cloned()
+                    .collect();
+                if !added.is_empty() {
+                    self.start_document_agents(Some(&added));
+                }
             }
             if old.subagents != new.subagents {
                 changed.push("subagents");

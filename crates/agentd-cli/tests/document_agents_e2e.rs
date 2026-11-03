@@ -762,3 +762,48 @@ fn a_recompose_that_cannot_start_keeps_the_running_child() {
         "the running alpha was retired: {log}"
     );
 }
+
+/// Turning `start: on_compose` on by a reload starts the agents the
+/// document had already composed, under the instance ceilings: with breadth
+/// for two, two of three start and the third's refusal is said.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn turning_on_compose_on_by_reload_starts_the_composed_agents() {
+    let extra = format!("limits: {{ subagents: {{ instances: {{ breadth: 2 }} }} }}\n{KEEPALIVE}");
+    let mut d = Daemon::boot_with(&team_in("warm", false), "drained", &extra);
+    d.wait_for("the team to be composed", |d| {
+        events(&d.log(), "subagent.template.composed").len() == 3
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(events(&d.log(), "instance.spawn").is_empty(), "{}", d.log());
+    let cfg = format!("{}/c.yaml", d.dir);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("subagents: { document_agents: { start: on_compose } }\n");
+    std::fs::write(&cfg, text).unwrap();
+    d.sighup();
+    d.wait_for("two to start and one to be refused", |d| {
+        let log = d.log();
+        events(&log, "subagent.template.started").len() == 2
+            && events(&log, "subagent.template.start_refused").len() == 1
+    });
+    let log = d.log();
+    let refused = &events(&log, "subagent.template.start_refused")[0];
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("breadth")),
+        "{refused}"
+    );
+    let started: Vec<String> = ["alpha", "beta", "gamma"]
+        .iter()
+        .filter(|t| d.handles(t).len() == 1)
+        .map(|t| t.to_string())
+        .collect();
+    assert_eq!(started.len(), 2, "{log}");
+    for t in &started {
+        let h = d.handles(t)[0].clone();
+        d.wait_for("each started agent's own workflow", |d| {
+            d.child_ran(&h, &format!("{t}-up"))
+        });
+    }
+}

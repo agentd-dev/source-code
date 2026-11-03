@@ -942,7 +942,8 @@ document_agents: {start: on_compose}
 
 With `start: on_compose`, agentd starts each instance-tier document agent's
 singleton at load, once the listeners are up, and each one a reload adds,
-with no workflow. A changed agent is respawned and a removed one retired, as
+with no workflow. A reload that turns `on_compose` on starts each one whose
+singleton is not live, the agents already composed included. A changed agent is respawned and a removed one retired, as
 any reload does. Every start obeys `limits.subagents.instances`: one refused
 is logged as `subagent.template.start_refused`, and the others still start.
 A workflow that spawns an agent already live gets the live one back

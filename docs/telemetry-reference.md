@@ -935,7 +935,7 @@ an instruction's by `origin: instruction` and `name`.
 | `subagent.template.respawned` | info | `handle`, `template`, `was` | A recomposed singleton started again from its new template; `was` the child it replaces. |
 | `subagent.template.retired` | info | `handle`, `template`, `why` | A reload removed the template of a live instance child, or made it no longer a singleton instance child: the child is retired and not started again. |
 | `subagent.template.start_refused` | warn | `error`, `reports_to`, `template` | Under `subagents.document_agents.start: on_compose`, a document agent's start was refused, by an instance ceiling say; the others still start. |
-| `subagent.template.started` | info | `handle`, `reports_to`, `template` | Under `subagents.document_agents.start: on_compose`, a document agent's singleton started: at load, or when a reload added it. |
+| `subagent.template.started` | info | `handle`, `reports_to`, `template` | Under `subagents.document_agents.start: on_compose`, a document agent's singleton started: at load, when a reload added it, or when a reload turned `on_compose` on and it was not live. |
 | `subagent.turn` | info | `handle`, `status` |  |
 
 ### timer

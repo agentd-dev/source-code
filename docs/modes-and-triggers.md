@@ -128,7 +128,7 @@ reference](node-registry.md) lists every field.
 
 | Start kind | Fires a run |
 |---|---|
-| `once` | at startup. `policy: ensure` (the default) fires unless a run it started is still on record, live or finished; `policy: always` fires on every boot |
+| `once` | at startup. `policy: ensure` (the default) fires unless a run it started is still on record, live or finished; `policy: always` fires on every boot. Within one boot a `once` start fires once per definition: a reload that installs a changed definition fires it again, but `workflow.resume`, `workflow.create` and `workflow.update` do not fire one that already fired for the same definition |
 | `manual` | only when asked: the `workflow.run` tool, an A2A `workflow.run` command, or a `workflow` step |
 | `loop` | again after each run ends, paced by `interval`, until a condition or `max_iterations` |
 | `schedule` | on a clock: a five-field UTC `cron`, an `every` interval, or an `at` delay |

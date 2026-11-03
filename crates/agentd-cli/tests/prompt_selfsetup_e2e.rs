@@ -171,3 +171,95 @@ fn an_agent_written_definition_naming_an_undeclared_server_is_refused() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// A `once {policy: always}` start fires once per daemon life: resuming a
+/// workflow (another one, or its own), and defining or redefining one,
+/// re-arm only what they touched, and an unchanged once-start that already
+/// fired is not fired again. Each of them re-armed every workflow, and
+/// `init` ran again.
+#[test]
+fn resume_and_redefine_do_not_fire_an_always_once_start_again() {
+    let made = json!({"name": "made", "steps": {
+        "m": {"kind": "manual"},
+        "f": {"kind": "finish", "depends_on": ["m"]}
+    }});
+    let call = |name: &str, args: Value| json!({"name": name, "arguments": args});
+    let playbook = json!({"turns": [
+        {"tool_calls": [
+            call("workflow.pause", json!({"name": "other"})),
+            call("workflow.resume", json!({"name": "other"})),
+            call("workflow.pause", json!({"name": "init"})),
+            call("workflow.resume", json!({"name": "init"})),
+            call("workflow.create", json!({"definition": made})),
+            call("workflow.update", json!({"name": "made", "definition": made})),
+        ]},
+        {"content": "rearranged"}
+    ]});
+    let llm = spawn_mock_llm(&playbook);
+    let cfg = common::unique_path("once-always", "yaml");
+    std::fs::write(
+        &cfg,
+        "agent: { name: once-always, preflight: never }\n\
+         store: { kind: memory }\n\
+         workflows:\n  \
+         - name: init\n    steps:\n      boot: { kind: once, policy: always }\n      \
+         f: { kind: finish, depends_on: [boot], status: completed }\n  \
+         - name: other\n    steps:\n      every: { kind: schedule, every: 1h }\n      \
+         f: { kind: finish, depends_on: [every], status: completed }\n\
+         observability: { log_level: info }\n",
+    )
+    .unwrap();
+    let err_path = common::unique_path("once-always", "log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args([
+            "--config",
+            &cfg,
+            "--prompt",
+            "Rearrange the workflows.",
+            "--intelligence",
+            &llm.uri,
+            "--model",
+            "m-1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .expect("spawn agentd");
+    let log = || std::fs::read_to_string(&err_path).unwrap_or_default();
+    let lines = |name: &str| -> Vec<Value> {
+        log()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == name)
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !lines("workflow.defined")
+        .iter()
+        .any(|e| e["op"] == "workflow.update")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the model never redefined `made`:\n{}",
+            log()
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the daemon exited:\n{}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Whatever the re-arming fired has had its time to start.
+    std::thread::sleep(Duration::from_millis(1000));
+    let _ = child.kill();
+    let _ = child.wait();
+    let inits = lines("run.start")
+        .iter()
+        .filter(|e| e["workflow"] == "init")
+        .count();
+    assert_eq!(inits, 1, "init ran more than once:\n{}", log());
+    let _ = std::fs::remove_file(&cfg);
+    let _ = std::fs::remove_file(&err_path);
+}

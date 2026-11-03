@@ -853,7 +853,7 @@ an instruction's by `origin: instruction` and `name`.
 | `start.key.empty` | warn | `node`, `template`, `workflow` |  |
 | `start.key.invalid` | warn | `err`, `node`, `workflow` |  |
 | `start.loop.stopped` | info | `node`, `reason`, `workflow` |  |
-| `start.once.skipped` | info | `live`, `node`, `pending`, `workflow` |  |
+| `start.once.skipped` | info | `fired`, `live`, `node`, `pending`, `workflow` | A `once` start was not fired: under `policy: ensure` a run it started is live or on record, or its firing is pending; or (`fired`) it already fired for this definition in this process's life. |
 | `start.schedule.armed` | info | `next_ms`, `node`, `workflow` | A `schedule` start is armed; `next_ms` is the next firing. |
 | `start.schedule.done` | info | `node`, `note`, `workflow` |  |
 | `start.schedule.invalid` | warn | `node`, `note`, `workflow` |  |

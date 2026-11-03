@@ -18,6 +18,13 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   document release retired the child and its replacement failed to start.
   A spawn makes the same workflow check, and refuses with `composes an
   invalid config` instead of starting a child that exits at once.
+- **`workflow.resume` and redefining a workflow do not fire a `once` start
+  again.** Each re-armed every workflow, so a `once {policy: always}` start
+  fired once more on every resume, `workflow.create` and `workflow.update`.
+  A resume now arms only the workflow it resumed, a definition only itself,
+  and a `once` start fires once per definition in a process's life
+  (`start.once.skipped` says `fired`). A reload that installs a changed
+  definition still fires it, as before.
 
 ## v1.22.0 — a document's own agents
 

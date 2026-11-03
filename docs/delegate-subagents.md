@@ -1011,8 +1011,10 @@ own definition changed.
   once `store.retention.runs` has evicted the earlier run, a team-spawning
   workflow whose
   definition changed spawns again, and a live singleton refuses the spawn.
-  `workflow.resume` and `workflow.create` arm every workflow, with the same
-  effect.
+  `workflow.resume` arms only the workflow it resumed, and
+  `workflow.create` and `workflow.update` only the one they define; none of
+  them fires a `once` start that already fired for the same definition in
+  this process's life.
 
 ## The subagent tools
 

@@ -767,9 +767,12 @@ impl Runtime {
     }
 
     /// [`Self::arm_workflows`] over `names` only: a reload arms the
-    /// definitions it installed new or replaced, so an unchanged one's
-    /// `policy: always` start, which already fired this boot, does not fire
-    /// again.
+    /// definitions it installed new or replaced, a resume the workflow it
+    /// resumes, a `workflow.create` or `workflow.update` the one it defines.
+    /// A `once` start fires once per definition in a process's life: one
+    /// that already fired for the same definition is not fired again by any
+    /// of them, `policy: always` included (always is every boot, not every
+    /// arming).
     pub(crate) fn arm_workflows_named(&mut self, names: Vec<String>) {
         for name in names {
             let Some(w) = self.workflows.get(&name) else {
@@ -778,6 +781,7 @@ impl Runtime {
             if !w.armed {
                 continue;
             }
+            let hash = w.hash.clone();
             let starts: Vec<(String, String, Map<String, Value>)> = w
                 .start_steps()
                 .iter()
@@ -804,10 +808,13 @@ impl Runtime {
                                 && e.payload["workflow"] == name.as_str()
                                 && e.payload["node"] == id.as_str()
                         });
-                        if policy == "ensure" && (live || ever || pending) {
-                            self.log.info("start.once.skipped", json!({"workflow": name, "node": id, "live": live, "pending": pending}));
+                        let key = (name.clone(), id.clone(), hash.clone());
+                        let fired = self.once_fired.contains(&key);
+                        if fired || (policy == "ensure" && (live || ever || pending)) {
+                            self.log.info("start.once.skipped", json!({"workflow": name, "node": id, "live": live, "pending": pending, "fired": fired}));
                             continue;
                         }
+                        self.once_fired.insert(key);
                         let inputs = spec.get("inputs").cloned().unwrap_or(json!({}));
                         // A `once` start is autonomous work like any other
                         // trigger, so it is attributed the same way.
@@ -4349,15 +4356,21 @@ impl Runtime {
                     return ToolOutcome::Ready(json!({"ok": true}), false);
                 }
                 if let Some(n) = args.get("name").and_then(Value::as_str) {
-                    match self.workflows.get_mut(n) {
+                    let was_armed = match self.workflows.get_mut(n) {
                         None => return err(format!("no such workflow {n:?}")),
                         // The definitions are shared (`Arc`) on the hot path;
                         // arming is the one mutation, and it is rare —
                         // copy-on-write is the honest cost here.
-                        Some(w) => std::sync::Arc::make_mut(w).armed = !pause,
-                    }
-                    if !pause {
-                        self.arm_workflows();
+                        Some(w) => {
+                            let was = w.armed;
+                            std::sync::Arc::make_mut(w).armed = !pause;
+                            was
+                        }
+                    };
+                    // A resume arms the one workflow it resumed, and only if
+                    // it was paused: every other workflow is as it was.
+                    if !pause && !was_armed {
+                        self.arm_workflows_named(vec![n.to_string()]);
                     }
                     return ToolOutcome::Ready(json!({"ok": true}), false);
                 }
@@ -4486,8 +4499,9 @@ impl Runtime {
                             json!({"name": wname, "hash": &hash[..12], "op": name}),
                         );
                         self.retag_workflow_tools();
+                        // Only the definition this call installed is armed.
                         if arm {
-                            self.arm_workflows();
+                            self.arm_workflows_named(vec![wname.clone()]);
                         }
                         ToolOutcome::Ready(
                             json!({"name": wname, "hash": hash, "armed": arm}),

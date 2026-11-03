@@ -935,6 +935,15 @@ live child's record takes its new `reports_to`, the TUI sees it in the
 A report whose manager is held, by an
 operator template of its name say, keeps its label, and the load says so.
 
+The operator can draw the same lines in the configuration, for its own
+templates and its A2A peers, with `reports_to` and `title`
+([Draw the org chart](#draw-the-org-chart)). An operator template that
+holds a document agent of its name carries the operator's line and title,
+not the document's; a document agent the operator does not name keeps the
+one its nesting gives it. A document cannot set either field: `subagents`
+is the operator's, and a `:::config` that writes `a2a.peers[].reports_to`
+or `.title` is refused.
+
 ### Start the team with the document
 
 By default a document agent starts when a workflow or the model spawns it.
@@ -990,6 +999,142 @@ changed agent's live child is retired and started again from its new body.
 The document's workflow that spawned the team does not run again unless its
 own definition changed.
 
+## Draw the org chart
+
+Who reports to whom is a label the operator writes on each template and
+each A2A peer: `reports_to` names the manager, and `title` says what the
+role is. A reporting line grants nothing. A manager gets no tool for its
+reports, no peer route to them and no authority over them, and a report
+gets nothing from its manager; what each can do is what it could do
+without the line. agentd checks the lines, carries them, and shows them.
+
+A small company: this agent is the CEO; a CTO and a CMO report to it, a
+writer reports to the CMO, and outside counsel, a remote A2A agent,
+reports to the CEO. Save it as `company.yaml`.
+
+```yaml
+agent:
+  name: ceo
+  instruction: |
+    You run a small company. Hand engineering questions to the cto
+    template and marketing to the cmo template.
+
+intelligence:
+  endpoints: https://api.anthropic.com
+  dialect: anthropic
+  token: "{{secret:ANTHROPIC_API_KEY}}"
+  model: claude-sonnet-5
+
+subagents:
+  templates:
+    cto:
+      title: Chief technology officer
+      reports_to: ceo
+      instruction: You answer engineering questions for the CEO.
+    cmo:
+      title: Chief marketing officer
+      reports_to: ceo
+      instruction: You plan how the company is made known.
+    writer:
+      title: Staff writer
+      reports_to: cmo
+      instruction: |
+        Write {{params.piece}} in the company's voice.
+      params:
+        piece: {type: string, required: true}
+
+a2a:
+  peers:
+    - name: legal
+      endpoint: https://legal.example.com
+      title: Outside counsel
+      reports_to: ceo
+```
+
+A `reports_to` names one of three things:
+
+- **another template**, by its `subagents.templates` name, a document
+  agent's included;
+- **an A2A peer**, by its `a2a.peers` name;
+- **this agent**, by its `agent.name`.
+
+The load refuses, naming the field:
+
+- a name that is none of them (with no `agent.name` set, this agent has no
+  name to be named by, and the error says so);
+- a template or a peer that reports to itself;
+- a name that two of them share, a template and a peer called `cmo` say,
+  which a line cannot tell apart: rename one;
+- a cycle, with its path: `reporting lines form a cycle: cto (template) →
+  legal (peer) → cto (template)`. A document agent's derived line counts
+  here too.
+
+A document agent the operator does not name keeps the line its nesting
+gives it ([Reporting lines](#reporting-lines)); an operator template of the
+same name carries the operator's.
+
+### Read the chart
+
+The status document, as the operator reads it, has the whole chart in one
+list, `org`: this agent first (`kind: self`), then every template, then
+every peer, each with its `title` and `reports_to` (null at the top). A
+client draws the hierarchy from it without joining other lists. For the
+company above:
+
+```json
+{
+  "org": [
+    {"name": "ceo", "kind": "self", "title": null, "reports_to": null},
+    {"name": "cmo", "kind": "template", "title": "Chief marketing officer", "reports_to": "ceo"},
+    {"name": "cto", "kind": "template", "title": "Chief technology officer", "reports_to": "ceo"},
+    {"name": "writer", "kind": "template", "title": "Staff writer", "reports_to": "cmo"},
+    {"name": "legal", "kind": "peer", "title": "Outside counsel", "reports_to": "ceo"}
+  ]
+}
+```
+
+`org` is in the operator's view only; a caller who is not the operator
+reads the instance's facts and its own work, as before. The Agent Card does
+not carry the chart: who reports to whom inside the company is not
+published to strangers.
+
+The line also travels with each child. A template's `reports_to` is on its
+`instance.spawn`, on the child's record, in `subagent.list` and
+`subagent.get`, in the A2A feed's `subagent` items, and in the TUI's
+subagents screen, which shows a `reports to` column. At load agentd logs
+the chart once as `agent.org` when any template or peer has a line or a
+title.
+
+A workflow reads the chart with a `status` tool step. No new node is
+needed. A run started by the operator, or by a `once` or `schedule` start,
+reads the operator's view; one acting for another caller reads that
+caller's, which has no `org`:
+
+```yaml
+# fragment: under workflows
+- name: org-chart
+  steps:
+    ask: {kind: a2a, command: org.chart, roles: [operator]}
+    read: {kind: tool, depends_on: [ask], name: status, args: {}}
+    done:
+      kind: finish
+      depends_on: [read]
+      status: completed
+      output: "{{steps.read.output.org}}"
+```
+
+### Move a line
+
+Both fields reload. A reload that changes a template's `reports_to` or
+`title` changes no one's composition, so nothing restarts: a live child of
+that template keeps running, its record takes the new `reports_to`, the
+feed's `subagent` item carries it, and the parent logs
+`subagent.template.reports_to_changed` (`template`, `handle`, `from`,
+`to`). A reload that moves a peer's line logs `a2a.peer.reports_to_changed`
+(`peer`, `from`, `to`) and lists `a2a.peers` among what changed. Either way
+the status document's `org` is the new chart at once, and `agent.org` is
+logged again.
+
 ## Avoid these traps
 
 - **A missing template is found at spawn.** A step's `template` that names
@@ -1036,7 +1181,7 @@ the principal that spawned it.
 | `subagent.send` | `handle`, `message` | `{ok, handle}` for a warm child, which queues the message; an instance child receives it over A2A and the reply adds `delivery: "async"` |
 | `subagent.kill` | `handle`, optional `reason` | `{ok, handle}`; flat children only |
 | `subagent.retire` | `handle` | `{ok, handle, status: "retiring"}`; instance children only |
-| `subagent.list` | none | `{subagents: [...]}`: handle, mode, status, the first 80 characters of the instruction, created, and for a templated child its template, tier and `reports_to` |
+| `subagent.list` | none | `{subagents: [...]}`: handle, mode, status, the first 80 characters of the instruction, created, and for a templated child its template, tier and `reports_to` (the template's reporting line, the operator's or its document's) |
 
 Over A2A, `subagent.send`, `subagent.kill` and `subagent.status` are command
 operations, each held to the caller's grants, and an introspection read
@@ -1067,7 +1212,9 @@ events to watch:
 | `subagent.template.composed` | A template the instruction document defined, at load or when a reload added or changed it: `template`, `title`, `reports_to`, `origin`, `line`, `tier`, `singleton`, the counts `servers`, `workflows`, `skills`, and their names in `server_names`, `workflow_names`, `skill_names` |
 | `subagent.template.started`, `subagent.template.start_refused`, `subagent.template.already_live` | Under `start: on_compose`, a document agent started, or refused by a ceiling (`error`); a spawn that found its singleton live and got it back |
 | `subagent.template.retired`, `subagent.template.recomposed`, `subagent.template.respawned`, `subagent.template.respawn_failed` | A reload removed or changed a live child's template: `template`, `handle`, `why`; a respawn names the child it replaces (`was`) |
-| `subagent.template.reports_to_changed` | A reload moved a live child's agent to another manager: `template`, `handle`, `from`, `to`; the child keeps running |
+| `subagent.template.reports_to_changed` | A reload moved a live child's template to another manager, in the document or in the operator's `reports_to`: `template`, `handle`, `from`, `to`; the child keeps running |
+| `a2a.peer.reports_to_changed` | A reload moved a peer's `reports_to`: `peer`, `from`, `to` |
+| `agent.org` | The org chart, `org`, as the status document has it: at load and after a reload that moved it, when any template or peer has a line or a title |
 
 The `agent_subagents_spawned_total` and `agent_subagents_exited_total`
 metrics count every child process, turn and think workers included. Count

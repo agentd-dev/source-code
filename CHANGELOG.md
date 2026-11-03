@@ -5,6 +5,34 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Added.**
+
+- **Reporting lines in the operator's configuration.**
+  `subagents.templates.<name>.reports_to` and `.title`, and
+  `a2a.peers[].reports_to` and `.title`, draw who reports to whom: a
+  `reports_to` names another template, a peer, or this agent by its
+  `agent.name`. A label only, like a document agent's (RFC 0056 §3.7): it
+  grants no tool, no peer route and no authority. A template's line is its
+  own `reports_to`, else the one its document's nesting gives it; an
+  operator template holding a document agent of its name carries the
+  operator's. The load refuses, at the field, an unknown name, a template
+  or peer reporting to itself, a name two of them share, and a cycle across
+  templates and peers, with its path. The operator's `status` read carries
+  the whole chart as `org` (`{name, kind: self|template|peer, title,
+  reports_to}`), which a workflow reads with a `status` tool step; a
+  template's line is on `instance.spawn`, the child's record,
+  `subagent.list`, `subagent.get`, the feed's `subagent` items and the
+  TUI's subagents screen. Both fields reload: a moved template line updates
+  the live child's record without a restart
+  (`subagent.template.reports_to_changed`), a moved peer line logs
+  `a2a.peer.reports_to_changed`, and `agent.org` logs the chart at load and
+  after a reload that moved it. A served document's `:::config` cannot set
+  a peer's `reports_to` or `title` (operator-only); `subagents` stays
+  wholly the operator's. The Agent Card does not carry the chart. See
+  [Draw the org chart](docs/delegate-subagents.md#draw-the-org-chart).
+
 ## v1.23.0 — spending controls
 
 Allowances (RFC 0057, agentd's half of instruction.md RFC-0041): what

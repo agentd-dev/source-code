@@ -162,6 +162,7 @@ case.
 | `a2a.send` | info | `run`, `step`, `to` | Its `span_id` is the send's, sent as `traceparent`. |
 | `a2a.task.continued` | info | `inbox_event`, `link`, `task` | A message continued a task. In the task's trace; `link` is the `traceparent` the request named. |
 | `a2a.task.auth_required` | info | `task`, `principal`, `idp?`, `why?`, `expires_in?`, `decision?` | A caller an enterprise access token named asked for work acting with a grant they lack: the task waits in `auth-required` on their sign-in (`why: admission`), then `decision: signed_in` and the work starts, `refused` and the task fails, `cancelled` — the task was cancelled while it waited, and its sign-in ended — or `ended`, a sign-in that came back to a task already ended, which starts nothing; or `not_offered` — paced, or no sign-in served — and the work starts as it would have. |
+| `a2a.peer.reports_to_changed` | info | `from`, `peer`, `to` | A reload moved `a2a.peers[].reports_to` (`from` → `to`, either null). The label is applied at once; nothing is re-dialed. |
 | `a2a.peer.auth_required` | info | `run`, `step`, `peer`, `peer_task`, `task?`, `to?`, `decision?` | A peer's task waits on a person's sign-in: the run's `task` waits in `auth-required` too, for `to` when the step names one; `decision: resumed` when the peer's task went on. |
 | `a2a.task.encode.fail` | warn | `err`, `task` |  |
 | `a2a.task.evict.fail` | warn | `err`, `task` |  |
@@ -180,6 +181,7 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
+| `agent.org` | info | `org` | The org chart, as the operator's `status` lists it: this agent, every template and every peer, each `{name, kind, title, reports_to}` (`kind` is `self`, `template` or `peer`). Logged at load, and after a reload that moved it, when any template or peer has a `reports_to` or a `title`. A label only. |
 | `agent.paused` | info | `reason` | An instance-wide `admin.pause` began. |
 | `agent.resumed` | info | — | The instance-wide pause ended. |
 
@@ -519,7 +521,7 @@ its `jti`.
 | `instance.result` | info | `handle`, `link` | `link`: the span of the child's report. |
 | `instance.retire` | info | `handle`, `pid`, `why` |  |
 | `instance.send` | info, warn | `handle`, `err?` |  |
-| `instance.spawn` | info | `dir`, `handle`, `log`, `pid`, `reports_to`, `retire_at`, `singleton`, `socket`, `template`, `until` | An instance-tier subagent started. `dir` is its directory and `log` the log it writes there, both absolute; `reports_to` a document agent's reporting line (RFC 0056), else null. |
+| `instance.spawn` | info | `dir`, `handle`, `log`, `pid`, `reports_to`, `retire_at`, `singleton`, `socket`, `template`, `until` | An instance-tier subagent started. `dir` is its directory and `log` the log it writes there, both absolute; `reports_to` its template's reporting line — the operator's `subagents.templates.<name>.reports_to`, else a document agent's (RFC 0056) — or null. |
 | `instance.spawn.refused` | warn | `reason`, `template` | An instance-tier subagent was refused before anything was created. |
 
 ### instruction
@@ -936,7 +938,7 @@ an instruction's by `origin: instruction` and `name`.
 | `subagent.template.composed` | info | `line`, `origin`, `reports_to`, `server_names`, `servers`, `singleton`, `skill_names`, `skills`, `template`, `tier`, `title`, `workflow_names`, `workflows` | A template the instruction document defined (`origin: document`, RFC 0056) as it is composed: at load, and when a reload added or changed it. `line` is the document line the agent opens on; `title` its title or null; `reports_to` the agent it is nested in, or null; `servers`, `workflows` and `skills` count its own, named in `server_names`, `workflow_names` and `skill_names`. |
 | `subagent.template.recomposed` | info | `handle`, `note`, `template`, `why` | A reload changed the composition of a live singleton's template: the child is retired and started again from the new template once it exits. |
 | `subagent.template.recompose_refused` | warn | `handle`, `note`, `template`, `why` | A reload changed a live singleton's template, but the new composition could not start (`why`: pressure, params the new template refuses, or a configuration or workflow the spawn refuses, `composes an invalid config`): it is checked before the child is retired, and the running child keeps its composition. |
-| `subagent.template.reports_to_changed` | info | `from`, `handle`, `template`, `to` | A reload moved a document agent to another manager (`from` → `to`, either null for a top-level agent). Its composition is unchanged, so the live child keeps running; its record, `subagent.list` and the feed's `subagent` item carry the new `reports_to`. |
+| `subagent.template.reports_to_changed` | info | `from`, `handle`, `template`, `to` | A reload moved a template to another manager (`from` → `to`, either null at the top): a document agent nested elsewhere, or the operator's `subagents.templates.<name>.reports_to` changed. Its composition is unchanged, so the live child keeps running; its record, `subagent.list` and the feed's `subagent` item carry the new `reports_to`. |
 | `subagent.template.respawn_failed` | warn | `error`, `template`, `was` | A recomposed singleton could not be started again: `error` is the spawn's refusal; `was` the retired child. |
 | `subagent.template.respawned` | info | `handle`, `template`, `was` | A recomposed singleton started again from its new template; `was` the child it replaces. |
 | `subagent.template.retired` | info | `handle`, `template`, `why` | A reload removed the template of a live instance child, or made it no longer a singleton instance child: the child is retired and not started again. |

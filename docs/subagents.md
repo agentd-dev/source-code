@@ -477,6 +477,10 @@ are checked. [Instruction documents](directives.md) explains the boundary.
 ## What delegation does not do
 
 - **Delegate onward.** A child has no `subagent.*` tools and no A2A peers.
+- **Follow the org chart.** A reporting line (`reports_to` on a template or
+  a peer, or an agent nested in a document agent) is a label. A manager gets
+  no tool, peer route or authority over its reports, and a report nothing
+  from its manager ([Draw the org chart](delegate-subagents.md#draw-the-org-chart)).
 - **Detect a spinning loop.** A child's loop has no repeated-call or
   no-progress detector; its step and token budgets are the bound.
 - **Bound `subagent.await`.** The tool's `timeout` argument is not applied;

@@ -541,6 +541,16 @@ waiting run in its own trace and names the reply's span as `link` on its
 `a2a.task.continued` line in the task's trace. [Observability](observability.md#correlate-with-other-services)
 lists every surface that adopts or sends a trace.
 
+**Where a peer stands in the org chart.** A peer may carry a `title` and
+a `reports_to` naming a template, another peer, or this agent by its
+`agent.name` (`a2a.peers[].reports_to`). The line is this agentd's view of
+its organisation and a label only: it changes nothing agentd may send the
+peer, nothing the peer may do here, and it is never sent to the peer or put
+on this agent's card. The operator's `status` read lists it in `org`
+beside the templates' lines, and a reload that moves it logs
+`a2a.peer.reports_to_changed`. [Draw the org chart](delegate-subagents.md#draw-the-org-chart)
+has a complete example.
+
 **A peer agent's request is outside input.** A message from a principal
 with the `agent` role is another agent's output, and agentd treats it like
 text from a webhook. The run it starts, signals or messages records that it

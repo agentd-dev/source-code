@@ -1467,6 +1467,8 @@ listener.
 | `a2a.peers[].rate` | rate | — | live · op | Pacing of sends to this peer, per process. |
 | `a2a.peers[].timeout` | duration | — | live · op | The per-request timeout to this peer. |
 | `a2a.peers[].client_cert`, `.client_key` | paths | — | live · doc | A client certificate for an mTLS peer. |
+| `a2a.peers[].reports_to` | string | — | live · op | Whom the peer reports to in this agentd's org chart: a `subagents.templates` name, another peer's name, or this agent's `agent.name`. A label only: it grants nothing and changes nothing agentd may send the peer. An unknown name, the peer's own, a name two of them share, and a cycle are refused at load. Listed in the operator's `status` as `org`; a reload that moves it logs `a2a.peer.reports_to_changed`. See [Draw the org chart](delegate-subagents.md#draw-the-org-chart). |
+| `a2a.peers[].title` | string | — | live · op | The peer's title in the org chart, a label. |
 
 The how-to is [Connect agents over A2A](connect-agents.md).
 
@@ -1533,6 +1535,8 @@ instruction document adds templates of its own under the `agents` grant
 | `subagents.templates.<name>.durable` | bool | `store.durability.work` | `false` keeps the record in memory. A parent with a `memory` or `none` store runs every instance child non-durable. |
 | `subagents.templates.<name>.result.workflow` | string | — | Instance tier, `mode: sync`: resolve the spawn when the child's named workflow first completes. Needs a parent A2A listener. |
 | `subagents.templates.<name>.mirror_streams` | list | — | Instance tier: child streams forwarded into the parent's same-named streams. Needs a parent A2A listener. |
+| `subagents.templates.<name>.reports_to` | string | a document agent's: the agent it is nested in | Whom the template reports to in the org chart: another template, an `a2a.peers` name, or this agent's `agent.name`. A label only: it grants no tool, no peer route and no authority. An unknown name, the template's own, a name two of them share, and a cycle are refused at load. Carried on `instance.spawn`, the child's record, `subagent.list`, `subagent.get`, the feed's `subagent` items and the operator's `status` (`org`); a reload that moves it updates a live child's record without a restart. See [Draw the org chart](delegate-subagents.md#draw-the-org-chart). |
+| `subagents.templates.<name>.title` | string | a document agent's: its block's title | The template's title in the org chart, a label. |
 
 The how-to is [Delegate to subagents](delegate-subagents.md).
 
@@ -1936,7 +1940,8 @@ naming the line:
   `agent.ask_human_unowned`, `agent.conversation_budget`,
   `agent.max_parallel_turns`, `agent.on_workflow_finished`,
   `agent.preflight`, `agent.wake_on`
-- `a2a.peers`, `tools.narrow`, `tools.disabled`
+- `a2a.peers` (not a peer's `reports_to` or `title`, its place in the
+  operator's org chart), `tools.narrow`, `tools.disabled`
 - `skills.max_bytes`, `skills.max_loaded`, `skills.reference_prefix`
 - `store.kind`, `store.durability`, `store.checkpoint`, `store.on_error`,
   `store.timeout`, `store.max_value_bytes`, `store.prefix`

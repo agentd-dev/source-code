@@ -165,6 +165,24 @@ the example's text.
   operator's names stand (§6). A report whose manager is held — an operator
   template of its name, say — keeps its label, and the load says so.
 
+**Note (2026-11-03): reporting lines in the operator's configuration.** The
+user asked that the operator's configuration outline who reports to whom,
+for its templates and its A2A peers. `subagents.templates.<name>.reports_to`
+and `.title`, and `a2a.peers[].reports_to` and `.title`, are the same label
+this section defines, written by the operator: a template's effective line
+is its own `reports_to`, else the one its document derives, and an operator
+template holding a document agent of its name (§6) carries the operator's.
+A `reports_to` names another template, a peer, or this agent by its
+`agent.name`; the load refuses an unknown name, a line to itself, a name two
+of them share, and a cycle across templates and peers, the derived lines
+included. The label grants nothing, as above. It is carried where the
+document's is (§8), and the operator's `status` read lists the whole chart
+as `org`. A reload moving a template's line follows the live child's record
+(`subagent.template.reports_to_changed`); one moving a peer's logs
+`a2a.peer.reports_to_changed`. A peer's labels are operator-only: a
+document's `:::config` writing them is refused. No new RFC: it extends this
+label, and the card does not publish it.
+
 ### 3.8 Names in a child's text
 
 A child's text refers to its document's people and agents

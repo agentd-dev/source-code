@@ -490,6 +490,14 @@ reaches every op. An operator-only op is the operator's whatever a grant
 says. An op behind a closed switch is answered as an unknown op, except the
 introspection ops, which answer `INTROSPECTION_DISABLED`.
 
+- **`status`** answers each caller with what it may see: the instance's
+  facts and the caller's own work. The operator's read adds the internals —
+  subagents, children, timers, budget, counters, the store, the instruction
+  — and `org`, the org chart in one list: this agent (`kind: self`, named
+  by `agent.name`), every template and every peer, each
+  `{name, kind, title, reports_to}`, so a client draws the hierarchy
+  without joining lists. The lines are labels
+  ([Draw the org chart](delegate-subagents.md#draw-the-org-chart)).
 - **`admin.drain`** begins a graceful drain, as `SIGTERM` does, and returns
   at once; the process exits `0` when the drain completes, within
   `lifecycle.drain_timeout`.

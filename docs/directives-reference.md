@@ -114,6 +114,15 @@ would go wherever the document points it. It uses `agents` only when it
 verified against a pinned publisher (`agent.instruction.trust`) and the
 author's signature attests `agents`.
 
+An agent written inside another agent's body, with a longer outer fence,
+is a report: its own template, labelled `reports_to` with the agent it is
+nested in. The label grants nothing. The operator can write a template's
+line itself (`subagents.templates.<name>.reports_to` and `.title`): an
+operator template of an agent's name carries the operator's line, and a
+document agent the operator does not name keeps the one its nesting gives it
+([Reporting lines](delegate-subagents.md#reporting-lines),
+[Draw the org chart](delegate-subagents.md#draw-the-org-chart)).
+
 An agent's body is compiled as its template's instruction with no grant at
 all: an A2A agent or an agent in it stays text, and a webhook route in it
 refuses the document, as it refuses any template (an instance child has no
@@ -134,7 +143,7 @@ under it.
 | A document may write | Why |
 |---|---|
 | `workflows`, `streams`, `mcp`, `vars` | What the agent does. |
-| `a2a.peers` | Another agent this one dials: an outbound connection, like an MCP server. |
+| `a2a.peers` | Another agent this one dials: an outbound connection, like an MCP server. Not its `reports_to` or `title`. |
 | `context`, `goal`, `knowledge`, `search`, `memory`, `limits` | How it thinks, remembers and bounds itself. |
 | `intelligence.model`, `.models`, `.roles.turn`, `.roles.think`, `.roles.decide`, `.roles.preflight`, `.roles.compaction`, `.roles.goal`, `.dialect`, `.budget`, `.timeout`, `.structured_output`, `.swap_policy` | Which model, and how much of it. |
 | `agent.name`, `.approval`, `.ask_human_fallback`, `.ask_human_unowned`, `.conversation_budget`, `.max_parallel_turns`, `.on_workflow_finished`, `.preflight`, `.wake_on` | The agent loop's own shape. |
@@ -157,6 +166,7 @@ Everything else is the operator's. A path on neither list is refused too.
 | `http`, `companies` | Endpoints `security.egress: closed` is checked against, and the Companies agentd acts at. |
 | `identity` | Who work is done on behalf of. |
 | `a2a.listen`, `.url`, `.tls`, `.bearer`, `.principals`, `.device_grant`, `.cors`, `.push`, `.events`, `.introspection` | Who may talk to this agent, as what, over which socket, and what the listener shows its clients. |
+| `a2a.peers[].reports_to`, `a2a.peers[].title` | Where a peer stands in the operator's org chart: a document declares a peer, not its place in the company. |
 | `webhooks` | Inbound sockets and the auth on them. |
 | `intelligence.endpoints`, `.token`, `.token_file`, `.headers`, `.auth`, `.providers` | Where model calls go, and the credential they go with. |
 | `intelligence.roles.approve` | The model that answers asks on the operator's behalf. |

@@ -544,6 +544,13 @@ agentd 1.23.0 triage-1 debug
 ● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
 ```
 
+`reports to` is the child's reporting line, a label: its template's
+`reports_to` in the operator's configuration, or, for an agent the
+instruction document defines, the agent it is nested in. A reload that moves
+it updates the row while the child keeps running. The whole chart, templates
+and peers included, is the `org` list of the operator's `status` read
+([Draw the org chart](delegate-subagents.md#draw-the-org-chart)).
+
 `↑` and `↓` select, `Enter` opens one. The detail view is where the controls
 are:
 

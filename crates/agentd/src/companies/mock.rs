@@ -136,7 +136,11 @@
 //! every conversation's events so far, so a cursor naming one of them is
 //! `cursor_expired`; `"operations": {"in_progress": n}` answers the next
 //! confirm `in_progress` with `Retry-After` (and `{"cancel_in_progress":
-//! true}` lets a cancel then stop it), and keeps the operation in
+//! true}` lets a cancel then stop it; `{"cancel_always": true}` has a
+//! cancel answer `cancelled` whatever the operation is, as no Company
+//! should; `{"no_confirmation": true}` has a confirm answered with no
+//! `confirmation`; `{"repropose": id}` proposes the operation `id` again,
+//! whatever it was, at its next revision), and keeps the operation in
 //! progress for `n` reads before it succeeds; `{"revise": n}` gives the next
 //! `n` confirmed operations a new revision first — the price changed — so
 //! the confirm is `terms_changed`; `{"user_approval_required": true}` has
@@ -932,6 +936,10 @@ struct OpControl {
     /// A cancel of an operation still `in_progress` cancels it (Ops §7)
     /// rather than answering it as it is.
     cancel_in_progress: bool,
+    /// A cancel answers `cancelled`, whatever the operation was.
+    cancel_always: bool,
+    /// A confirm's answer carries no `confirmation`.
+    no_confirmation: bool,
     /// Confirms still to meet a new revision first.
     revise: u32,
     user_approval_required: bool,
@@ -2924,6 +2932,8 @@ impl Company {
         let revise = tail.as_deref() == Some(wire::operations::CONFIRM) && st.ops.revise > 0;
         let in_progress = st.ops.in_progress;
         let cancel_in_progress = st.ops.cancel_in_progress;
+        let cancel_always = st.ops.cancel_always;
+        let no_confirmation = st.ops.no_confirmation;
         let refuse_standing = st.ops.refuse_standing > 0
             && tail.as_deref() == Some(wire::operations::CONFIRM)
             && body["approved_by"] == wire::operations::APPROVED_BY_STANDING;
@@ -3037,7 +3047,15 @@ impl Company {
                             if n == 0 {
                                 op.reads_left = 1;
                             }
-                            Company::operation_reply(202, op)
+                            if no_confirmation {
+                                let mut v = op.v.clone();
+                                v["confirmation"] = Value::Null;
+                                Reply::json(202, &v)
+                                    .note("op_state", v["state"].clone())
+                                    .with("Retry-After", &RETRY_AFTER_S.to_string())
+                            } else {
+                                Company::operation_reply(202, op)
+                            }
                         }
                         None => {
                             Company::succeed(op);
@@ -3051,7 +3069,9 @@ impl Company {
                     op.v["state"] = json!(wire::operations::CANCELLED);
                     op.v["result"] =
                         json!({"summary": "Cancelled before it was confirmed. Nothing was done."});
-                } else if cancel_in_progress && op.v["state"] == wire::operations::IN_PROGRESS {
+                } else if cancel_always
+                    || (cancel_in_progress && op.v["state"] == wire::operations::IN_PROGRESS)
+                {
                     // Confirmed, not yet done: it cancels (Ops §7).
                     op.v["state"] = json!(wire::operations::CANCELLED);
                     op.v["result"] = json!({"summary": "Cancelled while it was being performed; the charge was refunded."});
@@ -3989,6 +4009,21 @@ impl Company {
         }
         if let Some(b) = o["cancel_in_progress"].as_bool() {
             st.ops.cancel_in_progress = b;
+        }
+        if let Some(b) = o["cancel_always"].as_bool() {
+            st.ops.cancel_always = b;
+        }
+        if let Some(b) = o["no_confirmation"].as_bool() {
+            st.ops.no_confirmation = b;
+        }
+        if let Some(id) = o["repropose"].as_str()
+            && let Some(op) = st.operations.get_mut(id)
+        {
+            let next = op.v["revision"].as_u64().unwrap_or(1) + 1;
+            op.v["revision"] = json!(next);
+            op.v["state"] = json!(wire::operations::PROPOSED);
+            op.v["confirmation"] = Value::Null;
+            op.v["result"] = Value::Null;
         }
         if let Some(n) = o["revise"].as_u64() {
             st.ops.revise = u32::try_from(n).unwrap_or(u32::MAX);

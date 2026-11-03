@@ -506,6 +506,10 @@ enum Answered {
     Spent,
     /// The allowance refused its charge as it was sent: why.
     Refused(String),
+    /// A standing permission approved it, and the charge is now above the
+    /// allowance's `approve_above` (a reload lowered it): nothing was sent,
+    /// and the confirm is prepared again, asking the User.
+    Above,
 }
 
 /// What taking a confirm's lock came to.
@@ -531,18 +535,6 @@ pub enum Outcome {
     Unknown,
     /// It never left.
     Unsent,
-}
-
-impl Outcome {
-    /// What becomes of the operation's charge to an allowance.
-    fn charge(self) -> crate::spending::ChargeState {
-        use crate::spending::ChargeState;
-        match self {
-            Outcome::Taken => ChargeState::Confirmed,
-            Outcome::Unknown => ChargeState::Unknown,
-            Outcome::Untaken | Outcome::Refused | Outcome::Unsent => ChargeState::Refused,
-        }
-    }
 }
 
 impl Outcome {
@@ -609,6 +601,15 @@ pub enum Step {
     },
     /// It ended: the tool's answer, or an error.
     Done(Result<Value, String>),
+}
+
+/// Whether the Company took the confirm `s` answers (§5.2): it answered
+/// with a confirmation, or the operation is on its way — not `proposed`,
+/// nor final with nothing done ("returns the operation as it is and does
+/// nothing else").
+fn taken(s: &Sent) -> bool {
+    s.confirmation.is_some()
+        || !(s.state == ops::PROPOSED || ops::FINAL.contains(&s.state.as_str()))
 }
 
 /// How a charge's state is said in its log line and audit record.
@@ -821,6 +822,9 @@ impl Supervisor {
             self.session_of(company, account)
         };
         let mut rewritten = false;
+        // agentd's own record moving from a state that is not final to a
+        // final one: the state, and whether the Company took a confirm.
+        let mut ended: Option<(String, bool)> = None;
         let tracked = self.ledger.update(self.principal(), issuer, |b| {
             let new = !b.operations.contains_key(&s.id);
             let op = b
@@ -857,12 +861,15 @@ impl Supervisor {
                 op.terms = s.terms.clone().map(Value::Object);
                 op.expires_at = s.expires_at.clone();
                 // A final operation never changes state again (Ops §3).
-                if !op.is_final() {
+                let was_final = op.is_final();
+                if !was_final {
                     op.state = s.state.clone();
                 }
                 if s.confirmation.is_some() {
                     op.confirmation = s.confirmation.clone();
                 }
+                ended = (!new && !was_final && op.is_final())
+                    .then(|| (op.state.clone(), op.confirmation.is_some()));
                 if s.result.is_some() {
                     op.result = s.result.clone();
                 }
@@ -883,6 +890,25 @@ impl Supervisor {
             b.trim_operations(now_ms());
             Ok((new, revised))
         })?;
+        // The operation's charge follows agentd's own record, never only
+        // what the Company says now (RFC 0057 §5.2): a cancellation of an
+        // operation that was not over credits it back; a succeeded one's
+        // stays counted, whatever comes after.
+        if let Some((state, confirmed)) = ended
+            && let Some(to) = self
+                .spending
+                .settle_final(&company.name, &s.id, &state, confirmed)
+        {
+            self.log().info(
+                if to == crate::spending::ChargeState::Credited {
+                    "payment.allowance.credited"
+                } else {
+                    "payment.allowance.settled"
+                },
+                json!({"company": company.name, "operation_id": s.id, "state": state,
+                       "charge": state_name(to)}),
+            );
+        }
         if rewritten {
             self.log().warn(
                 "company.operation.rewritten",
@@ -1059,21 +1085,6 @@ impl Supervisor {
         // confirm of it was taken.
         self.keep(company, &v.issuer, &s, None, None, account.as_deref())
             .map_err(CallError::Unsent)?;
-        // A cancellation the Company confirms credits the operation's charge
-        // back to its allowance (RFC 0057 §5.2).
-        if s.state == ops::CANCELLED
-            && self
-                .spending
-                .charge_of(&company.name, id)
-                .is_some_and(|c| c.state.counts())
-        {
-            self.spending
-                .settle(&company.name, id, crate::spending::ChargeState::Credited);
-            self.log().info(
-                "payment.allowance.credited",
-                json!({"company": company.name, "operation_id": id}),
-            );
-        }
         if s.state == ops::IN_PROGRESS {
             self.read_after(&v.issuer, id, reply.retry_after());
         }
@@ -1168,32 +1179,31 @@ impl Supervisor {
                 });
             }
             let charged = charge.zip(amount);
-            let answered = self.confirm(company, id, account, &approval, trace, stop, charged);
-            // The charge goes with what came of the confirm.
-            if let Some((ct, amount)) = charged {
-                let state = match &answered {
-                    Ok(Answered::Said(s)) if s.confirmation.is_some() => {
-                        Some(crate::spending::ChargeState::Confirmed)
-                    }
-                    Ok(Answered::Said(_)) | Ok(Answered::Again(_)) => {
-                        Some(crate::spending::ChargeState::Refused)
-                    }
-                    Err(e) => Some(Outcome::of(e).charge()),
-                    _ => None,
-                };
-                if let Some(state) = state {
-                    self.spending.settle(&company.name, id, state);
-                    send(Step::Charge {
-                        allowance: ct.allowance.id.clone(),
-                        amount: crate::config::settings::payments::format_amount(
-                            amount,
-                            crate::spending::SCALE,
-                        ),
-                        currency: ct.allowance.currency.clone(),
-                        state: state_name(state),
-                        why: None,
-                    });
-                }
+            // Where this call's own charge is once the confirm went — set
+            // only when this call took the charge, so an error before it
+            // (the lock another call holds, say) never touches it.
+            let mut settled = None;
+            let answered = self.confirm(
+                company,
+                id,
+                account,
+                &approval,
+                trace,
+                stop,
+                charged,
+                &mut settled,
+            );
+            if let (Some((ct, amount)), Some(state)) = (charged, settled) {
+                send(Step::Charge {
+                    allowance: ct.allowance.id.clone(),
+                    amount: crate::config::settings::payments::format_amount(
+                        amount,
+                        crate::spending::SCALE,
+                    ),
+                    currency: ct.allowance.currency.clone(),
+                    state: state_name(state),
+                    why: None,
+                });
             }
             match answered {
                 Ok(Answered::Refused(why)) => {
@@ -1204,6 +1214,11 @@ impl Supervisor {
                 Ok(Answered::Withdrawn) => return send(withdrawn()),
                 Ok(Answered::Spent) => {
                     why = Some("The standing permission that covered this has no use left.");
+                }
+                Ok(Answered::Above) => {
+                    why = Some(
+                        "The charge is above what the allowance it draws on lets a standing permission approve.",
+                    );
                 }
                 Ok(Answered::Said(s)) => {
                     send(Step::Confirmed {
@@ -1340,16 +1355,24 @@ impl Supervisor {
             ))
         })?;
         let now = now_ms();
-        if s.state != ops::PROPOSED {
-            if s.state == ops::IN_PROGRESS {
+        // agentd's own record, not only what the Company says now: an
+        // operation it holds as final — a Company proposing the same id
+        // again — is never confirmed again.
+        if s.state != ops::PROPOSED || op.is_final() {
+            if s.state == ops::IN_PROGRESS && !op.is_final() {
                 self.read_after(&issuer, id, after);
             }
+            let state = if op.is_final() { &op.state } else { &s.state };
             let mut out = view(&company.name, id, &op);
             out["note"] = json!(format!(
-                "operation {id} is {}; nothing was confirmed now",
-                s.state
+                "operation {id} is {state}; nothing was confirmed now"
             ));
             return Ok(Prepared::Done(out));
+        }
+        // An operation whose charge is confirmed was confirmed already,
+        // whatever record of it is kept now (RFC 0057 §5.2).
+        if let Some(why) = self.spending.confirmed_already(&company.name, id) {
+            return Err(CallError::Unsent(why));
         }
         if lapsed(&op, now) {
             let mut out = view(&company.name, id, &op);
@@ -1393,16 +1416,25 @@ impl Supervisor {
         let mut amount = None;
         let mut above = false;
         if let Some(ct) = charge {
-            let a = match charge_of(&op, ct) {
+            // The allowance in force now, not as the confirm's thread read it.
+            let allowance = match self.spending.allowance(&ct.allowance.id) {
+                Ok(al) => al,
+                Err(why) => return Ok(Prepared::Refused(why)),
+            };
+            let live = ChargeTerm {
+                allowance: allowance.clone(),
+                term: ct.term.clone(),
+            };
+            let a = match charge_of(&op, &live) {
                 Ok(a) => a,
                 Err(why) => return Ok(Prepared::Refused(why)),
             };
             let usage = {
                 let held = self.spending.hold();
                 self.spending
-                    .usage(&held, &ct.allowance, now, Some((&company.name, id)))
+                    .usage(&held, &allowance, now, Some((&company.name, id)))
             };
-            match crate::spending::judge(&ct.allowance, &company.name, a, usage, now) {
+            match crate::spending::judge(&allowance, &company.name, a, usage, now) {
                 Ok(over) => above = over,
                 Err(why) => return Ok(Prepared::Refused(why.join("; "))),
             }
@@ -1541,6 +1573,7 @@ impl Supervisor {
         trace: Option<&TraceContext>,
         stop: &AtomicBool,
         charge: Option<(&ChargeTerm, u128)>,
+        settled: &mut Option<crate::spending::ChargeState>,
     ) -> Result<Answered, CallError> {
         let (v, ep) = self.operations_endpoint(company)?;
         let issuer = v.issuer.clone();
@@ -1567,6 +1600,14 @@ impl Supervisor {
                     return Err(format!(
                         "company {}: operation {id} is being confirmed by another call; nothing more was sent",
                         company.name
+                    ));
+                }
+                // agentd's own record says it is over: whatever the Company
+                // says of the id now, it is never confirmed again.
+                if op.is_final() {
+                    return Err(format!(
+                        "company {}: operation {id} is {} in agentd's record, so it is not confirmed again; nothing was sent",
+                        company.name, op.state
                     ));
                 }
                 if stop.load(Ordering::SeqCst) {
@@ -1630,113 +1671,174 @@ impl Supervisor {
         // The charge, kept before the confirm leaves, under the spending
         // ledger's lock: two confirms, or a confirm and an x402 payment,
         // never pass the allowance together (RFC 0057 §5.2).
-        if let Some((ct, amount)) = charge
-            && let Err(why) =
-                self.spending
-                    .charge(&ct.allowance, &company.name, id, amount, now_ms())
-        {
-            untaken();
-            return Ok(Answered::Refused(why.join("; ")));
-        }
-        let url = format!("{}/{id}/{}", ep.url.trim_end_matches('/'), ops::CONFIRM);
-        let body = serde_json::to_vec(
-            &json!({"revision": approval.revision, "approved_by": approval.approved_by}),
-        )
-        .unwrap_or_default();
-        let sent_confirm = self.send_signed(
-            company,
-            &Signed {
-                account,
-                method: "POST",
-                url: &url,
-                headers: &[
-                    ("Content-Type", "application/json".to_string()),
-                    ("Accept", "application/json".to_string()),
-                ],
-                body: &body,
-                resource: ep.resource.as_deref(),
-                // The same operation id and revision: a confirm sent again
-                // finds the operation confirmed, and the Company returns it as
-                // it is (§5.2, §6).
-                repeat: Repeat::Deduplicated,
-                what: &format!("the confirm of operation {id}"),
-                held: None,
-                trace,
-            },
-        );
-        // It may have been taken: read again until it is final, the
-        // reservation and the approval kept for the confirm.
-        let unknown = |e: String| {
-            unlock(&mut |op| {
-                op.unanswered = true;
-                op.read_at_ms = Some(now_ms() + READ_AGAIN.as_millis() as u64);
-            });
-            self.wake_tracker();
-            CallError::Unknown(format!(
-                "{e} — agentd reads operation {id} again until it is final, and company.operation.confirm sends this confirm again"
-            ))
-        };
-        let reply = match sent_confirm {
-            Ok(r) => r,
-            Err(CallError::Unknown(e)) => return Err(unknown(e)),
-            Err(e) => {
-                untaken();
-                return Err(e);
+        // Judged against the allowance in force now, not as the confirm's
+        // thread read it.
+        let took = match charge {
+            None => None,
+            Some((ct, amount)) => {
+                match self
+                    .spending
+                    .charge(&ct.allowance.id, &company.name, id, amount, now_ms())
+                {
+                    // Above approve_above as it is now: no standing permission
+                    // covers it, and the User is asked.
+                    Ok(crate::spending::Charged::New(true))
+                        if approval.approved_by == ops::APPROVED_BY_STANDING =>
+                    {
+                        self.spending.settle(
+                            &company.name,
+                            id,
+                            crate::spending::ChargeState::Refused,
+                        );
+                        untaken();
+                        return Ok(Answered::Above);
+                    }
+                    Ok(c) => Some(c),
+                    Err(why) => {
+                        untaken();
+                        return Ok(Answered::Refused(why.join("; ")));
+                    }
+                }
             }
         };
-        let answer: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
-        if reply.is_success() {
-            let s = sent(&answer).map_err(|e| {
+        let answered = (|| -> Result<Answered, CallError> {
+            let url = format!("{}/{id}/{}", ep.url.trim_end_matches('/'), ops::CONFIRM);
+            let body = serde_json::to_vec(
+                &json!({"revision": approval.revision, "approved_by": approval.approved_by}),
+            )
+            .unwrap_or_default();
+            let sent_confirm = self.send_signed(
+                company,
+                &Signed {
+                    account,
+                    method: "POST",
+                    url: &url,
+                    headers: &[
+                        ("Content-Type", "application/json".to_string()),
+                        ("Accept", "application/json".to_string()),
+                    ],
+                    body: &body,
+                    resource: ep.resource.as_deref(),
+                    // The same operation id and revision: a confirm sent again
+                    // finds the operation confirmed, and the Company returns it as
+                    // it is (§5.2, §6).
+                    repeat: Repeat::Deduplicated,
+                    what: &format!("the confirm of operation {id}"),
+                    held: None,
+                    trace,
+                },
+            );
+            // It may have been taken: read again until it is final, the
+            // reservation and the approval kept for the confirm.
+            let unknown = |e: String| {
+                unlock(&mut |op| {
+                    op.unanswered = true;
+                    op.read_at_ms = Some(now_ms() + READ_AGAIN.as_millis() as u64);
+                });
+                self.wake_tracker();
+                CallError::Unknown(format!(
+                    "{e} — agentd reads operation {id} again until it is final, and company.operation.confirm sends this confirm again"
+                ))
+            };
+            let reply = match sent_confirm {
+                Ok(r) => r,
+                Err(CallError::Unknown(e)) => return Err(unknown(e)),
+                Err(e) => {
+                    untaken();
+                    return Err(e);
+                }
+            };
+            let answer: Value = serde_json::from_slice(&reply.body).unwrap_or(Value::Null);
+            if reply.is_success() {
+                let s = sent(&answer).map_err(|e| {
                 unknown(format!(
                     "{OUTCOME_UNKNOWN}company {} answered the confirm of operation {id} with what is not an operation ({e})",
                     company.name
                 ))
             })?;
-            // Kept, its use settled; or — the store refusing — the confirm's
-            // answer is not, and it is read again until it is final.
-            if let Err(e) = self.keep(company, &issuer, &s, None, None, account) {
-                return Err(unknown(format!(
-                    "{OUTCOME_UNKNOWN}company {} answered the confirm of operation {id} ({}), and agentd could not keep the answer: {e}",
-                    company.name, s.state
-                )));
-            }
-            if s.confirmation.is_none()
-                && (s.state == ops::PROPOSED || ops::FINAL.contains(&s.state.as_str()))
-            {
-                // It did nothing with it (§5.2: "returns the operation as it
-                // is and does nothing else").
-                untaken();
-            } else {
-                unlock(&mut |op| op.unanswered = false);
-            }
-            if s.state == ops::IN_PROGRESS {
-                self.read_after(&issuer, id, reply.retry_after());
-            }
-            return Ok(Answered::Said(s));
-        }
-        let code = answer["error"].as_str().unwrap_or_default().to_string();
-        if code == err::TERMS_CHANGED || code == err::USER_APPROVAL_REQUIRED {
-            if let Ok(s) = sent(&answer["operation"])
-                && s.id == id
-            {
-                let _ = self.keep(company, &issuer, &s, None, None, account);
-            }
-            let required = code == err::USER_APPROVAL_REQUIRED;
-            unlock(&mut |op| {
-                op.approval = None;
-                if required {
-                    op.user_approval_required = true;
+                // Kept, its use settled; or — the store refusing — the confirm's
+                // answer is not, and it is read again until it is final.
+                if let Err(e) = self.keep(company, &issuer, &s, None, None, account) {
+                    return Err(unknown(format!(
+                        "{OUTCOME_UNKNOWN}company {} answered the confirm of operation {id} ({}), and agentd could not keep the answer: {e}",
+                        company.name, s.state
+                    )));
                 }
-            });
-            self.release(&issuer, id);
-            return Ok(Answered::Again(if required {
-                err::USER_APPROVAL_REQUIRED
-            } else {
-                err::TERMS_CHANGED
-            }));
+                if !taken(&s) {
+                    // It did nothing with it (§5.2: "returns the operation as it
+                    // is and does nothing else").
+                    untaken();
+                } else {
+                    unlock(&mut |op| op.unanswered = false);
+                }
+                if s.state == ops::IN_PROGRESS {
+                    self.read_after(&issuer, id, reply.retry_after());
+                }
+                return Ok(Answered::Said(s));
+            }
+            let code = answer["error"].as_str().unwrap_or_default().to_string();
+            if code == err::TERMS_CHANGED || code == err::USER_APPROVAL_REQUIRED {
+                if let Ok(s) = sent(&answer["operation"])
+                    && s.id == id
+                {
+                    let _ = self.keep(company, &issuer, &s, None, None, account);
+                }
+                let required = code == err::USER_APPROVAL_REQUIRED;
+                unlock(&mut |op| {
+                    op.approval = None;
+                    if required {
+                        op.user_approval_required = true;
+                    }
+                });
+                self.release(&issuer, id);
+                return Ok(Answered::Again(if required {
+                    err::USER_APPROVAL_REQUIRED
+                } else {
+                    err::TERMS_CHANGED
+                }));
+            }
+            untaken();
+            Err(refusal(&company.name, id, reply.status, &reply.body))
+        })();
+        // Only this call's own charge, once it was taken, moves with what
+        // came of the confirm.
+        if let Some(c) = took {
+            *settled = self.charge_after(company, id, c, &answered);
         }
-        untaken();
-        Err(refusal(&company.name, id, reply.status, &reply.body))
+        answered
+    }
+
+    /// The operation's charge after a confirm this call charged it for went
+    /// as `answered`, and where it is now. What `confirm` treats as taken —
+    /// an answer with a confirmation, or `in_progress`, or anything but
+    /// `proposed` or final without one — keeps it counted: `keep` settles
+    /// it when agentd's record reaches a final state, the tracker's reads
+    /// included. One the Company did not take is released; one of unknown
+    /// outcome stays counted. A charge kept from an earlier confirm of
+    /// unknown outcome ([`crate::spending::Charged::Held`]) is released only
+    /// when the Company says it did not take it.
+    fn charge_after(
+        &self,
+        company: &Company,
+        id: &str,
+        took: crate::spending::Charged,
+        answered: &Result<Answered, CallError>,
+    ) -> Option<crate::spending::ChargeState> {
+        use crate::spending::{ChargeState, Charged};
+        let held = took == Charged::Held;
+        let to = match answered {
+            Ok(Answered::Said(s)) if !taken(s) => Some(ChargeState::Refused),
+            Ok(Answered::Said(_)) => None,
+            Ok(Answered::Again(_)) => Some(ChargeState::Refused),
+            Err(CallError::Unknown(_)) => Some(ChargeState::Unknown),
+            Err(_) if held => None,
+            Err(_) => Some(ChargeState::Refused),
+            Ok(_) => None,
+        };
+        if let Some(st) = to {
+            self.spending.settle(&company.name, id, st);
+        }
+        self.spending.charge_of(&company.name, id).map(|c| c.state)
     }
 
     /// Whether the standing permissions covering the account `account`

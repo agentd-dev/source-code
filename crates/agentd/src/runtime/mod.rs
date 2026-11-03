@@ -774,7 +774,10 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // What each allowance was charged (RFC 0057): read before either rail
     // can charge one.
     let spending = match crate::spending::Spending::open(Arc::clone(&durable)) {
-        Ok(s) => Arc::new(s),
+        Ok(s) => {
+            s.set_allowances(crate::spending::Allowance::all(&settings.security.payments));
+            Arc::new(s)
+        }
         Err(e) => {
             log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
             return crate::exit::USAGE;

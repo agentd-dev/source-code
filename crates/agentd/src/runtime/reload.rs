@@ -191,7 +191,9 @@ impl Runtime {
         self.machinery_noted = None;
         let mut changed = self.commit_reload(&old, staged);
         // Read live at every payment and charge (RFC 0057 §4.4): applied
-        // once the settings are.
+        // once the settings are — a Company charge taken from now on is
+        // judged against them.
+        self.spending.set_allowances(self.allowances());
         if self.allowances_reloaded(&old) {
             changed.retain(|c| *c != "nothing");
             changed.push("security.payments.allowances");

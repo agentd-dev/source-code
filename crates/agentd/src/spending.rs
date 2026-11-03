@@ -408,6 +408,21 @@ pub struct Spending {
     durable: Arc<Durable>,
     charges: Mutex<Charges>,
     x402: OnceLock<Arc<dyn Counted>>,
+    /// The allowances as the settings say now: set at start and by every
+    /// reload, read under the charges' lock when a Company charge is
+    /// taken, so the charge is judged against what is in force then.
+    live: Mutex<BTreeMap<String, Allowance>>,
+}
+
+/// What [`Spending::charge`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Charged {
+    /// A new charge is kept; whether it is above `approve_above`.
+    New(bool),
+    /// The operation's charge from a confirm whose outcome is not known
+    /// yet — `sent` or `unknown` — is kept as it is: the confirm is sent
+    /// again, and the charge still counts once.
+    Held,
 }
 
 impl Spending {
@@ -441,6 +456,7 @@ impl Spending {
             durable,
             charges: Mutex::new(Charges(charges)),
             x402: OnceLock::new(),
+            live: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -485,20 +501,77 @@ impl Spending {
         u
     }
 
-    /// The charge of `amount` for `operation` at `company` to `a`, if it is
-    /// within it at `now_ms`, kept before the confirm is sent: one step
-    /// under the lock, so two confirms never pass a budget together.
-    /// `Ok(above approve_above)`, or every limit it is past.
+    /// The allowances in force from now on: every reload sets them.
+    pub fn set_allowances(&self, all: BTreeMap<String, Allowance>) {
+        *self.live.lock().unwrap_or_else(|e| e.into_inner()) = all;
+    }
+
+    /// One allowance in force from now on, beside the others.
+    pub fn set_allowance(&self, a: Allowance) {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(a.id.clone(), a);
+    }
+
+    /// The allowance `id` as it is in force now, or why there is none.
+    pub fn allowance(&self, id: &str) -> Result<Allowance, String> {
+        self.live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "allowance {id}: it is no longer a security.payments.allowances entry, so nothing is charged to it"
+                )
+            })
+    }
+
+    /// Why `operation` at `company` is not charged again: its charge is
+    /// confirmed — the Company took a confirm of it — so a confirm of the
+    /// same operation id is never sent again (RFC 0057 §4.5).
+    pub fn confirmed_already(&self, company: &str, operation: &str) -> Option<String> {
+        self.charge_of(company, operation)
+            .filter(|c| c.state == ChargeState::Confirmed)
+            .map(|c| {
+                format!(
+                    "company {company}: operation {operation} was confirmed and charged already ({} {} to allowance {}) — agentd never confirms an operation twice; nothing was sent",
+                    c.amount, c.currency, c.allowance
+                )
+            })
+    }
+
+    /// The charge of `amount` for `operation` at `company` to the allowance
+    /// `id` as it is in force now, if it is within it at `now_ms`, kept
+    /// before the confirm is sent: one step under the lock, so two confirms
+    /// never pass a budget together. A charge of the operation that counts
+    /// already is never written over nor left out: a confirmed one refuses,
+    /// one of unknown outcome is kept as it is ([`Charged::Held`]).
     pub fn charge(
         &self,
-        a: &Allowance,
+        id: &str,
         company: &str,
         operation: &str,
         amount: u128,
         now_ms: u64,
-    ) -> Result<bool, Vec<String>> {
+    ) -> Result<Charged, Vec<String>> {
         let mut held = self.hold();
-        let usage = self.usage(&held, a, now_ms, Some((company, operation)));
+        if let Some(c) = held.0.get(&charge_id(company, operation)) {
+            match c.state {
+                ChargeState::Confirmed => {
+                    return Err(vec![format!(
+                        "company {company}: operation {operation} was confirmed and charged already ({} {} to allowance {}) — agentd never confirms an operation twice",
+                        c.amount, c.currency, c.allowance
+                    )]);
+                }
+                ChargeState::Sent | ChargeState::Unknown => return Ok(Charged::Held),
+                ChargeState::Refused | ChargeState::Credited => {}
+            }
+        }
+        let a = self.allowance(id).map_err(|e| vec![e])?;
+        let a = &a;
+        let usage = self.usage(&held, a, now_ms, None);
         let above = judge(a, company, amount, usage, now_ms)?;
         let c = Charge {
             company: company.to_string(),
@@ -511,7 +584,34 @@ impl Spending {
             ended_ms: None,
         };
         self.put(&mut held, c).map_err(|e| vec![e])?;
-        Ok(above)
+        Ok(Charged::New(above))
+    }
+
+    /// The charge for `operation` at `company` once agentd's own record of
+    /// the operation moved to the final `state` from a state that was not
+    /// final (`confirmed`: the Company took a confirm of it): `succeeded`
+    /// confirms it; `cancelled` credits it back; `failed` or `expired`
+    /// keeps a taken one counted and releases one never taken. What it is
+    /// now, when it moved.
+    pub fn settle_final(
+        &self,
+        company: &str,
+        operation: &str,
+        state: &str,
+        confirmed: bool,
+    ) -> Option<ChargeState> {
+        let c = self.charge_of(company, operation)?;
+        let to = match state {
+            "succeeded" => ChargeState::Confirmed,
+            "cancelled" => ChargeState::Credited,
+            _ if confirmed || c.state == ChargeState::Confirmed => ChargeState::Confirmed,
+            _ => ChargeState::Refused,
+        };
+        if c.state == to || c.state == ChargeState::Credited || c.state == ChargeState::Refused {
+            return None;
+        }
+        self.settle(company, operation, to);
+        Some(to)
     }
 
     /// The charge for `operation` at `company` moved to `state`; nothing
@@ -929,12 +1029,23 @@ mod tests {
         a.payees = Some(vec!["shop".into()]);
         let now = crate::state::now_ms();
         let s = Spending::open(durable()).unwrap();
-        assert_eq!(s.charge(&a, "shop", "op1", gbp("50"), now), Ok(false));
-        assert_eq!(s.charge(&a, "shop", "op2", gbp("100"), now), Ok(true));
-        // Again for the same operation: its own charge is not counted twice.
-        assert!(s.charge(&a, "shop", "op2", gbp("100"), now).is_ok());
+        s.set_allowance(a.clone());
+        let g = "groceries";
+        assert_eq!(
+            s.charge(g, "shop", "op1", gbp("50"), now),
+            Ok(Charged::New(false))
+        );
+        assert_eq!(
+            s.charge(g, "shop", "op2", gbp("100"), now),
+            Ok(Charged::New(true))
+        );
+        // Again for the same operation, its outcome not known yet: the
+        // charge is kept as it is, counted once — never written over.
+        assert_eq!(s.charge(g, "shop", "op2", gbp("1"), now), Ok(Charged::Held));
+        assert_eq!(s.charge_of("shop", "op2").unwrap().amount, "100");
         a.max = gbp("300");
-        let e = s.charge(&a, "shop", "op3", gbp("300"), now).unwrap_err();
+        s.set_allowance(a.clone());
+        let e = s.charge(g, "shop", "op3", gbp("300"), now).unwrap_err();
         assert_eq!(
             e,
             ["allowance groceries: budget 400 GBP per month, 150 spent, this payment 300"]
@@ -943,9 +1054,48 @@ mod tests {
             s.charge_of("shop", "op3").is_none(),
             "a refused charge is not kept"
         );
+        // A confirmed charge is never charged again: the same operation id
+        // proposed again refuses.
+        s.settle("shop", "op1", ChargeState::Confirmed);
+        let e = s.charge(g, "shop", "op1", gbp("5"), now).unwrap_err();
+        assert!(e[0].contains("was confirmed and charged already"), "{e:?}");
+        assert!(s.confirmed_already("shop", "op1").is_some());
+        assert_eq!(s.charge_of("shop", "op1").unwrap().amount, "50");
+        // Judged against the allowance in force, not the one a caller read.
+        let mut lower = a.clone();
+        lower.max = gbp("10");
+        s.set_allowance(lower);
+        let e = s.charge(g, "shop", "op4", gbp("20"), now).unwrap_err();
+        assert!(e[0].contains("max 10 GBP, this payment 20"), "{e:?}");
+        s.set_allowance(a.clone());
+        // agentd's record moving to a final state settles the charge: a
+        // succeeded operation's stays counted whatever comes after.
+        assert_eq!(
+            s.settle_final("shop", "op1", "succeeded", true),
+            None,
+            "confirmed already"
+        );
+        assert_eq!(
+            s.settle_final("shop", "op1", "cancelled", true),
+            Some(ChargeState::Credited)
+        );
+        s.settle("shop", "op1", ChargeState::Confirmed);
+        assert_eq!(
+            s.charge_of("shop", "op1").unwrap().state,
+            ChargeState::Credited
+        );
+        // A taken charge whose operation failed or expired stays counted.
+        assert_eq!(
+            s.settle_final("shop", "op2", "expired", true),
+            Some(ChargeState::Confirmed)
+        );
         let s = Spending::open(durable()).unwrap();
         let u = s.usage(&s.hold(), &a, now, None);
-        assert_eq!((u.spent, u.payments), (gbp("150"), 2));
+        assert_eq!(
+            (u.spent, u.payments),
+            (gbp("100"), 1),
+            "op1 credited, op2 kept"
+        );
         s.settle("shop", "op1", ChargeState::Refused);
         s.settle("shop", "op2", ChargeState::Credited);
         let u = s.usage(&s.hold(), &a, now, None);

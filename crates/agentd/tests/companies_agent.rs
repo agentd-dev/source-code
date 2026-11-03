@@ -5233,6 +5233,18 @@ fn confirm_charged(
     given: Option<Approval>,
     ct: &agentd::companies::operations::ChargeTerm,
 ) -> Vec<Step> {
+    // In force, as the runtime sets it.
+    a.sup.spending().set_allowance(ct.allowance.clone());
+    confirm_in_force(a, id, given, ct)
+}
+
+/// [`confirm_charged`] against whatever allowance is in force.
+fn confirm_in_force(
+    a: &Agent,
+    id: &str,
+    given: Option<Approval>,
+    ct: &agentd::companies::operations::ChargeTerm,
+) -> Vec<Step> {
     let steps = Mutex::new(Vec::new());
     a.sup.confirm_operation(
         &shop(a),
@@ -5245,6 +5257,11 @@ fn confirm_charged(
         Some(ct),
     );
     steps.into_inner().unwrap()
+}
+
+/// The state of the operation `id`'s charge.
+fn charge_state(a: &Agent, id: &str) -> Option<agentd::spending::ChargeState> {
+    a.sup.spending().charge_of("shop", id).map(|c| c.state)
 }
 
 /// What `shopping` has been charged and how many times, as a decimal.
@@ -5404,4 +5421,147 @@ fn above_approve_above_a_standing_permission_does_not_apply() {
     assert!(standing_used(&steps), "{steps:?}");
     assert_eq!(confirms(&f).len(), 1);
     assert_eq!(charged(&a, &high), ("15".into(), 1));
+}
+
+/// An approved, confirmed and charged exchange of `item` for $15: its id.
+fn bought(a: &Agent, ct: &agentd::companies::operations::ChargeTerm, item: &str) -> String {
+    let id = propose(a, item, "stormline-m", item);
+    let yes = approval(&confirm_charged(a, &id, None, ct));
+    assert!(done(&confirm_charged(a, &id, Some(yes), ct)).is_ok());
+    id
+}
+
+/// Review finding 1: a Company proposing again an operation id agentd
+/// holds as succeeded — its charge confirmed — is never asked of the User,
+/// never confirmed again and never charged again: agentd's own record says
+/// it is over, whatever the Company says of the id now.
+#[test]
+fn a_reused_operation_id_is_never_confirmed_or_charged_again() {
+    use agentd::spending::ChargeState;
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let ct = shopping("100", "100", "");
+    let id = bought(&a, &ct, "itm_1");
+    assert_eq!(charged(&a, &ct), ("15".into(), 1));
+    assert_eq!(charge_state(&a, &id), Some(ChargeState::Confirmed));
+    f.control(json!({"operations": {"repropose": id}}));
+    let steps = confirm_charged(&a, &id, None, &ct);
+    assert!(asked(&steps).is_none(), "the User is not asked: {steps:?}");
+    let out = done(&steps).unwrap();
+    assert!(
+        out["note"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("is succeeded"),
+        "{out}"
+    );
+    assert_eq!(confirms(&f).len(), 1, "never confirmed again");
+    assert_eq!(charged(&a, &ct), ("15".into(), 1));
+    assert_eq!(charge_state(&a, &id), Some(ChargeState::Confirmed));
+}
+
+/// Review finding 2: a Company answering a cancel `cancelled` for an
+/// operation agentd holds as succeeded credits nothing back: the charge
+/// follows agentd's own record, and a succeeded operation's stays counted.
+#[test]
+fn a_cancelled_answer_never_credits_a_succeeded_operations_charge() {
+    use agentd::spending::ChargeState;
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let ct = shopping("100", "100", "");
+    let id = bought(&a, &ct, "itm_1");
+    f.control(json!({"operations": {"cancel_always": true}}));
+    let _ = a.sup.cancel_operation(&shop(&a), &id, None, None);
+    assert_eq!(charged(&a, &ct), ("15".into(), 1), "still counted");
+    assert_eq!(charge_state(&a, &id), Some(ChargeState::Confirmed));
+}
+
+/// Review finding 3: a second confirm of the same operation, racing the
+/// first, never touches the first one's charge: while the first confirm is
+/// out the charge counts, whatever became of the second.
+#[test]
+fn a_racing_confirm_never_releases_the_first_ones_charge() {
+    use agentd::spending::ChargeState;
+    let f = fake(&[]);
+    let a = Arc::new(operating(&f, ""));
+    let ct = shopping("500", "500", "");
+    for n in 0..8 {
+        let item = format!("itm_r{n}");
+        let id = propose(&a, &item, "stormline-m", &item);
+        let yes = approval(&confirm_charged(&a, &id, None, &ct));
+        // The first confirm to reach the Company is held there a while.
+        f.control(json!({"http_fail": {"method": "POST", "path": format!("/poppy/operations/{id}/confirm"), "times": 1, "ms": 800}}));
+        let go = Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let (a, ct, id, yes, go) = (
+                    Arc::clone(&a),
+                    ct.clone(),
+                    id.clone(),
+                    yes.clone(),
+                    Arc::clone(&go),
+                );
+                std::thread::spawn(move || {
+                    go.wait();
+                    confirm_in_force(&a, &id, Some(yes), &ct)
+                })
+            })
+            .collect();
+        // While the confirm is held, its charge counts.
+        std::thread::sleep(Duration::from_millis(450));
+        let during = charge_state(&a, &id);
+        let ends: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        assert!(
+            matches!(during, Some(ChargeState::Sent | ChargeState::Confirmed)),
+            "round {n}: the charge while the confirm was out: {during:?} ({ends:?})"
+        );
+        assert_eq!(
+            charge_state(&a, &id),
+            Some(ChargeState::Confirmed),
+            "round {n}"
+        );
+    }
+    assert_eq!(charged(&a, &ct).1, 8);
+}
+
+/// Review finding 4: a confirm the Company answers `in_progress` with no
+/// confirmation was taken — it is being performed — so its charge stays
+/// counted, and is confirmed once agentd reads the operation succeeded.
+#[test]
+fn an_in_progress_answer_keeps_the_charge_until_it_is_final() {
+    use agentd::spending::ChargeState;
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let ct = shopping("100", "100", "");
+    let id = propose(&a, "itm_1", "stormline-m", "slow");
+    let yes = approval(&confirm_charged(&a, &id, None, &ct));
+    f.control(json!({"operations": {"in_progress": 1, "no_confirmation": true}}));
+    let steps = confirm_charged(&a, &id, Some(yes), &ct);
+    assert!(done(&steps).is_ok(), "{steps:?}");
+    assert_eq!(charge_state(&a, &id), Some(ChargeState::Sent), "{steps:?}");
+    assert_eq!(charged(&a, &ct), ("15".into(), 1));
+    let v = a.sup.get_operation(&shop(&a), &id, None, None).unwrap();
+    assert_eq!(v["state"], "succeeded", "{v}");
+    assert_eq!(charge_state(&a, &id), Some(ChargeState::Confirmed));
+    assert_eq!(charged(&a, &ct), ("15".into(), 1));
+}
+
+/// Review finding 7: a confirm is judged and charged against the allowance
+/// in force when the charge is taken — a reload that lowered it since the
+/// confirm's thread read it holds — not the copy the thread was handed.
+#[test]
+fn a_charge_is_judged_against_the_allowance_in_force() {
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let handed = shopping("100", "100", "");
+    a.sup
+        .spending()
+        .set_allowance(shopping("10", "100", "").allowance);
+    let id = propose(&a, "itm_1", "stormline-m", "lowered");
+    let e = done(&confirm_in_force(&a, &id, None, &handed)).unwrap_err();
+    assert!(
+        e.contains("allowance shopping: max 10 USD, this payment 15"),
+        "{e}"
+    );
+    assert!(confirms(&f).is_empty());
 }

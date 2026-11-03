@@ -434,8 +434,62 @@ enum Prepared {
         digest: String,
     },
     /// An approval covers the current revision; with a standing
-    /// permission's id and the uses it has left after this one.
-    Approved(Approval, Option<(String, Option<u32>)>),
+    /// permission's id and the uses it has left after this one, and the
+    /// charge its terms say, in the allowance's currency.
+    Approved(Approval, Option<(String, Option<u32>)>, Option<u128>),
+    /// The allowance refuses its charge (RFC 0057 §5.2): why.
+    Refused(String),
+}
+
+/// What an operation's charge is held to (RFC 0057 §5.2): the allowance its
+/// company entry names, as the settings say when the confirm starts, and
+/// the term key whose value is the charge.
+#[derive(Debug, Clone)]
+pub struct ChargeTerm {
+    pub allowance: crate::spending::Allowance,
+    pub term: String,
+}
+
+/// The charge `op`'s terms say, at `spending::SCALE`, in `ct`'s
+/// allowance's currency: a term `{"amount": "<decimal>", "currency":
+/// "<ISO 4217>"}`, or a number in the allowance's currency — else why it
+/// cannot be read.
+pub fn charge_of(op: &Operation, ct: &ChargeTerm) -> Result<u128, String> {
+    use crate::spending::SCALE;
+    let at = format!("allowance {}", ct.allowance.id);
+    let term = op.terms.as_ref().and_then(|t| t.get(&ct.term));
+    let amount = |s: &str| {
+        crate::config::settings::payments::parse_amount(s, SCALE)
+            .map_err(|e| format!("{at}: the charge term {:?} does not read: {e}", ct.term))
+    };
+    match term {
+        None => Err(format!(
+            "{at}: the operation's terms have no charge term {:?} (companies.<name>.spending.amount)",
+            ct.term
+        )),
+        Some(Value::Number(n)) => amount(&n.to_string()),
+        Some(Value::Object(o)) => {
+            let (Some(Value::String(a)), Some(Value::String(c))) =
+                (o.get("amount"), o.get("currency"))
+            else {
+                return Err(format!(
+                    "{at}: the charge term {:?} is not {{\"amount\": \"<decimal>\", \"currency\": \"<ISO 4217>\"}}",
+                    ct.term
+                ));
+            };
+            if *c != ct.allowance.currency {
+                return Err(format!(
+                    "{at}: the charge is in {c}, the allowance in {}; agentd never converts between currencies",
+                    ct.allowance.currency
+                ));
+            }
+            amount(a)
+        }
+        Some(_) => Err(format!(
+            "{at}: the charge term {:?} is neither an amount with its currency nor a number",
+            ct.term
+        )),
+    }
 }
 
 /// How a confirm went.
@@ -450,6 +504,8 @@ enum Answered {
     /// The standing permission that approved it has no use left — another
     /// confirm took it — and the confirm is prepared again.
     Spent,
+    /// The allowance refused its charge as it was sent: why.
+    Refused(String),
 }
 
 /// What taking a confirm's lock came to.
@@ -475,6 +531,18 @@ pub enum Outcome {
     Unknown,
     /// It never left.
     Unsent,
+}
+
+impl Outcome {
+    /// What becomes of the operation's charge to an allowance.
+    fn charge(self) -> crate::spending::ChargeState {
+        use crate::spending::ChargeState;
+        match self {
+            Outcome::Taken => ChargeState::Confirmed,
+            Outcome::Unknown => ChargeState::Unknown,
+            Outcome::Untaken | Outcome::Refused | Outcome::Unsent => ChargeState::Refused,
+        }
+    }
 }
 
 impl Outcome {
@@ -529,8 +597,30 @@ pub enum Step {
         state: Option<String>,
         error: Option<String>,
     },
+    /// The operation's charge to an allowance (RFC 0057 §5.2): where it is
+    /// — `confirmed`, `unknown`, `refused`, or `refused_by_allowance` with
+    /// why — and the amount, in the allowance's currency.
+    Charge {
+        allowance: String,
+        amount: String,
+        currency: String,
+        state: &'static str,
+        why: Option<String>,
+    },
     /// It ended: the tool's answer, or an error.
     Done(Result<Value, String>),
+}
+
+/// How a charge's state is said in its log line and audit record.
+fn state_name(s: crate::spending::ChargeState) -> &'static str {
+    use crate::spending::ChargeState;
+    match s {
+        ChargeState::Sent => "sent",
+        ChargeState::Confirmed => "confirmed",
+        ChargeState::Unknown => "unknown",
+        ChargeState::Refused => "refused",
+        ChargeState::Credited => "credited",
+    }
 }
 
 /// What agentd tells the runtime of a Company's operations, through
@@ -969,6 +1059,21 @@ impl Supervisor {
         // confirm of it was taken.
         self.keep(company, &v.issuer, &s, None, None, account.as_deref())
             .map_err(CallError::Unsent)?;
+        // A cancellation the Company confirms credits the operation's charge
+        // back to its allowance (RFC 0057 §5.2).
+        if s.state == ops::CANCELLED
+            && self
+                .spending
+                .charge_of(&company.name, id)
+                .is_some_and(|c| c.state.counts())
+        {
+            self.spending
+                .settle(&company.name, id, crate::spending::ChargeState::Credited);
+            self.log().info(
+                "payment.allowance.credited",
+                json!({"company": company.name, "operation_id": id}),
+            );
+        }
         if s.state == ops::IN_PROGRESS {
             self.read_after(&v.issuer, id, reply.retry_after());
         }
@@ -1007,6 +1112,7 @@ impl Supervisor {
         trace: Option<&TraceContext>,
         stop: &AtomicBool,
         send: &dyn Fn(Step),
+        charge: Option<&ChargeTerm>,
     ) {
         let mut given = given;
         let mut why: Option<&'static str> = None;
@@ -1029,12 +1135,18 @@ impl Supervisor {
             if stop.load(Ordering::SeqCst) {
                 return send(withdrawn());
             }
-            let prepared = match self.prepare(company, id, account, given.take(), why, trace) {
-                Ok(p) => p,
-                Err(e) => return send(Step::Done(Err(e.to_string()))),
-            };
-            let (approval, standing) = match prepared {
+            let prepared =
+                match self.prepare(company, id, account, given.take(), why, trace, charge) {
+                    Ok(p) => p,
+                    Err(e) => return send(Step::Done(Err(e.to_string()))),
+                };
+            let (approval, standing, amount) = match prepared {
                 Prepared::Done(v) => return send(Step::Done(Ok(v))),
+                Prepared::Refused(why) => {
+                    return send(Step::Done(Err(
+                        self.refuse_charge(company, id, account, trace, charge, &why, send)
+                    )));
+                }
                 Prepared::Ask {
                     question,
                     revision,
@@ -1046,7 +1158,7 @@ impl Supervisor {
                         digest,
                     });
                 }
-                Prepared::Approved(a, standing) => (a, standing),
+                Prepared::Approved(a, standing, amount) => (a, standing, amount),
             };
             if let Some((rule, uses_left)) = &standing {
                 send(Step::Standing {
@@ -1055,7 +1167,40 @@ impl Supervisor {
                     uses_left: *uses_left,
                 });
             }
-            match self.confirm(company, id, account, &approval, trace, stop) {
+            let charged = charge.zip(amount);
+            let answered = self.confirm(company, id, account, &approval, trace, stop, charged);
+            // The charge goes with what came of the confirm.
+            if let Some((ct, amount)) = charged {
+                let state = match &answered {
+                    Ok(Answered::Said(s)) if s.confirmation.is_some() => {
+                        Some(crate::spending::ChargeState::Confirmed)
+                    }
+                    Ok(Answered::Said(_)) | Ok(Answered::Again(_)) => {
+                        Some(crate::spending::ChargeState::Refused)
+                    }
+                    Err(e) => Some(Outcome::of(e).charge()),
+                    _ => None,
+                };
+                if let Some(state) = state {
+                    self.spending.settle(&company.name, id, state);
+                    send(Step::Charge {
+                        allowance: ct.allowance.id.clone(),
+                        amount: crate::config::settings::payments::format_amount(
+                            amount,
+                            crate::spending::SCALE,
+                        ),
+                        currency: ct.allowance.currency.clone(),
+                        state: state_name(state),
+                        why: None,
+                    });
+                }
+            }
+            match answered {
+                Ok(Answered::Refused(why)) => {
+                    return send(Step::Done(Err(
+                        self.refuse_charge(company, id, account, trace, charge, &why, send)
+                    )));
+                }
                 Ok(Answered::Withdrawn) => return send(withdrawn()),
                 Ok(Answered::Spent) => {
                     why = Some("The standing permission that covered this has no use left.");
@@ -1128,11 +1273,48 @@ impl Supervisor {
         ))))
     }
 
+    /// The allowance refused `id`'s charge, `why`: nothing is confirmed,
+    /// and the operation is cancelled at the Company as a decline is (Ops
+    /// §7). What the asker is told.
+    #[allow(clippy::too_many_arguments)] // the confirm's own context, named
+    fn refuse_charge(
+        &self,
+        company: &Company,
+        id: &str,
+        account: Option<&str>,
+        trace: Option<&TraceContext>,
+        charge: Option<&ChargeTerm>,
+        why: &str,
+        send: &dyn Fn(Step),
+    ) -> String {
+        if let Some(ct) = charge {
+            send(Step::Charge {
+                allowance: ct.allowance.id.clone(),
+                amount: String::new(),
+                currency: ct.allowance.currency.clone(),
+                state: "refused_by_allowance",
+                why: Some(why.to_string()),
+            });
+        }
+        match self.cancel_operation(company, id, account, trace) {
+            Ok(v) => format!(
+                "company {}: operation {id} was NOT confirmed — {why}; agentd cancelled it at the Company (it is {})",
+                company.name,
+                v["state"].as_str().unwrap_or("unknown")
+            ),
+            Err(e) => format!(
+                "company {}: operation {id} was NOT confirmed — {why}; cancelling it at the Company failed: {e}",
+                company.name
+            ),
+        }
+    }
+
     /// Everything before a confirm: the operation read again, held to its
     /// state, its expiry, the lock and the operations of the same terms, and
     /// what approves its revision as the Company says it now — `given`, or
     /// the User's approval kept for it, or a standing permission that still
     /// covers it, asked again each time — else the User's gate, saying `why`.
+    #[allow(clippy::too_many_arguments)] // the confirm's own context, named
     fn prepare(
         &self,
         company: &Company,
@@ -1141,6 +1323,7 @@ impl Supervisor {
         given: Option<Approval>,
         why: Option<&str>,
         trace: Option<&TraceContext>,
+        charge: Option<&ChargeTerm>,
     ) -> Result<Prepared, CallError> {
         let (v, ep) = self.operations_endpoint(company)?;
         let issuer = v.issuer.clone();
@@ -1204,6 +1387,27 @@ impl Supervisor {
         // Company says the same of it. A standing permission's is never
         // reused: whether it still covers the operation — still in effect,
         // not suspended, a use reserved — is asked again.
+        // The allowance first (RFC 0057 §5.2): past a limit nothing is
+        // asked or applied; above its approve_above no standing permission
+        // covers the operation. It never approves an operation itself.
+        let mut amount = None;
+        let mut above = false;
+        if let Some(ct) = charge {
+            let a = match charge_of(&op, ct) {
+                Ok(a) => a,
+                Err(why) => return Ok(Prepared::Refused(why)),
+            };
+            let usage = {
+                let held = self.spending.hold();
+                self.spending
+                    .usage(&held, &ct.allowance, now, Some((&company.name, id)))
+            };
+            match crate::spending::judge(&ct.allowance, &company.name, a, usage, now) {
+                Ok(over) => above = over,
+                Err(why) => return Ok(Prepared::Refused(why.join("; "))),
+            }
+            amount = Some(a);
+        }
         let digest = approval_digest(&op);
         let covers_now = |a: &Approval| a.revision == op.revision && a.digest == digest;
         for a in [
@@ -1216,10 +1420,10 @@ impl Supervisor {
         .flatten()
         {
             if covers_now(a) {
-                return Ok(Prepared::Approved(a.clone(), None));
+                return Ok(Prepared::Approved(a.clone(), None, amount));
             }
         }
-        if let Some((rule, left)) = self.reserve(company, &issuer, id, &op, now) {
+        if !above && let Some((rule, left)) = self.reserve(company, &issuer, id, &op, now) {
             return Ok(Prepared::Approved(
                 Approval {
                     revision: op.revision,
@@ -1228,8 +1432,12 @@ impl Supervisor {
                     by: rule.clone(),
                 },
                 Some((rule, left)),
+                amount,
             ));
         }
+        let why = why.or(above.then_some(
+            "The charge is above what the allowance it draws on lets a standing permission approve.",
+        ));
         let changed = given.filter(|g| !covers_now(g)).map(|g| {
             if g.revision != op.revision {
                 "The terms changed after you were asked: this is the revision the Company holds now."
@@ -1323,6 +1531,7 @@ impl Supervisor {
     /// Send the confirm of `id` with `approval` under the operation's lock,
     /// in the Session of the account `account` names, unless `stop` is set
     /// first, and keep what the Company answered (§5.2, §6).
+    #[allow(clippy::too_many_arguments)] // the confirm's own context, named
     fn confirm(
         &self,
         company: &Company,
@@ -1331,6 +1540,7 @@ impl Supervisor {
         approval: &Approval,
         trace: Option<&TraceContext>,
         stop: &AtomicBool,
+        charge: Option<(&ChargeTerm, u128)>,
     ) -> Result<Answered, CallError> {
         let (v, ep) = self.operations_endpoint(company)?;
         let issuer = v.issuer.clone();
@@ -1416,6 +1626,17 @@ impl Supervisor {
         if stop.load(Ordering::SeqCst) {
             untaken();
             return Ok(Answered::Withdrawn);
+        }
+        // The charge, kept before the confirm leaves, under the spending
+        // ledger's lock: two confirms, or a confirm and an x402 payment,
+        // never pass the allowance together (RFC 0057 §5.2).
+        if let Some((ct, amount)) = charge
+            && let Err(why) =
+                self.spending
+                    .charge(&ct.allowance, &company.name, id, amount, now_ms())
+        {
+            untaken();
+            return Ok(Answered::Refused(why.join("; ")));
         }
         let url = format!("{}/{id}/{}", ep.url.trim_end_matches('/'), ops::CONFIRM);
         let body = serde_json::to_vec(

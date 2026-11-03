@@ -189,7 +189,13 @@ impl Runtime {
         let machinery_moved = digest != self.machinery_in_force;
         self.machinery_in_force = digest;
         self.machinery_noted = None;
-        let changed = self.commit_reload(&old, staged);
+        let mut changed = self.commit_reload(&old, staged);
+        // Read live at every payment and charge (RFC 0057 §4.4): applied
+        // once the settings are.
+        if self.allowances_reloaded(&old) {
+            changed.retain(|c| *c != "nothing");
+            changed.push("security.payments.allowances");
+        }
         for f in &self.settings.agent.skill_fetches {
             self.log.info("skills.fetched", f.clone());
         }

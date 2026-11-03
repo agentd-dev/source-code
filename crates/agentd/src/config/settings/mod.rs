@@ -3009,6 +3009,10 @@ pub struct Company {
     /// `security.companies.context`.
     #[serde(default)]
     pub context: Option<companies::Context>,
+    /// Which term of an operation it proposes is the charge, and the
+    /// allowance it draws on (RFC 0057 §5.2).
+    #[serde(default)]
+    pub spending: Option<companies::Spending>,
 }
 
 /// `http:` — the plain-HTTP endpoints this deployment reaches (RFC 0055
@@ -12144,8 +12148,19 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "security.experimental",
     // The spend policy, the wallets and the approver (RFC 0049 §4): what a
     // payment is judged by, and the gate a reload would move under a
-    // question the approver is reading.
-    "security.payments",
+    // question the approver is reading. Every field but `allowances`, which
+    // reload (RFC 0057 §4): RELOADABLE_PATHS.
+    "security.payments.approval_timeout",
+    "security.payments.approver",
+    "security.payments.ask_when_tainted",
+    "security.payments.assets",
+    "security.payments.key_custody",
+    "security.payments.max_validity",
+    "security.payments.payees",
+    "security.payments.rpc",
+    "security.payments.seal_key",
+    "security.payments.signer",
+    "security.payments.wallets",
     "security.tls_ca",
     "security.workflows",
     // The listener as a resource server (RFC 0044 §5.9): the resource and
@@ -12299,6 +12314,10 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     // that raised it, and a first use approved under a rule stands while
     // the rule's content does.
     "security.policies",
+    // Read from the live settings at every payment and every Company
+    // charge, and when an approval is answered (RFC 0057 §4): a lowered
+    // budget stops the next payment.
+    "security.payments.allowances",
     "skills.dir",
     "skills.inline",
     "skills.max_bytes",
@@ -12825,6 +12844,9 @@ mod tests {
                     }}),
                     "security.payments.payees" => {
                         json!({"api": {"address": "0x209693Bc6afc0C5328bA36FaF03C514EF312287C"}})
+                    }
+                    "security.payments.allowances" => {
+                        json!({"groceries": {"currency": "GBP", "max": "120", "budget": "400"}})
                     }
                     _ => json!({"k": "v"}),
                 },

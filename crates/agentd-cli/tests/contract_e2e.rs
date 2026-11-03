@@ -451,6 +451,9 @@ fn every_reachable_feed_kind_and_read_reply_matches_the_published_schema() {
             // Served only where an IdP or a delegated server is declared, in
             // a build with `xaa`: the `ema` conformance family reads it.
             "delegation.list" => continue,
+            // Served only where an allowance is declared: x402_e2e reads it
+            // over A2A, and its document is the tool's published output.
+            "payment.allowances" => continue,
             other => panic!("the read {other} needs arguments in this test"),
         };
         run(op, args);

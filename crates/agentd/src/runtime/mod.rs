@@ -63,6 +63,7 @@ pub(crate) mod registries; // registry servers: resolved on use, pinned per run 
 pub mod reload;
 pub(crate) mod retire;
 pub(crate) mod skills; // the skills catalogue: built, loaded into contexts, its tools (RFC 0051)
+pub(crate) mod spending; // allowances as the runtime holds them: live, reported, swept (RFC 0057)
 pub mod starts;
 pub mod steps;
 #[cfg(feature = "xaa")]
@@ -770,9 +771,22 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // absent) and its Companies registered. Nothing is dialled here: each
     // Company's MCP servers join off the loop, as a server down at boot does
     // (`join`), so a Company that does not answer holds nothing up.
+    // What each allowance was charged (RFC 0057): read before either rail
+    // can charge one.
+    let spending = match crate::spending::Spending::open(Arc::clone(&durable)) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
+            return crate::exit::USAGE;
+        }
+    };
     #[cfg(feature = "companies")]
-    let companies = match crate::companies::Supervisor::build(&settings, Arc::clone(&durable), &log)
-    {
+    let companies = match crate::companies::Supervisor::build(
+        &settings,
+        Arc::clone(&durable),
+        &log,
+        Arc::clone(&spending),
+    ) {
         Ok(c) => c,
         Err(e) => {
             log.error("proc.exit", json!({"code": crate::exit::USAGE, "err": e}));
@@ -794,7 +808,13 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
                 return crate::exit::USAGE;
             }
         };
+    #[cfg(feature = "x402")]
+    if let Some(p) = &payments {
+        spending.count_x402(Arc::clone(p) as Arc<dyn crate::spending::Counted>);
+    }
     let mut rt = Runtime {
+        spending,
+        spending_swept_ms: 0,
         instance: instance.clone(),
         run_id: run_id.clone(),
         durable,

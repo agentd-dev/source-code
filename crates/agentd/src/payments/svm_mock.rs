@@ -223,6 +223,7 @@ mod tests {
             wallet: "sol".into(),
             max: vec![("usdc-sol".into(), 100_000)],
             approve: false,
+            allowance: None,
         }
     }
 
@@ -256,7 +257,8 @@ mod tests {
         let entry = sponsor.entry(MAINNET, &mint, &pay_to, 40_000, None, Some(&[3u8; 32]));
         let required = json!({"x402Version": 2, "resource": {"url": "https://api.example/data"},
                               "accepts": [entry.clone()]});
-        let choice = policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none).unwrap();
+        let choice =
+            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, None).unwrap();
         let crate::payments::scheme::Terms::Svm(terms) = &choice.terms else {
             panic!("a Solana entry's terms");
         };
@@ -324,7 +326,8 @@ mod tests {
         );
         let required = json!({"x402Version": 2, "resource": {"url": "https://api.example/data"},
                               "accepts": [entry.clone()]});
-        let choice = policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none).unwrap();
+        let choice =
+            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, None).unwrap();
         let crate::payments::scheme::Terms::Svm(terms) = &choice.terms else {
             panic!("a Solana entry's terms");
         };
@@ -456,7 +459,8 @@ mod tests {
         let required = json!({"x402Version": 2, "resource": {"url": "https://api.example/data"},
                               "accepts": [entry.clone()]});
         let pol = policy::Policy::from_settings(&p).unwrap();
-        let choice = policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none).unwrap();
+        let choice =
+            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, None).unwrap();
         let crate::payments::scheme::Terms::Svm(terms) = &choice.terms else {
             panic!("a Solana entry's terms");
         };
@@ -510,7 +514,7 @@ mod tests {
         let mint = Pubkey::parse(USDC).unwrap();
         let pay_to = Pubkey::parse(PAY_TO).unwrap();
         let entry = sponsor.entry(MAINNET, &mint, &pay_to, 40_000, None, None);
-        let ok = policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none).unwrap();
+        let ok = policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, None).unwrap();
         let crate::payments::scheme::Terms::Svm(t) = &ok.terms else {
             panic!("a Solana entry's terms");
         };
@@ -520,7 +524,7 @@ mod tests {
             "no blockhash: the RPC is asked"
         );
         let refused = |e: Value, pol: &policy::Policy| {
-            policy::choose(pol, &step(), &[e], &none).unwrap_err()[0]
+            policy::choose(pol, &step(), &[e], &none, None).unwrap_err()[0]
                 .reasons
                 .join("; ")
         };

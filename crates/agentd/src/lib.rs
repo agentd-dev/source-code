@@ -53,6 +53,7 @@ pub mod runtime; // the runtime: event loop, turn workers, lifecycle
 pub mod sec; // secrets, tool-scope, gated exec
 pub mod sha; // dependency-free SHA-256 (content identity: workflow hashes, skill bodies, artifacts)
 pub mod signals; // sigaction + self-pipe wakeup; SIGTERM/INT/CHLD/PIPE/HUP latches
+pub mod spending; // allowances: what agentd may spend, over what period, and who approves (RFC 0057)
 pub mod state; // durable state model: entities, manifest, inbox, timers, restore
 pub mod store; // remote state store adapters: a 4-op contract over MCP tools / HTTP / memory
 pub mod subagent; // supervisor<->subagent control protocol

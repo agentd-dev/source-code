@@ -52,6 +52,7 @@ fn unknown_command(c: &Command) -> Value {
 enum ReadOp {
     Status,
     Config,
+    Allowances,
     PlanGet,
 }
 
@@ -100,6 +101,7 @@ fn route(op: &str) -> Option<(&'static surface::OpSpec, Route)> {
         Handler::Read => match op {
             "status" => Some(ReadOp::Status),
             "config" => Some(ReadOp::Config),
+            "payment.allowances" => Some(ReadOp::Allowances),
             "plan.get" => Some(ReadOp::PlanGet),
             _ => None,
         }
@@ -295,6 +297,8 @@ impl Runtime {
             // operator-only is not the same as public (see `redact_settings`).
             // What survives is the `{{secret:…}}` reference, never a value.
             ReadOp::Config => Answer::Doc(json!({"config": redact_settings(&self.settings_doc)})),
+            // What each allowance has left (RFC 0057 §6): operator-only.
+            ReadOp::Allowances => Answer::Doc(self.allowances_value()),
             ReadOp::PlanGet => {
                 let id = data["id"]
                     .as_str()

@@ -1237,6 +1237,8 @@ impl Runtime {
             // ---- status ----
             // The model is its caller's deputy: it reads what that caller may.
             "status" => ok(self.status_for(caller.principal.as_deref())),
+            // ---- allowances: what each has left (RFC 0057 §6), read-only ----
+            "payment.allowances" => ok(self.allowances_value()),
             // ---- companies ----
             #[cfg(feature = "companies")]
             "company.status" => ok(self.company_status(false)),

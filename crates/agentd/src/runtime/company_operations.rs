@@ -308,6 +308,34 @@ impl Runtime {
         let Some(company) = sup.company(&company) else {
             return;
         };
+        // The allowance the entry's charges draw on, as the settings say
+        // now: each time the confirm moves, so a reload that lowered it
+        // holds an approval given before (RFC 0057 §4.4).
+        let charge = match self
+            .settings
+            .companies
+            .get(&company.name)
+            .and_then(|c| c.spending.clone())
+        {
+            None => None,
+            Some(sp) => match self.allowance_now(&sp.allowance) {
+                Ok(allowance) => Some(crate::companies::operations::ChargeTerm {
+                    allowance,
+                    term: sp.amount,
+                }),
+                Err(e) => {
+                    let why = format!(
+                        "company {}: operation {id} was NOT confirmed — {e}",
+                        company.name
+                    );
+                    self.end_confirm(track, Err(why));
+                    return;
+                }
+            },
+        };
+        let Some(t) = self.company_operations.get_mut(track) else {
+            return;
+        };
         t.running = true;
         let stop = Arc::clone(&t.stop);
         let unit = t.trace.clone();
@@ -342,6 +370,7 @@ impl Runtime {
                     sent.as_ref(),
                     &stop,
                     &send,
+                    charge.as_ref(),
                 );
                 drop(slot);
             })
@@ -451,6 +480,41 @@ impl Runtime {
                     action: "company.operation",
                     target,
                     outcome: outcome.audit(),
+                    principal: principal.as_deref(),
+                    role: None,
+                    request_id: None,
+                    sid: None,
+                    trace: trace.as_ref(),
+                    link: None,
+                });
+            }
+            Step::Charge {
+                allowance,
+                amount,
+                currency,
+                state,
+                why,
+            } => {
+                let detail = json!({"company": company, "operation_id": op, "account": account,
+                                    "allowance": allowance, "charge": (!amount.is_empty()).then_some(&amount),
+                                    "currency": currency, "state": state, "why": why});
+                if state == "refused_by_allowance" {
+                    self.log
+                        .in_trace(trace.as_ref())
+                        .warn("payment.refused", detail.clone());
+                } else {
+                    self.log
+                        .in_trace(trace.as_ref())
+                        .info("payment.allowance.charged", detail.clone());
+                }
+                self.audit(super::audit::AuditEvent {
+                    action: "company.operation",
+                    target: detail,
+                    outcome: if state == "refused_by_allowance" {
+                        "refused_by_allowance"
+                    } else {
+                        "charged"
+                    },
                     principal: principal.as_deref(),
                     role: None,
                     request_id: None,

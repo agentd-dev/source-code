@@ -1049,6 +1049,17 @@ pub fn contracts() -> Vec<Contract> {
         ALL,
     );
 
+    // ---- allowances (RFC 0057): offered where one is declared ----
+    c(
+        "payment.allowances",
+        "payments",
+        "What each spending allowance has left: for each, its currency, its period and when the current one started, its budget, what was spent in it, how many payments were made and the most allowed. Read-only: nothing changes an allowance but the operator's configuration.",
+        obj(json!({}), &[]),
+        allowances_output(),
+        true,
+        ROOT_WF,
+    );
+
     // ---- companies (RFC 0047): offered where a Company is declared ----
     let account = company_account_arg;
     c(
@@ -1356,6 +1367,34 @@ pub fn company_sign_out_output() -> Value {
         }),
         &["company", "account", "signed_out", "revoked"],
     )
+}
+
+/// What `payment.allowances` answers — the tool and the operator op, and
+/// the status document's `payments` (RFC 0057 §6). Amounts are decimals in
+/// the allowance's currency; `period_start` and `period_end` are null for
+/// `once`.
+pub fn allowances_output() -> Value {
+    let amount =
+        || json!({"type": "string", "description": "a decimal in the allowance's currency"});
+    let optional = |t: &str| json!({"type": [t, "null"]});
+    json!({"type": "object", "additionalProperties": false, "required": ["allowances"], "properties": {
+    "allowances": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+        "required": ["id", "currency", "period", "period_start", "spent", "budget", "left", "max", "payments"],
+        "properties": {
+            "id": {"type": "string"},
+            "title": optional("string"),
+            "currency": {"type": "string"},
+            "period": {"enum": ["day", "week", "month", "quarter", "year", "once"]},
+            "period_start": optional("string"),
+            "period_end": optional("string"),
+            "spent": amount(),
+            "budget": amount(),
+            "left": amount(),
+            "max": amount(),
+            "approve_above": {"type": ["string", "null"]},
+            "payments": {"type": "integer"},
+            "times": optional("integer"),
+        }}}}})
 }
 
 /// What `company.status` answers — the tool, and with `detail` (why a

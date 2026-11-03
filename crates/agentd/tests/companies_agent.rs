@@ -228,6 +228,11 @@ fn config(host: &Host, fake: &Fake, dir: &Path, extra: &str) -> agentd::config::
         .settings
 }
 
+/// The spending ledger over `durable` (RFC 0057), as the runtime opens it.
+fn spending_of(durable: &Arc<agentd::state::Durable>) -> Arc<agentd::spending::Spending> {
+    Arc::new(agentd::spending::Spending::open(Arc::clone(durable)).unwrap())
+}
+
 fn logger() -> agentd::obs::log::Logger {
     agentd::obs::log::Logger::new(
         agentd::obs::log::LogCtx {
@@ -260,9 +265,14 @@ fn agent_on(
         agentd::state::Policy::default(),
         None,
     ));
-    let sup = Supervisor::build(&settings, durable, &logger())
-        .unwrap()
-        .expect("a Company is declared");
+    let sup = Supervisor::build(
+        &settings,
+        Arc::clone(&durable),
+        &logger(),
+        spending_of(&durable),
+    )
+    .unwrap()
+    .expect("a Company is declared");
     host.publish(&sup.identity);
     Agent {
         sup,
@@ -984,9 +994,14 @@ fn sealed_agent(
         agentd::state::Policy::default(),
         None,
     ));
-    let sup = Supervisor::build(&settings, durable, &logger())
-        .unwrap()
-        .expect("two Companies are declared");
+    let sup = Supervisor::build(
+        &settings,
+        Arc::clone(&durable),
+        &logger(),
+        spending_of(&durable),
+    )
+    .unwrap()
+    .expect("two Companies are declared");
     h.publish(&sup.identity);
     Agent {
         sup,
@@ -1107,9 +1122,14 @@ fn supervisor_with(
         agentd::state::Policy::default(),
         None,
     ));
-    let sup = Supervisor::build(settings, durable, &logger())
-        .unwrap()
-        .expect("a Company is declared");
+    let sup = Supervisor::build(
+        settings,
+        Arc::clone(&durable),
+        &logger(),
+        spending_of(&durable),
+    )
+    .unwrap()
+    .expect("a Company is declared");
     host.publish(&sup.identity);
     sup
 }
@@ -3077,9 +3097,14 @@ fn the_conversation_limit_holds_and_closing_frees_a_place() {
         None,
     ));
     let a = Agent {
-        sup: Supervisor::build(&settings, durable, &logger())
-            .unwrap()
-            .unwrap(),
+        sup: Supervisor::build(
+            &settings,
+            Arc::clone(&durable),
+            &logger(),
+            spending_of(&durable),
+        )
+        .unwrap()
+        .unwrap(),
         _dir: dir,
     };
     h.publish(&a.sup.identity);
@@ -3331,6 +3356,7 @@ fn confirm(a: &Agent, id: &str, given: Option<Approval>) -> Vec<Step> {
         None,
         &AtomicBool::new(false),
         &|s| steps.lock().unwrap().push(s),
+        None,
     );
     steps.into_inner().unwrap()
 }
@@ -3617,6 +3643,7 @@ fn two_calls_racing_for_a_permissions_last_use_confirm_once() {
                 None,
                 &AtomicBool::new(false),
                 &|s| steps.lock().unwrap().push(s),
+                None,
             );
             steps.into_inner().unwrap()
         })
@@ -4202,6 +4229,7 @@ fn a_confirm_whose_answer_is_not_kept_is_outcome_unknown() {
             None,
             &AtomicBool::new(false),
             &|s| steps.lock().unwrap().push(s),
+            None,
         );
         steps.into_inner().unwrap()
     });
@@ -4829,6 +4857,7 @@ fn an_operation_is_confirmed_in_the_session_that_proposed_it() {
             None,
             &AtomicBool::new(false),
             &|s| steps.lock().unwrap().push(s),
+            None,
         );
         steps.into_inner().unwrap()
     };
@@ -5175,4 +5204,204 @@ fn each_label_is_signed_in_to_on_its_own() {
     );
     assert_eq!(session(HOME), replaced);
     assert_eq!(at_path(&f, "/auth/revoke").len(), 1, "nothing more revoked");
+}
+
+// ---- A Company's operations against an allowance (RFC 0057 phase B) -------
+
+/// The allowance `shopping`, in dollars, of `fields` over `max` and
+/// `budget`, charged the term `price_difference`.
+fn shopping(max: &str, budget: &str, fields: &str) -> agentd::companies::operations::ChargeTerm {
+    let mut a: agentd::config::settings::payments::Allowance =
+        serde_json::from_value(json!({"currency": "USD", "max": max, "budget": budget})).unwrap();
+    let extra: Value = serde_json::from_str(if fields.is_empty() { "{}" } else { fields }).unwrap();
+    if let Some(t) = extra["approve_above"].as_str() {
+        a.approve_above = Some(t.into());
+    }
+    if let Some(p) = extra["payees"].as_array() {
+        a.payees = Some(p.iter().map(|x| x.as_str().unwrap().to_string()).collect());
+    }
+    agentd::companies::operations::ChargeTerm {
+        allowance: agentd::spending::Allowance::from_settings("shopping", &a).unwrap(),
+        term: "price_difference".into(),
+    }
+}
+
+/// [`confirm`], its charge held to `ct`.
+fn confirm_charged(
+    a: &Agent,
+    id: &str,
+    given: Option<Approval>,
+    ct: &agentd::companies::operations::ChargeTerm,
+) -> Vec<Step> {
+    let steps = Mutex::new(Vec::new());
+    a.sup.confirm_operation(
+        &shop(a),
+        id,
+        None,
+        given,
+        None,
+        &AtomicBool::new(false),
+        &|s| steps.lock().unwrap().push(s),
+        Some(ct),
+    );
+    steps.into_inner().unwrap()
+}
+
+/// What `shopping` has been charged and how many times, as a decimal.
+fn charged(a: &Agent, ct: &agentd::companies::operations::ChargeTerm) -> (String, u32) {
+    let s = a.sup.spending();
+    let u = s.usage(
+        &s.hold(),
+        &ct.allowance,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+        None,
+    );
+    (
+        agentd::config::settings::payments::format_amount(u.spent, agentd::spending::SCALE),
+        u.payments,
+    )
+}
+
+/// The cancels that reached the fake.
+fn cancels(f: &Fake) -> Vec<Value> {
+    f.record()
+        .into_iter()
+        .filter(|r| r["operation_request"] == true && path_of(r).ends_with("/cancel"))
+        .collect()
+}
+
+/// RFC 0057 §5.2: a charge past the allowance — over its `max`, past its
+/// budget, to a Company it does not list, or in a term that is not there —
+/// is never asked of the User nor confirmed: the operation is cancelled at
+/// the Company as a decline is, and the asker told why, naming the
+/// allowance and the limit.
+#[test]
+fn a_charge_past_the_allowance_is_cancelled_with_the_reason() {
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let ct = shopping("50", "500", "");
+    // $70 for the insulated one.
+    let dear = propose(&a, "itm_1", "stormline-insulated-m", "dear");
+    let steps = confirm_charged(&a, &dear, None, &ct);
+    assert!(asked(&steps).is_none(), "the User is not asked: {steps:?}");
+    let e = done(&steps).unwrap_err();
+    assert!(
+        e.contains("was NOT confirmed — allowance shopping: max 50 USD, this payment 70"),
+        "{e}"
+    );
+    assert!(
+        e.contains("agentd cancelled it at the Company (it is cancelled)"),
+        "{e}"
+    );
+    assert!(
+        steps.iter().any(|s| matches!(
+            s,
+            Step::Charge {
+                state: "refused_by_allowance",
+                ..
+            }
+        )),
+        "{steps:?}"
+    );
+    assert!(confirms(&f).is_empty());
+    assert_eq!(cancels(&f).len(), 1);
+    assert_eq!(charged(&a, &ct), ("0".into(), 0));
+    // Not one of its payees.
+    let other = shopping("500", "500", r#"{"payees": ["mall"]}"#);
+    let id = propose(&a, "itm_2", "stormline-m", "payee");
+    let e = done(&confirm_charged(&a, &id, None, &other)).unwrap_err();
+    assert!(
+        e.contains("allowance shopping: payee shop is not one of its payees"),
+        "{e}"
+    );
+    // A term the operation does not carry.
+    let missing = agentd::companies::operations::ChargeTerm {
+        term: "total".into(),
+        ..shopping("500", "500", "")
+    };
+    let id = propose(&a, "itm_3", "stormline-m", "term");
+    let e = done(&confirm_charged(&a, &id, None, &missing)).unwrap_err();
+    assert!(
+        e.contains("the operation's terms have no charge term \"total\""),
+        "{e}"
+    );
+    // Another currency.
+    let mut gbp = shopping("500", "500", "");
+    gbp.allowance.currency = "GBP".into();
+    let id = propose(&a, "itm_4", "stormline-m", "gbp");
+    let e = done(&confirm_charged(&a, &id, None, &gbp)).unwrap_err();
+    assert!(
+        e.contains("the charge is in USD, the allowance in GBP"),
+        "{e}"
+    );
+    assert!(confirms(&f).is_empty());
+}
+
+/// RFC 0057 §5.2: a confirm sent is a charge in the allowance's ledger —
+/// the next operation past what is left is refused naming what was spent —
+/// and a cancellation the Company confirms credits it back. Within the
+/// allowance the User is still asked: it never approves an operation.
+#[test]
+fn a_confirm_is_a_charge_and_a_confirmed_cancellation_credits_it() {
+    let f = fake(&[]);
+    let a = operating(&f, "");
+    let ct = shopping("80", "80", "");
+    let cheap = propose(&a, "itm_1", "stormline-m", "cheap");
+    let steps = confirm_charged(&a, &cheap, None, &ct);
+    let yes = approval(&steps);
+    assert_eq!(charged(&a, &ct), ("0".into(), 0), "asking charges nothing");
+    let steps = confirm_charged(&a, &cheap, Some(yes), &ct);
+    assert!(done(&steps).is_ok(), "{steps:?}");
+    assert!(
+        steps.iter().any(
+            |s| matches!(s, Step::Charge { state: "confirmed", amount, .. } if amount == "15")
+        ),
+        "{steps:?}"
+    );
+    assert_eq!(charged(&a, &ct), ("15".into(), 1));
+    // $70 more is past the $80 budget.
+    let dear = propose(&a, "itm_2", "stormline-insulated-m", "dear");
+    let e = done(&confirm_charged(&a, &dear, None, &ct)).unwrap_err();
+    assert!(
+        e.contains("allowance shopping: budget 80 USD in all, 15 spent, this payment 70"),
+        "{e}"
+    );
+    // A confirm the Company is still performing, cancelled: credited back.
+    f.control(json!({"operations": {"in_progress": 5, "cancel_in_progress": true}}));
+    let more = propose(&a, "itm_3", "stormline-m", "more");
+    let yes = approval(&confirm_charged(&a, &more, None, &ct));
+    let steps = confirm_charged(&a, &more, Some(yes), &ct);
+    assert!(done(&steps).is_ok(), "{steps:?}");
+    assert_eq!(charged(&a, &ct), ("30".into(), 2));
+    let v = a
+        .sup
+        .cancel_operation(&shop(&a), &more, None, None)
+        .unwrap();
+    assert_eq!(v["state"], "cancelled", "{v}");
+    assert_eq!(charged(&a, &ct), ("15".into(), 1), "credited back");
+}
+
+/// RFC 0057 §5.2: above the allowance's `approve_above` a standing
+/// permission does not cover the operation — the User is asked — and
+/// within it the permission applies as before.
+#[cfg(feature = "cel")]
+#[test]
+fn above_approve_above_a_standing_permission_does_not_apply() {
+    let f = fake(&[]);
+    let a = operating(&f, &cheap_exchanges(""));
+    let low = shopping("100", "500", r#"{"approve_above": "10"}"#);
+    let cheap = propose(&a, "itm_1", "stormline-m", "low");
+    let steps = confirm_charged(&a, &cheap, None, &low);
+    assert!(!standing_used(&steps), "{steps:?}");
+    let (q, _) = asked(&steps).unwrap_or_else(|| panic!("the User is asked: {steps:?}"));
+    assert!(q.contains("above what the allowance"), "{q}");
+    assert!(confirms(&f).is_empty());
+    let high = shopping("100", "500", r#"{"approve_above": "20"}"#);
+    let steps = confirm_charged(&a, &cheap, None, &high);
+    assert!(standing_used(&steps), "{steps:?}");
+    assert_eq!(confirms(&f).len(), 1);
+    assert_eq!(charged(&a, &high), ("15".into(), 1));
 }

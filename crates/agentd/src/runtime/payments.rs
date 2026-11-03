@@ -185,6 +185,9 @@ pub(crate) struct Pending {
     pub required: Required,
     pub call: Box<dyn PaidCall>,
     pub step_payment: StepPayment,
+    /// Who is asked: the allowance's approver, else the policy's.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    pub approver: String,
 }
 
 /// A payment waiting for the approver.
@@ -496,14 +499,32 @@ impl Runtime {
             }
         };
         let key = crate::engine::run::idempotency_key(run, step);
+        // The allowance the step draws on, as the settings say now, and
+        // what counts against it (RFC 0057 §5.1).
+        let now = now_ms();
+        let allowance = match step_payment
+            .allowance
+            .as_deref()
+            .map(|id| self.allowance_now(id))
+        {
+            None => None,
+            Some(Ok(a)) => Some(a),
+            Some(Err(e)) => {
+                self.payment_refused(run, step, Some(first), e, target, Some(call));
+                return;
+            }
+        };
+        let usage = allowance
+            .as_ref()
+            .map(|a| self.spending.usage(&self.spending.hold(), a, now, None));
         let chosen = {
             let ledger = p.ledger();
-            let now = now_ms();
             crate::payments::policy::choose(
                 &p.policy,
                 &step_payment,
                 &required.accepts,
                 &|asset, payee| ledger.spent(asset, run, payee, now),
+                under(allowance.as_ref(), usage, now),
             )
         };
         let choice = match chosen {
@@ -536,6 +557,17 @@ impl Runtime {
                 a.show(t)
             ));
         }
+        if choice.allowance_above
+            && let (Some(a), Some(c)) = (&allowance, choice.charge)
+            && let Some(t) = a.approve_above
+        {
+            ask.push(format!(
+                "{} is above allowance {}'s approve_above {}",
+                a.show(c),
+                a.id,
+                a.show(t)
+            ));
+        }
         if step_payment.approve {
             ask.push("the step asks for approval of every payment (approve: true)".into());
         }
@@ -552,6 +584,10 @@ impl Runtime {
                 ask.push("a model asked for this run".into());
             }
         }
+        let approver = allowance
+            .as_ref()
+            .and_then(|a| a.approver.clone())
+            .unwrap_or_else(|| p.policy.approver.clone());
         let pending = Pending {
             run: run.to_string(),
             step: step.to_string(),
@@ -560,6 +596,7 @@ impl Runtime {
             required,
             call,
             step_payment,
+            approver,
         };
         if ask.is_empty() {
             self.pay(pending, None);
@@ -575,43 +612,79 @@ impl Runtime {
             run,
             step,
             key,
-            choice,
+            mut choice,
             required,
             call,
             step_payment,
+            ..
         } = pending;
         let Some(p) = self.payments.clone() else {
             self.executing.remove(&format!("{run}/{step}"));
             return;
         };
         let target = self.payment_target(&run, &step, &*call);
+        // Under an allowance, its charges are held from the check to the
+        // record, so no Company confirm passes its budget beside this.
+        let spending = std::sync::Arc::clone(&self.spending);
+        let held = step_payment.allowance.as_ref().map(|_| spending.hold());
+        // The allowance as the settings say now: a reload that lowered or
+        // removed it revokes an approval given under the old limits.
+        let allowance = match step_payment
+            .allowance
+            .as_deref()
+            .map(|id| self.allowance_now(id))
+        {
+            None => None,
+            Some(Ok(a)) => Some(a),
+            Some(Err(e)) => {
+                drop(held);
+                let why = format!("payment refused unsent: {e}");
+                self.payment_refused(&run, &step, None, why, target, Some(call));
+                return;
+            }
+        };
         // The policy again, now: an approval does not outlast a cap another
         // payment reached while it was asked.
-        if approved_by.is_some() {
+        if approved_by.is_some() || allowance.is_some() {
+            let now = now_ms();
+            let usage = allowance
+                .as_ref()
+                .zip(held.as_ref())
+                .map(|(a, h)| spending.usage(h, a, now, None));
             let again = {
                 let ledger = p.ledger();
-                let now = now_ms();
                 crate::payments::policy::choose(
                     &p.policy,
                     &step_payment,
                     std::slice::from_ref(&choice.entry),
                     &|asset, payee| ledger.spent(asset, &run, payee, now),
+                    under(allowance.as_ref(), usage, now),
                 )
             };
-            if let Err(passed) = again {
-                let why = format!(
-                    "payment refused unsent after its approval: {}",
-                    passed[0].reasons.join("; ")
-                );
-                let mut t = target;
-                t["reasons"] = json!(passed.iter().map(|x| x.to_json()).collect::<Vec<_>>());
-                self.payment_refused(&run, &step, None, why, t, Some(call));
-                return;
+            match again {
+                Ok(c) => choice.charge = c.charge,
+                Err(passed) => {
+                    drop(held);
+                    let why = format!(
+                        "payment refused unsent{}: {}",
+                        if approved_by.is_some() {
+                            " after its approval"
+                        } else {
+                            ""
+                        },
+                        passed[0].reasons.join("; ")
+                    );
+                    let mut t = target;
+                    t["reasons"] = json!(passed.iter().map(|x| x.to_json()).collect::<Vec<_>>());
+                    self.payment_refused(&run, &step, None, why, t, Some(call));
+                    return;
+                }
             }
         }
         // The server is told nothing: it may hold the payment made already.
         let blocking = p.ledger().blocking(&key).map(never_twice);
         if let Some(why) = blocking {
+            drop(held);
             self.payment_refused(&run, &step, None, why, target, None);
             return;
         }
@@ -620,6 +693,7 @@ impl Runtime {
         let prepared = match scheme::prepare(&choice, p.policy.max_validity, now_ms() / 1000) {
             Ok(x) => x,
             Err(e) => {
+                drop(held);
                 self.payment_refused(
                     &run,
                     &step,
@@ -660,10 +734,16 @@ impl Runtime {
             approved_by: approved_by.clone(),
             at_ms: now_ms(),
             ended_ms: None,
+            allowance: choice.allowance.clone(),
+            charge: choice.charge.map(|c| {
+                crate::config::settings::payments::format_amount(c, crate::spending::SCALE)
+            }),
+            currency: allowance.as_ref().map(|a| a.currency.clone()),
         };
         let mut t = record_target(&record);
         // Kept apart: a refusal reads the ledger again.
         let kept = p.ledger().put(record.clone());
+        drop(held);
         if let Err(e) = kept {
             t["error"] = json!(e);
             self.payment_refused(
@@ -703,7 +783,8 @@ impl Runtime {
             json!({"run": run, "step": step, "wallet": step_payment.wallet, "network": choice.network,
                    "asset": choice.asset, "amount": choice.amount.to_string(), "payee": choice.payee,
                    "nonce": prepared.nonce, "valid_before": prepared.valid_before,
-                   "attempt": attempt, "approved_by": approved_by}),
+                   "attempt": attempt, "approved_by": approved_by,
+                   "allowance": record.allowance, "charge": record.charge, "currency": record.currency}),
         );
         self.executing
             .insert(format!("{run}/{step}"), std::time::Instant::now());
@@ -855,7 +936,7 @@ impl Runtime {
         let Some(p) = self.payments.clone() else {
             return;
         };
-        let approver = p.policy.approver.clone();
+        let approver = pending.approver.clone();
         // A gate's id names its wait: with none, nobody can be asked.
         let id = match crate::sec::random::b64url_token(9) {
             Ok(id) => id,
@@ -936,7 +1017,9 @@ impl Runtime {
         let c = &pending.choice;
         let t = json!({"run": run, "step": step, "workflow": wf, "task": task, "approver": approver,
                        "asset": c.asset, "amount": c.amount.to_string(), "payee": c.payee,
-                       "network": c.network, "url": pending.call.shown(), "asked_because": why});
+                       "network": c.network, "url": pending.call.shown(), "asked_because": why,
+                       "allowance": c.allowance,
+                       "charge": c.charge.map(|v| crate::config::settings::payments::format_amount(v, crate::spending::SCALE))});
         self.step_log(&run, &step).info("payment.asked", t.clone());
         self.payment_audit("asked", t, None, trace.as_ref());
         self.payment_gates.insert(
@@ -977,10 +1060,13 @@ impl Runtime {
         message: &Value,
     ) -> Value {
         use super::a2a_server::err_obj;
-        let Some(p) = self.payments.clone() else {
+        let Some(approver) = self
+            .payment_gates
+            .get(id)
+            .map(|g| g.pending.approver.clone())
+        else {
             return err_obj(::mcp::rpc::INVALID_PARAMS, "this approval has ended");
         };
-        let approver = p.policy.approver.clone();
         let theirs = if approver == crate::config::settings::payments::OPERATOR {
             principal.is_operator()
         } else {
@@ -1219,8 +1305,17 @@ impl Runtime {
                 .filter(|(_, r)| !r.status.is_terminal())
                 .map(|(id, _)| id.clone())
                 .collect();
+            let allowances = self.allowances();
+            let kept = |r: &Record| {
+                r.allowance
+                    .as_ref()
+                    .and_then(|id| allowances.get(id))
+                    .is_some_and(|a| a.holds(r.at_ms, now))
+            };
             if let Some(p) = &self.payments {
-                let n = p.ledger().sweep(now, &|run| live.iter().any(|l| l == run));
+                let n = p
+                    .ledger()
+                    .sweep(now, &|run| live.iter().any(|l| l == run), &kept);
                 if n > 0 {
                     self.log.info("payment.ledger.swept", json!({"records": n}));
                 }
@@ -1288,6 +1383,20 @@ impl Runtime {
     }
 }
 
+/// The allowance a step draws on, with what counts against it, as the
+/// policy reads it.
+fn under(
+    allowance: Option<&crate::spending::Allowance>,
+    usage: Option<crate::spending::Usage>,
+    now_ms: u64,
+) -> Option<crate::payments::policy::Under<'_>> {
+    allowance.map(|a| crate::payments::policy::Under {
+        allowance: a,
+        usage: usage.unwrap_or_default(),
+        now_ms,
+    })
+}
+
 /// Why a request with this record is never paid again.
 fn never_twice(r: &Record) -> String {
     match r.state {
@@ -1312,7 +1421,9 @@ fn record_target(r: &Record) -> Value {
            "asset_id": r.asset_id, "payee": r.payee, "pay_to": r.pay_to, "amount": r.amount,
            "nonce": r.nonce, "valid_before": r.valid_before, "url": r.url, "state": r.state.as_str(),
            "transaction": r.transaction, "payer": r.payer, "error_reason": r.error_reason,
-           "approved_by": r.approved_by})
+           "approved_by": r.approved_by, "allowance": r.allowance, "charge": r.charge,
+           "currency": r.currency,
+           "tier": if r.approved_by.is_some() { "approved" } else { "auto" }})
 }
 
 /// What the approver reads: agentd's words, the server's quoted.
@@ -1341,6 +1452,12 @@ fn gate_text(
         pending.step,
         why.join("; and "),
     );
+    if let (Some(id), Some(charge)) = (&c.allowance, c.charge) {
+        q.push_str(&format!(
+            " It is paid under the allowance {id}: {} of it.",
+            crate::config::settings::payments::format_amount(charge, crate::spending::SCALE)
+        ));
+    }
     if let Some(d) = &pending.required.description {
         q.push_str(&format!(
             " The server describes it as {}.",

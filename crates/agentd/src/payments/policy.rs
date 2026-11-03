@@ -41,6 +41,8 @@ pub struct Asset {
     pub per_day: u128,
     pub per_payee: u128,
     pub approve_above: Option<u128>,
+    /// The currency one whole unit is worth one unit of (RFC 0057 §3).
+    pub currency: Option<String>,
 }
 
 impl Asset {
@@ -111,6 +113,7 @@ impl Policy {
                         amount("limits.per_payee", &a.limits.per_payee)?,
                     )?,
                     approve_above: amount("approve_above", &a.approve_above)?,
+                    currency: a.currency.clone(),
                     id,
                 },
             );
@@ -168,6 +171,12 @@ pub struct Choice {
     pub max_timeout: u64,
     /// Above the asset's `approve_above`.
     pub above_threshold: bool,
+    /// The allowance it is paid under, and the charge in its currency, at
+    /// `spending::SCALE`.
+    pub allowance: Option<String>,
+    pub charge: Option<u128>,
+    /// Above the allowance's `approve_above`.
+    pub allowance_above: bool,
 }
 
 /// An entry passed over, and every reason.
@@ -183,18 +192,29 @@ impl Passed {
     }
 }
 
+/// The allowance a step draws on, as it is now, and what counts against it
+/// in its current period (RFC 0057 §5.1).
+#[derive(Debug, Clone, Copy)]
+pub struct Under<'a> {
+    pub allowance: &'a crate::spending::Allowance,
+    pub usage: crate::spending::Usage,
+    pub now_ms: u64,
+}
+
 /// The first entry of `accepts` the step and the policy allow, or why each
 /// was passed over. `spent` is what the ledger counts for an asset and a
-/// payee.
+/// payee; `under`, the allowance the step draws on, whose checks every
+/// entry is held to as well.
 pub fn choose(
     policy: &Policy,
     step: &StepPayment,
     accepts: &[Value],
     spent: &dyn Fn(&str, &Account) -> Spent,
+    under: Option<Under<'_>>,
 ) -> Result<Choice, Vec<Passed>> {
     let mut passed = Vec::new();
     for (index, v) in accepts.iter().enumerate() {
-        match one(policy, step, index, v, spent) {
+        match one(policy, step, index, v, spent, under) {
             Ok(c) => return Ok(c),
             Err(reasons) => passed.push(Passed { index, reasons }),
         }
@@ -208,6 +228,7 @@ fn one(
     index: usize,
     v: &Value,
     spent: &dyn Fn(&str, &Account) -> Spent,
+    under: Option<Under<'_>>,
 ) -> Result<Choice, Vec<String>> {
     let e = Entry::parse(v).map_err(|e| vec![format!("malformed: {e}")])?;
     let mut why = Vec::new();
@@ -377,6 +398,45 @@ fn one(
             }
         }
     }
+    // The allowance: it narrows, never widens (RFC 0057 §4.1).
+    let mut charge = None;
+    let mut allowance_above = false;
+    if let Some(u) = under {
+        let al = u.allowance;
+        let at = format!("allowance {}", al.id);
+        if let Some(l) = &al.wallets
+            && !l.contains(&step.wallet)
+        {
+            why.push(format!(
+                "{at}: wallet {} is not one of its wallets",
+                step.wallet
+            ));
+        }
+        if let (Some(a), Some(amount)) = (asset, amount) {
+            match a.currency.as_deref() {
+                None => why.push(format!(
+                    "{at}: rail-cannot-enforce: currency — asset {} says no currency (security.payments.assets.{}.currency), so what it is worth in {} is not known",
+                    a.name, a.name, al.currency
+                )),
+                Some(c) if c != al.currency => why.push(format!(
+                    "{at}: rail-cannot-enforce: currency — asset {} is {c}, the allowance {}; agentd never converts between currencies",
+                    a.name, al.currency
+                )),
+                Some(_) => match crate::spending::to_currency(amount, a.decimals) {
+                    None => why.push(format!("{at}: {} is past what it can count", a.show(amount))),
+                    Some(c) => {
+                        charge = Some(c);
+                        if let Some(p) = payee {
+                            match crate::spending::judge(al, &p.name, c, u.usage, u.now_ms) {
+                                Ok(above) => allowance_above = above,
+                                Err(reasons) => why.extend(reasons),
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
     if !why.is_empty() {
         return Err(why);
     }
@@ -396,6 +456,9 @@ fn one(
         terms,
         max_timeout: e.max_timeout,
         above_threshold: a.approve_above.is_some_and(|t| amount > t),
+        allowance: under.map(|u| u.allowance.id.clone()),
+        charge,
+        allowance_above,
     })
 }
 
@@ -435,6 +498,7 @@ pub(crate) mod tests {
             wallet: "ops".into(),
             max: vec![("usdc-base".into(), parse_amount(max, 6).unwrap())],
             approve: false,
+            allowance: None,
         }
     }
 
@@ -446,7 +510,7 @@ pub(crate) mod tests {
     /// above `approve_above` it says so.
     #[test]
     fn an_entry_within_the_policy_is_chosen() {
-        let c = choose(&policy(), &step("0.10"), &[entry("40000")], &none).unwrap();
+        let c = choose(&policy(), &step("0.10"), &[entry("40000")], &none, None).unwrap();
         assert_eq!(c.amount, 40_000);
         assert!(matches!(c.token, Token::Evm { chain_id: 8453, .. }));
         assert_eq!(c.payee, "weather");
@@ -458,7 +522,7 @@ pub(crate) mod tests {
             }
         );
         assert!(!c.above_threshold);
-        let c = choose(&policy(), &step("0.10"), &[entry("60000")], &none).unwrap();
+        let c = choose(&policy(), &step("0.10"), &[entry("60000")], &none, None).unwrap();
         assert!(c.above_threshold, "0.06 is above 0.05");
     }
 
@@ -468,7 +532,14 @@ pub(crate) mod tests {
     fn the_first_allowed_entry_wins() {
         let mut other = entry("1000");
         other["scheme"] = json!("upto");
-        let r = choose(&policy(), &step("0.10"), &[other, entry("2000")], &none).unwrap();
+        let r = choose(
+            &policy(),
+            &step("0.10"),
+            &[other, entry("2000")],
+            &none,
+            None,
+        )
+        .unwrap();
         assert_eq!(r.index, 1);
     }
 
@@ -477,7 +548,7 @@ pub(crate) mod tests {
     fn every_reason_is_named() {
         let p = policy();
         let refused = |e: Value, s: &StepPayment, spent: &dyn Fn(&str, &Account) -> Spent| {
-            let r = choose(&p, s, &[e], spent).unwrap_err();
+            let r = choose(&p, s, &[e], spent, None).unwrap_err();
             r[0].reasons.join("; ")
         };
         let with = |f: &dyn Fn(&mut Value)| {
@@ -558,13 +629,113 @@ pub(crate) mod tests {
             run: 150_000,
             ..Spent::default()
         };
-        assert!(choose(&p, &s, &[entry("100000")], &at).is_ok());
+        assert!(choose(&p, &s, &[entry("100000")], &at, None).is_ok());
         // A payee held to other assets.
         let mut held = policy();
         held.payees.get_mut("weather").unwrap().assets = Some(vec!["eurc".into()]);
         assert!(
-            choose(&held, &s, &[entry("1000")], &none).unwrap_err()[0].reasons[0]
+            choose(&held, &s, &[entry("1000")], &none, None).unwrap_err()[0].reasons[0]
                 .contains("not to be paid in")
         );
+    }
+
+    /// Under an allowance every entry is held to it too (RFC 0057 §5.1):
+    /// an asset with no currency, or another one, is rail-cannot-enforce;
+    /// its max, budget, count, payees and wallets each refuse by name, with
+    /// what was spent; above its approve_above the choice says so, whatever
+    /// the asset's own threshold says.
+    #[test]
+    fn an_allowance_adds_its_checks_to_every_entry() {
+        use crate::spending::{Allowance, Usage};
+        let mut p = policy();
+        let mut al = Allowance::from_settings(
+            "api",
+            &cfg::Allowance {
+                currency: "USD".into(),
+                max: Some("0.08".into()),
+                budget: Some("0.20".into()),
+                per: Some("month".into()),
+                times: Some(2),
+                approve_above: Some("0.03".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let now = crate::state::now_ms();
+        let s = StepPayment {
+            allowance: Some("api".into()),
+            ..step("0.10")
+        };
+        let why = |p: &Policy, al: &Allowance, e: Value, u: Usage| {
+            let under = Under {
+                allowance: al,
+                usage: u,
+                now_ms: now,
+            };
+            choose(p, &s, &[e], &none, Some(under)).unwrap_err()[0]
+                .reasons
+                .join("; ")
+        };
+        let none_used = Usage::default();
+        assert!(why(&p, &al, entry("1000"), none_used).contains(
+            "allowance api: rail-cannot-enforce: currency — asset usdc-base says no currency"
+        ));
+        p.assets.get_mut("usdc-base").unwrap().currency = Some("EUR".into());
+        assert!(
+            why(&p, &al, entry("1000"), none_used)
+                .contains("asset usdc-base is EUR, the allowance USD")
+        );
+        p.assets.get_mut("usdc-base").unwrap().currency = Some("USD".into());
+        fn under(al: &Allowance, usage: Usage, now_ms: u64) -> Option<Under<'_>> {
+            Some(Under {
+                allowance: al,
+                usage,
+                now_ms,
+            })
+        }
+        // Within it: the charge in dollars, and the tiers apart.
+        let c = choose(&p, &s, &[entry("20000")], &none, under(&al, none_used, now)).unwrap();
+        assert_eq!(c.allowance.as_deref(), Some("api"));
+        assert_eq!(
+            c.charge,
+            Some(crate::spending::to_currency(20_000, 6).unwrap())
+        );
+        assert!(!c.allowance_above && !c.above_threshold);
+        let c = choose(&p, &s, &[entry("40000")], &none, under(&al, none_used, now)).unwrap();
+        assert!(c.allowance_above, "0.04 is above the allowance's 0.03");
+        assert!(!c.above_threshold, "and not above the asset's 0.05");
+        let spent = Usage {
+            spent: parse_amount("0.19", crate::spending::SCALE).unwrap(),
+            payments: 1,
+        };
+        assert_eq!(
+            why(&p, &al, entry("20000"), spent),
+            "allowance api: budget 0.2 USD per month, 0.19 spent, this payment 0.02"
+        );
+        let two = Usage {
+            spent: 0,
+            payments: 2,
+        };
+        assert!(
+            why(&p, &al, entry("1000"), two).contains("allowance api: times 2 per month, 2 made")
+        );
+        assert!(
+            why(&p, &al, entry("90000"), none_used)
+                .contains("allowance api: max 0.08 USD, this payment 0.09")
+        );
+        al.payees = Some(vec!["other".into()]);
+        assert!(
+            why(&p, &al, entry("1000"), none_used)
+                .contains("payee weather is not one of its payees")
+        );
+        al.payees = None;
+        al.wallets = Some(vec!["cold".into()]);
+        assert!(
+            why(&p, &al, entry("1000"), none_used).contains("wallet ops is not one of its wallets")
+        );
+        // The asset's own caps still hold: the allowance never widens them.
+        al.wallets = None;
+        al.max = parse_amount("1", crate::spending::SCALE).unwrap();
+        assert!(why(&p, &al, entry("100001"), none_used).contains("per_payment"));
     }
 }

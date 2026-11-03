@@ -534,6 +534,11 @@ pub struct Runtime {
     /// Acting for the enrolled person at delegated servers (RFC 0044).
     #[cfg(feature = "xaa")]
     pub(crate) delegation: Option<Arc<crate::delegation::Delegation>>,
+    /// What both rails charged each allowance (RFC 0057): the Company
+    /// operations' charges, and through the x402 ledger its payments.
+    pub(crate) spending: Arc<crate::spending::Spending>,
+    /// When the spending ledger was last swept.
+    pub(crate) spending_swept_ms: u64,
     /// The spend policy, the wallets and the ledger (RFC 0049): `None`
     /// when no payment is configured.
     #[cfg(feature = "x402")]
@@ -1008,6 +1013,7 @@ impl Runtime {
             self.delegation_tick();
             #[cfg(feature = "x402")]
             self.payments_tick();
+            self.spending_tick();
             self.poll_mcp_notifications();
             #[cfg(feature = "mcp-events")]
             self.events_tick();
@@ -2534,6 +2540,10 @@ impl Runtime {
         #[cfg(feature = "a2a")]
         {
             doc["conversation_bindings"] = json!(self.conv_index.len());
+        }
+        // What each allowance has left this period (RFC 0057 §6).
+        if !self.settings.security.payments.allowances.is_empty() {
+            doc["payments"] = self.allowances_value();
         }
         doc
     }

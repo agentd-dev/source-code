@@ -446,6 +446,25 @@
           },
           "type": "array"
         },
+        "spending": {
+          "additionalProperties": false,
+          "description": "the allowance an operation the Company proposes is charged to (RFC 0057 §5.2): checked before the User is asked or a standing permission applies — past a limit the operation is not confirmed and is cancelled at the Company, above approve_above no standing permission covers it. A confirm sent is a charge; a cancellation the Company confirms credits it back. Operations are proposed only where client.extensions lists operations",
+          "properties": {
+            "allowance": {
+              "description": "a security.payments.allowances entry",
+              "type": "string"
+            },
+            "amount": {
+              "description": "the term key whose value is the charge: {\"amount\": \"<decimal>\", \"currency\": \"<ISO 4217>\"}, or a number in the allowance's currency; an operation without it, or with one that does not read, is refused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "allowance",
+            "amount"
+          ],
+          "type": "object"
+        },
         "tags": {
           "additionalProperties": {
             "items": {
@@ -5627,8 +5646,93 @@
         },
         "payments": {
           "additionalProperties": false,
-          "description": "paying for things with x402 (RFC 0049; needs the x402 feature): the spend policy every payment is held to — assets by CAIP-19, payees by address, caps per payment, run, day and payee, the approver above a threshold — and the wallets. Restart-only, operator-only. Needs observability.audit.chain and a durable store",
+          "description": "paying for things with x402 (RFC 0049; needs the x402 feature): the spend policy every payment is held to — assets by CAIP-19, payees by address, caps per payment, run, day and payee, the approver above a threshold — the wallets, and the allowances people set. Operator-only; restart-only but allowances, which reload. Needs observability.audit.chain and a durable store",
           "properties": {
+            "allowances": {
+              "additionalProperties": {
+                "additionalProperties": false,
+                "properties": {
+                  "approve_above": {
+                    "description": "above it, up to max, the approver is asked each time; at most max",
+                    "type": "string"
+                  },
+                  "approver": {
+                    "description": "who answers: `operator` or one principal id; default security.payments.approver",
+                    "type": "string"
+                  },
+                  "budget": {
+                    "description": "the most paid per period, a decimal in the currency; at least max",
+                    "type": "string"
+                  },
+                  "categories": {
+                    "description": "kinds of purchase: no rail agentd pays on can enforce them, so every payment under an allowance that sets them is refused rail-cannot-enforce",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "currency": {
+                    "description": "ISO 4217: every amount of the allowance is in it",
+                    "pattern": "^[A-Z]{3}$",
+                    "type": "string"
+                  },
+                  "from": {
+                    "description": "an RFC 3339 instant: no payment before it",
+                    "type": "string"
+                  },
+                  "max": {
+                    "description": "the most one payment may be, a decimal in the currency",
+                    "type": "string"
+                  },
+                  "payees": {
+                    "description": "the payees it may pay: security.payments.payees names (x402) or companies names; default every payee the operator allows",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "per": {
+                    "description": "the budget's period, a UTC calendar period (week: ISO, from Monday); once is the allowance's whole life. Default once",
+                    "enum": [
+                      "day",
+                      "week",
+                      "month",
+                      "quarter",
+                      "year",
+                      "once"
+                    ]
+                  },
+                  "times": {
+                    "description": "the most payments per period",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "title": {
+                    "description": "a label for receipts, gates and the status document",
+                    "type": "string"
+                  },
+                  "until": {
+                    "description": "an RFC 3339 instant: no payment at or after it",
+                    "type": "string"
+                  },
+                  "wallets": {
+                    "description": "the security.payments.wallets it may draw on; default every wallet",
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "currency",
+                  "max",
+                  "budget"
+                ],
+                "type": "object"
+              },
+              "description": "what agentd may spend, on what, over what period, and who approves (RFC 0057), by id (1 to 32 of a-z, 0-9, - and _): an x402 step draws on one with payment: {allowance: <id>}, a Company's priced operations with companies.<name>.spending. It narrows, never widens: a payment under it passes every other check too. Reloadable; what was spent this period still counts after a change",
+              "type": "object"
+            },
             "approval_timeout": {
               "description": "how long the approver is waited for before the payment is declined, 1s to 7d; default 1h",
               "type": [
@@ -5654,6 +5758,11 @@
                   },
                   "asset": {
                     "description": "the CAIP-19 asset type, eip155:<chain id>/erc20:<contract> or solana:<genesis hash prefix>/token:<mint>: names the network (CAIP-2) and the token",
+                    "type": "string"
+                  },
+                  "currency": {
+                    "description": "ISO 4217: one whole unit of the token is one unit of this currency (a dollar stablecoin is USD); an asset is usable under an allowance only in its own currency, and agentd never converts between currencies. At most 18 decimals",
+                    "pattern": "^[A-Z]{3}$",
                     "type": "string"
                   },
                   "decimals": {

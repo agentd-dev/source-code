@@ -1346,3 +1346,335 @@ fn without_the_feature_a_spend_policy_is_refused() {
         "{err}"
     );
 }
+
+// ---- Allowances (RFC 0057 phase A) ----------------------------------------
+
+/// `security.payments` whose `usdc` is worth a dollar, with the allowance
+/// `api` of `allowance`'s fields.
+#[cfg(feature = "x402")]
+fn under_allowance(dir: &Path, allowance: &str) -> String {
+    local(
+        dir,
+        &usdc(
+            "per_run: \"1\", per_day: \"1\", per_payee: \"1\"",
+            "        currency: USD\n",
+        ),
+        &format!(
+            "    ask_when_tainted: false\n    allowances:\n      api: {{currency: USD, {allowance}}}\n"
+        ),
+    )
+}
+
+/// A paying `http` step to `url` that draws on the allowance `api`.
+#[cfg(feature = "x402")]
+fn drawing(id: &str, after: &str, url: &str, more: &str) -> String {
+    format!(
+        "      {id}: {{kind: http, depends_on: [{after}], url: \"{url}\", allow_private: true, payment: {{allowance: api}}{more}}}\n"
+    )
+}
+
+/// RFC 0057 §3, §6: a monthly budget stops the payment that would pass it,
+/// unsent, the refusal naming the allowance, the budget, what was spent
+/// and the payment; the payment within it is paid, and its audit record
+/// names the allowance, the charge in its currency and its tier.
+#[cfg(feature = "x402")]
+#[test]
+fn a_monthly_budget_stops_the_payment_that_would_pass_it() {
+    let dir = scratch();
+    let first = mock(json!({"price": "30000"}));
+    let second = mock(json!({"price": "30000"}));
+    let payments = under_allowance(
+        dir.path(),
+        "title: Data, max: \"0.05\", budget: \"0.05\", per: month",
+    );
+    let steps = format!(
+        "{}{}      done: {{kind: finish, depends_on: [b]}}\n",
+        drawing("a", "s", &format!("{}/a", first.url), ""),
+        drawing(
+            "b",
+            "a",
+            &format!("{}/b", second.url),
+            ", on_error: continue"
+        ),
+    );
+    let cfg = config(dir.path(), &payments, "", "buy", &steps);
+    wallet_address(&cfg);
+    let mut d = Daemon::spawn(&cfg, &[]);
+    assert_eq!(d.step("a")["status"], "done", "{}", d.read());
+    let b = d.step("b")["err"].as_str().unwrap().to_string();
+    assert!(
+        b.contains("allowance api: budget 0.05 USD per month, 0.03 spent, this payment 0.03"),
+        "{b}"
+    );
+    assert_eq!(paid(&first).len(), 1);
+    assert!(paid(&second).is_empty(), "refused unsent");
+    assert_eq!(d.exits(), Some(0));
+    let authorized = audit(dir.path())
+        .into_iter()
+        .find(|r| r["outcome"] == "authorized")
+        .unwrap();
+    assert_eq!(authorized["target"]["allowance"], "api");
+    assert_eq!(authorized["target"]["charge"], "0.03");
+    assert_eq!(authorized["target"]["currency"], "USD");
+    assert_eq!(authorized["target"]["tier"], "auto");
+    let refused = d.events("payment.refused");
+    assert!(
+        refused.iter().any(|e| e["why"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("allowance api: budget")),
+        "{refused:#?}"
+    );
+}
+
+/// RFC 0057 §3: `times` caps how many payments a period holds, whatever is
+/// left of the budget.
+#[cfg(feature = "x402")]
+#[test]
+fn times_caps_the_count_of_payments() {
+    let dir = scratch();
+    let first = mock(json!({"price": "10000"}));
+    let second = mock(json!({"price": "10000"}));
+    let payments = under_allowance(
+        dir.path(),
+        "max: \"0.05\", budget: \"1\", per: week, times: 1",
+    );
+    let steps = format!(
+        "{}{}      done: {{kind: finish, depends_on: [b]}}\n",
+        drawing("a", "s", &format!("{}/a", first.url), ""),
+        drawing(
+            "b",
+            "a",
+            &format!("{}/b", second.url),
+            ", on_error: continue"
+        ),
+    );
+    let cfg = config(dir.path(), &payments, "", "buy", &steps);
+    wallet_address(&cfg);
+    let mut d = Daemon::spawn(&cfg, &[]);
+    assert_eq!(d.step("a")["status"], "done", "{}", d.read());
+    let b = d.step("b")["err"].as_str().unwrap().to_string();
+    assert!(b.contains("allowance api: times 1 per week, 1 made"), "{b}");
+    assert!(paid(&second).is_empty());
+    assert_eq!(d.exits(), Some(0));
+}
+
+/// RFC 0057 §6, §7: a workflow reads what is left with the
+/// `payment.allowances` tool step, read-only: the period, the budget, what
+/// was spent and how many payments were made.
+#[cfg(feature = "x402")]
+#[test]
+fn payment_allowances_reports_what_was_spent() {
+    let dir = scratch();
+    let m = mock(json!({"price": "30000"}));
+    let payments = under_allowance(
+        dir.path(),
+        "title: Data, max: \"0.05\", budget: \"0.50\", per: month",
+    );
+    let steps = format!(
+        "{}      left: {{kind: tool, name: payment.allowances, depends_on: [a]}}\n      done: {{kind: finish, depends_on: [left], output: \"{{{{ steps.left.output }}}}\"}}\n",
+        drawing("a", "s", &format!("{}/a", m.url), ""),
+    );
+    let cfg = config(dir.path(), &payments, "", "buy", &steps);
+    wallet_address(&cfg);
+    let mut d = Daemon::spawn(&cfg, &[]);
+    let done = d.wait("run.done", |d| d.events("run.done").into_iter().next());
+    assert_eq!(done["status"], "completed", "{}", d.read());
+    let out = match &done["output"] {
+        Value::String(s) => serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
+        v => v.clone(),
+    };
+    let a = &out["allowances"][0];
+    assert_eq!(a["id"], "api", "{out}");
+    assert_eq!(a["title"], "Data");
+    assert_eq!(a["currency"], "USD");
+    assert_eq!(a["period"], "month");
+    assert!(
+        a["period_start"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("-01T00:00:00Z"),
+        "{a}"
+    );
+    assert_eq!(a["spent"], "0.03");
+    assert_eq!(a["left"], "0.47");
+    assert_eq!(a["budget"], "0.5");
+    assert_eq!(a["payments"], 1);
+    assert_eq!(d.exits(), Some(0));
+}
+
+/// RFC 0057 §5.1: above the allowance's `approve_above` its approver is
+/// asked — the allowance's own, not `security.payments.approver` — and it
+/// pays only on their yes; the operator, who approves other payments, is
+/// refused this one. The operator's `payment.allowances` op then reports
+/// what was spent.
+#[cfg(all(feature = "x402", feature = "a2a"))]
+#[test]
+fn above_the_allowances_approve_above_its_approver_is_asked() {
+    let dir = scratch();
+    let m = mock(json!({"price": "30000"}));
+    let payments = under_allowance(
+        dir.path(),
+        "max: \"0.05\", budget: \"1\", per: month, approve_above: \"0.02\", approver: \"user:alice\"",
+    );
+    let steps = format!(
+        "{}      done: {{kind: finish, depends_on: [a]}}\n",
+        drawing("a", "s", &format!("{}/a", m.url), ""),
+    );
+    let (d, addr) = common::spawn_bound(|port| {
+        let top = format!(
+            "lifecycle: {{run_until: drained}}\na2a:\n  listen: \"http://127.0.0.1:{port}\"\n  bearer: \"{{{{secret:OPS}}}}\"\n  principals:\n    - {{id: alice, match: {{bearer_ref: \"{{{{secret:ALICE}}}}\"}}, role: user}}\n"
+        );
+        let cfg = config(dir.path(), &payments, &top, "buy", &steps);
+        if !dir.path().join("ops.key").exists() {
+            wallet_address(&cfg);
+        }
+        let d = Daemon::spawn(
+            &cfg,
+            &[("OPS", "ops-bearer-x402"), ("ALICE", "alice-bearer-x402")],
+        );
+        let log = d.log.display().to_string();
+        (d, log)
+    });
+    let asked = d.wait("payment.asked", |d| {
+        d.events("payment.asked").into_iter().next()
+    });
+    assert_eq!(asked["approver"], "user:alice", "{asked}");
+    assert_eq!(asked["allowance"], "api");
+    assert!(
+        asked["asked_because"]
+            .to_string()
+            .contains("0.03 USD is above allowance api's approve_above 0.02 USD"),
+        "{asked}"
+    );
+    let task = asked["task"].as_str().unwrap().to_string();
+    let v = common::SendMessage::text("approve")
+        .task(&task)
+        .bearer("ops-bearer-x402")
+        .post(&addr);
+    let (_, msg) = common::error_of(&v);
+    assert!(msg.contains("approval is for user:alice"), "{v}");
+    assert!(paid(&m).is_empty());
+    let v = common::SendMessage::text("approve")
+        .task(&task)
+        .bearer("alice-bearer-x402")
+        .post(&addr);
+    assert!(v.get("error").is_none(), "{v}");
+    assert_eq!(d.step("a")["status"], "done", "{}", d.read());
+    assert_eq!(paid(&m).len(), 1);
+    let authorized = audit(dir.path())
+        .into_iter()
+        .find(|r| r["outcome"] == "authorized")
+        .unwrap();
+    assert_eq!(authorized["target"]["approved_by"], "user:alice");
+    assert_eq!(authorized["target"]["tier"], "approved");
+    let left = common::SendMessage::command("payment.allowances", json!({}))
+        .bearer("ops-bearer-x402")
+        .post(&addr);
+    let shown = left.to_string();
+    assert!(
+        shown.contains("\"spent\":\"0.03\"") || shown.contains("\\\"spent\\\":\\\"0.03\\\""),
+        "{left}"
+    );
+    // Nobody but an operator reads it.
+    let alice = common::SendMessage::command("payment.allowances", json!({}))
+        .bearer("alice-bearer-x402")
+        .post(&addr);
+    assert!(alice.get("error").is_some(), "{alice}");
+}
+
+/// SIGHUP the daemon `d`.
+#[cfg(all(feature = "x402", feature = "hot-reload"))]
+fn reload(d: &Daemon) {
+    // SAFETY: a signal to the child this test spawned.
+    unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };
+}
+
+/// RFC 0057 §4.4: allowances reload. A reload that lowers the budget to
+/// what was spent applies at once — the next payment is refused, naming
+/// the new budget — and says which fields changed.
+#[cfg(all(feature = "x402", feature = "hot-reload"))]
+#[test]
+fn a_reload_lowering_the_budget_refuses_the_next_payment() {
+    let dir = scratch();
+    let first = mock(json!({"price": "30000"}));
+    let second = mock(json!({"price": "10000"}));
+    let payments = under_allowance(dir.path(), "max: \"0.05\", budget: \"1\", per: month");
+    let steps = format!(
+        "{}      n: {{kind: sleep, depends_on: [a], duration: 3s}}\n{}      done: {{kind: finish, depends_on: [b]}}\n",
+        drawing("a", "s", &format!("{}/a", first.url), ""),
+        drawing(
+            "b",
+            "n",
+            &format!("{}/b", second.url),
+            ", on_error: continue"
+        ),
+    );
+    let cfg = config(dir.path(), &payments, "", "buy", &steps);
+    wallet_address(&cfg);
+    let mut d = Daemon::spawn(&cfg, &[]);
+    assert_eq!(d.step("a")["status"], "done", "{}", d.read());
+    let text = std::fs::read_to_string(&cfg).unwrap().replace(
+        "max: \"0.05\", budget: \"1\"",
+        "max: \"0.03\", budget: \"0.03\"",
+    );
+    std::fs::write(&cfg, text).unwrap();
+    reload(&d);
+    let changed = d.wait("payment.allowance.changed", |d| {
+        d.events("payment.allowance.changed").into_iter().next()
+    });
+    assert_eq!(changed["id"], "api");
+    assert_eq!(changed["fields"], json!(["max", "budget"]));
+    let b = d.step("b")["err"].as_str().unwrap().to_string();
+    assert!(
+        b.contains("allowance api: budget 0.03 USD per month, 0.03 spent, this payment 0.01"),
+        "{b}"
+    );
+    assert!(paid(&second).is_empty());
+    assert_eq!(d.exits(), Some(0));
+}
+
+/// RFC 0057 §4.4: a reload that removes an allowance a workflow's step
+/// names fails, said, and the old configuration stays.
+#[cfg(all(feature = "x402", feature = "hot-reload"))]
+#[test]
+fn a_reload_removing_an_allowance_a_step_names_is_refused() {
+    let dir = scratch();
+    let m = mock(json!({"price": "10000"}));
+    let payments = under_allowance(dir.path(), "max: \"0.05\", budget: \"1\"");
+    let steps = format!(
+        "{}      done: {{kind: finish, depends_on: [a]}}\n",
+        drawing("a", "s", &format!("{}/a", m.url), ""),
+    );
+    let cfg = config(
+        dir.path(),
+        &payments,
+        "lifecycle: {run_until: drained}\n",
+        "buy",
+        &steps,
+    );
+    wallet_address(&cfg);
+    let d = Daemon::spawn(&cfg, &[]);
+    assert_eq!(d.step("a")["status"], "done", "{}", d.read());
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    let without: String = text
+        .lines()
+        .filter(|l| !l.contains("allowances:") && !l.contains("api: {currency"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert_ne!(text, without);
+    std::fs::write(&cfg, without).unwrap();
+    reload(&d);
+    let invalid = d.wait("config.reload.invalid", |d| {
+        d.events("config.reload.invalid").into_iter().next()
+    });
+    assert!(
+        invalid["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("payment.allowance \"api\" is not a security.payments.allowances entry"),
+        "{invalid}"
+    );
+    assert!(d.events("payment.allowance.removed").is_empty());
+    assert!(d.events("config.reloaded").is_empty());
+}

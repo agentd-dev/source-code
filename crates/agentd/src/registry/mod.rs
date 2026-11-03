@@ -302,6 +302,8 @@ impl Registry {
             let offered = match c.family {
                 // Only where a registry entry lets the model discover.
                 "registries" => crate::config::settings::registries::discovers(settings),
+                // Only where an allowance is declared (RFC 0057 §6).
+                "payments" => !settings.security.payments.allowances.is_empty(),
                 // Only where a server may answer a call with a task.
                 "tasks" => settings
                     .mcp

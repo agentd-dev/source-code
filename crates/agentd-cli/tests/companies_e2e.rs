@@ -3395,6 +3395,148 @@ mod over_a2a {
         );
     }
 
+    /// [`operating_setup`] whose `shop` charges its exchanges' price
+    /// difference to the allowance `shopping` of `fields` (RFC 0057 §5.2),
+    /// with the audit chain an allowance needs.
+    fn spending_setup(h: &Host, f: &Fake, fields: &str) -> Setup {
+        let top = format!(
+            "{OPERATING}  payments:\n    allowances:\n      shopping: {{currency: USD, per: month, {fields}}}\n"
+        );
+        let s = operating_setup_with(
+            h,
+            f,
+            &top,
+            "",
+            ", spending: {allowance: shopping, amount: price_difference}",
+            EXCHANGES,
+        );
+        let cfg = std::fs::read_to_string(&s.cfg).unwrap().replace(
+            "  audit:\n    sink: [log]\n",
+            &format!(
+                "  audit:\n    sink: [log]\n    chain: {{path: \"{}/audit.log\"}}\n",
+                s.dir.display()
+            ),
+        );
+        std::fs::write(&s.cfg, cfg).unwrap();
+        s
+    }
+
+    /// What the operator's `payment.allowances` says of `shopping`.
+    fn shopping_left(addr: &str) -> Value {
+        let v = common::SendMessage::command("payment.allowances", json!({}))
+            .bearer(OPERATOR)
+            .post(addr);
+        let text = v.to_string();
+        let doc = v["result"]["message"]["parts"][0]["data"].clone();
+        let doc = if doc.is_null() {
+            v["result"]["parts"][0]["data"].clone()
+        } else {
+            doc
+        };
+        doc["allowances"]
+            .as_array()
+            .and_then(|l| l.iter().find(|a| a["id"] == "shopping").cloned())
+            .unwrap_or_else(|| panic!("no allowance shopping in {text}"))
+    }
+
+    /// RFC 0057 §5.2, end to end: an exchange whose price difference is
+    /// over the allowance's `max` is never asked of the User nor confirmed
+    /// — whatever calls `company.operation.confirm`, here a workflow — it is
+    /// cancelled at the Company, and the run fails saying why, naming the
+    /// allowance and the limit. Nothing is charged.
+    #[test]
+    fn a_charge_over_the_allowance_is_cancelled_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = spending_setup(&h, &f, "max: \"50\", budget: \"100\"");
+        let (d, addr) = start_listening(&s, "spend-refused", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("exchange").bearer(DANA).result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        let t = wait_state(&addr, DANA, &task, "TASK_STATE_FAILED", &d.log);
+        let l = d.read();
+        let refused = events(&l, "payment.refused");
+        assert!(
+            refused.iter().any(|e| e["why"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("allowance shopping: max 50 USD, this payment 70")),
+            "{refused:#?}"
+        );
+        let said = events(&l, "step.done")
+            .into_iter()
+            .find(|e| e["step"] == "c")
+            .unwrap_or_else(|| panic!("{l}"));
+        let err = said["err"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("was NOT confirmed — allowance shopping: max 50 USD")
+                && err.contains("cancelled it at the Company"),
+            "{err}\n{t}"
+        );
+        let record = f.record();
+        let at = |end: &str| {
+            record
+                .iter()
+                .filter(|r| {
+                    r["operation_request"] == true
+                        && r["path"].as_str().unwrap_or_default().ends_with(end)
+                })
+                .count()
+        };
+        assert_eq!(at("/confirm"), 0, "never confirmed");
+        assert_eq!(at("/cancel"), 1, "cancelled as a decline is");
+        assert!(
+            events(&l, "company.operation.asked").is_empty(),
+            "the User was not asked"
+        );
+        let left = shopping_left(&addr);
+        assert_eq!(left["spent"], "0", "{left}");
+        assert_eq!(left["payments"], 0, "{left}");
+    }
+
+    /// RFC 0057 §5.2, end to end: within the allowance the User is still
+    /// asked — it never approves an operation — and the confirm their
+    /// approval sends is a charge: `payment.allowances` says what was spent.
+    #[test]
+    fn a_confirm_within_the_allowance_records_what_was_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = fake(dir.path(), &[], None);
+        let h = host();
+        let s = spending_setup(&h, &f, "max: \"100\", budget: \"100\"");
+        let (d, addr) = start_listening(&s, "spend-charged", &[]);
+        wait_for(&d.log, "joined", |l| joined(l, "shop"));
+        let started = run_workflow("exchange").bearer(DANA).result(&addr);
+        let task = started["task"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{started}"))
+            .to_string();
+        wait_state(&addr, DANA, &task, "TASK_STATE_INPUT_REQUIRED", &d.log);
+        assert_eq!(shopping_left(&addr)["spent"], "0", "asking charges nothing");
+        let ok = common::SendMessage::text("approve")
+            .bearer(DANA)
+            .task(&task)
+            .return_immediately()
+            .post(&addr);
+        assert!(ok.get("error").is_none(), "{ok}");
+        wait_state(&addr, DANA, &task, "TASK_STATE_COMPLETED", &d.log);
+        let left = shopping_left(&addr);
+        assert_eq!(left["spent"], "70", "{left}");
+        assert_eq!(left["left"], "30", "{left}");
+        assert_eq!(left["payments"], 1, "{left}");
+        let l = d.read();
+        let charged = events(&l, "payment.allowance.charged");
+        assert!(
+            charged.iter().any(|e| e["state"] == "confirmed"
+                && e["charge"] == "70"
+                && e["allowance"] == "shopping"),
+            "{charged:#?}"
+        );
+    }
+
     /// An exchange proposed in the account a run signed the User in to, by
     /// its label: the User's gate names the account, and every record of
     /// the operation — the question, the answer, the confirm, each event and

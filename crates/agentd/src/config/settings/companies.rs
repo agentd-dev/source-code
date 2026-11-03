@@ -161,6 +161,18 @@ pub struct Standing {
     pub accounts: Option<Vec<String>>,
 }
 
+/// A company entry's `spending` (RFC 0057 §5.2): the term of an operation
+/// it proposes that is the charge, and the allowance it draws on.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Spending {
+    /// A `security.payments.allowances` entry.
+    pub allowance: String,
+    /// The term key whose value is the charge: `{"amount": "<decimal>",
+    /// "currency": "<ISO 4217>"}`, or a number in the allowance's currency.
+    pub amount: String,
+}
+
 /// The label of the account a sign-in names none for (RFC 0047 §9, P5b).
 pub const DEFAULT_ACCOUNT: &str = "default";
 
@@ -1128,6 +1140,31 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     }
     for (name, svc) in &entries {
         validate_entry(name, svc, &mut err);
+        if let Some(sp) = &svc.spending {
+            let at = format!("companies.{name}.spending");
+            match s.security.payments.allowances.get(&sp.allowance) {
+                None => err(format!(
+                    "{at}.allowance: {:?} is not a security.payments.allowances entry",
+                    sp.allowance
+                )),
+                Some(a)
+                    if a.payees
+                        .as_ref()
+                        .is_some_and(|l| !l.iter().any(|p| p == *name)) =>
+                {
+                    err(format!(
+                        "{at}.allowance: allowance {:?} lists payees, and {name:?} is not one of them — every operation would be refused",
+                        sp.allowance
+                    ))
+                }
+                Some(_) => {}
+            }
+            if sp.amount.trim().is_empty() {
+                err(format!(
+                    "{at}.amount: the term key whose value is the charge"
+                ));
+            }
+        }
     }
     // Signing in keeps an Account Token, which is only ever kept sealed
     // (§4.8: "MUST store Account Tokens as secrets"), and Direct Sign-In

@@ -2438,18 +2438,26 @@ fn parse_step(
             }
             _ => false,
         };
+        // Under an allowance (RFC 0057 §5.1) the wallet and `max` may be
+        // left to it.
         let ok = p.as_object().is_some_and(|o| {
-            o.get("wallet")
-                .and_then(Value::as_str)
-                .is_some_and(|w| !w.is_empty())
-                && o.get("max").is_some_and(max_ok)
+            let allowance = o.get("allowance");
+            allowance.is_none_or(|a| a.as_str().is_some_and(|a| !a.is_empty()))
+                && match o.get("wallet") {
+                    Some(w) => w.as_str().is_some_and(|w| !w.is_empty()),
+                    None => allowance.is_some(),
+                }
+                && match o.get("max") {
+                    Some(m) => max_ok(m),
+                    None => allowance.is_some(),
+                }
                 && o.get("approve").is_none_or(Value::is_boolean)
                 && o.keys()
-                    .all(|k| matches!(k.as_str(), "wallet" | "max" | "approve"))
+                    .all(|k| matches!(k.as_str(), "wallet" | "max" | "approve" | "allowance"))
         });
         if !ok {
             errs.push(format!(
-                "{at}: {kind} payment takes {{wallet: <name>, max: \"<amount> <asset>\" or a list of them, approve: true|false}}"
+                "{at}: {kind} payment takes {{wallet: <name>, max: \"<amount> <asset>\" or a list of them, approve: true|false, allowance: <id>}} — wallet and max may be left out under an allowance"
             ));
         }
         if p.to_string().contains("{{") {

@@ -62,6 +62,44 @@ pub struct Payments {
     /// blockhash when a server's entry gives none: a URL, `{{secret:…}}`
     /// references in it resolved when it is dialled.
     pub rpc: BTreeMap<String, String>,
+    /// What agentd may spend, on what, over what period, and who approves
+    /// (RFC 0057), by id. Reloadable: the rest of `security.payments` is
+    /// restart-only.
+    pub allowances: BTreeMap<String, Allowance>,
+}
+
+/// `security.payments.allowances.<id>` (RFC 0057 §3): every amount a
+/// decimal in `currency`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Allowance {
+    /// A label for receipts, gates and the status document.
+    pub title: Option<String>,
+    /// ISO 4217: three upper-case letters.
+    pub currency: String,
+    /// The operator wallets it may draw on; default every wallet.
+    pub wallets: Option<Vec<String>>,
+    /// The most one payment may be. Required.
+    pub max: Option<String>,
+    /// The most paid per period. Required.
+    pub budget: Option<String>,
+    /// `day`, `week`, `month`, `quarter`, `year` or `once` (the default).
+    pub per: Option<String>,
+    /// The most payments per period.
+    pub times: Option<u32>,
+    /// `security.payments.payees` names, or `companies` names; default every
+    /// payee the operator allows.
+    pub payees: Option<Vec<String>>,
+    /// Kinds of purchase: no rail can enforce them, so a payment under an
+    /// allowance that sets them is refused `rail-cannot-enforce`.
+    pub categories: Vec<String>,
+    /// RFC 3339 instants: the window payments may happen in.
+    pub from: Option<String>,
+    pub until: Option<String>,
+    /// Above it, up to `max`, the approver is asked each time.
+    pub approve_above: Option<String>,
+    /// `operator` or a principal id; default `security.payments.approver`.
+    pub approver: Option<String>,
 }
 
 /// `security.payments.signer`.
@@ -135,6 +173,10 @@ pub struct Asset {
     pub limits: Limits,
     /// Above this amount the approver is asked.
     pub approve_above: Option<String>,
+    /// ISO 4217: what one whole unit of the token is worth — one unit of
+    /// this currency (RFC 0057 §3). Without it the asset is not usable
+    /// under an allowance.
+    pub currency: Option<String>,
 }
 
 /// An asset's caps, each a decimal in its whole units.
@@ -165,6 +207,17 @@ impl Payments {
     /// Whether the section says anything.
     pub fn declared(&self) -> bool {
         self != &Payments::default()
+    }
+
+    /// Whether it configures the x402 rail — anything beside `allowances`,
+    /// which a Company's operations are charged under with no wallet (RFC
+    /// 0057 §5.2).
+    pub fn pays(&self) -> bool {
+        let rest = Payments {
+            allowances: BTreeMap::new(),
+            ..self.clone()
+        };
+        rest != Payments::default()
     }
 
     /// The approver.
@@ -379,6 +432,12 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     if !p.declared() {
         return;
     }
+    validate_allowances(s, d);
+    if !p.pays() {
+        // Allowances alone, for a Company's operations: no wallet, no
+        // asset, no payee, no x402.
+        return;
+    }
     let mut err = |m: String| d.errors.push(m);
     if !cfg!(feature = "x402") {
         err("security.payments needs the `x402` feature (build with --features x402)".into());
@@ -397,13 +456,8 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     if s.store.kind == StoreKind::Memory {
         err("security.payments needs a durable store (store.kind file, mcp or http): the ledger of what was paid must survive a restart, or a payment whose outcome is unknown could be made again (RFC 0049 D9)".into());
     }
-    let approver = p.approver();
-    if approver != OPERATOR
-        && (!super::companies::is_principal_id(approver) || approver.contains(['*', '?']))
-    {
-        err(format!(
-            "security.payments.approver: {approver:?} is neither `operator` nor a principal id (`<role>:<id>`); a glob or a role names more than the one person a payment's approval is asked of"
-        ));
+    if let Some(e) = approver_refusal("security.payments.approver", p.approver()) {
+        err(e);
     }
     if let Some(t) = p.approval_timeout
         && (t.0 < std::time::Duration::from_secs(1)
@@ -543,6 +597,20 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
         amount("limits.per_day", &l.per_day, &mut err);
         amount("limits.per_payee", &l.per_payee, &mut err);
         amount("approve_above", &a.approve_above, &mut err);
+        if let Some(c) = &a.currency {
+            if !crate::spending::is_currency(c) {
+                err(format!(
+                    "{at}.currency: {c:?} is not an ISO 4217 code (three upper-case letters, such as USD)"
+                ));
+            }
+            if a.decimals > crate::spending::SCALE {
+                err(format!(
+                    "{at}.currency: an asset of {} decimals is past the {} an allowance's amounts are held at, so it cannot say what it is worth exactly",
+                    a.decimals,
+                    crate::spending::SCALE
+                ));
+            }
+        }
         if p.assets
             .values()
             .filter(|x| x.asset.eq_ignore_ascii_case(&a.asset))
@@ -608,6 +676,108 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     }
 }
 
+/// Why `approver`, at `at`, is not one person a payment's approval can be
+/// asked of; `None` when it is.
+fn approver_refusal(at: &str, approver: &str) -> Option<String> {
+    (approver != OPERATOR
+        && (!super::companies::is_principal_id(approver) || approver.contains(['*', '?'])))
+    .then(|| {
+        format!(
+            "{at}: {approver:?} is neither `operator` nor a principal id (`<role>:<id>`); a glob or a role names more than the one person a payment's approval is asked of"
+        )
+    })
+}
+
+/// Every check RFC 0057 §3 makes at load on `security.payments.allowances`,
+/// each an error naming the field.
+fn validate_allowances(s: &Settings, d: &mut Diagnostics) {
+    use crate::spending::{SCALE, is_currency};
+    let p = &s.security.payments;
+    if p.allowances.is_empty() {
+        return;
+    }
+    if s.store.kind == StoreKind::Memory {
+        d.errors.push("security.payments.allowances needs a durable store (store.kind file, mcp or http): what was spent under an allowance must survive a restart, or a budget would start again at every one (RFC 0057 §4)".into());
+    }
+    for (id, a) in &p.allowances {
+        let at = format!("security.payments.allowances.{id}");
+        let mut err = |m: String| d.errors.push(m);
+        if !is_name(id) {
+            err(format!(
+                "{at}: an allowance's id is 1 to 32 of a-z, 0-9, - and _"
+            ));
+        }
+        if !is_currency(&a.currency) {
+            err(format!(
+                "{at}.currency: {:?} is not an ISO 4217 code (three upper-case letters, such as GBP)",
+                a.currency
+            ));
+        }
+        let read = match crate::spending::Allowance::from_settings(id, a) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                err(e);
+                None
+            }
+        };
+        if let Some(r) = &read {
+            if r.max > r.budget {
+                err(format!(
+                    "{at}.max: {} is more than the budget {}",
+                    format_amount(r.max, SCALE),
+                    format_amount(r.budget, SCALE)
+                ));
+            }
+            if let Some(t) = r.approve_above
+                && t > r.max
+            {
+                err(format!(
+                    "{at}.approve_above: {} is more than max {}",
+                    format_amount(t, SCALE),
+                    format_amount(r.max, SCALE)
+                ));
+            }
+            if let (Some(f), Some(u)) = (r.from_ms, r.until_ms)
+                && f >= u
+            {
+                err(format!("{at}.from: it is not before until"));
+            }
+        }
+        if a.times == Some(0) {
+            err(format!("{at}.times: at least 1"));
+        }
+        for w in a.wallets.iter().flatten() {
+            if !p.wallets.contains_key(w) {
+                err(format!(
+                    "{at}.wallets: {w:?} is not a security.payments.wallets entry"
+                ));
+            }
+        }
+        if a.wallets.as_ref().is_some_and(Vec::is_empty) {
+            err(format!(
+                "{at}.wallets: name at least one, or leave it out for every wallet"
+            ));
+        }
+        for py in a.payees.iter().flatten() {
+            if !p.payees.contains_key(py) && !s.companies.contains_key(py) {
+                err(format!(
+                    "{at}.payees: {py:?} is neither a security.payments.payees entry nor a companies entry"
+                ));
+            }
+        }
+        if let Some(ap) = &a.approver
+            && let Some(e) = approver_refusal(&format!("{at}.approver"), ap)
+        {
+            err(e);
+        }
+        if !a.categories.is_empty() {
+            d.warnings.push(format!(
+                "{at}.categories: no rail agentd pays on can enforce a kind of purchase, so every payment under this allowance is refused rail-cannot-enforce (RFC 0057 §5.3)"
+            ));
+        }
+    }
+}
+
 /// The step's `payment`, at any depth of `w`: `(step id, the field)`.
 pub fn paying_steps(w: &crate::engine::model::Workflow) -> Vec<(String, Value)> {
     fn walk(steps: &BTreeMap<String, crate::engine::model::Step>, out: &mut Vec<(String, Value)>) {
@@ -665,26 +835,95 @@ pub struct StepPayment {
     pub max: Vec<(String, u128)>,
     /// Whether every payment of the step asks the approver.
     pub approve: bool,
+    /// The allowance it draws on (RFC 0057 §5.1).
+    pub allowance: Option<String>,
 }
 
 /// Read a step's `payment` against the policy `p`.
 pub fn step_payment(p: &Payments, v: &Value) -> Result<StepPayment, String> {
     let o = v.as_object().ok_or("payment is an object")?;
-    let wallet = o
-        .get("wallet")
-        .and_then(Value::as_str)
-        .ok_or("payment.wallet is not set")?;
+    let allowance = match o.get("allowance") {
+        None => None,
+        Some(Value::String(id)) => match p.allowances.get(id) {
+            Some(a) => Some((id.clone(), a)),
+            None => {
+                return Err(format!(
+                    "payment.allowance {id:?} is not a security.payments.allowances entry"
+                ));
+            }
+        },
+        Some(_) => return Err("payment.allowance is an allowance's id".into()),
+    };
+    let wallet = match (o.get("wallet").and_then(Value::as_str), &allowance) {
+        (Some(w), _) => w.to_string(),
+        (None, Some((id, a))) => {
+            let ws: Vec<&String> = match &a.wallets {
+                Some(l) => l.iter().collect(),
+                None => p.wallets.keys().collect(),
+            };
+            match ws.as_slice() {
+                [one] => (*one).clone(),
+                _ => {
+                    return Err(format!(
+                        "payment.wallet is not set, and allowance {id:?} draws on {} wallets — name the one the step pays from",
+                        ws.len()
+                    ));
+                }
+            }
+        }
+        (None, None) => return Err("payment.wallet is not set".into()),
+    };
+    let wallet = wallet.as_str();
     if !p.wallets.contains_key(wallet) {
         return Err(format!(
             "payment.wallet {wallet:?} is not a security.payments.wallets entry"
         ));
     }
-    let maxes: Vec<&str> = match o.get("max") {
-        Some(Value::String(s)) => vec![s.as_str()],
-        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+    if let Some((id, a)) = &allowance
+        && let Some(l) = &a.wallets
+        && !l.iter().any(|w| w == wallet)
+    {
+        return Err(format!(
+            "payment.wallet {wallet:?} is not one of allowance {id:?}'s wallets"
+        ));
+    }
+    let chain = p.wallets[wallet].chain;
+    let maxes: Vec<&str> = match (o.get("max"), &allowance) {
+        (Some(Value::String(s)), _) => vec![s.as_str()],
+        (Some(Value::Array(a)), _) => a.iter().filter_map(Value::as_str).collect(),
+        // The allowance's `max`, in each asset on the wallet's chains that
+        // says it is the allowance's currency.
+        (None, Some((id, a))) => {
+            let read = crate::spending::Allowance::from_settings(id, a)?;
+            let max: Vec<(String, u128)> = p
+                .assets
+                .iter()
+                .filter(|(_, x)| {
+                    x.currency.as_deref() == Some(a.currency.as_str())
+                        && namespace_of_asset(&x.asset) == chain.namespace()
+                })
+                .map(|(n, x)| {
+                    (
+                        n.clone(),
+                        crate::spending::from_currency(read.max, x.decimals),
+                    )
+                })
+                .collect();
+            if max.is_empty() {
+                return Err(format!(
+                    "payment.max is not set, and no asset on wallet {wallet:?}'s chains says it is {} (security.payments.assets.<name>.currency), the currency of allowance {id:?}",
+                    a.currency
+                ));
+            }
+            return Ok(StepPayment {
+                wallet: wallet.to_string(),
+                max,
+                approve: o.get("approve").and_then(Value::as_bool).unwrap_or(false),
+                allowance: Some(id.clone()),
+            });
+        }
         _ => return Err("payment.max is not set".into()),
     };
-    let chain = p.wallets[wallet].chain;
     let mut max = Vec::new();
     for m in maxes {
         let (amount, asset) = m.trim().split_once(' ').ok_or_else(|| {
@@ -710,6 +949,7 @@ pub fn step_payment(p: &Payments, v: &Value) -> Result<StepPayment, String> {
         wallet: wallet.to_string(),
         max,
         approve: o.get("approve").and_then(Value::as_bool).unwrap_or(false),
+        allowance: allowance.map(|(id, _)| id),
     })
 }
 
@@ -725,7 +965,7 @@ pub fn workflow_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Ve
             ));
             continue;
         }
-        if !s.security.payments.declared() {
+        if !s.security.payments.pays() {
             out.push(format!(
                 "{at}: a step's payment needs security.payments, the spend policy it pays within (RFC 0049 §4)"
             ));
@@ -919,6 +1159,164 @@ workflows:
             let e = load_error(&*edit);
             assert!(e.contains(says), "want {says:?}, got: {e}");
         }
+    }
+
+    /// Every load check RFC 0057 §3 makes on an allowance, each an error
+    /// naming the field; and a step naming an allowance it does not have,
+    /// or leaving the wallet or `max` to one that cannot say them.
+    #[cfg(feature = "x402")]
+    #[test]
+    fn an_allowance_is_checked_at_load_field_by_field() {
+        let with = |allowance: &'static str, asset: &'static str, payment: &'static str| {
+            move |y: String| {
+                y.replace(
+                    "    payees: {api:",
+                    &format!("    allowances:\n      api: {{{allowance}}}\n    payees: {{api:"),
+                )
+                .replace(
+                    "        decimals: 6\n",
+                    &format!("        decimals: 6\n{asset}"),
+                )
+                .replace("payment: {wallet: ops, max: \"0.05 usdc\"}", payment)
+            }
+        };
+        const OK: &str = "currency: USD, max: \"0.05\", budget: \"1\", per: month, payees: [api], approve_above: \"0.02\"";
+        const USD: &str = "        currency: USD\n";
+        const STEP: &str = "payment: {allowance: api}";
+        assert_eq!(load_error(&with(OK, USD, STEP)), "");
+        for (allowance, asset, payment, says) in [
+            (
+                "currency: usd, max: \"1\", budget: \"1\"",
+                USD,
+                STEP,
+                "allowances.api.currency: \"usd\" is not an ISO 4217 code",
+            ),
+            (
+                "currency: USD, budget: \"1\"",
+                USD,
+                STEP,
+                "allowances.api.max is not set",
+            ),
+            (
+                "currency: USD, max: \"1\"",
+                USD,
+                STEP,
+                "allowances.api.budget is not set",
+            ),
+            (
+                "currency: USD, max: \"2\", budget: \"1\"",
+                USD,
+                STEP,
+                "allowances.api.max: 2 is more than the budget 1",
+            ),
+            (
+                "currency: USD, max: \"1\", budget: \"1\", approve_above: \"3\"",
+                USD,
+                STEP,
+                "allowances.api.approve_above: 3 is more than max 1",
+            ),
+            (
+                "currency: USD, max: \"1\", budget: \"1\", per: fortnight",
+                USD,
+                STEP,
+                "allowances.api.per: \"fortnight\"",
+            ),
+            (
+                "currency: USD, max: \"1\", budget: \"1\", from: \"2027-01-01T00:00:00Z\", until: \"2026-01-01T00:00:00Z\"",
+                USD,
+                STEP,
+                "allowances.api.from: it is not before until",
+            ),
+            (
+                "currency: USD, max: \"1\", budget: \"1\", until: yesterday",
+                USD,
+                STEP,
+                "allowances.api.until: \"yesterday\" is not an RFC 3339 instant",
+            ),
+            (
+                "currency: USD, max: \"1\", budget: \"1\", wallets: [cold]",
+                USD,
+                STEP,
+                "allowances.api.wallets: \"cold\" is not a security.payments.wallets entry",
+            ),
+            (
+                "currency: USD, max: \"1\", budget: \"1\", payees: [aldi]",
+                USD,
+                STEP,
+                "allowances.api.payees: \"aldi\" is neither a security.payments.payees entry nor a companies entry",
+            ),
+            (
+                "currency: USD, max: \"1\", budget: \"1\", approver: \"user:*\"",
+                USD,
+                STEP,
+                "allowances.api.approver",
+            ),
+            (
+                "currency: USD, max: \"1\", budget: \"1\", times: 0",
+                USD,
+                STEP,
+                "allowances.api.times: at least 1",
+            ),
+            (
+                OK,
+                "        currency: dollars\n",
+                "payment: {wallet: ops, max: \"0.05 usdc\"}",
+                "assets.usdc.currency: \"dollars\" is not an ISO 4217 code",
+            ),
+            (
+                OK,
+                USD,
+                "payment: {allowance: food}",
+                "payment.allowance \"food\" is not a security.payments.allowances entry",
+            ),
+            (
+                OK,
+                "",
+                STEP,
+                "no asset on wallet \"ops\"'s chains says it is USD",
+            ),
+        ] {
+            let e = load_error(&with(allowance, asset, payment));
+            assert!(e.contains(says), "want {says:?}, got: {e}");
+        }
+        // Under an allowance, the step's own max still names an asset.
+        assert_eq!(
+            load_error(&with(
+                OK,
+                USD,
+                "payment: {allowance: api, max: \"0.01 usdc\"}"
+            )),
+            ""
+        );
+    }
+
+    /// The allowance's `max` is the step's in each asset of its currency
+    /// when the step names none, and its only wallet is the step's.
+    #[cfg(feature = "x402")]
+    #[test]
+    fn a_step_under_an_allowance_takes_its_wallet_and_max() {
+        use serde_json::json;
+        let p: Payments = serde_json::from_value(json!({
+            "wallets": {"ops": {"key_file": "/k"}, "cold": {"key_file": "/c"}},
+            "assets": {
+                "usdc": {"asset": "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                         "decimals": 6, "currency": "USD", "limits": {"per_run": "1", "per_day": "1", "per_payee": "1"}},
+                "eurc": {"asset": "eip155:8453/erc20:0x209693Bc6afc0C5328bA36FaF03C514EF312287C",
+                         "decimals": 6, "currency": "EUR", "limits": {"per_run": "1", "per_day": "1", "per_payee": "1"}}},
+            "allowances": {
+                "api": {"currency": "USD", "max": "0.0500009", "budget": "1", "wallets": ["ops"]},
+                "any": {"currency": "USD", "max": "1", "budget": "1"}}
+        }))
+        .unwrap();
+        let s = step_payment(&p, &json!({"allowance": "api"})).unwrap();
+        assert_eq!(s.wallet, "ops");
+        assert_eq!(s.max, vec![("usdc".to_string(), 50_000)], "rounded down");
+        assert_eq!(s.allowance.as_deref(), Some("api"));
+        let e = step_payment(&p, &json!({"allowance": "any"})).unwrap_err();
+        assert!(e.contains("draws on 2 wallets"), "{e}");
+        let e = step_payment(&p, &json!({"allowance": "api", "wallet": "cold"})).unwrap_err();
+        assert!(e.contains("not one of allowance \"api\"'s wallets"), "{e}");
+        assert!(step_payment(&p, &json!({"allowance": "any", "wallet": "cold"})).is_ok());
     }
 
     /// Paying steps are found at any depth, in the definition and its JSON.

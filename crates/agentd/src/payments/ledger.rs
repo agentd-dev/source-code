@@ -105,6 +105,14 @@ pub struct Record {
     pub at_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_ms: Option<u64>,
+    /// The allowance it was paid under (RFC 0057 §4.2), the charge in its
+    /// currency as a decimal (`"20.5"`), and that currency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
 }
 
 impl Record {
@@ -251,10 +259,44 @@ impl Ledger {
         s
     }
 
-    /// Forget records older than [`KEEP_MS`] whose run is not live: past
-    /// every window a cap looks back over, and past every `validBefore`;
-    /// how many.
-    pub fn sweep(&mut self, now_ms: u64, live: &dyn Fn(&str) -> bool) -> usize {
+    /// What counts against the allowance `allowance` in `currency` from
+    /// `since` at `now_ms`: what counts against a cap (RFC 0057 §4.2).
+    pub fn allowance_usage(
+        &self,
+        allowance: &str,
+        currency: &str,
+        since: u64,
+        now_ms: u64,
+    ) -> crate::spending::Usage {
+        let mut u = crate::spending::Usage::default();
+        for r in self.records.values().filter(|r| {
+            r.allowance.as_deref() == Some(allowance)
+                && r.currency.as_deref() == Some(currency)
+                && r.at_ms >= since
+                && r.counts(now_ms)
+        }) {
+            let c = r
+                .charge
+                .as_deref()
+                .and_then(|c| {
+                    crate::config::settings::payments::parse_amount(c, crate::spending::SCALE).ok()
+                })
+                .unwrap_or(u128::MAX);
+            u.add(c);
+        }
+        u
+    }
+
+    /// Forget records older than [`KEEP_MS`] whose run is not live and that
+    /// `kept` — an allowance's period that still counts them — does not
+    /// hold: past every window a cap looks back over, and past every
+    /// `validBefore`; how many.
+    pub fn sweep(
+        &mut self,
+        now_ms: u64,
+        live: &dyn Fn(&str) -> bool,
+        kept: &dyn Fn(&Record) -> bool,
+    ) -> usize {
         let old: Vec<String> = self
             .records
             .values()
@@ -262,6 +304,7 @@ impl Ledger {
                 r.at_ms.saturating_add(KEEP_MS) < now_ms
                     && r.state != State::Sending
                     && !live(&r.run)
+                    && !kept(r)
             })
             .map(Record::id)
             .collect();
@@ -322,6 +365,9 @@ mod tests {
             approved_by: None,
             at_ms,
             ended_ms: None,
+            allowance: None,
+            charge: None,
+            currency: None,
         }
     }
 
@@ -416,6 +462,30 @@ mod tests {
         let mut other = record("h", "run1", 12800, State::Settled, now);
         other.asset = "eurc".into();
         l.put(other).unwrap();
+        // Under an allowance: the records that name it, in its currency,
+        // that count.
+        let mut under = |id: &str, state: State, at: u64, currency: &str| {
+            let mut r = record(id, "run4", 1, state, at);
+            r.asset = "usdc-x".into();
+            r.allowance = Some("api".into());
+            r.charge = Some("0.25".into());
+            r.currency = Some(currency.into());
+            l.put(r).unwrap();
+        };
+        under("i", State::Settled, now, "USD");
+        under("j", State::Unsent, now, "USD");
+        under("k", State::Unknown, now - DAY_MS * 40, "USD");
+        under("m", State::Sending, now, "EUR");
+        let u = l.allowance_usage("api", "USD", 0, now);
+        assert_eq!(
+            (
+                u.payments,
+                crate::config::settings::payments::format_amount(u.spent, crate::spending::SCALE)
+            ),
+            (2, "0.5".into())
+        );
+        let u = l.allowance_usage("api", "USD", now - DAY_MS, now);
+        assert_eq!(u.payments, 1, "the period starts after k");
         let payee = Account::parse("0x209693Bc6afc0C5328bA36FaF03C514EF312287C").unwrap();
         let s = l.spent("usdc-base", "run1", &payee, now);
         assert_eq!(s.run, 300);
@@ -428,5 +498,9 @@ mod tests {
             6400,
             "a run's own counts past the day"
         );
+        // The sweep keeps what an allowance's period still counts.
+        let later = now + KEEP_MS + 1;
+        let n = l.sweep(later, &|_| false, &|r| r.request == "i");
+        assert!(n > 0 && l.get("i", 1).is_some() && l.get("a", 1).is_none());
     }
 }

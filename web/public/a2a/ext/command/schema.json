@@ -366,6 +366,21 @@
           "if": {
             "properties": {
               "op": {
+                "const": "payment.allowances"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/payment.allowances"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
                 "const": "company.status"
               }
             },
@@ -1225,6 +1240,18 @@
               "description": "A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject; the caller's own grants when absent. Anyone but an operator revokes their own alone",
               "minLength": 1,
               "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        "payment.allowances": {
+          "additionalProperties": false,
+          "properties": {
+            "op": {
+              "const": "payment.allowances"
             }
           },
           "required": [
@@ -2818,6 +2845,110 @@
         "description": "Revoke the grants {target?} names — a principal, or idp:<name>#<sub> for every grant of that subject; the caller's own when absent: RFC 7009 at the IdP, then the tombstone, the record and every token. An operator revokes anyone's; anyone else their own alone",
         "reply": "task",
         "result": false
+      },
+      "payment.allowances": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "description": "What each spending allowance has left: its currency, its period and when the current one started, its budget, what was spent in it and how many payments were made. Read-only",
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "allowances": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "approve_above": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "budget": {
+                    "description": "a decimal in the allowance's currency",
+                    "type": "string"
+                  },
+                  "currency": {
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "left": {
+                    "description": "a decimal in the allowance's currency",
+                    "type": "string"
+                  },
+                  "max": {
+                    "description": "a decimal in the allowance's currency",
+                    "type": "string"
+                  },
+                  "payments": {
+                    "type": "integer"
+                  },
+                  "period": {
+                    "enum": [
+                      "day",
+                      "week",
+                      "month",
+                      "quarter",
+                      "year",
+                      "once"
+                    ]
+                  },
+                  "period_end": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "period_start": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "spent": {
+                    "description": "a decimal in the allowance's currency",
+                    "type": "string"
+                  },
+                  "times": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "title": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "currency",
+                  "period",
+                  "period_start",
+                  "spent",
+                  "budget",
+                  "left",
+                  "max",
+                  "payments"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "allowances"
+          ],
+          "type": "object"
+        }
       },
       "plan.get": {
         "args": {

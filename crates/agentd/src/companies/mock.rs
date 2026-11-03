@@ -135,7 +135,8 @@
 //! as no Company should; `"expire_events": true` forgets
 //! every conversation's events so far, so a cursor naming one of them is
 //! `cursor_expired`; `"operations": {"in_progress": n}` answers the next
-//! confirm `in_progress` with `Retry-After`, and keeps the operation in
+//! confirm `in_progress` with `Retry-After` (and `{"cancel_in_progress":
+//! true}` lets a cancel then stop it), and keeps the operation in
 //! progress for `n` reads before it succeeds; `{"revise": n}` gives the next
 //! `n` confirmed operations a new revision first — the price changed — so
 //! the confirm is `terms_changed`; `{"user_approval_required": true}` has
@@ -928,6 +929,9 @@ struct OpenapiControl {
 struct OpControl {
     /// Reads the next confirmed operation stays `in_progress` for.
     in_progress: Option<u32>,
+    /// A cancel of an operation still `in_progress` cancels it (Ops §7)
+    /// rather than answering it as it is.
+    cancel_in_progress: bool,
     /// Confirms still to meet a new revision first.
     revise: u32,
     user_approval_required: bool,
@@ -2919,6 +2923,7 @@ impl Company {
         }
         let revise = tail.as_deref() == Some(wire::operations::CONFIRM) && st.ops.revise > 0;
         let in_progress = st.ops.in_progress;
+        let cancel_in_progress = st.ops.cancel_in_progress;
         let refuse_standing = st.ops.refuse_standing > 0
             && tail.as_deref() == Some(wire::operations::CONFIRM)
             && body["approved_by"] == wire::operations::APPROVED_BY_STANDING;
@@ -3046,6 +3051,10 @@ impl Company {
                     op.v["state"] = json!(wire::operations::CANCELLED);
                     op.v["result"] =
                         json!({"summary": "Cancelled before it was confirmed. Nothing was done."});
+                } else if cancel_in_progress && op.v["state"] == wire::operations::IN_PROGRESS {
+                    // Confirmed, not yet done: it cancels (Ops §7).
+                    op.v["state"] = json!(wire::operations::CANCELLED);
+                    op.v["result"] = json!({"summary": "Cancelled while it was being performed; the charge was refunded."});
                 }
                 Company::operation_reply(200, op)
             }
@@ -3977,6 +3986,9 @@ impl Company {
         let o = &body["operations"];
         if let Some(n) = o["in_progress"].as_u64() {
             st.ops.in_progress = Some(u32::try_from(n).unwrap_or(u32::MAX));
+        }
+        if let Some(b) = o["cancel_in_progress"].as_bool() {
+            st.ops.cancel_in_progress = b;
         }
         if let Some(n) = o["revise"].as_u64() {
             st.ops.revise = u32::try_from(n).unwrap_or(u32::MAX);

@@ -696,7 +696,7 @@ fn companies() -> Value {
 fn payments() -> Value {
     let amount = json!({ "type": "string", "description": "a decimal in the asset's whole units (\"0.25\"), at most `decimals` digits after the point" });
     json!({ "type": "object", "additionalProperties": false,
-        "description": "paying for things with x402 (RFC 0049; needs the x402 feature): the spend policy every payment is held to — assets by CAIP-19, payees by address, caps per payment, run, day and payee, the approver above a threshold — and the wallets. Restart-only, operator-only. Needs observability.audit.chain and a durable store",
+        "description": "paying for things with x402 (RFC 0049; needs the x402 feature): the spend policy every payment is held to — assets by CAIP-19, payees by address, caps per payment, run, day and payee, the approver above a threshold — the wallets, and the allowances people set. Operator-only; restart-only but allowances, which reload. Needs observability.audit.chain and a durable store",
         "properties": {
             "approver": { "type": "string", "description": "who approves a payment the policy asks about: `operator` (default: any operator principal) or one principal id `<role>:<id>`, the only one who can — no judge answers, and no operator but the approver" },
             "approval_timeout": { "type": ["string", "integer"], "description": "how long the approver is waited for before the payment is declined, 1s to 7d; default 1h" },
@@ -722,10 +722,27 @@ fn payments() -> Value {
                 "limits": { "type": "object", "additionalProperties": false, "required": ["per_run", "per_day", "per_payee"], "properties": {
                     "per_payment": amount, "per_run": amount, "per_day": amount, "per_payee": amount },
                     "description": "per_payment: one payment; per_run: one run's payments; per_day: all payments in any 24 hours; per_payee: all payments to one payee in any 24 hours — each counting every payment that left agentd or may have" },
-                "approve_above": { "type": "string", "description": "above this amount (whole units) the approver is asked" } } } },
+                "approve_above": { "type": "string", "description": "above this amount (whole units) the approver is asked" },
+                "currency": { "type": "string", "pattern": "^[A-Z]{3}$", "description": "ISO 4217: one whole unit of the token is one unit of this currency (a dollar stablecoin is USD); an asset is usable under an allowance only in its own currency, and agentd never converts between currencies. At most 18 decimals" } } } },
             "payees": { "type": "object", "description": "the addresses agentd may pay, by name", "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["address"], "properties": {
                 "address": { "type": "string", "description": "the payTo address: 0x and 40 hex digits on an EVM chain, 32 bytes in base58 on Solana" },
                 "assets": { "type": "array", "items": { "type": "string" }, "description": "the assets it may be paid in, each on its address's chain family; default every asset" } } } },
+            "allowances": { "type": "object",
+                "description": "what agentd may spend, on what, over what period, and who approves (RFC 0057), by id (1 to 32 of a-z, 0-9, - and _): an x402 step draws on one with payment: {allowance: <id>}, a Company's priced operations with companies.<name>.spending. It narrows, never widens: a payment under it passes every other check too. Reloadable; what was spent this period still counts after a change",
+                "additionalProperties": { "type": "object", "additionalProperties": false, "required": ["currency", "max", "budget"], "properties": {
+                    "title": { "type": "string", "description": "a label for receipts, gates and the status document" },
+                    "currency": { "type": "string", "pattern": "^[A-Z]{3}$", "description": "ISO 4217: every amount of the allowance is in it" },
+                    "wallets": { "type": "array", "items": { "type": "string" }, "description": "the security.payments.wallets it may draw on; default every wallet" },
+                    "max": { "type": "string", "description": "the most one payment may be, a decimal in the currency" },
+                    "budget": { "type": "string", "description": "the most paid per period, a decimal in the currency; at least max" },
+                    "per": { "enum": ["day", "week", "month", "quarter", "year", "once"], "description": "the budget's period, a UTC calendar period (week: ISO, from Monday); once is the allowance's whole life. Default once" },
+                    "times": { "type": "integer", "minimum": 1, "description": "the most payments per period" },
+                    "payees": { "type": "array", "items": { "type": "string" }, "description": "the payees it may pay: security.payments.payees names (x402) or companies names; default every payee the operator allows" },
+                    "categories": { "type": "array", "items": { "type": "string" }, "description": "kinds of purchase: no rail agentd pays on can enforce them, so every payment under an allowance that sets them is refused rail-cannot-enforce" },
+                    "from": { "type": "string", "description": "an RFC 3339 instant: no payment before it" },
+                    "until": { "type": "string", "description": "an RFC 3339 instant: no payment at or after it" },
+                    "approve_above": { "type": "string", "description": "above it, up to max, the approver is asked each time; at most max" },
+                    "approver": { "type": "string", "description": "who answers: `operator` or one principal id; default security.payments.approver" } } } },
             "rpc": { "type": "object", "additionalProperties": { "type": "string" },
                 "description": "by Solana network (CAIP-2, e.g. solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp), the RPC endpoint asked for a recent blockhash (getLatestBlockhash) when a server's entry gives no extra.recentBlockhash: https://, or http:// to this host; {{secret:NAME}} references in it resolved when it is dialled. Without one, an entry with no blockhash is passed over" } } })
 }
@@ -1025,7 +1042,12 @@ fn defs_properties(
                 "api_allow": { "type": "array", "items": { "type": "string" },
                                "description": "the OpenAPI operations agentd may call there, each `METHOD /path-template` as the description's paths name it (`GET /orders/{order_id}`); one outside them, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, `<server>.<method>_<path>` (`shop.get_orders_order_id`). Needs `openapi` in interfaces; default none" },
                 "api_names": { "type": "object", "additionalProperties": { "type": "string" }, "description": "a server name for each OpenAPI API url the Company lists, under which its operation tools are named, when it lists more than one or the entry's name is taken; with one, the server is named after the entry. Needs api_allow" },
-                "context": company_context("what this Company's conversations share of the User's situation, each field over security.companies.context. Needs `agent` in interfaces") } }));
+                "context": company_context("what this Company's conversations share of the User's situation, each field over security.companies.context. Needs `agent` in interfaces"),
+                "spending": { "type": "object", "additionalProperties": false, "required": ["allowance", "amount"],
+                    "description": "the allowance an operation the Company proposes is charged to (RFC 0057 §5.2): checked before the User is asked or a standing permission applies — past a limit the operation is not confirmed and is cancelled at the Company, above approve_above no standing permission covers it. A confirm sent is a charge; a cancellation the Company confirms credits it back. Operations are proposed only where client.extensions lists operations",
+                    "properties": {
+                    "allowance": { "type": "string", "description": "a security.payments.allowances entry" },
+                    "amount": { "type": "string", "description": "the term key whose value is the charge: {\"amount\": \"<decimal>\", \"currency\": \"<ISO 4217>\"}, or a number in the allowance's currency; an operation without it, or with one that does not read, is refused" } } } } }));
     m.insert("HttpEndpoint".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["endpoint"],
                 "description": "a plain-HTTP endpoint: a URL prefix and how it is reached",
                 "properties": {

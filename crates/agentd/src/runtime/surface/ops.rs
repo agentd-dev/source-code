@@ -66,6 +66,8 @@ pub enum Gate {
     Listener,
     /// A Company is declared, in a build that acts at one (RFC 0047).
     Companies,
+    /// An allowance is declared (RFC 0057).
+    Allowances,
     /// A delegated server or an IdP is declared, in a build that acts for
     /// an enrolled person (RFC 0044).
     Delegation,
@@ -453,6 +455,18 @@ pub const OPS: &[OpSpec] = &[
         sessions_revoke_result,
     ),
     op(
+        "payment.allowances",
+        Message,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Allowances,
+        Handler::Read,
+        "What each spending allowance has left: its currency, its period and when the current one started, its budget, what was spent in it and how many payments were made. Read-only",
+        no_args,
+        allowances_result,
+    ),
+    op(
         "company.status",
         Message,
         Operator,
@@ -697,6 +711,7 @@ pub fn gate_open(spec: &OpSpec, s: &Settings) -> bool {
         Gate::Companies => {
             cfg!(feature = "companies") && crate::config::settings::companies::any_company(s)
         }
+        Gate::Allowances => !s.security.payments.allowances.is_empty(),
         Gate::Delegation => {
             cfg!(feature = "xaa")
                 && (!s.identity.providers.is_empty()
@@ -1307,6 +1322,11 @@ fn sessions_revoke_args() -> Value {
 
 fn sessions_revoke_result() -> Value {
     closed(&["revoked"], json!({"revoked": count()}))
+}
+
+/// `payment.allowances`: the internal tool's document — the one shape.
+fn allowances_result() -> Value {
+    crate::registry::internal::allowances_output()
 }
 
 /// `company.status`: the internal tool's document, with why each failed
@@ -2009,6 +2029,7 @@ mod tests {
             | "auth.device.pending"
             | "auth.sessions"
             | "company.status"
+            | "payment.allowances"
             | "delegation.list" => json!({}),
             other => panic!("no sample for {other}: add one"),
         };

@@ -81,7 +81,7 @@ impl Payments {
         log: &Logger,
     ) -> Result<Option<Opened>, String> {
         let p = &settings.security.payments;
-        if !p.declared() {
+        if !p.pays() {
             return Ok(None);
         }
         let policy = policy::Policy::from_settings(p)?;
@@ -124,6 +124,20 @@ impl Payments {
     /// The ledger, locked.
     pub fn ledger(&self) -> std::sync::MutexGuard<'_, ledger::Ledger> {
         self.ledger.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// An allowance counts the payments made under it (RFC 0057 §4.2).
+impl crate::spending::Counted for Payments {
+    fn usage(
+        &self,
+        allowance: &str,
+        currency: &str,
+        since: u64,
+        now_ms: u64,
+    ) -> crate::spending::Usage {
+        self.ledger()
+            .allowance_usage(allowance, currency, since, now_ms)
     }
 }
 

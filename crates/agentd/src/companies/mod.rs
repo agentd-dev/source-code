@@ -346,6 +346,9 @@ mod supervisor {
         pub(super) operations: bool,
         /// The standing permissions, as configured.
         pub(super) standing: Vec<super::operations::Rule>,
+        /// What each allowance was charged: an operation's charge is kept
+        /// here before its confirm is sent (RFC 0057 §5.2).
+        pub(super) spending: Arc<crate::spending::Spending>,
         /// The Companies and account labels whose standing permissions are
         /// suspended until a restart.
         pub(super) standing_suspended: Mutex<BTreeSet<(String, String)>>,
@@ -372,6 +375,7 @@ mod supervisor {
             settings: &Settings,
             durable: Arc<Durable>,
             log: &Logger,
+            spending: Arc<crate::spending::Spending>,
         ) -> Result<Option<Arc<Supervisor>>, String> {
             if !cfg::any_company(settings) {
                 return Ok(None);
@@ -476,6 +480,7 @@ mod supervisor {
                     .filter_map(super::operations::Rule::of)
                     .collect(),
                 standing_suspended: Mutex::default(),
+                spending,
                 track_wake: (Mutex::new(0), Condvar::new()),
                 life: crate::sec::random::b64url_token(12)
                     .map_err(|e| format!("no OS randomness: {e}"))?,
@@ -501,6 +506,11 @@ mod supervisor {
 
         pub fn log(&self) -> &Logger {
             &self.log
+        }
+
+        /// What each allowance was charged (RFC 0057).
+        pub fn spending(&self) -> &Arc<crate::spending::Spending> {
+            &self.spending
         }
 
         /// The User every Company sees this instance act for.

@@ -800,9 +800,14 @@ record closes `failed` with that pid in its error, and the parent logs
 
 > **Warning.** The parent's load checks a template's tier rules and its
 > boundary, but not the steps of its workflows. Those are validated when a
-> spawn composes the child's configuration, and an error refuses that spawn
-> with `composes an invalid config`. Spawn each instance template once in a
-> test environment before you rely on it.
+> spawn composes the child's configuration: the configuration is checked,
+> and each of the child's workflows is compiled and its `tool` steps checked
+> against the tools the child will have (built in, or served by an MCP
+> server the parent has tools from). An error refuses that spawn with
+> `composes an invalid config`. A tool step's name is not checked while the
+> child composes a server the parent has no tools from; the child then
+> checks it when it starts. Spawn each instance template once in a test
+> environment before you rely on it.
 
 When a reload changes the templates, the live instance children follow. A
 child whose template the reload removed is retired, and the parent logs
@@ -811,10 +816,13 @@ composition changed (its prose, machinery, skills or fields) is retired,
 logged as `subagent.template.recomposed`, and started again from the new
 template once it has exited, with the params it was spawned with, logged as
 `subagent.template.respawned`. The new child replaces the old one, so the
-instance ceilings (breadth, total, rate) do not count it again. What could
-still refuse it, pressure or params the new template refuses, is checked
-before the old child is retired: the old child then keeps running, and the
-parent logs `subagent.template.recompose_refused`. A template that is no
+instance ceilings (breadth, total, rate) do not count it again. Everything
+that could still refuse it is checked before the old child is retired:
+pressure, params the new template refuses, and the new configuration,
+composed and checked as a spawn checks it, its workflows compiled. A refused
+recompose leaves the old child running, and the parent logs
+`subagent.template.recompose_refused` with the reason (`why`), so a bad
+document release does not take a live agent down. A template that is no
 longer a singleton, or whose agent became prose-only, retires its child and
 does not start another (`subagent.template.retired`). Other children of a
 changed template keep the composition they were spawned with until they

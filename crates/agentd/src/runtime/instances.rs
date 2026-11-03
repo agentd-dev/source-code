@@ -259,39 +259,11 @@ impl Runtime {
                 s.handle
             ));
         }
-        let params =
-            match validate_params(&t.spec.params, args.get("params").unwrap_or(&Value::Null)) {
-                Ok(p) => p,
-                Err(e) => return err(format!("subagent.run: template '{tname}': {e}")),
-            };
-        let prose = fold_params(&t.cleaned, &params);
-        if params_introduced_machinery(&t.cleaned, &prose) {
-            return err(format!(
-                "subagent.run refused: params for template '{tname}' introduced directive machinery"
-            ));
-        }
-        // A param is data, and names no credential: folded into the child's
-        // configuration, a secret reference would have the child resolve it,
-        // and be started with the variable it names (`sec::harden`), at its
-        // caller's choice.
-        if params.values().any(names_a_secret) {
-            return err(format!(
-                "subagent.run refused: a param for template '{tname}' names a secret ({{{{secret:…}}}} or {{{{secret-file:…}}}}); a param is data, and names no credential"
-            ));
-        }
-        // Durability class (call site > template > store.durability.work):
-        // non-durable ⇒ memory-only record, child on a memory store in this
-        // process's private directory, no restore-respawn — the throwaway
-        // war-room shape. A parent whose store does not outlive it has only
-        // non-durable children: nothing would respawn a durable one, or read
-        // its state, again.
-        let root = durable_instances_root(&self.settings, &self.instance);
-        let durable = root.is_some()
-            && args
-                .get("durable")
-                .and_then(Value::as_bool)
-                .or(t.spec.durable)
-                .unwrap_or_else(|| self.work_durable_default());
+        let plan = match spawn_plan(tname, t, args) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        let (root, durable) = self.spawn_durability(t, args);
         let handle = self.next_id("inst");
         let dir = match self.instance_dir(&handle, root.filter(|_| durable)) {
             Ok(d) => d,
@@ -315,65 +287,25 @@ impl Runtime {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
-        let until = t
-            .spec
-            .until
-            .as_ref()
-            .map(|u| fold_params(u, &params))
-            .filter(|u| !u.trim().is_empty());
-        // `mode: sync` resolves the spawn when the child's declared result
-        // workflow first completes — the composed reporter dials home.
-        // `detached` returns as soon as the daemon is up.
-        let mode = args
-            .get("mode")
-            .and_then(Value::as_str)
-            .or(t.spec.mode.as_deref())
-            .unwrap_or("detached")
-            .to_string();
-        match mode.as_str() {
-            "detached" => {}
-            "sync" if t.spec.result.is_some() => {}
-            "sync" => {
-                return err(format!(
-                    "subagent.run: template '{tname}' has no `result: {{workflow}}` — mode: sync needs one"
-                ));
-            }
-            other => {
-                return err(format!(
-                    "subagent.run: instance children support mode detached|sync (got '{other}')"
-                ));
-            }
-        }
         // The child daemon is a span of the unit that spawned it: its process
         // trace continues this one, and so does the work it starts itself.
         let trace = self
             .caller_trace(caller)
             .unwrap_or_else(|| self.trace.clone());
-        let doc = match self.compose_instance_doc(
-            t,
-            &prose,
-            &params,
-            &dir,
-            &socket,
-            until.as_deref(),
-            durable,
-            &handle,
-            &trace,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                self.release_instance_dir(&dir, Some(&socket), false);
-                return err(format!("subagent.run: template '{tname}': {e}"));
-            }
-        };
-        // The composed document must be a bootable config NOW — a child that
-        // exits 2 on its first breath is a refusal we can make synchronously.
-        if let Err(e) = validate_composed(&doc, &prose) {
-            self.release_instance_dir(&dir, Some(&socket), false);
-            return err(format!(
-                "subagent.run: template '{tname}' composes an invalid config: {e}"
-            ));
-        }
+        let doc =
+            match self.compose_checked(tname, t, &plan, &dir, &socket, durable, &handle, &trace) {
+                Ok(d) => d,
+                Err(e) => {
+                    self.release_instance_dir(&dir, Some(&socket), false);
+                    return err(e);
+                }
+            };
+        let SpawnPlan {
+            params,
+            prose,
+            until,
+            mode,
+        } = plan;
         let config_path = dir.join("config.json");
         let rendered = serde_json::to_string_pretty(&doc).unwrap_or_default();
         if let Err(e) = std::fs::write(&config_path, rendered) {
@@ -465,6 +397,69 @@ impl Runtime {
                 err(format!("subagent.run: instance spawn failed: {e}"))
             }
         }
+    }
+
+    /// Durability class (call site > template > store.durability.work):
+    /// non-durable ⇒ memory-only record, child on a memory store in this
+    /// process's private directory, no restore-respawn — the throwaway
+    /// war-room shape. A parent whose store does not outlive it has only
+    /// non-durable children: nothing would respawn a durable one, or read
+    /// its state, again. The root durable children live under, and whether
+    /// this one is.
+    fn spawn_durability(&self, t: &CompiledTemplate, args: &Value) -> (Option<PathBuf>, bool) {
+        let root = durable_instances_root(&self.settings, &self.instance);
+        let durable = root.is_some()
+            && args
+                .get("durable")
+                .and_then(Value::as_bool)
+                .or(t.spec.durable)
+                .unwrap_or_else(|| self.work_durable_default());
+        (root, durable)
+    }
+
+    /// The child's configuration composed ([`Runtime::compose_instance_doc`])
+    /// and checked as the child will check it: a bootable config, whose own
+    /// workflows compile against the tools it will have. A child that exits 2
+    /// on its first breath is a refusal made here, synchronously — by a
+    /// spawn, and by a recompose before it retires the child it replaces.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_checked(
+        &self,
+        tname: &str,
+        t: &CompiledTemplate,
+        plan: &SpawnPlan,
+        dir: &std::path::Path,
+        socket: &str,
+        durable: bool,
+        handle: &str,
+        trace: &crate::obs::trace::TraceContext,
+    ) -> Result<Value, String> {
+        let doc = self
+            .compose_instance_doc(
+                t,
+                &plan.prose,
+                &plan.params,
+                dir,
+                socket,
+                plan.until.as_deref(),
+                durable,
+                handle,
+                trace,
+            )
+            .map_err(|e| format!("subagent.run: template '{tname}': {e}"))?;
+        validate_composed(&doc, &plan.prose)
+            .and_then(|child| {
+                let errs = child_workflow_refusals(&child, &self.registry);
+                if errs.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errs.join("; "))
+                }
+            })
+            .map_err(|e| {
+                format!("subagent.run: template '{tname}' composes an invalid config: {e}")
+            })?;
+        Ok(doc)
     }
 
     /// Compose the child's settings document from four sources: the template's
@@ -1135,7 +1130,7 @@ impl Runtime {
                 Some(now) if was.spec.singleton && !now.same_composition(was) => {
                     // What can refuse the new composition is asked before the
                     // old child goes: one that cannot start keeps it.
-                    if let Err(why) = self.recompose_refusal(&handle, now) {
+                    if let Err(why) = self.recompose_refusal(&handle, &tname, now) {
                         self.subagent_log(&handle).warn(
                             "subagent.template.recompose_refused",
                             json!({"template": tname, "handle": handle, "why": why,
@@ -1158,24 +1153,50 @@ impl Runtime {
     }
 
     /// Why the live child `handle` could not be started again from the new
-    /// composition `now`, asked before it is retired: pressure that sheds new
-    /// work, or params it was spawned with that the new template refuses. The
-    /// instance ceilings are not asked: a respawn replaces its predecessor.
-    fn recompose_refusal(&self, handle: &str, now: &CompiledTemplate) -> Result<(), String> {
+    /// composition `now` of template `tname`, asked before it is retired:
+    /// everything its respawn checks — pressure that sheds new work, params
+    /// it was spawned with that the new template refuses, and the new
+    /// configuration composed and checked as the child will check it, its
+    /// own workflows compiled. The instance ceilings are not asked: a
+    /// respawn replaces its predecessor.
+    fn recompose_refusal(
+        &self,
+        handle: &str,
+        tname: &str,
+        now: &CompiledTemplate,
+    ) -> Result<(), String> {
         if self.pressure.shedding() {
             return Err(format!(
                 "{} pressure (shedding new work)",
                 self.pressure.cause()
             ));
         }
-        let given = self
-            .subagents
-            .get(handle)
-            .and_then(|s| s.spawn_args.as_ref())
-            .and_then(|a| a.get("params"))
-            .cloned()
-            .unwrap_or(Value::Null);
-        validate_params(&now.spec.params, &given).map(|_| ())
+        let Some(rec) = self.subagents.get(handle) else {
+            return Ok(());
+        };
+        // What `respawn_recomposed` starts the next one with.
+        let mut args = rec.spawn_args.clone().unwrap_or_else(|| json!({}));
+        args["mode"] = json!("detached");
+        let plan = spawn_plan(tname, now, &args)?;
+        let (_, durable) = self.spawn_durability(now, &args);
+        // Composed in the live child's own directory, where nothing is
+        // written but the identity it already holds: the check starts
+        // nothing and leaves nothing behind.
+        let (Some(dir), Some(socket)) = (self.instance_dir_of(handle), rec.socket.as_deref())
+        else {
+            return Ok(());
+        };
+        self.compose_checked(
+            tname,
+            now,
+            &plan,
+            &dir,
+            socket,
+            durable,
+            handle,
+            &self.trace,
+        )
+        .map(|_| ())
     }
 
     /// Start a recomposed singleton again: the template `tname`, as it is
@@ -2272,8 +2293,12 @@ fn delivered_prose_of(config: &std::path::Path) -> Option<String> {
 /// Boot the composed document through the same typing + resolution +
 /// validation a config file gets. Errors are the aggregate report. `prose`
 /// is the instruction the composed document carries, delivered here: it is
-/// checked as the child will read it, not delivered a second time.
-fn validate_composed(doc: &Value, prose: &str) -> Result<(), String> {
+/// checked as the child will read it, not delivered a second time. The
+/// child's settings, once they validate.
+fn validate_composed(
+    doc: &Value,
+    prose: &str,
+) -> Result<crate::config::settings::Settings, String> {
     let mut settings =
         crate::config::settings::Settings::from_delivered_document(doc.clone(), "template", prose)
             .map_err(|e| e.to_string())?;
@@ -2291,10 +2316,129 @@ fn validate_composed(doc: &Value, prose: &str) -> Result<(), String> {
     let mut errs = res;
     errs.extend(diags.errors);
     if errs.is_empty() {
-        Ok(())
+        Ok(loaded.settings)
     } else {
         Err(errs.join("; "))
     }
+}
+
+/// What a spawn of a template starts the child with, checked: its params,
+/// the prose they fold into, its `until` signal and its mode.
+struct SpawnPlan {
+    params: Map<String, Value>,
+    prose: String,
+    until: Option<String>,
+    mode: String,
+}
+
+/// The [`SpawnPlan`] of template `tname` (`t`) spawned with `args`, or the
+/// spawn's refusal: params the template refuses, params that introduce
+/// machinery or name a secret, a mode the template cannot run in.
+fn spawn_plan(tname: &str, t: &CompiledTemplate, args: &Value) -> Result<SpawnPlan, String> {
+    let params = validate_params(&t.spec.params, args.get("params").unwrap_or(&Value::Null))
+        .map_err(|e| format!("subagent.run: template '{tname}': {e}"))?;
+    let prose = fold_params(&t.cleaned, &params);
+    if params_introduced_machinery(&t.cleaned, &prose) {
+        return Err(format!(
+            "subagent.run refused: params for template '{tname}' introduced directive machinery"
+        ));
+    }
+    // A param is data, and names no credential: folded into the child's
+    // configuration, a secret reference would have the child resolve it,
+    // and be started with the variable it names (`sec::harden`), at its
+    // caller's choice.
+    if params.values().any(names_a_secret) {
+        return Err(format!(
+            "subagent.run refused: a param for template '{tname}' names a secret ({{{{secret:…}}}} or {{{{secret-file:…}}}}); a param is data, and names no credential"
+        ));
+    }
+    let until = t
+        .spec
+        .until
+        .as_ref()
+        .map(|u| fold_params(u, &params))
+        .filter(|u| !u.trim().is_empty());
+    // `mode: sync` resolves the spawn when the child's declared result
+    // workflow first completes — the composed reporter dials home.
+    // `detached` returns as soon as the daemon is up.
+    let mode = args
+        .get("mode")
+        .and_then(Value::as_str)
+        .or(t.spec.mode.as_deref())
+        .unwrap_or("detached")
+        .to_string();
+    match mode.as_str() {
+        "detached" => {}
+        "sync" if t.spec.result.is_some() => {}
+        "sync" => {
+            return Err(format!(
+                "subagent.run: template '{tname}' has no `result: {{workflow}}` — mode: sync needs one"
+            ));
+        }
+        other => {
+            return Err(format!(
+                "subagent.run: instance children support mode detached|sync (got '{other}')"
+            ));
+        }
+    }
+    Ok(SpawnPlan {
+        params,
+        prose,
+        until,
+        mode,
+    })
+}
+
+/// What the composed child `child`'s own workflows name that its load would
+/// refuse: a `tool` step's tool that its registry does not hold or does not
+/// grant to workflows — the child's load check (`Runtime::reference_errors`),
+/// made here against the registry it will build. Its MCP servers' tools are
+/// the ones this parent has from the same servers; while the child composes
+/// a server this parent has no tools from, a name that is not built in may
+/// be that server's, and is the child's to judge.
+fn child_workflow_refusals(
+    child: &crate::config::settings::Settings,
+    parent: &crate::registry::Registry,
+) -> Vec<String> {
+    let mut unknown = false;
+    let servers: Vec<crate::registry::ServerTools> = child
+        .mcp
+        .servers
+        .iter()
+        .filter_map(|s| {
+            let known = parent.built_from().iter().find(|b| b.name == s.name);
+            unknown |= known.is_none();
+            known.cloned()
+        })
+        .collect();
+    let registry = match crate::registry::Registry::build(child, &servers) {
+        Ok(r) => r,
+        Err(errs) => return errs,
+    };
+    let mut errs = Vec::new();
+    for w in child.workflows.iter().filter(|w| w.get("steps").is_some()) {
+        let mut w = w.clone();
+        crate::config::settings::substitute_config_vars(&mut w, &child.vars, "workflow", &mut errs);
+        let w = match crate::engine::model::parse_workflow(&w) {
+            Ok(w) => w,
+            Err(e) => {
+                errs.extend(e);
+                continue;
+            }
+        };
+        for s in w.steps.values().filter(|s| s.kind == "tool") {
+            if let Some(n) = s.field_str("name")
+                && !unknown
+                && !registry.allowed(&crate::registry::Caller::Workflow, n)
+            {
+                errs.push(format!(
+                    "workflow {:?} step {:?}: tool {n:?} is unknown, disabled or not granted to workflows",
+                    w.name, s.id
+                ));
+            }
+        }
+    }
+    errs
 }
 
 /// The `_instance.*` ops a child sends home.

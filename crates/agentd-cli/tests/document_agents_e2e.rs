@@ -685,3 +685,80 @@ fn an_agent_that_turns_flat_is_retired_not_respawned() {
         "the parent still runs: {log}"
     );
 }
+
+/// The keep-alive every on-compose test runs under: a workflow on a long
+/// schedule, so a `drained` daemon has standing work.
+#[cfg(feature = "hot-reload")]
+const KEEPALIVE: &str = "workflows:\n  - name: tick\n    steps:\n      every: { kind: schedule, every: 1h }\n      \
+    done: { kind: finish, depends_on: [every], status: completed }\n";
+
+/// One agent, `alpha`, written as `prose`; `broken` gives its own workflow
+/// a step that calls a tool the child does not have.
+#[cfg(feature = "hot-reload")]
+fn solo(prose: &str, broken: bool) -> String {
+    let bad = if broken {
+        "  bad: { kind: tool, depends_on: [s], name: no.such.tool, args: {} }\n"
+    } else {
+        ""
+    };
+    format!(
+        "---\nspec: \"1\"\n---\n# Solo\n\n\
+         ::::agent{{id=alpha}}\n{prose}\n\n\
+         :::workflow{{id=alpha-up dialect=\"instruction/workflow\"}}\n\
+         name: alpha-up\nsteps:\n  s: {{ kind: once }}\n  \
+         f: {{ kind: finish, depends_on: [s], status: completed }}\n{bad}:::\n::::\n"
+    )
+}
+
+/// A reload whose new composition of a live singleton cannot start — its
+/// workflow calls a tool the child does not have — is refused before
+/// the live child is retired: the child keeps running, the same handle,
+/// and the refusal says why. (The child was retired first, and the
+/// respawn then failed, taking the agent down.)
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_recompose_that_cannot_start_keeps_the_running_child() {
+    let extra = format!("subagents: {{ document_agents: {{ start: on_compose }} }}\n{KEEPALIVE}");
+    let mut d = Daemon::boot_with(&solo("You are alpha.", false), "drained", &extra);
+    d.wait_for("alpha to start and run its own workflow", |d| {
+        let a = d.handles("alpha");
+        a.len() == 1 && d.child_ran(&a[0], "alpha-up")
+    });
+    let alpha = d.handles("alpha")[0].clone();
+    std::fs::write(
+        format!("{}/team.md", d.dir),
+        solo("You are alpha, version two.", true),
+    )
+    .unwrap();
+    d.sighup();
+    d.wait_for("the recompose to be refused", |d| {
+        !events(&d.log(), "subagent.template.recompose_refused").is_empty()
+            || !events(&d.log(), "subagent.template.recomposed").is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = d.log();
+    let refused = events(&log, "subagent.template.recompose_refused");
+    assert_eq!(refused.len(), 1, "{log}");
+    assert_eq!(refused[0]["template"], "alpha", "{log}");
+    assert_eq!(refused[0]["handle"], alpha.as_str(), "{log}");
+    assert!(
+        refused[0]["why"]
+            .as_str()
+            .is_some_and(|w| w.contains("no.such.tool")),
+        "{log}"
+    );
+    for gone in [
+        "subagent.template.recomposed",
+        "subagent.template.respawn_failed",
+        "subagent.template.retired",
+    ] {
+        assert!(events(&log, gone).is_empty(), "{gone}: {log}");
+    }
+    assert_eq!(d.handles("alpha"), vec![alpha.clone()], "{log}");
+    assert!(
+        !events(&log, "instance.exited")
+            .iter()
+            .any(|e| e["handle"] == alpha.as_str()),
+        "the running alpha was retired: {log}"
+    );
+}

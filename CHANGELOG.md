@@ -5,6 +5,20 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Fixed.**
+
+- **A recompose validates before it retires.** When a reload changes a live
+  singleton's template, the new composition is composed and checked as its
+  respawn would check it, its own workflows compiled and their `tool` steps
+  checked against the tools the child will have, before the live child is
+  retired. One that cannot start leaves the child running and is logged as
+  `subagent.template.recompose_refused` with the reason; before, a bad
+  document release retired the child and its replacement failed to start.
+  A spawn makes the same workflow check, and refuses with `composes an
+  invalid config` instead of starting a child that exits at once.
+
 ## v1.22.0 — a document's own agents
 
 An instruction document can now define the team agentd runs: each `agent`

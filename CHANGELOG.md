@@ -30,7 +30,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `a2a.peer.reports_to_changed`, and `agent.org` logs the chart at load and
   after a reload that moved it. A served document's `:::config` cannot set
   a peer's `reports_to` or `title` (operator-only); `subagents` stays
-  wholly the operator's. The Agent Card does not carry the chart. See
+  wholly the operator's. The operator's names stand across kinds: a
+  document's peer named as an operator template or `agent.name`, a document
+  agent named as an operator peer or `agent.name`, and a document's
+  `agent.name` naming an operator template or peer are held (`host-policy`),
+  so a document cannot make the operator's lines ambiguous. The Agent Card
+  does not carry the chart. See
   [Draw the org chart](docs/delegate-subagents.md#draw-the-org-chart).
 
 ## v1.23.0 — spending controls

@@ -892,7 +892,8 @@ load, with its tier, servers, workflows and skills, before any is spawned.
   ones the parent's own servers and model carry.
 - **The operator's names stand.** An operator template of the same name is
   used, and the document's agent is held as text with a `host-policy`
-  warning; the rest of the document applies.
+  warning; the rest of the document applies. So is an agent named as one
+  of the operator's `a2a.peers` or as the operator's `agent.name`.
 - **Over the wire** (`url:`, `oci:`, `mcp:`), the agents run only when the
   document verified against a pinned publisher (`agent.instruction.trust`)
   and the author's signature attests `agents`. A child of such a document
@@ -1063,8 +1064,9 @@ The load refuses, naming the field:
 - a name that is none of them (with no `agent.name` set, this agent has no
   name to be named by, and the error says so);
 - a template or a peer that reports to itself;
-- a name that two of them share, a template and a peer called `cmo` say,
-  which a line cannot tell apart: rename one;
+- a name that two of them share in the operator's configuration, a
+  template and a peer called `cmo` say, which a line cannot tell apart:
+  rename one;
 - a cycle, with its path: `reporting lines form a cycle: cto (template) →
   legal (peer) → cto (template)`. A document agent's derived line counts
   here too.
@@ -1072,6 +1074,13 @@ The load refuses, naming the field:
 A document agent the operator does not name keeps the line its nesting
 gives it ([Reporting lines](#reporting-lines)); an operator template of the
 same name carries the operator's.
+
+A document cannot make the operator's lines ambiguous. The operator's names
+stand across kinds: a document's A2A agent named as an operator template or
+as this agent's `agent.name`, a document agent named as an operator peer,
+and a document's `agent.name` that names an operator template or peer are
+each held, with a `host-policy` warning, and a line naming that name reaches
+the operator's entry.
 
 ### Read the chart
 

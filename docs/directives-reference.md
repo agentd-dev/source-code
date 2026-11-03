@@ -67,7 +67,8 @@ unresolved, and is reported as a host-policy diagnostic (§17): a
 | `::agent` with `protocol` other than `a2a`, a `binding` other than `JSONRPC`, or a `tenant` | agentd speaks A2A's JSON-RPC binding and takes the tenant from the card |
 | `::agent` whose `src` is not an Agent Card at `/.well-known/agent-card.json`, or an A2A agent with neither `endpoint` nor `src` | agentd finds an agent by its endpoint or that card |
 | An agent agentd runs itself (no `protocol`, `src` or `endpoint`) without the `agents` grant; from a document that arrived over the wire, one that is not verified against a pinned publisher or whose signature does not attest `agents`; or one with no body | the grant; a wire document's agents run only from a publisher the operator pinned; the body is the agent's instruction |
-| An agent agentd runs itself whose `id` names a template in the operator's `subagents.templates` | the operator's template stands; the rest of the document applies |
+| An agent agentd runs itself whose `id` names a template in the operator's `subagents.templates`, a peer in its `a2a.peers`, or its `agent.name` | the operator's entry stands; the rest of the document applies |
+| An A2A agent whose `id` names a template in the operator's `subagents.templates` or its `agent.name`; a `:::config` `agent.name` that names an operator template or peer | the operator's name stands; the rest of the document applies |
 | An agent inside an agent's body | a child defines no agents of its own |
 | `:::mcp` with neither a `src` nor both `registry` and `server` | agentd dials a server by its URL, or by a registry the operator trusts and the server's name there |
 | `:::workflow` or `:::config` in another dialect | agentd runs `instruction/workflow` and reads `agentd/config` |

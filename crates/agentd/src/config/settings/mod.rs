@@ -1570,17 +1570,13 @@ fn document_agent_templates(
 ) -> Result<Vec<DocumentTemplate>, String> {
     let mut out = Vec::new();
     for a in std::mem::take(&mut ex.agents) {
-        if operator
-            .pointer("/subagents/templates")
-            .and_then(Value::as_object)
-            .is_some_and(|t| t.contains_key(&a.id))
-        {
+        if let Some(said) = operator_name_kind(operator, &a.id, "") {
             ex.declarations
                 .entry("agent".into())
                 .or_default()
                 .push(json!({"id": a.id, "title": a.title, "line": a.line}));
             warnings.push(format!(
-                "agent.instruction: line {}: agent {:?} is not activated: the operator's subagents.templates has a template of that name, and the operator's stands — the document's block stays text (host-policy)",
+                "agent.instruction: line {}: agent {:?} is not activated: the operator's {said} of that name, and the operator's stands — the document's block stays text (host-policy)",
                 a.line, a.id
             ));
             continue;
@@ -1887,6 +1883,24 @@ fn fold_instruction_document(
     let mut held = Vec::new();
     drop_document_workflows_the_operator_names(&mut fragment, &mut ex.workflows, doc, &mut held);
     warnings.extend(held.iter().map(|w| format!("agent.instruction: {w}")));
+    // A name the document gives this agent that the operator gives a
+    // template or a peer is held: the operator's names stand.
+    if doc.pointer("/agent/name").is_none()
+        && let Some(agent) = fragment.get_mut("agent").and_then(Value::as_object_mut)
+        && let Some(name) = agent
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        && let Some(said) = operator_name_kind(doc, &name, "self")
+    {
+        agent.remove("name");
+        if agent.is_empty() {
+            fragment.remove("agent");
+        }
+        warnings.push(format!(
+            "agent.instruction: agent.name {name:?} is not applied: the operator's {said} of that name, and the operator's stands (host-policy)"
+        ));
+    }
     let servers = fold_document_servers(&mut fragment, &mut ex.workflows, doc, egress.closed());
     warnings.extend(
         servers
@@ -3325,6 +3339,7 @@ pub fn fold_document_servers(
                     .and_then(|o| o.get("name").and_then(Value::as_str))
                     .map(str::to_string)
             });
+        let other_kind = operator_name_kind(operator, &name, "peer");
         match target {
             Some(op_name) => {
                 if name != op_name {
@@ -3334,6 +3349,12 @@ pub fn fold_document_servers(
             None if named(operator, "/a2a/peers", &name) => out.warnings.push(format!(
                 "a2a peer {name:?} ({endpoint}) is not activated: the operator's a2a.peers has a peer of that name at another endpoint, and the operator's stands — the document's block stays text (host-policy)"
             )),
+            None if other_kind.is_some() => {
+                let said = other_kind.unwrap_or_default();
+                out.warnings.push(format!(
+                    "a2a peer {name:?} ({endpoint}) is not activated: the operator's {said} of that name, and the operator's stands — the document's block stays text (host-policy)"
+                ))
+            }
             None if closed => out.warnings.push(format!(
                 "a2a peer {name:?} ({endpoint}) is not activated: security.egress is closed and it matches no a2a.peers endpoint of the operator's — the document's block stays text (host-policy)"
             )),
@@ -3374,6 +3395,33 @@ fn named(operator: &Value, pointer: &str, name: &str) -> bool {
             l.iter()
                 .any(|e| e.get("name").and_then(Value::as_str) == Some(name))
         })
+}
+
+/// What the operator's configuration (`operator`, before a document folds
+/// into it) calls `name` that is not `except`: one of its
+/// `subagents.templates`, one of its `a2a.peers`, or this agent's
+/// `agent.name` — in the words a hold names it by. The operator's names
+/// stand across kinds (RFC 0055 §3.1, RFC 0056 §6): a document's peer or
+/// agent under such a name is held, so a reporting line naming it reaches
+/// the operator's entry.
+fn operator_name_kind(operator: &Value, name: &str, except: &str) -> Option<&'static str> {
+    let template = operator
+        .pointer("/subagents/templates")
+        .and_then(Value::as_object)
+        .is_some_and(|t| t.contains_key(name));
+    let self_name = operator.pointer("/agent/name").and_then(Value::as_str) == Some(name);
+    [
+        ("template", template, "subagents.templates has a template"),
+        (
+            "peer",
+            named(operator, "/a2a/peers", name),
+            "a2a.peers has a peer",
+        ),
+        ("self", self_name, "agent.name is"),
+    ]
+    .into_iter()
+    .find(|(k, hit, _)| *hit && *k != except)
+    .map(|(_, _, said)| said)
 }
 
 /// A document's workflows whose name is one of the operator's own inline
@@ -20128,5 +20176,94 @@ mod reporting_line_tests {
         let now = crate::config::templates::compile_templates(&moved).unwrap();
         assert!(now["writer"].same_composition(&was["writer"]));
         assert_eq!(now["writer"].spec.reporting_line(), Some("cto"));
+    }
+}
+
+/// The operator's names stand across kinds: a document's peer, agent or
+/// `agent.name` under a name the operator's configuration already uses is
+/// held, said, and the operator's reporting lines load.
+#[cfg(test)]
+mod reporting_line_hold_tests {
+    use super::*;
+
+    fn base(instruction: &str, grants: &[&str]) -> Value {
+        json!({
+            "agent": {"name": "ceo", "instruction": instruction, "document_capabilities": grants},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "store": {"kind": "memory"},
+            "subagents": {"templates": {
+                "cto": {"instruction": "Build it.", "reports_to": "ceo"},
+                "writer": {"instruction": "Write it.", "reports_to": "legal"},
+            }},
+            "a2a": {"peers": [{"name": "legal", "endpoint": "https://legal.example", "reports_to": "ceo"}]},
+        })
+    }
+
+    fn said(s: &Settings, what: &str) -> bool {
+        s.agent.instruction_warnings.iter().any(|w| {
+            w.contains(what) && w.contains("the operator's stands") && w.contains("host-policy")
+        })
+    }
+
+    /// A document's A2A agent named as this agent is: held, and the
+    /// operator's `cto -> ceo` is no ambiguity.
+    #[test]
+    fn a_documents_peer_named_as_this_agent_is_held() {
+        let doc = "---\nspec: \"1\"\n---\n# Co\n\n::agent{id=ceo protocol=a2a endpoint=\"https://other-ceo.example\"}\n";
+        let s = Settings::from_document(base(doc, &["identity"]), MERGED_DOCUMENT).unwrap();
+        assert_eq!(reporting_line_errors(&s), Vec::<String>::new());
+        assert!(
+            !s.a2a.peers.iter().any(|p| p.name == "ceo"),
+            "{:?}",
+            s.a2a.peers
+        );
+        assert!(
+            said(&s, "a2a peer \"ceo\""),
+            "{:?}",
+            s.agent.instruction_warnings
+        );
+    }
+
+    /// A document agent named as an operator peer is: held, and the
+    /// operator's `writer -> legal` reaches the peer.
+    #[test]
+    fn a_documents_agent_named_as_an_operator_peer_is_held() {
+        let doc =
+            "---\nspec: \"1\"\n---\n# Co\n\n::::agent{id=legal}\nYou are our counsel.\n::::\n";
+        let s = Settings::from_document(base(doc, &["agents"]), MERGED_DOCUMENT).unwrap();
+        assert_eq!(reporting_line_errors(&s), Vec::<String>::new());
+        assert!(!s.subagents.templates.contains_key("legal"));
+        assert!(
+            said(
+                &s,
+                "agent \"legal\" is not activated: the operator's a2a.peers has a peer"
+            ),
+            "{:?}",
+            s.agent.instruction_warnings
+        );
+    }
+
+    /// A document naming this agent as an operator template is named is
+    /// not applied, when the operator names it nothing itself.
+    #[test]
+    fn a_documents_agent_name_an_operator_template_has_is_held() {
+        let doc = "---\nspec: \"1\"\n---\n# Co\n\n\
+            :::config{id=c dialect=\"agentd/config\"}\nagent:\n  name: cto\n:::\n";
+        let mut op = base(doc, &[]);
+        op["agent"].as_object_mut().unwrap().remove("name");
+        op["subagents"]["templates"]["cto"]["reports_to"] = json!("legal");
+        op["a2a"]["peers"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("reports_to");
+        op["subagents"]["templates"]["writer"]["reports_to"] = json!("cto");
+        let s = Settings::from_document(op, MERGED_DOCUMENT).unwrap();
+        assert_eq!(reporting_line_errors(&s), Vec::<String>::new());
+        assert_eq!(s.agent.name, None);
+        assert!(
+            said(&s, "agent.name \"cto\" is not applied"),
+            "{:?}",
+            s.agent.instruction_warnings
+        );
     }
 }

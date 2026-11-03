@@ -243,6 +243,8 @@ transaction in the audit chain, and settle the question on chain yourself.
 The approver is asked, over A2A, about a payment:
 
 - above the asset's `approve_above`;
+- above the `approve_above` of the allowance the step draws on
+  ([Allowances](#allowances)), whose `approver` is then the one asked;
 - of a step that says `approve: true`;
 - of work that has read outside text — an `http` response, a webhook's
   payload, an A2A peer's answer, the result of an MCP server tagged
@@ -278,6 +280,85 @@ an A2A message on the task: see [Payment
 approvals](human-in-the-loop.md#payment-approvals) for the gate from the
 approver's side, and [Answer from a
 client](human-in-the-loop.md#answer-from-a-client).
+
+## Allowances
+
+An asset's caps are per payment, per run and per 24 hours. An allowance
+says what a person means: a budget per calendar month, a count of
+payments, a window, a list of payees, and who is asked above an amount.
+It is in money, not tokens, and it counts across rails: an x402 payment
+and a Company's priced operation ([Spending at a
+Company](act-at-companies.md#spending-at-a-company)) draw on the same one.
+
+```yaml
+security:
+  payments:
+    assets:
+      usdc-base:
+        asset: "eip155:8453/erc20:0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+        decimals: 6
+        currency: USD                    # one USDC is one dollar
+        limits: {per_run: "5", per_day: "20", per_payee: "10"}
+    allowances:
+      data:
+        title: Market data
+        currency: USD
+        wallets: [ops]
+        max: "0.50"                      # one payment
+        budget: "30"                     # per period
+        per: month                       # day, week, month, quarter, year, once
+        times: 200                       # payments per period
+        payees: [weather]
+        approve_above: "0.20"
+        approver: "user:alice"
+
+workflows:
+  - name: quote
+    steps:
+      get: {kind: http, url: "https://api.example/quote", payment: {allowance: data}}
+```
+
+A step that names an allowance may leave out `wallet` and `max`. The
+wallet is the allowance's only one. The `max` is the allowance's, in each
+asset whose `currency` is the allowance's. A step may still set a lower
+`max`.
+
+What an allowance means:
+
+- **It narrows, never widens.** A payment under it passes every other
+  check too: the asset's caps, the payees, the step's `max`. The smallest
+  limit wins.
+- **Three tiers.** Up to `approve_above` and within every limit, agentd
+  pays. Above it, up to `max`, the allowance's `approver` (else
+  `security.payments.approver`) is asked, and agentd pays only on a yes.
+  Past a limit, the payment is refused unsent, naming it: `allowance data:
+  budget 30 USD per month, 29.8 spent, this payment 0.25`.
+- **Periods are UTC calendar periods.** A `month` budget renews at 00:00
+  UTC on the 1st; a `week` on Monday. `once` never renews.
+- **Currency.** An asset is usable under an allowance only when its
+  `currency` is the allowance's. One whole token is one unit of that
+  currency. agentd never converts. An asset with no `currency`, or
+  another one, is refused `rail-cannot-enforce: currency`.
+- **Categories** can't be enforced by any rail, so an allowance that sets
+  them refuses every payment, `rail-cannot-enforce: categories`.
+- **What counts** is what counts against a cap: settled, out, of unknown
+  outcome, and refused until its authorization expires. The ledger record
+  names the allowance and the charge in its currency. It is kept until its
+  period ends, or while a `once` allowance exists.
+- **Live.** A reload (SIGHUP, or the file watch) that changes an allowance
+  applies at once: a lowered budget stops the next payment. An approval
+  still open is checked again when it is answered, so lowering or removing
+  an allowance revokes approvals given under the old limits. A reload that
+  removes an allowance a workflow step names is refused, and the old
+  configuration stays; remove the step first. A changed allowance is the
+  same allowance: what was spent this period still counts. Renaming it
+  starts a new one. The log says `payment.allowance.changed` (with the
+  fields) or `payment.allowance.removed`.
+
+What is left is in the status document, under `payments.allowances`, and
+in the operator's `payment.allowances` op. A workflow reads it with a tool
+step, `{kind: tool, name: payment.allowances}`, and can branch before it
+tries. Nothing in a workflow changes an allowance.
 
 ## Keep the key with a signer
 

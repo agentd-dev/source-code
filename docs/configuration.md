@@ -802,6 +802,7 @@ a restart.
 | `companies.<name>.api_allow` | list of `METHOD /path-template` | none | The OpenAPI operations agentd may call there, each as the description's `paths` names it (`GET /orders/{order_id}`; a parameter matches another of any name). An operation outside it, or outside the description, is refused unsent. Each one the description declares is also a tool of its own, named from its entry ([operation tools](#a-companys-operation-tools)). An operation listed twice, or two entries that make one tool name, are refused. Needs `openapi` in `interfaces`. |
 | `companies.<name>.api_names` | map of an OpenAPI API `url` to a server name | — | Names the server a Company's operation tools are named under, by the URL its OpenAPI API is listed at. Without it the server is named after the entry, or `<entry>_api` when the entry's own MCP server has that name, which needs the Company to list one OpenAPI API. Needs `openapi` in `interfaces` and an operation in `api_allow`. |
 | `companies.<name>.context` | `{locale, time_zone, share_availability}` | inherits | What this Company's conversations share of the User's situation, each field over `security.companies.context`. Needs `agent` in `interfaces`. |
+| `companies.<name>.spending` | `{allowance, amount}` | — | The allowance the Company's operations are charged to, and the term key whose value is the charge (`{"amount": "<decimal>", "currency": "<ISO 4217>"}`, or a number in the allowance's currency). Checked before the User is asked or a standing permission applies ([Spending at a Company](act-at-companies.md#spending-at-a-company)). |
 
 With `security.egress: closed`, every Company agentd reaches is a
 `companies` entry.
@@ -1755,6 +1756,19 @@ reload swaps whole or not at all ([Reload classes](#reload-classes)).
 | `security.payments.assets.<name>.decimals` | int, 0–36 | required | The token's decimals: `"1"` is 10^decimals atomic units. |
 | `security.payments.assets.<name>.limits` | `{per_payment, per_run, per_day, per_payee}` | `per_run`, `per_day`, `per_payee` required | Caps, each a decimal in whole units: one payment, one run's payments, every payment in any 24 hours, every payment to one payee in any 24 hours. |
 | `security.payments.assets.<name>.approve_above` | decimal | — | Above this amount the approver is asked. |
+| `security.payments.assets.<name>.currency` | ISO 4217 code | — | What the token is worth: one whole unit is one unit of this currency (a dollar stablecoin is `USD`). An asset is usable under an allowance only in its own currency. At most 18 `decimals`. |
+| `security.payments.allowances.<id>.currency` | ISO 4217 code | required | The allowance's currency: every amount below is in it ([Allowances](pay-with-x402.md#allowances)). Live. |
+| `security.payments.allowances.<id>.max` | decimal | required | The most one payment may be. At most `budget`. |
+| `security.payments.allowances.<id>.budget` | decimal | required | The most paid per period. |
+| `security.payments.allowances.<id>.per` | `day \| week \| month \| quarter \| year \| once` | `once` | The budget's period: a UTC calendar period (`week` is ISO, from Monday); `once` is the allowance's whole life. |
+| `security.payments.allowances.<id>.times` | int ≥ 1 | — | The most payments per period. |
+| `security.payments.allowances.<id>.wallets` | list of wallet names | every wallet | The wallets it may draw on. |
+| `security.payments.allowances.<id>.payees` | list of payee or company names | every payee | The `security.payments.payees` (x402) and `companies` entries it may pay. |
+| `security.payments.allowances.<id>.categories` | list of strings | — | Kinds of purchase. No rail can enforce them, so every payment under an allowance that sets them is refused `rail-cannot-enforce` (a load warning says so). |
+| `security.payments.allowances.<id>.from`, `.until` | RFC 3339 instants | — | The window payments may happen in. `from` is before `until`. |
+| `security.payments.allowances.<id>.approve_above` | decimal | — | Above it, up to `max`, the approver is asked each time. At most `max`. |
+| `security.payments.allowances.<id>.approver` | `operator` or a principal id | `security.payments.approver` | Who answers when an x402 payment under it is asked about. |
+| `security.payments.allowances.<id>.title` | string | — | A label for receipts, gates and the status document. |
 | `security.payments.payees.<name>.address` | address | required | The address paid (`payTo`): an EVM address — a mixed-case one is held to its EIP-55 checksum — or a Solana address in base58. |
 | `security.payments.payees.<name>.assets` | list of asset names | every asset | The assets it may be paid in, each on the address's chain family. |
 | `security.payments.rpc.<network>` | URL | — | By Solana network (CAIP-2), the RPC endpoint asked for a recent blockhash (`getLatestBlockhash`) when a server's entry gives none: `https://`, or `http://` to this host, its `{{secret:NAME}}` references resolved when it is dialled. A network no asset is on is refused. |
@@ -1772,8 +1786,16 @@ above an asset's `approve_above`. A payment outside it is refused before
 anything is signed. It needs `observability.audit.chain` — every payment is
 a record there, the one before it is sent flushed first — and a store that
 outlives the process (`file`, `mcp` or `http`), which keeps the ledger. Every
-path is restart · op: a served document cannot set it, and a reload does not
-change it under a question the approver is reading.
+path but `allowances` is restart · op: a served document cannot set it, and a
+reload does not change it under a question the approver is reading.
+
+`security.payments.allowances` is live · op: what agentd may spend, on what,
+over what period, and who approves (RFC 0057). A reload that changes one
+applies at once; one that removes an allowance a workflow step names is
+refused, and the old configuration stays. Allowances alone — for a
+Company's operations, with no wallet — need only a durable store, not the
+`x402` feature. A step draws on one with `payment: {allowance: <id>}`, a
+Company's operations with `companies.<name>.spending`.
 
 A step pays only with its own `payment` field — `{wallet, max, approve?}`
 on an `http`, `mcp.tool`, `a2a.send` or `a2a.delegate` step ([node
@@ -1872,6 +1894,7 @@ Every other path is applied live, as follows:
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |
 | `a2a.principals` | Recompiled and swapped into the live listener, so a demotion or a rotated `bearer_ref` applies to the next request. |
 | `security.policies` | Swapped whole at the next call (`security.policies.reloaded`); a list that does not load, or whose rules could hold a tool a running turn or subagent dials itself, refuses the reload and the old one stands. A gate already open keeps the rule that raised it. |
+| `security.payments.allowances` | Read at every payment, every Company charge and every answered approval: a change applies at once (`payment.allowance.changed`, `payment.allowance.removed`). A reload that removes an allowance a workflow step names is refused, and the old configuration stays. Every other `security.payments` path is a restart. |
 | `identity.delegation` templates, pins, first binding, consent timing | Taken at once: a narrowed template holds every grant it allowed to the new ceilings at the next call; a removed template, a server removed from one, a changed or removed pin and first binding turned off revoke the grants they allowed — at the IdP, tombstoned, off the loop — and drop the IdP proofs of those device names' sessions (`delegation.bindings.cleared`). A template's `unattended` and `unattended_tools` hold every firing from its next call. |
 | a workflow's `act_for`, and the definition it is in | A firing acts only while its workflow's digest is the one the person consented to when they last signed in: a changed definition's firings start nothing (`start.unattended.suspended`) until they sign in again. A firing already running keeps the definition it started on. |
 | `a2a.cors.origins` | Replaced in the live listener; removing an origin revokes it. |

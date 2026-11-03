@@ -478,6 +478,7 @@ op answers with a Task whose `<taskId>.result` artifact carries the result.
 | `auth.device.deny` | task | operator | device grant on | `user_code`, or `all: true` |
 | `auth.sessions` | message | operator | a TCP listener | none |
 | `auth.sessions.revoke` | task | operator | a TCP listener | `sid`, `name`, or `all: true` |
+| `payment.allowances` | message | operator | an allowance (`security.payments.allowances`) | none |
 | `company.status` | message | operator | a `companies` entry | none |
 | `company.user_id.reset` | task | operator | a `companies` entry | `company` |
 | `company.sign_in` | task | operator | a `companies` entry | `company`; `account`, `scopes`, `new_account` |

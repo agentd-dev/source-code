@@ -1,7 +1,7 @@
 # RFC 0057: Spending controls — allowances
 
 **Status:** Accepted 2026-11-03 by the user (decisions in §9); phases A–B
-being built, phase C waits on the specification
+implemented, phase C waits on the specification
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-11-03
 **Builds on:** RFC 0049 (x402 payments: wallets, assets, payees, the

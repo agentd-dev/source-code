@@ -7,7 +7,54 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+**Added.**
+
+- **Allowances (RFC 0057, phases A and B).** `security.payments.allowances.<id>`
+  says what agentd may spend, on what, over what period, and who approves:
+  a `currency`, a `max` per payment, a `budget` per UTC calendar period
+  (`per: day`, `week`, `month`, `quarter`, `year` or `once`), a `times`
+  count, `payees`, `wallets`, a `from`/`until` window and an
+  `approve_above` with its own `approver`. Amounts are exact decimals in
+  the allowance's currency. An allowance narrows, never widens: a payment
+  under it passes every other check too. Each load check names the field.
+- **x402 under an allowance.** A paying step draws on one with
+  `payment: {allowance: <id>}`; `wallet` and `max` may then be left to it.
+  An asset is usable only in the currency it names
+  (`security.payments.assets.<name>.currency`); one whole token is one
+  unit of it, and agentd never converts. Past a limit the payment is
+  refused unsent, naming it: `allowance data: budget 30 USD per month, 29.8
+  spent, this payment 0.25`. Above `approve_above` the allowance's approver
+  is asked. A currency an asset doesn't name, and any `categories`, are
+  refused `rail-cannot-enforce`. Ledger and audit records name the
+  allowance, the charge in its currency and the tier.
+- **A Company's priced operations against an allowance.**
+  `companies.<name>.spending: {allowance, amount}` names the term that is
+  the charge. Past a limit the operation is not confirmed and is cancelled
+  at the Company, with the reason. Above `approve_above` a standing
+  permission does not apply and the User is asked. The allowance never
+  approves an operation. A confirm sent is a charge; a cancellation the
+  Company confirms credits it back. Allowances alone need no wallet and no
+  `x402` feature.
+- **Allowances reload.** A change applies at once and is logged
+  (`payment.allowance.changed`, `payment.allowance.removed`); an open
+  approval is checked again when it is answered. A reload that removes an
+  allowance a workflow step names is refused, and the old configuration
+  stays. The rest of `security.payments` stays restart-only.
+- **What is left.** The status document's `payments.allowances`, and the
+  operator-only `payment.allowances` op and read-only tool, give each
+  allowance's period, budget, what was spent and how many payments were
+  made. A workflow reads it with `{kind: tool, name: payment.allowances}`.
+
 **Fixed.**
+
+- **A registry's binding is made though its result carries a `resource_link`.**
+  The instruction.md registry answers its tools with the JSON as text, a
+  `resource_link` and `structuredContent`; agentd parsed the whole text,
+  which notes the link, so no binding was made and no
+  `instructions_bindings_report` was sent, with nothing logged. A tool
+  result is now read as JSON from `structuredContent`, or else from its text
+  parts only, and a create that names no binding id is logged as
+  `instruction.binding.fail`.
 
 - **A recompose validates before it retires.** When a reload changes a live
   singleton's template, the new composition is composed and checked as its

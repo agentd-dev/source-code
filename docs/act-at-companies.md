@@ -728,6 +728,50 @@ label's token goes in that label's own Session, where the company takes
 only the same account, so the permissions go on applying. Add `operations` to `client.extensions` and you change the
 metadata document: print and publish it again.
 
+### Spending at a company
+
+A company entry can charge its operations to an allowance ([Allowances](pay-with-x402.md#allowances)).
+`amount` names the term whose value is the charge: `{"amount": "15.00",
+"currency": "USD"}`, as the Personal Agent Protocol writes it, or a number
+in the allowance's currency.
+
+```yaml
+security:
+  payments:
+    allowances:
+      shopping: {currency: USD, max: "100", budget: "400", per: month, approve_above: "20"}
+
+companies:
+  shop:
+    endpoint: https://shop.example.com
+    spending: {allowance: shopping, amount: price_difference}
+```
+
+Allowances alone need no wallet and no `x402` feature, only a durable
+store. Before agentd asks the User about an operation, or applies a
+standing permission to it, it checks the charge:
+
+- Over `max`, past the budget or the count, outside the window, a company
+  the allowance doesn't list, another currency, or a charge term that's
+  missing or unreadable: the operation is not confirmed. agentd cancels it
+  at the company, as a decline does, and says why: `operation op_1 was NOT
+  confirmed — allowance shopping: max 100 USD, this payment 130`.
+- Above `approve_above`: no standing permission covers it, and the User is
+  asked.
+- Otherwise as before: the User is asked, or a standing permission applies.
+
+The allowance never approves an operation itself. The User's approval is
+still required, as the protocol says. The check is made whatever calls
+`company.operation.confirm`, a model or a workflow, and again when the
+User answers, against the allowance as it is then.
+
+A confirm sent is a charge to the allowance, kept before it leaves. One the
+company didn't take is not counted. If agentd cancels the operation later
+and the company confirms the cancellation, the charge is credited back.
+Each charge is a `payment.allowance.charged` line and a `company.operation`
+audit record (`charged`, or `refused_by_allowance`); `payment.allowances`
+says what is left.
+
 ## Direct conversations
 
 A company's agent can ask to talk with the User directly, and the model can

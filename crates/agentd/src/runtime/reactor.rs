@@ -702,11 +702,14 @@ pub struct Runtime {
     /// composition changed, by handle, with the template each is started
     /// again from once it exits (`Runtime::recompose_children`).
     pub(crate) recomposing: BTreeMap<String, String>,
-    /// The `once` starts fired in this process's life, as (workflow, start
-    /// node, definition hash): arming a definition again — a resume, a
-    /// `workflow.create` or `workflow.update` — does not fire one of them a
-    /// second time, `policy: always` included (`Runtime::arm_workflows_named`).
-    pub(crate) once_fired: std::collections::BTreeSet<(String, String, String)>,
+    /// The definition hash each `once` start last fired under in this
+    /// process's life, by (workflow, start node): arming the same
+    /// definition again — a resume, a `workflow.create` or
+    /// `workflow.update` of it unchanged — does not fire it a second time,
+    /// `policy: always` included; installing another definition does, even
+    /// one that fired earlier (A, then B, then A fires each time)
+    /// (`Runtime::arm_workflows_named`).
+    pub(crate) once_fired: BTreeMap<(String, String), String>,
     /// The directory of this process's own that its non-durable instance
     /// children live in, made at the first of them and removed with the
     /// runtime (`runtime::instances`).

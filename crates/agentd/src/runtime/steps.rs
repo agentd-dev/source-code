@@ -808,13 +808,13 @@ impl Runtime {
                                 && e.payload["workflow"] == name.as_str()
                                 && e.payload["node"] == id.as_str()
                         });
-                        let key = (name.clone(), id.clone(), hash.clone());
-                        let fired = self.once_fired.contains(&key);
+                        let key = (name.clone(), id.clone());
+                        let fired = self.once_fired.get(&key) == Some(&hash);
                         if fired || (policy == "ensure" && (live || ever || pending)) {
                             self.log.info("start.once.skipped", json!({"workflow": name, "node": id, "live": live, "pending": pending, "fired": fired}));
                             continue;
                         }
-                        self.once_fired.insert(key);
+                        self.once_fired.insert(key, hash.clone());
                         let inputs = spec.get("inputs").cloned().unwrap_or(json!({}));
                         // A `once` start is autonomous work like any other
                         // trigger, so it is attributed the same way.

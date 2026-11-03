@@ -263,3 +263,88 @@ fn resume_and_redefine_do_not_fire_an_always_once_start_again() {
     let _ = std::fs::remove_file(&cfg);
     let _ = std::fs::remove_file(&err_path);
 }
+
+/// Review finding 8: a once-start fires once per definition installed, not
+/// once per definition ever seen: `tick` defined as A, then B, then A again
+/// fires on each change — three runs — while an unchanged one does not
+/// fire again (the test above).
+#[test]
+fn an_always_once_start_fires_again_for_each_new_definition() {
+    let def = |out: &str| {
+        json!({"name": "tick", "steps": {
+            "boot": {"kind": "once", "policy": "always"},
+            "f": {"kind": "finish", "depends_on": ["boot"], "status": "completed", "output": out}
+        }})
+    };
+    let call = |name: &str, args: Value| json!({"name": name, "arguments": args});
+    let playbook = json!({"turns": [
+        {"tool_calls": [call("workflow.create", json!({"definition": def("A")}))]},
+        {"tool_calls": [call("workflow.update", json!({"name": "tick", "definition": def("B")}))]},
+        {"tool_calls": [call("workflow.update", json!({"name": "tick", "definition": def("A")}))]},
+        {"content": "redefined"}
+    ]});
+    let llm = spawn_mock_llm(&playbook);
+    let cfg = common::unique_path("once-each", "yaml");
+    std::fs::write(
+        &cfg,
+        "agent: { name: once-each, preflight: never }\n\
+         store: { kind: memory }\n\
+         workflows:\n  \
+         - name: other\n    steps:\n      every: { kind: schedule, every: 1h }\n      \
+         f: { kind: finish, depends_on: [every], status: completed }\n\
+         observability: { log_level: info }\n",
+    )
+    .unwrap();
+    let err_path = common::unique_path("once-each", "log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args([
+            "--config",
+            &cfg,
+            "--prompt",
+            "Redefine tick.",
+            "--intelligence",
+            &llm.uri,
+            "--model",
+            "m-1",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .spawn()
+        .expect("spawn agentd");
+    let log = || std::fs::read_to_string(&err_path).unwrap_or_default();
+    let lines = |name: &str| -> Vec<Value> {
+        log()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["event"] == name)
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while lines("workflow.defined")
+        .iter()
+        .filter(|e| e["op"] == "workflow.update")
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the model never redefined `tick` twice:\n{}",
+            log()
+        );
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(1000));
+    let _ = child.kill();
+    let _ = child.wait();
+    let ticks = lines("run.start")
+        .iter()
+        .filter(|e| e["workflow"] == "tick")
+        .count();
+    assert_eq!(ticks, 3, "A, B, then A again each fire:\n{}", log());
+    let _ = std::fs::remove_file(&cfg);
+    let _ = std::fs::remove_file(&err_path);
+}

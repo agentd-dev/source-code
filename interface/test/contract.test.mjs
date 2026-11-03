@@ -132,6 +132,7 @@ const SEND = {
   [OPS.delegationRevoke]: (c, e) => c.delegationRevoke(e.target),
   [OPS.delegationForget]: (c, e) => c.delegationForget(e.principal),
   [OPS.delegationAudit]: (c, e) => c.delegationAudit(e.principal, e.limit),
+  [OPS.paymentAllowances]: (c) => c.paymentAllowances(),
 };
 
 /**
@@ -188,6 +189,7 @@ const MORE = [
   { op: OPS.delegationForget, principal: 'operator:ada' },
   { op: OPS.delegationAudit },
   { op: OPS.delegationAudit, principal: 'operator:ada', limit: 10 },
+  { op: OPS.paymentAllowances },
 ];
 
 /** Replace fetch for one test: record each JSON-RPC body, answer `reply(body)` with the echo `echo`. */

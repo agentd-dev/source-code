@@ -104,6 +104,7 @@ export const OPS = Object.freeze({
   delegationRevoke: 'delegation.revoke',
   delegationForget: 'delegation.forget',
   delegationAudit: 'delegation.audit',
+  paymentAllowances: 'payment.allowances',
 } as const);
 
 /**

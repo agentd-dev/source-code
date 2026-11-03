@@ -352,6 +352,12 @@ export class AgentdClient {
     return this.data(OPS.status);
   }
 
+  /** Each allowance's spend this period (RFC 0057): the operator's alone,
+   * and served only where an allowance is declared. */
+  async paymentAllowances(): Promise<Json> {
+    return this.data(OPS.paymentAllowances);
+  }
+
   /** The effective config (operator). */
   async config(): Promise<Json> {
     return this.data(OPS.config);

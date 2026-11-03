@@ -167,11 +167,7 @@ impl McpStore {
 /// content parsed as JSON), `isError`, `text`, `content`.
 pub fn result_ctx(res: &CallToolResult) -> Value {
     let text = res.text();
-    let structured = res
-        .structured_content
-        .clone()
-        .or_else(|| serde_json::from_str::<Value>(&text).ok())
-        .unwrap_or(Value::Null);
+    let structured = crate::runtime::worker::tool_result_json(res).unwrap_or(Value::Null);
     json!({
         "result": {
             "structuredContent": structured,

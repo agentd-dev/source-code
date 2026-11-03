@@ -2400,13 +2400,22 @@ impl Runtime {
             });
             match client.call_tool("instructions_bindings_create", Some(args)) {
                 Ok(r) if !r.is_error() => {
-                    binding_id = serde_json::from_str::<Value>(&r.text()).ok().and_then(|v| {
+                    binding_id = worker::tool_result_json(&r).and_then(|v| {
                         v.get("bindingId")
                             .or_else(|| v.pointer("/binding/id"))
                             .or_else(|| v.get("id"))
                             .and_then(Value::as_str)
                             .map(str::to_string)
                     });
+                    if binding_id.is_none() {
+                        // Said: a binding never made is a consumer the
+                        // registry lists as behind, with nothing here.
+                        self.log.warn(
+                            "instruction.binding.fail",
+                            json!({"op": "create", "server": server,
+                                   "err": "the result names no binding id (bindingId, binding.id or id)"}),
+                        );
+                    }
                     if let Some(id) = &binding_id {
                         let _ = self.durable.put(
                             Kind::Memory,

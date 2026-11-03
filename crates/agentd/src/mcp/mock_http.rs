@@ -1011,6 +1011,18 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
         && n.starts_with("instructions_bindings_")
     {
         eprintln!("MOCK_BINDINGS {n} {args}");
+        // As the registry answers its tools: the JSON as text, then a
+        // `resource_link` to what it names, and the JSON as
+        // `structuredContent`.
+        fn tool_ok(id: json::Id, v: serde_json::Value) -> Response {
+            Response::ok(
+                id,
+                json!({"content": [
+                    {"type": "text", "text": v.to_string()},
+                    {"type": "resource_link", "uri": "instruction://ins_mock/bindings", "name": "binding"},
+                ], "structuredContent": v, "isError": false}),
+            )
+        }
         return match n {
             // The registry validates `consumer` against its schema and
             // refuses the call when it does not match.

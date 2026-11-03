@@ -282,11 +282,24 @@ impl McpCaller for McpClients<'_> {
 /// The value of an MCP tool result: `structuredContent`, else the text parsed
 /// as JSON, else the text.
 pub fn tool_result_value(res: &::mcp::wire::CallToolResult) -> Value {
+    tool_result_json(res).unwrap_or_else(|| Value::String(res.text()))
+}
+
+/// An MCP tool result as JSON: its `structuredContent`, else its text parts
+/// parsed as JSON. Only the text parts: a server that sends the JSON as text
+/// beside a `resource_link` or an image still answers JSON, though the
+/// result's text (what a model reads) notes those parts too.
+pub fn tool_result_json(res: &::mcp::wire::CallToolResult) -> Option<Value> {
     if let Some(sc) = &res.structured_content {
-        return sc.clone();
+        return Some(sc.clone());
     }
-    let text = res.text();
-    serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text))
+    let text: Vec<&str> = res
+        .content
+        .iter()
+        .filter(|c| matches!(c.get("type").and_then(Value::as_str), Some("text") | None))
+        .filter_map(|c| c.get("text").and_then(Value::as_str))
+        .collect();
+    serde_json::from_str::<Value>(&text.join("\n")).ok()
 }
 
 /// The knobs of one turn (from the payload).
@@ -1286,6 +1299,21 @@ pub fn run_turn_child(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_tool_results_json_is_read_from_its_text_parts_only() {
+        let res: ::mcp::wire::CallToolResult = serde_json::from_value(serde_json::json!({
+            "content": [
+                {"type": "text", "text": "{\"bindingId\": \"b1\"}"},
+                {"type": "resource_link", "uri": "instruction://x", "name": "x"},
+            ],
+        }))
+        .unwrap();
+        // What a model reads notes the link; the JSON is the text alone.
+        assert!(res.text().contains("[resource_link content]"));
+        assert_eq!(super::tool_result_json(&res).unwrap()["bindingId"], "b1");
+        assert_eq!(super::tool_result_value(&res)["bindingId"], "b1");
+    }
     use super::*;
     use crate::obs::log::{Comp, Level, LogCtx};
     use crate::wire::intel::ToolDef;

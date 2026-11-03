@@ -30,6 +30,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   reload added; now it starts every instance-tier document agent whose
   singleton is not live, under the instance ceilings, and a refused one is
   logged as `subagent.template.start_refused`.
+- **A moved report reports to its new manager.** A document version that
+  moves a nested agent to another manager leaves its composition as it was,
+  so nothing recomposed and the live child's record kept the old
+  `reports_to`. The reload now updates the record without restarting the
+  child, the feed's `subagent` item and `subagent.list` carry the new line,
+  and the parent logs `subagent.template.reports_to_changed`.
 
 ## v1.22.0 — a document's own agents
 

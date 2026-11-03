@@ -927,7 +927,12 @@ adding or removing a report leaves the manager's composition as it was. The
 line is a label, nothing more: the manager gets no tools for its report and
 no peer to it. It is on `subagent.template.composed`, `instance.spawn`, the
 child's record, and the TUI's subagents screen, which lists each child's
-template and who it reports to. A report whose manager is held, by an
+template and who it reports to. A new document version that moves an agent
+to another manager changes no one's composition, so nothing restarts: the
+live child's record takes its new `reports_to`, the TUI sees it in the
+`subagent` feed item, and the parent logs
+`subagent.template.reports_to_changed` (`template`, `handle`, `from`, `to`).
+A report whose manager is held, by an
 operator template of its name say, keeps its label, and the load says so.
 
 ### Start the team with the document
@@ -1062,6 +1067,7 @@ events to watch:
 | `subagent.template.composed` | A template the instruction document defined, at load or when a reload added or changed it: `template`, `title`, `reports_to`, `origin`, `line`, `tier`, `singleton`, the counts `servers`, `workflows`, `skills`, and their names in `server_names`, `workflow_names`, `skill_names` |
 | `subagent.template.started`, `subagent.template.start_refused`, `subagent.template.already_live` | Under `start: on_compose`, a document agent started, or refused by a ceiling (`error`); a spawn that found its singleton live and got it back |
 | `subagent.template.retired`, `subagent.template.recomposed`, `subagent.template.respawned`, `subagent.template.respawn_failed` | A reload removed or changed a live child's template: `template`, `handle`, `why`; a respawn names the child it replaces (`was`) |
+| `subagent.template.reports_to_changed` | A reload moved a live child's agent to another manager: `template`, `handle`, `from`, `to`; the child keeps running |
 
 The `agent_subagents_spawned_total` and `agent_subagents_exited_total`
 metrics count every child process, turn and think workers included. Count

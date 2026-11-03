@@ -763,6 +763,89 @@ fn a_recompose_that_cannot_start_keeps_the_running_child() {
     );
 }
 
+/// A document with two top-level agents, `alpha` and `gamma`, and `beta`
+/// nested under `manager`.
+#[cfg(feature = "hot-reload")]
+fn chart(manager: &str) -> String {
+    let lead = |id: &str| {
+        let beta = if id == manager {
+            "\n::::agent{id=beta}\nYou are beta.\n\n\
+             :::workflow{id=beta-up dialect=\"instruction/workflow\"}\n\
+             name: beta-up\nsteps: { s: { kind: once }, f: { kind: finish, depends_on: [s], status: completed } }\n:::\n\
+             ::::\n"
+        } else {
+            ""
+        };
+        format!(
+            ":::::agent{{id={id}}}\nYou lead {id}.\n\n\
+             ::::workflow{{id={id}-up dialect=\"instruction/workflow\"}}\n\
+             name: {id}-up\nsteps: {{ s: {{ kind: once }}, f: {{ kind: finish, depends_on: [s], status: completed }} }}\n::::\n\
+             {beta}:::::\n\n"
+        )
+    };
+    format!(
+        "---\nspec: \"1\"\n---\n# The org\n\n{}{}",
+        lead("alpha"),
+        lead("gamma")
+    )
+}
+
+/// A reload that moves a nested agent to another manager changes no one's
+/// composition, so nothing restarts — but the live child's record follows
+/// the document: it reports to its new manager, said, and listed so.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_moved_report_reports_to_its_new_manager() {
+    let extra = format!(
+        "subagents: {{ document_agents: {{ start: on_compose }} }}\n\
+         limits: {{ subagents: {{ instances: {{ breadth: 3 }} }} }}\n{KEEPALIVE}"
+    );
+    let mut d = Daemon::boot_with(&chart("alpha"), "drained", &extra);
+    d.wait_for("the org to start", |d| {
+        ["alpha", "beta", "gamma"]
+            .iter()
+            .all(|t| d.handles(t).len() == 1)
+    });
+    let beta = d.handles("beta")[0].clone();
+    // The new version moves beta under gamma, and lists who reports to whom.
+    let lister = ":::workflow{id=ls dialect=\"instruction/workflow\"}\n\
+        name: ls\nsteps: { s: { kind: once }, ls: { kind: tool, depends_on: [s], name: subagent.list, args: {} }, \
+        f: { kind: finish, depends_on: [ls], status: completed, output: \"{{steps.ls.output.subagents}}\" } }\n:::\n";
+    std::fs::write(
+        format!("{}/team.md", d.dir),
+        format!("{}{lister}", chart("gamma")),
+    )
+    .unwrap();
+    d.sighup();
+    d.wait_for("the ls run to end", |d| {
+        events(&d.log(), "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "ls")
+    });
+    let log = d.log();
+    let moved = events(&log, "subagent.template.reports_to_changed");
+    assert_eq!(moved.len(), 1, "{log}");
+    assert_eq!(moved[0]["template"], "beta", "{log}");
+    assert_eq!(moved[0]["handle"], beta.as_str(), "{log}");
+    assert_eq!(moved[0]["from"], "alpha", "{log}");
+    assert_eq!(moved[0]["to"], "gamma", "{log}");
+    let ls = events(&log, "run.done")
+        .into_iter()
+        .find(|e| e["workflow"] == "ls")
+        .unwrap();
+    let out = ls["output"].to_string();
+    assert!(out.contains(r#""reports_to":"gamma""#), "{ls}");
+    assert!(!out.contains(r#""reports_to":"alpha""#), "{ls}");
+    // Nothing restarted.
+    assert!(
+        events(&log, "subagent.template.recomposed").is_empty(),
+        "{log}"
+    );
+    for t in ["alpha", "beta", "gamma"] {
+        assert_eq!(d.handles(t).len(), 1, "{t}: {log}");
+    }
+}
+
 /// Turning `start: on_compose` on by a reload starts the agents the
 /// document had already composed, under the instance ceilings: with breadth
 /// for two, two of three start and the third's refusal is said.

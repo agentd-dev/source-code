@@ -1143,6 +1143,7 @@ impl Runtime {
                             json!({"template": tname, "handle": handle, "why": why,
                                    "note": "the running child keeps its composition"}),
                         );
+                        self.follow_reports_to(&handle, &tname, now);
                         continue;
                     }
                     if self.retire_instance(&handle, "its template was recomposed") {
@@ -1154,9 +1155,38 @@ impl Runtime {
                         );
                     }
                 }
-                Some(_) => {}
+                // Its composition stands, and the child keeps running; where
+                // it stands in the document may have moved.
+                Some(now) => self.follow_reports_to(&handle, &tname, now),
             }
         }
+    }
+
+    /// The live child `handle` of template `tname` keeps running, and its
+    /// record follows the reporting line `now` gives it: an agent moved to
+    /// another manager is not recomposed (its text is its own), so this is
+    /// where its `reports_to` changes. Said, and seen in the feed's
+    /// `subagent` item, which carries the record's `reports_to`.
+    fn follow_reports_to(&mut self, handle: &str, tname: &str, now: &CompiledTemplate) {
+        let to = now
+            .spec
+            .document
+            .as_ref()
+            .and_then(|d| d.reports_to.clone());
+        let Some(s) = self.subagents.get_mut(handle) else {
+            return;
+        };
+        if s.reports_to == to {
+            return;
+        }
+        let from = std::mem::replace(&mut s.reports_to, to.clone());
+        s.updated = now_ms();
+        s.dirty = true;
+        self.persist_subagent(handle);
+        self.subagent_log(handle).info(
+            "subagent.template.reports_to_changed",
+            json!({"template": tname, "handle": handle, "from": from, "to": to}),
+        );
     }
 
     /// Why the live child `handle` could not be started again from the new

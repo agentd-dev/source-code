@@ -535,12 +535,33 @@ fn a_listen_stream_that_ends_is_said_and_a_narrowed_one_fails_the_wait_it_droppe
     // every update outside an acknowledgment, so the URI is said dropped,
     // asked for again, and — the server still leaving it out — the wait on it
     // fails rather than parking for ever.
+    //
+    // The first restart may rightly wake the waited URI: the pump doubts a
+    // read that finished after its stream ended and wakes that URI once, and
+    // whether the baseline read was stamped before the end or after it is a
+    // race no test can close from outside (the mock answering it is not
+    // agentd having read it). A woken one-shot wait completes, and the
+    // narrowing it is here to see cannot be seen. Then the scenario is run
+    // again from the start, at most three times.
+    for attempt in 1..=3 {
+        if listen_end_then_narrowing(attempt == 3) {
+            return;
+        }
+        eprintln!(
+            "attempt {attempt}: the first restart woke the wait (a doubted baseline read); again"
+        );
+    }
+}
+
+/// One run of the scenario above: `false` when the first restart's doubt
+/// woke the wait before the narrowing (and `last` is not set); otherwise
+/// every assertion holds.
+fn listen_end_then_narrowing(last: bool) -> bool {
     let mock = common::spawn_mock_mcp_at("2026-07-28", WATCHED, true);
     let daemon = Daemon::start("mcp-listen", &watch_and_wait(&mock.uri(), "listener"));
     // And the acknowledgment's baseline read of the waited URI to have been
-    // answered: a read that finishes after the stream ends is doubted and
-    // its URI woken once, which resolves this one-shot wait before the
-    // narrowing it is here to see.
+    // answered, and a moment for the daemon to have taken it: a read that
+    // finishes after the stream ends is doubted and its URI woken once.
     daemon.wait_for(
         "the start to fire, the wait to be in the listen, and its baseline read",
         |log| {
@@ -549,6 +570,7 @@ fn a_listen_stream_that_ends_is_said_and_a_narrowed_one_fails_the_wait_it_droppe
                 && mock.reads("mock://waited") >= 1
         },
     );
+    std::thread::sleep(Duration::from_millis(300));
 
     mock.control("mock.restart", json!({}));
 
@@ -567,16 +589,33 @@ fn a_listen_stream_that_ends_is_said_and_a_narrowed_one_fails_the_wait_it_droppe
         "{}",
         mock.log()
     );
+    let woken = |log: &str| {
+        events(log, "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "waits" && e["status"] == "completed")
+    };
+    if woken(&log) && !last {
+        return false;
+    }
 
     mock.control("mock.narrow", json!({"uri": "mock://waited"}));
     mock.control("mock.restart", json!({}));
 
-    daemon.wait_for("the wait on the dropped URI to fail", |log| {
+    daemon.wait_for("the wait on the dropped URI to end", |log| {
         events(log, "run.done")
             .iter()
-            .any(|e| e["workflow"] == "waits" && e["status"] == "failed")
+            .any(|e| e["workflow"] == "waits")
     });
     let log = daemon.log();
+    if woken(&log) && !last {
+        return false;
+    }
+    assert!(
+        events(&log, "run.done")
+            .iter()
+            .any(|e| e["workflow"] == "waits" && e["status"] == "failed"),
+        "the wait on the dropped URI fails:\n{log}"
+    );
     assert!(
         events(&log, "mcp.listen.narrowed")
             .iter()
@@ -594,6 +633,7 @@ fn a_listen_stream_that_ends_is_said_and_a_narrowed_one_fails_the_wait_it_droppe
         "the retry met the refusal, and the wait was told:\n{log}"
     );
     assert_stateless_wire(&mock);
+    true
 }
 
 #[test]

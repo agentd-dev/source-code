@@ -911,6 +911,16 @@ fn status_result() -> Value {
             "runs": list_of(FeedKind::Run.data_schema()),
             "conversations": list_of(FeedKind::Conversation.data_schema()),
             "activity": list_of(FeedKind::Activity.data_schema()),
+            // The operator's view only: the org chart, labels.
+            "org": list_of(closed(
+                &["name", "kind", "title", "reports_to"],
+                json!({
+                    "name": string_or_null(),
+                    "kind": {"enum": ["self", "template", "peer"]},
+                    "title": string_or_null(),
+                    "reports_to": string_or_null(),
+                }),
+            )),
         },
     })
 }

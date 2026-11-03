@@ -29,12 +29,20 @@
           "description": "per-instance pacing of sends to this peer (`<burst>/<per>`); a dry bucket fails the send, which a step's retry absorbs",
           "type": "string"
         },
+        "reports_to": {
+          "description": "whom this peer reports to in this agentd's org chart: a subagents.templates name, another a2a.peers name, or this agent's agent.name. A label only: it grants nothing and changes nothing agentd may send the peer. Operator-only",
+          "type": "string"
+        },
         "timeout": {
           "description": "a duration: `10m`, `90s`, `500ms`, or bare seconds",
           "type": [
             "string",
             "integer"
           ]
+        },
+        "title": {
+          "description": "the peer's title in the org chart, a label. Operator-only",
+          "type": "string"
         }
       },
       "required": [
@@ -1479,6 +1487,10 @@
             "high"
           ]
         },
+        "reports_to": {
+          "description": "whom this template reports to in the org chart: another subagents.templates name, an a2a.peers name, or this agent's agent.name; unset, a document agent's is the agent it is nested in. A label only: it grants no tool, no peer route and no authority",
+          "type": "string"
+        },
         "result": {
           "additionalProperties": false,
           "description": "instance mode: sync — resolve the spawn when the child's named workflow first completes, returning its output (needs a parent A2A listener)",
@@ -1508,6 +1520,10 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "title": {
+          "description": "the template's title in the org chart, a label; unset, a document agent's is its block's title",
+          "type": "string"
         },
         "tools": {
           "description": "flat tier: narrowing tool grants",

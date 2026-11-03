@@ -2526,6 +2526,8 @@ impl Runtime {
             "conversations": self.conversation_views(),
             "subagents": self.subagents.values().map(|s| json!({"handle": s.handle, "mode": s.mode, "status": s.status, "tokens": s.tokens, "template": s.template, "tier": s.tier, "reports_to": s.reports_to, "pid": s.pid, "retire_at": s.retire_at})).collect::<Vec<_>>(),
             "children": self.children.status(),
+            // The org chart, whole: who reports to whom, as labels.
+            "org": self.settings.org_chart(),
             "timers": self.timers.status(),
             "inbox_pending": self.inbox_queue.len(),
             "budget": self.governor.status(now_ms()),

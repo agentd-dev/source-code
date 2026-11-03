@@ -688,7 +688,6 @@ fn an_agent_that_turns_flat_is_retired_not_respawned() {
 
 /// The keep-alive every on-compose test runs under: a workflow on a long
 /// schedule, so a `drained` daemon has standing work.
-#[cfg(feature = "hot-reload")]
 const KEEPALIVE: &str = "workflows:\n  - name: tick\n    steps:\n      every: { kind: schedule, every: 1h }\n      \
     done: { kind: finish, depends_on: [every], status: completed }\n";
 
@@ -889,4 +888,161 @@ fn turning_on_compose_on_by_reload_starts_the_composed_agents() {
             d.child_ran(&h, &format!("{t}-up"))
         });
     }
+}
+
+/// The operator's org chart: `parent` (this agent) runs `cto`, an instance
+/// child, and `cmo`, a flat worker, and talks to a peer, `legal`. Each
+/// reporting line is a label the configuration writes (`reports_to`).
+const COMPANY: &str = "subagents:\n  templates:\n    cto:\n      title: CTO\n      reports_to: parent\n      \
+    singleton: true\n      instruction: |\n        You build it.\n\n        \
+    :::workflow{id=cto-up dialect=\"instruction/workflow\"}\n        \
+    name: cto-up\n        steps: { s: { kind: once }, f: { kind: finish, depends_on: [s], status: completed } }\n        \
+    :::\n    cmo:\n      title: CMO\n      reports_to: parent\n      instruction: You sell it.\n\
+    a2a:\n  peers:\n    - { name: legal, endpoint: \"https://legal.example\", title: Counsel, reports_to: parent }\n";
+
+/// A document whose workflows read the chart: `open` spawns `cto` (the
+/// first version; a later one finds it live) and lists the subagents,
+/// `chart` reads `status` — each run's output what it read.
+fn reader(suffix: &str) -> String {
+    let spawn = if suffix.is_empty() {
+        "run: { kind: subagent, depends_on: [s], template: cto }, nap: { kind: sleep, depends_on: [run], duration: 500ms }"
+    } else {
+        "nap: { kind: sleep, depends_on: [s], duration: 100ms }"
+    };
+    format!(
+        "---\nspec: \"1\"\n---\n# The company\n\nRun it.\n\n\
+         :::workflow{{id=open{suffix} dialect=\"instruction/workflow\"}}\n\
+         name: open{suffix}\nsteps: {{ s: {{ kind: once }}, {spawn}, \
+         ls: {{ kind: tool, depends_on: [nap], name: subagent.list, args: {{}} }}, \
+         f: {{ kind: finish, depends_on: [ls], status: completed, output: \"{{{{steps.ls.output.subagents}}}}\" }} }}\n:::\n\n\
+         :::workflow{{id=chart{suffix} dialect=\"instruction/workflow\"}}\n\
+         name: chart{suffix}\nsteps: {{ s: {{ kind: once }}, st: {{ kind: tool, depends_on: [s], name: status, args: {{}} }}, \
+         f: {{ kind: finish, depends_on: [st], status: completed, output: \"{{{{steps.st.output.org}}}}\" }} }}\n:::\n"
+    )
+}
+
+/// The output of the first run of `workflow` to finish.
+fn output_of(log: &str, workflow: &str) -> Value {
+    events(log, "run.done")
+        .into_iter()
+        .find(|e| e["workflow"] == workflow)
+        .map(|e| e["output"].clone())
+        .unwrap_or(Value::Null)
+}
+
+/// The org entry `name` of kind `kind`.
+fn entry<'a>(org: &'a Value, kind: &str, name: &str) -> &'a Value {
+    org.as_array()
+        .and_then(|o| o.iter().find(|e| e["kind"] == kind && e["name"] == name))
+        .unwrap_or_else(|| panic!("no {kind} {name} in {org}"))
+}
+
+/// An operator template's reporting line is on its `instance.spawn`, on the
+/// child's record (`subagent.list`), and in the status document's `org` —
+/// read by a workflow's `status` step — beside the peer's and this agent's.
+#[test]
+fn an_operators_reporting_lines_reach_the_spawn_the_record_and_the_status_org() {
+    let extra = format!("{COMPANY}{KEEPALIVE}");
+    let mut d = Daemon::boot_with(&reader(""), "drained", &extra);
+    d.wait_for("both readers to finish", |d| {
+        let log = d.log();
+        !output_of(&log, "open").is_null() && !output_of(&log, "chart").is_null()
+    });
+    let log = d.log();
+    let spawn = events(&log, "instance.spawn");
+    assert_eq!(spawn.len(), 1, "{log}");
+    assert_eq!(spawn[0]["template"], "cto", "{log}");
+    assert_eq!(spawn[0]["reports_to"], "parent", "{log}");
+    let listed = output_of(&log, "open");
+    let cto = listed
+        .as_array()
+        .and_then(|l| l.iter().find(|s| s["template"] == "cto"))
+        .unwrap_or_else(|| panic!("no cto in {listed}"));
+    assert_eq!(cto["reports_to"], "parent", "{listed}");
+    let org = output_of(&log, "chart");
+    assert_eq!(
+        entry(&org, "self", "parent"),
+        &serde_json::json!({"name": "parent", "kind": "self", "title": null, "reports_to": null})
+    );
+    assert_eq!(
+        entry(&org, "template", "cto"),
+        &serde_json::json!({"name": "cto", "kind": "template", "title": "CTO", "reports_to": "parent"})
+    );
+    assert_eq!(entry(&org, "template", "cmo")["reports_to"], "parent");
+    assert_eq!(
+        entry(&org, "peer", "legal"),
+        &serde_json::json!({"name": "legal", "kind": "peer", "title": "Counsel", "reports_to": "parent"})
+    );
+    // And the chart is said at load.
+    let said = events(&log, "agent.org");
+    assert_eq!(said.len(), 1, "{log}");
+    assert_eq!(said[0]["org"], org, "{log}");
+}
+
+/// A reload that moves an operator template's line, and a peer's, restarts
+/// nothing: the live child's record follows (`reports_to_changed`), the
+/// peer's move is said, and `status` draws the new chart.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_reload_moves_an_operators_lines_without_a_restart() {
+    let extra = format!("{COMPANY}{KEEPALIVE}");
+    let mut d = Daemon::boot_with(&reader(""), "drained", &extra);
+    d.wait_for("the first readers to finish", |d| {
+        let log = d.log();
+        !output_of(&log, "open").is_null() && !output_of(&log, "chart").is_null()
+    });
+    let cto = d.handles("cto")[0].clone();
+    let cfg = format!("{}/c.yaml", d.dir);
+    let text = std::fs::read_to_string(&cfg)
+        .unwrap()
+        .replacen(
+            "title: CTO\n      reports_to: parent",
+            "title: CTO\n      reports_to: legal",
+            1,
+        )
+        .replacen(
+            "title: Counsel, reports_to: parent",
+            "title: General counsel, reports_to: cmo",
+            1,
+        );
+    std::fs::write(&cfg, text).unwrap();
+    // The new version reads the chart again.
+    std::fs::write(format!("{}/team.md", d.dir), reader("2")).unwrap();
+    d.sighup();
+    d.wait_for("the second readers to finish", |d| {
+        let log = d.log();
+        !output_of(&log, "open2").is_null() && !output_of(&log, "chart2").is_null()
+    });
+    let log = d.log();
+    let moved = events(&log, "subagent.template.reports_to_changed");
+    assert_eq!(moved.len(), 1, "{log}");
+    assert_eq!(moved[0]["template"], "cto", "{log}");
+    assert_eq!(moved[0]["handle"], cto.as_str(), "{log}");
+    assert_eq!(moved[0]["from"], "parent", "{log}");
+    assert_eq!(moved[0]["to"], "legal", "{log}");
+    let peer = events(&log, "a2a.peer.reports_to_changed");
+    assert_eq!(peer.len(), 1, "{log}");
+    assert_eq!(peer[0]["peer"], "legal", "{log}");
+    assert_eq!(peer[0]["from"], "parent", "{log}");
+    assert_eq!(peer[0]["to"], "cmo", "{log}");
+    // Nothing restarted: the one cto is the one that was running.
+    assert!(
+        events(&log, "subagent.template.recomposed").is_empty(),
+        "{log}"
+    );
+    assert_eq!(d.handles("cto"), std::slice::from_ref(&cto), "{log}");
+    let listed = output_of(&log, "open2");
+    let rec = listed
+        .as_array()
+        .and_then(|l| l.iter().find(|s| s["handle"] == cto.as_str()))
+        .unwrap_or_else(|| panic!("no {cto} in {listed}"));
+    assert_eq!(rec["reports_to"], "legal", "{listed}");
+    let org = output_of(&log, "chart2");
+    assert_eq!(entry(&org, "template", "cto")["reports_to"], "legal");
+    assert_eq!(
+        entry(&org, "peer", "legal"),
+        &serde_json::json!({"name": "legal", "kind": "peer", "title": "General counsel", "reports_to": "cmo"})
+    );
+    // The new chart is said once more.
+    assert_eq!(events(&log, "agent.org").len(), 2, "{log}");
 }

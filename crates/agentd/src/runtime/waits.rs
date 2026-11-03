@@ -1969,6 +1969,8 @@ impl Runtime {
                         client_cert: None,
                         client_key: None,
                         auth: None,
+                        reports_to: None,
+                        title: None,
                     },
                     true,
                 ),

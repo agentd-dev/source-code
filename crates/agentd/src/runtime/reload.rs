@@ -1225,6 +1225,15 @@ impl Runtime {
                 changed.push("subagents");
             }
         }
+        // A peer is read from the settings at each send, so a moved peer
+        // has nothing to rebuild; its reporting line is said.
+        if old.a2a.peers != new.a2a.peers {
+            self.follow_peer_lines(old, &new);
+            changed.push("a2a.peers");
+        }
+        if old.org_chart() != new.org_chart() {
+            self.log_org_chart();
+        }
         if changed.is_empty() {
             changed.push("nothing");
         }

@@ -1008,6 +1008,8 @@ fn defs_properties(
                 "durable": { "type": "boolean", "description": "false = memory-only record (an instance child runs on a memory store; no restore-respawn); absent = the store.durability.work default" },
                 "result": { "type": "object", "additionalProperties": false, "required": ["workflow"], "properties": { "workflow": { "type": "string" } },
                             "description": "instance mode: sync — resolve the spawn when the child's named workflow first completes, returning its output (needs a parent A2A listener)" },
+                "reports_to": { "type": "string", "description": "whom this template reports to in the org chart: another subagents.templates name, an a2a.peers name, or this agent's agent.name; unset, a document agent's is the agent it is nested in. A label only: it grants no tool, no peer route and no authority" },
+                "title": { "type": "string", "description": "the template's title in the org chart, a label; unset, a document agent's is its block's title" },
                 "mirror_streams": { "type": "array", "items": { "type": "string" },
                             "description": "child streams mirrored into the parent's same-named streams (declared on both sides; needs a parent A2A listener)" } } }));
     m.insert(
@@ -1063,7 +1065,9 @@ fn defs_properties(
                 "headers": string_map, "client_cert": { "type": "string" }, "client_key": { "type": "string" },
                 "rate": { "type": "string", "description": "per-instance pacing of sends to this peer (`<burst>/<per>`); a dry bucket fails the send, which a step's retry absorbs" },
                 "timeout": duration,
-                "auth": { "$ref": "#/$defs/Auth" } } }));
+                "auth": { "$ref": "#/$defs/Auth" },
+                "reports_to": { "type": "string", "description": "whom this peer reports to in this agentd's org chart: a subagents.templates name, another a2a.peers name, or this agent's agent.name. A label only: it grants nothing and changes nothing agentd may send the peer. Operator-only" },
+                "title": { "type": "string", "description": "the peer's title in the org chart, a label. Operator-only" } } }));
     m.insert("AAuth".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["provider"], "properties": {
                 "provider": { "type": "string" }, "key_file": { "type": "string" }, "enroll_token": secret,
                 "enroll_assertion_file": { "type": "string" }, "person_server": { "type": "string" } } }));

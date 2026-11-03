@@ -605,8 +605,8 @@ impl Runtime {
                     .subagents
                     .templates
                     .get(n)
-                    .and_then(|t| t.document.as_ref())
-                    .and_then(|d| d.reports_to.clone())
+                    .and_then(|t| t.reporting_line())
+                    .map(str::to_string)
             }),
             pid: None,
             config_path: None,

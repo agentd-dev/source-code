@@ -348,7 +348,7 @@ impl Runtime {
             spawn_args: Some(json!({"params": params, "mode": mode, "durable": durable})),
             trace: Some(trace.clone()),
             template: Some(tname.to_string()),
-            reports_to: t.spec.document.as_ref().and_then(|d| d.reports_to.clone()),
+            reports_to: t.spec.reporting_line().map(str::to_string),
             tier: Some("instance".into()),
             pid: None,
             config_path: Some(config_path.display().to_string()),
@@ -1024,12 +1024,47 @@ impl Runtime {
             self.log.info(
                 "subagent.template.composed",
                 json!({"template": name, "origin": "document",
-                       "line": origin.map(|o| o.line), "title": origin.and_then(|o| o.title.clone()),
-                       "reports_to": origin.and_then(|o| o.reports_to.clone()),
+                       "line": origin.map(|o| o.line), "title": t.spec.title_label(),
+                       "reports_to": t.spec.reporting_line(),
                        "tier": t.tier.as_str(), "singleton": t.spec.singleton,
                        "servers": servers.len(), "workflows": workflows.len(), "skills": skills.len(),
                        "server_names": servers, "workflow_names": workflows, "skill_names": skills}),
             );
+        }
+    }
+
+    /// The org chart (`Settings::org_chart`) as one `agent.org` line, when
+    /// any template or peer in it has a reporting line or a title: at load,
+    /// and after a reload that moved it.
+    pub(crate) fn log_org_chart(&self) {
+        let org = self.settings.org_chart();
+        let drawn =
+            org.as_array().into_iter().flatten().any(|e| {
+                e["kind"] != "self" && (!e["reports_to"].is_null() || !e["title"].is_null())
+            });
+        if drawn {
+            self.log.info("agent.org", json!({"org": org}));
+        }
+    }
+
+    /// A reload's peers, held to their reporting lines: a peer whose
+    /// `reports_to` moved is said (`a2a.peer.reports_to_changed`). The label
+    /// is read from the settings, so it is applied once they are swapped in.
+    pub(crate) fn follow_peer_lines(
+        &self,
+        old: &crate::config::settings::Settings,
+        new: &crate::config::settings::Settings,
+    ) {
+        for p in &new.a2a.peers {
+            let Some(was) = old.a2a.peers.iter().find(|o| o.name == p.name) else {
+                continue;
+            };
+            if was.reports_to != p.reports_to {
+                self.log.info(
+                    "a2a.peer.reports_to_changed",
+                    json!({"peer": p.name, "from": was.reports_to, "to": p.reports_to}),
+                );
+            }
         }
     }
 
@@ -1066,7 +1101,7 @@ impl Runtime {
             }) {
                 continue;
             }
-            let reports_to = t.spec.document.as_ref().and_then(|d| d.reports_to.clone());
+            let reports_to = t.spec.reporting_line().map(str::to_string);
             match self.instance_run(&super::tools::ToolCaller::default(), name, &json!({})) {
                 ToolOutcome::Ready(v, false) => {
                     if v.get("already_live").is_none() {
@@ -1163,16 +1198,13 @@ impl Runtime {
     }
 
     /// The live child `handle` of template `tname` keeps running, and its
-    /// record follows the reporting line `now` gives it: an agent moved to
-    /// another manager is not recomposed (its text is its own), so this is
-    /// where its `reports_to` changes. Said, and seen in the feed's
+    /// record follows the reporting line `now` gives it — the operator's
+    /// `reports_to`, else the document's: an agent moved to another manager
+    /// is not recomposed (its text is its own, and a reporting line is a
+    /// label), so this is where its `reports_to` changes. Said, and seen in the feed's
     /// `subagent` item, which carries the record's `reports_to`.
     fn follow_reports_to(&mut self, handle: &str, tname: &str, now: &CompiledTemplate) {
-        let to = now
-            .spec
-            .document
-            .as_ref()
-            .and_then(|d| d.reports_to.clone());
+        let to = now.spec.reporting_line().map(str::to_string);
         let Some(s) = self.subagents.get_mut(handle) else {
             return;
         };

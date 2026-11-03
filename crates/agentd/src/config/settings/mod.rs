@@ -1288,6 +1288,12 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // `a2a.peers` — an outbound dial — is the document's and sits inside it;
     // a field added here later lands unclassified, which is the point.
     "a2a.bearer",
+    // Where a peer stands in this agentd's org chart is the operator's
+    // view of its organisation: a label, but not one a document gives the
+    // agents it declares (a document's own agents take theirs from where
+    // they are nested, RFC 0056 §3.7).
+    "a2a.peers[].reports_to",
+    "a2a.peers[].title",
     "a2a.cors",
     "a2a.device_grant",
     "a2a.events",
@@ -1369,6 +1375,10 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "skills.inline",
 ];
 
+/// The fields of an `a2a.peers` element only the operator writes: its
+/// place in the org chart.
+pub(crate) const PEER_OPERATOR_ONLY: &[&str] = &["reports_to", "title"];
+
 /// Whether `path` is at or under one of `list`'s entries.
 fn path_covered(path: &str, list: &[&str]) -> bool {
     list.iter()
@@ -1416,6 +1426,22 @@ pub(crate) fn document_wrote_operator_config(fragment: &Map<String, Value>) -> V
     }
     let mut found = Vec::new();
     walk(fragment, "", &mut found);
+    // A document may declare a peer, never where it stands in the org
+    // chart: the walk stops at `a2a.peers`, so its labels are said here.
+    for (i, p) in fragment
+        .get("a2a")
+        .and_then(|a| a.get("peers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        for f in PEER_OPERATOR_ONLY {
+            if p.get(*f).is_some() {
+                found.push(format!("a2a.peers[{i}].{f}"));
+            }
+        }
+    }
     // A document may declare and name models — which model, never where it
     // lives: one it declares cannot name a connection, or it would point the
     // agent's content at a provider of its choosing (RFC 0046 §5.3). The
@@ -5128,12 +5154,40 @@ pub struct SubagentTemplate {
     /// on BOTH sides and a parent A2A listener.
     #[serde(default)]
     pub mirror_streams: Option<Vec<String>>,
+    /// Whom this template reports to in the org chart: another template, an
+    /// `a2a.peers` name, or this agent's own `agent.name`. A label only — it
+    /// grants no tool, no peer route and no authority. Unset, a document
+    /// agent's reporting line is the agent it is nested in (RFC 0056 §3.7).
+    #[serde(default)]
+    pub reports_to: Option<String>,
+    /// Its title in the org chart, a label. Unset, a document agent's is
+    /// its block's title.
+    #[serde(default)]
+    pub title: Option<String>,
     /// Set when the instruction document defined this template — one of its
     /// agents (RFC 0056) — DERIVED, never a config key. Such a template is
     /// compiled with no grants, and to the §7.8 floor when the document
     /// arrived over the wire (`config::templates`).
     #[serde(skip)]
     pub document: Option<DocumentAgentOrigin>,
+}
+
+impl SubagentTemplate {
+    /// The template's reporting line: the operator's `reports_to`, else the
+    /// one its document derived from where the agent is nested. A label.
+    pub fn reporting_line(&self) -> Option<&str> {
+        self.reports_to
+            .as_deref()
+            .or_else(|| self.document.as_ref()?.reports_to.as_deref())
+    }
+
+    /// The template's title: the operator's `title`, else its document
+    /// block's. A label.
+    pub fn title_label(&self) -> Option<&str> {
+        self.title
+            .as_deref()
+            .or_else(|| self.document.as_ref()?.title.as_deref())
+    }
 }
 
 /// One declared template parameter — the only hole a spawn may fill.
@@ -5646,6 +5700,14 @@ pub struct A2aPeer {
     /// time, or `aws`, which instead signs every request body individually.
     #[serde(default)]
     pub auth: Option<Auth>,
+    /// Whom this peer reports to in this agentd's view of the org chart: a
+    /// template, another peer, or this agent's own `agent.name`. A label
+    /// only — it changes nothing agentd may send the peer or the peer may do.
+    #[serde(default)]
+    pub reports_to: Option<String>,
+    /// Its title in the org chart, a label.
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -9254,6 +9316,169 @@ fn unresolved_secret_ref(value: &str) -> Option<String> {
     .err()
 }
 
+/// A node of the org chart: this agent, a template, or a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum OrgKind {
+    SelfAgent,
+    Template,
+    Peer,
+}
+
+impl OrgKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            OrgKind::SelfAgent => "self",
+            OrgKind::Template => "template",
+            OrgKind::Peer => "peer",
+        }
+    }
+}
+
+/// Every reporting line the operator wrote that names nothing it may, each
+/// said at its field: a `reports_to` names another template, a peer, or
+/// this agent by its `agent.name` — one of them, not a name two share — and
+/// never the template or peer it is written on; and the lines, the ones a
+/// document derives included, form no cycle. A document's own line naming
+/// an agent that is not activated stands as a label, said where the
+/// document is read (RFC 0056 §3.7).
+pub(crate) fn reporting_line_errors(s: &Settings) -> Vec<String> {
+    let mut errs = Vec::new();
+    let self_name = s.agent.name.as_deref();
+    let kinds_of = |name: &str| -> Vec<OrgKind> {
+        let mut k = Vec::new();
+        if self_name == Some(name) {
+            k.push(OrgKind::SelfAgent);
+        }
+        if s.subagents.templates.contains_key(name) {
+            k.push(OrgKind::Template);
+        }
+        if s.a2a.peers.iter().any(|p| p.name == name) {
+            k.push(OrgKind::Peer);
+        }
+        k
+    };
+    let said = |k: &[OrgKind]| {
+        k.iter()
+            .map(|k| match k {
+                OrgKind::SelfAgent => "this agent's agent.name",
+                OrgKind::Template => "a subagents.templates entry",
+                OrgKind::Peer => "an a2a.peers name",
+            })
+            .collect::<Vec<_>>()
+            .join(" and ")
+    };
+    // The lines the operator wrote, each with the field it is written at.
+    let written = s
+        .subagents
+        .templates
+        .iter()
+        .filter_map(|(n, t)| {
+            Some((
+                OrgKind::Template,
+                n.as_str(),
+                t.reports_to.as_deref()?,
+                format!("subagents.templates.{n}.reports_to"),
+            ))
+        })
+        .chain(s.a2a.peers.iter().enumerate().filter_map(|(i, p)| {
+            Some((
+                OrgKind::Peer,
+                p.name.as_str(),
+                p.reports_to.as_deref()?,
+                format!("a2a.peers[{i}].reports_to ({})", p.name),
+            ))
+        }));
+    // Where each node's line leads, resolved: (kind, name) to (kind, name).
+    let mut edges: BTreeMap<(OrgKind, &str), (OrgKind, &str)> = BTreeMap::new();
+    for (kind, name, to, at) in written {
+        if to == name {
+            errs.push(format!(
+                "{at}: {name:?} reports to itself — a reporting line names another template, a peer, or this agent by its agent.name"
+            ));
+            continue;
+        }
+        match kinds_of(to).as_slice() {
+            [] => errs.push(format!(
+                "{at}: {to:?} is no subagents.templates entry, a2a.peers name or this agent's agent.name{}",
+                if self_name.is_none() {
+                    " (set agent.name to name this agent)"
+                } else {
+                    ""
+                }
+            )),
+            [k] => {
+                edges.insert((kind, name), (*k, to));
+            }
+            many => errs.push(format!(
+                "{at}: {to:?} is {} — a reporting line must name one; rename one of them",
+                said(many)
+            )),
+        }
+    }
+    // A document agent's derived line names an agent of its document: the
+    // template of that name, when there is one.
+    for (n, t) in &s.subagents.templates {
+        if t.reports_to.is_none()
+            && let Some(to) = t.document.as_ref().and_then(|d| d.reports_to.as_deref())
+            && s.subagents.templates.contains_key(to)
+        {
+            edges.insert((OrgKind::Template, n.as_str()), (OrgKind::Template, to));
+        }
+    }
+    // A cycle, said once, from the node it is first met at.
+    let mut seen: BTreeSet<(OrgKind, &str)> = BTreeSet::new();
+    for start in edges.keys() {
+        if seen.contains(start) {
+            continue;
+        }
+        let mut path: Vec<(OrgKind, &str)> = Vec::new();
+        let mut at = *start;
+        loop {
+            if let Some(i) = path.iter().position(|p| *p == at) {
+                let cycle: Vec<String> = path[i..]
+                    .iter()
+                    .chain(std::iter::once(&at))
+                    .map(|(k, n)| format!("{n} ({})", k.as_str()))
+                    .collect();
+                errs.push(format!(
+                    "reporting lines form a cycle: {} — each reports_to must lead up to someone who reports to no one",
+                    cycle.join(" → ")
+                ));
+                break;
+            }
+            if seen.contains(&at) {
+                break;
+            }
+            path.push(at);
+            match edges.get(&at) {
+                Some(next) => at = *next,
+                None => break,
+            }
+        }
+        seen.extend(path);
+    }
+    errs
+}
+
+impl Settings {
+    /// The org chart as the operator's configuration and the instruction
+    /// document draw it: this agent, every template, every peer, each with
+    /// its title and reporting line. Labels only — the chart grants nothing.
+    pub fn org_chart(&self) -> Value {
+        let mut out = vec![json!({"name": self.agent.name, "kind": "self",
+                                   "title": Value::Null, "reports_to": Value::Null})];
+        out.extend(self.subagents.templates.iter().map(|(n, t)| {
+            json!({"name": n, "kind": "template",
+                   "title": t.title_label(), "reports_to": t.reporting_line()})
+        }));
+        out.extend(self.a2a.peers.iter().map(|p| {
+            json!({"name": p.name, "kind": "peer",
+                   "title": p.title, "reports_to": p.reports_to})
+        }));
+        Value::Array(out)
+    }
+}
+
 pub fn validate(loaded: &Loaded) -> Diagnostics {
     let s = &loaded.settings;
     let mut d = Diagnostics::default();
@@ -11039,6 +11264,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 );
             }
         }
+    }
+
+    for e in reporting_line_errors(s) {
+        err(&mut d, e);
     }
 
     let mut peer_names = std::collections::HashSet::new();
@@ -13747,6 +13976,14 @@ mod tests {
             }
             true
         };
+        // A peer's place in the org chart is the operator's.
+        for f in super::PEER_OPERATOR_ONLY {
+            let p = format!("a2a.peers[].{f}");
+            assert!(
+                OPERATOR_ONLY.contains(&p.as_str()) && element_path(&p),
+                "{p} is a peer's org-chart label and must be an OPERATOR_ONLY path the schema has"
+            );
+        }
         // Every delegation field of a server's `auth` is the operator's.
         for f in super::delegation::SERVER_AUTH_OPERATOR_ONLY {
             let p = format!("mcp.servers[].auth.{f}");
@@ -19619,5 +19856,277 @@ mod document_agent_tests {
         );
         doc["subagents"] = json!({"document_agents": {"start": "always"}});
         assert!(Settings::from_document(doc, MERGED_DOCUMENT).is_err());
+    }
+}
+
+/// Reporting lines in the operator's configuration: `subagents.templates.*`
+/// and `a2a.peers[]` `reports_to` and `title`, labels only.
+#[cfg(test)]
+mod reporting_line_tests {
+    use super::*;
+
+    fn company() -> Value {
+        json!({
+            "agent": {"name": "ceo", "instruction": "Run the company."},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "store": {"kind": "memory"},
+            "subagents": {"templates": {
+                "cto": {"instruction": "Build it.", "title": "CTO", "reports_to": "ceo"},
+                "cmo": {"instruction": "Sell it.", "title": "CMO", "reports_to": "ceo"},
+                "writer": {"instruction": "Write it.", "reports_to": "cmo"},
+            }},
+            "a2a": {"peers": [{"name": "legal", "endpoint": "https://legal.example",
+                               "title": "Counsel", "reports_to": "ceo"}]},
+        })
+    }
+
+    fn errors(doc: Value) -> Vec<String> {
+        let s = Settings::from_document(doc, MERGED_DOCUMENT).unwrap();
+        reporting_line_errors(&s)
+    }
+
+    /// A line naming this agent by its `agent.name`, a template or a peer
+    /// loads, and the chart has every one, the agent itself first.
+    #[test]
+    fn a_line_names_this_agent_a_template_or_a_peer() {
+        assert_eq!(errors(company()), Vec::<String>::new());
+        let s = Settings::from_document(company(), MERGED_DOCUMENT).unwrap();
+        let org = s.org_chart();
+        assert_eq!(
+            org[0],
+            json!({"name": "ceo", "kind": "self", "title": null, "reports_to": null})
+        );
+        let by = |n: &str| {
+            org.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == n)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(
+            by("writer"),
+            json!({"name": "writer", "kind": "template", "title": null, "reports_to": "cmo"})
+        );
+        assert_eq!(
+            by("legal"),
+            json!({"name": "legal", "kind": "peer", "title": "Counsel", "reports_to": "ceo"})
+        );
+        let mut doc = company();
+        doc["a2a"]["peers"][0]["reports_to"] = json!("cto");
+        assert_eq!(
+            errors(doc),
+            Vec::<String>::new(),
+            "a peer reports to a template"
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_is_refused_at_its_field() {
+        let mut doc = company();
+        doc["subagents"]["templates"]["writer"]["reports_to"] = json!("cfo");
+        let e = errors(doc).join("; ");
+        assert!(
+            e.contains(
+                "subagents.templates.writer.reports_to: \"cfo\" is no subagents.templates entry"
+            ),
+            "{e}"
+        );
+        let mut doc = company();
+        doc["a2a"]["peers"][0]["reports_to"] = json!("board");
+        let e = errors(doc).join("; ");
+        assert!(
+            e.contains("a2a.peers[0].reports_to (legal): \"board\""),
+            "{e}"
+        );
+        // With no agent.name, this agent has no name to be named by: said.
+        let mut doc = company();
+        doc["agent"].as_object_mut().unwrap().remove("name");
+        let e = errors(doc).join("; ");
+        assert!(e.contains("set agent.name to name this agent"), "{e}");
+    }
+
+    #[test]
+    fn a_template_or_a_peer_reporting_to_itself_is_refused() {
+        let mut doc = company();
+        doc["subagents"]["templates"]["cto"]["reports_to"] = json!("cto");
+        let e = errors(doc).join("; ");
+        assert!(
+            e.contains("subagents.templates.cto.reports_to: \"cto\" reports to itself"),
+            "{e}"
+        );
+        let mut doc = company();
+        doc["a2a"]["peers"][0]["reports_to"] = json!("legal");
+        let e = errors(doc).join("; ");
+        assert!(
+            e.contains("a2a.peers[0].reports_to (legal): \"legal\" reports to itself"),
+            "{e}"
+        );
+    }
+
+    /// A cycle is refused with its path, templates and peers alike.
+    #[test]
+    fn a_cycle_is_refused_with_its_path() {
+        let mut doc = company();
+        doc["subagents"]["templates"]["cmo"]["reports_to"] = json!("writer");
+        let e = errors(doc);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains(
+                "reporting lines form a cycle: cmo (template) \u{2192} writer (template) \u{2192} cmo (template)"
+            ),
+            "{e:?}"
+        );
+        // Across a template and a peer.
+        let mut doc = company();
+        doc["subagents"]["templates"]["cto"]["reports_to"] = json!("legal");
+        doc["a2a"]["peers"][0]["reports_to"] = json!("cto");
+        let e = errors(doc);
+        assert_eq!(e.len(), 1, "{e:?}");
+        assert!(
+            e[0].contains("cto (template) \u{2192} legal (peer) \u{2192} cto (template)"),
+            "{e:?}"
+        );
+    }
+
+    /// A name a template and a peer share is one a reporting line cannot
+    /// name.
+    #[test]
+    fn a_name_two_share_is_refused_as_ambiguous() {
+        let mut doc = company();
+        doc["a2a"]["peers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name": "cmo", "endpoint": "https://cmo.example"}));
+        let e = errors(doc).join("; ");
+        assert!(
+            e.contains(
+                "subagents.templates.writer.reports_to: \"cmo\" is a subagents.templates entry and an a2a.peers name"
+            ),
+            "{e}"
+        );
+    }
+
+    /// The validator says it: a configuration with a bad line is refused.
+    #[test]
+    fn the_load_refuses_a_bad_line() {
+        let f = tempfile::Builder::new().suffix(".yaml").tempfile().unwrap();
+        std::fs::write(
+            f.path(),
+            "agent: {name: ceo}\nintelligence: {endpoints: [\"http://127.0.0.1:1/v1\"], model: mock}\n\
+             subagents:\n  templates:\n    cto: {instruction: Build it., reports_to: cfo}\n",
+        )
+        .unwrap();
+        let args: Vec<String> = ["--config", f.path().to_str().unwrap()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let e = match load(&args, &[]) {
+            Ok((l, _)) => validate(&l).errors.join("; "),
+            Err(e) => e.to_string(),
+        };
+        assert!(e.contains("subagents.templates.cto.reports_to"), "{e}");
+    }
+
+    /// An operator template holding a document agent of its name carries
+    /// the operator's line and title; a document agent with none of its own
+    /// carries the document's.
+    #[test]
+    fn the_operators_line_stands_over_the_documents() {
+        let org_doc = "---\nspec: \"1\"\n---\n# Org\n\n\
+            :::::agent{id=cmo title=\"CMO\"}\nYou run marketing.\n\n\
+            ::::agent{id=community title=\"Community lead\"}\nYou run the forum.\n::::\n\
+            :::::\n";
+        let mut doc = json!({
+            "agent": {"name": "ceo", "instruction": org_doc, "document_capabilities": ["agents"]},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "store": {"kind": "memory"},
+        });
+        let s = Settings::from_document(doc.clone(), MERGED_DOCUMENT).unwrap();
+        assert_eq!(
+            s.subagents.templates["community"].reporting_line(),
+            Some("cmo")
+        );
+        assert_eq!(
+            s.subagents.templates["community"].title_label(),
+            Some("Community lead")
+        );
+        assert_eq!(s.subagents.templates["cmo"].reporting_line(), None);
+        doc["subagents"] = json!({"templates": {
+            "cmo": {"instruction": "The operator's CMO.", "reports_to": "ceo",
+                    "title": "Chief Marketing Officer"},
+        }});
+        let s = Settings::from_document(doc, MERGED_DOCUMENT).unwrap();
+        assert_eq!(reporting_line_errors(&s), Vec::<String>::new());
+        assert_eq!(s.subagents.templates["cmo"].reporting_line(), Some("ceo"));
+        assert_eq!(
+            s.subagents.templates["cmo"].title_label(),
+            Some("Chief Marketing Officer")
+        );
+        assert_eq!(
+            s.subagents.templates["community"].reporting_line(),
+            Some("cmo")
+        );
+    }
+
+    /// A document's derived line joins the cycle check: an operator
+    /// template that reports to its own document report is refused.
+    #[test]
+    fn a_cycle_through_a_documents_line_is_refused() {
+        let org_doc = "---\nspec: \"1\"\n---\n# Org\n\n\
+            :::::agent{id=cmo}\nYou run marketing.\n\n\
+            ::::agent{id=community}\nYou run the forum.\n::::\n\
+            :::::\n";
+        let doc = json!({
+            "agent": {"name": "ceo", "instruction": org_doc, "document_capabilities": ["agents"]},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "store": {"kind": "memory"},
+            "subagents": {"templates": {
+                "cmo": {"instruction": "The operator's CMO.", "reports_to": "community"},
+            }},
+        });
+        let e = errors(doc);
+        assert!(
+            e.iter().any(|e| e
+                .contains("cmo (template) \u{2192} community (template) \u{2192} cmo (template)")),
+            "{e:?}"
+        );
+    }
+
+    /// A `:::config` declares a peer, never its place in the org chart.
+    #[test]
+    fn a_documents_config_sets_no_peer_label() {
+        let frag = json!({"a2a": {"peers": [
+            {"name": "p", "endpoint": "https://p.example", "reports_to": "ceo", "title": "Boss"},
+        ]}});
+        let refused = document_wrote_operator_config(frag.as_object().unwrap());
+        assert_eq!(refused, ["a2a.peers[0].reports_to", "a2a.peers[0].title"]);
+        let frag = json!({"a2a": {"peers": [{"name": "p", "endpoint": "https://p.example"}]}});
+        assert!(document_wrote_operator_config(frag.as_object().unwrap()).is_empty());
+        // Through the load: the document is refused, naming the field.
+        let instruction = "---\nspec: \"1\"\n---\n# Co\n\n\
+            :::config{id=c dialect=\"agentd/config\"}\na2a:\n  peers:\n    - {name: p, endpoint: \"https://p.example\", reports_to: ceo}\n:::\n";
+        let doc = json!({
+            "agent": {"name": "ceo", "instruction": instruction},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "store": {"kind": "memory"},
+        });
+        let e = Settings::from_document(doc, MERGED_DOCUMENT).unwrap_err();
+        assert!(e.contains("a2a.peers[0].reports_to"), "{e}");
+    }
+
+    /// A template's composition is not its place in the chart: a reload
+    /// moving only a line or a title recomposes nothing.
+    #[test]
+    fn a_line_is_not_a_templates_composition() {
+        let s = Settings::from_document(company(), MERGED_DOCUMENT).unwrap();
+        let mut doc = company();
+        doc["subagents"]["templates"]["writer"]["reports_to"] = json!("cto");
+        doc["subagents"]["templates"]["writer"]["title"] = json!("Staff writer");
+        let moved = Settings::from_document(doc, MERGED_DOCUMENT).unwrap();
+        let was = crate::config::templates::compile_templates(&s).unwrap();
+        let now = crate::config::templates::compile_templates(&moved).unwrap();
+        assert!(now["writer"].same_composition(&was["writer"]));
+        assert_eq!(now["writer"].spec.reporting_line(), Some("cto"));
     }
 }

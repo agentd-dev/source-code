@@ -59,8 +59,12 @@ impl CompiledTemplate {
     /// template is: the same tier, prose, machinery, skills, channels and
     /// fields. Where in its document an agent stands is not its composition.
     pub fn same_composition(&self, other: &CompiledTemplate) -> bool {
+        // Nor is where it stands in the org chart: a reporting line and a
+        // title are labels, which a live child's record follows instead.
         let spec = |t: &CompiledTemplate| SubagentTemplate {
             document: None,
+            reports_to: None,
+            title: None,
             ..t.spec.clone()
         };
         self.tier == other.tier

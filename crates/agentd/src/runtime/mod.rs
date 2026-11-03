@@ -1173,6 +1173,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     }
     // The agents it defines, as composed: the team, before any is spawned.
     rt.log_document_templates(None);
+    // Who reports to whom, when the configuration draws any of it.
+    rt.log_org_chart();
 
     if let Err(errs) = rt.load_workflows() {
         for e in &errs {

@@ -1046,3 +1046,69 @@ fn a_reload_moves_an_operators_lines_without_a_restart() {
     // The new chart is said once more.
     assert_eq!(events(&log, "agent.org").len(), 2, "{log}");
 }
+
+/// A document whose `open{suffix}` workflow lists the subagents, the first
+/// version starting `cmo` as a warm flat worker first.
+#[cfg(feature = "hot-reload")]
+fn worker_reader(suffix: &str) -> String {
+    let spawn = if suffix.is_empty() {
+        "run: { kind: tool, depends_on: [s], name: subagent.run, args: { template: cmo, mode: warm } }, \
+         nap: { kind: sleep, depends_on: [run], duration: 500ms }"
+    } else {
+        "nap: { kind: sleep, depends_on: [s], duration: 100ms }"
+    };
+    format!(
+        "---\nspec: \"1\"\n---\n# The company\n\nRun it.\n\n\
+         :::workflow{{id=open{suffix} dialect=\"instruction/workflow\"}}\n\
+         name: open{suffix}\nsteps: {{ s: {{ kind: once }}, {spawn}, \
+         ls: {{ kind: tool, depends_on: [nap], name: subagent.list, args: {{}} }}, \
+         f: {{ kind: finish, depends_on: [ls], status: completed, output: \"{{{{steps.ls.output.subagents}}}}\" }} }}\n:::\n"
+    )
+}
+
+/// A live flat worker of an operator template follows a reload that moves
+/// the template's line, as an instance child does: its record, said.
+#[cfg(feature = "hot-reload")]
+#[test]
+fn a_reload_moves_a_live_workers_line() {
+    let extra = format!("{COMPANY}{KEEPALIVE}");
+    let mut d = Daemon::boot_with(&worker_reader(""), "drained", &extra);
+    d.wait_for("the first reader to finish", |d| {
+        !output_of(&d.log(), "open").is_null()
+    });
+    let log = d.log();
+    let listed = output_of(&log, "open");
+    let cmo = listed
+        .as_array()
+        .and_then(|l| l.iter().find(|s| s["template"] == "cmo"))
+        .unwrap_or_else(|| panic!("no cmo in {listed}"))
+        .clone();
+    assert_eq!(cmo["tier"], "flat", "{listed}");
+    assert_eq!(cmo["reports_to"], "parent", "{listed}");
+    let handle = cmo["handle"].as_str().unwrap().to_string();
+    let cfg = format!("{}/c.yaml", d.dir);
+    let text = std::fs::read_to_string(&cfg).unwrap().replacen(
+        "title: CMO\n      reports_to: parent",
+        "title: CMO\n      reports_to: cto",
+        1,
+    );
+    std::fs::write(&cfg, text).unwrap();
+    std::fs::write(format!("{}/team.md", d.dir), worker_reader("2")).unwrap();
+    d.sighup();
+    d.wait_for("the second reader to finish", |d| {
+        !output_of(&d.log(), "open2").is_null()
+    });
+    let log = d.log();
+    let moved = events(&log, "subagent.template.reports_to_changed");
+    assert_eq!(moved.len(), 1, "{log}");
+    assert_eq!(moved[0]["template"], "cmo", "{log}");
+    assert_eq!(moved[0]["handle"], handle.as_str(), "{log}");
+    assert_eq!(moved[0]["from"], "parent", "{log}");
+    assert_eq!(moved[0]["to"], "cto", "{log}");
+    let listed = output_of(&log, "open2");
+    let rec = listed
+        .as_array()
+        .and_then(|l| l.iter().find(|s| s["handle"] == handle.as_str()))
+        .unwrap_or_else(|| panic!("no {handle} in {listed}"));
+    assert_eq!(rec["reports_to"], "cto", "{listed}");
+}

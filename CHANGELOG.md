@@ -24,8 +24,8 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   reports_to}`), which a workflow reads with a `status` tool step; a
   template's line is on `instance.spawn`, the child's record,
   `subagent.list`, `subagent.get`, the feed's `subagent` items and the
-  TUI's subagents screen. Both fields reload: a moved template line updates
-  the live child's record without a restart
+  TUI's subagents screen. Both fields reload: a moved template line updates the
+  record of every live child of the template, instance or flat, without a restart
   (`subagent.template.reports_to_changed`), a moved peer line logs
   `a2a.peer.reports_to_changed`, and `agent.org` logs the chart at load and
   after a reload that moved it. A served document's `:::config` cannot set

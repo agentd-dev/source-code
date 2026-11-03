@@ -1135,8 +1135,8 @@ caller's, which has no `org`:
 ### Move a line
 
 Both fields reload. A reload that changes a template's `reports_to` or
-`title` changes no one's composition, so nothing restarts: a live child of
-that template keeps running, its record takes the new `reports_to`, the
+`title` changes no one's composition, so nothing restarts: every live child
+of that template, an instance child or a flat worker, keeps running, its record takes the new `reports_to`, the
 feed's `subagent` item carries it, and the parent logs
 `subagent.template.reports_to_changed` (`template`, `handle`, `from`,
 `to`). A reload that moves a peer's line logs `a2a.peer.reports_to_changed`

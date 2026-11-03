@@ -1131,6 +1131,20 @@ impl Runtime {
         old: &BTreeMap<String, CompiledTemplate>,
         new: &BTreeMap<String, CompiledTemplate>,
     ) {
+        // A live worker of a template — flat, in-process — is never
+        // recomposed, but its record follows the template's reporting line
+        // as an instance child's does.
+        let workers: Vec<(String, String)> = self
+            .subagents
+            .values()
+            .filter(|s| s.tier.as_deref() != Some("instance") && !is_terminal_status(&s.status))
+            .filter_map(|s| Some((s.handle.clone(), s.template.clone()?)))
+            .collect();
+        for (handle, tname) in workers {
+            if let Some(now) = new.get(&tname) {
+                self.follow_reports_to(&handle, &tname, now);
+            }
+        }
         let live: Vec<(String, String)> = self
             .subagents
             .values()

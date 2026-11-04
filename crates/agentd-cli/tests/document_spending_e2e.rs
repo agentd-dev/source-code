@@ -311,8 +311,10 @@ fn a_document_workflow_pays_under_its_allowance_and_not_past_it() {
     let dir = scratch();
     let first = mock("30000");
     let second = mock("30000");
+    // The workflow branches on what is left before it tries again: 0.02 is
+    // less than the 0.03 a third payment would be, so `more` is pruned.
     let steps = format!(
-        "{}{}  left: {{kind: tool, name: payment.allowances, depends_on: [b]}}\n  f: {{kind: finish, depends_on: [left], output: \"{{{{ steps.left.output }}}}\"}}\n",
+        "{}{}  left: {{kind: tool, name: payment.allowances, depends_on: [b]}}\n{}  f: {{kind: finish, depends_on: [left, more], output: \"{{{{ steps.left.output }}}}\"}}\n",
         paying("a", "s", &format!("{}/a", first.url), "data", ""),
         paying(
             "b",
@@ -320,6 +322,13 @@ fn a_document_workflow_pays_under_its_allowance_and_not_past_it() {
             &format!("{}/b", second.url),
             "data",
             ", on_error: continue"
+        ),
+        paying(
+            "more",
+            "left",
+            &format!("{}/c", second.url),
+            "data",
+            ", when: \"steps.left.output.allowances.exists(a, a.id == 'doc:data' && double(a.left) >= 0.03)\""
         ),
     );
     std::fs::write(
@@ -357,6 +366,11 @@ fn a_document_workflow_pays_under_its_allowance_and_not_past_it() {
     );
     assert_eq!(a["spent"], "0.03");
     assert_eq!(a["left"], "0.02");
+    assert!(
+        d.events("step.start").iter().all(|e| e["step"] != "more"),
+        "pruned: {}",
+        d.read()
+    );
     assert_eq!(d.exits(), Some(0));
     let authorized = audit(dir.path())
         .into_iter()

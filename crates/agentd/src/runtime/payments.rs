@@ -88,6 +88,14 @@ pub(crate) trait PaidCall: Send {
     /// which the transport puts where it carries one — and read what came
     /// back. On a thread of its own: it may take the call's timeout.
     fn send_paid(&mut self, payload: &Value, run: &str, step: &str) -> Answer;
+    /// The origin host of the resource paid for, when agentd requested it
+    /// itself and the payment request was held to it ([`PaidCall::is_resource`]):
+    /// an `http` step's URL. `None` where the resource is the server's to
+    /// name — an MCP tool, an A2A peer's task — so a document allowance's
+    /// `payees` cannot be held there (`rail-cannot-enforce: payees`).
+    fn resource_host(&self) -> Option<String> {
+        None
+    }
     /// Whether the server that asked is told that agentd will not pay: an
     /// A2A peer is, with a2a-x402's `payment-rejected`, so it ends the task
     /// that waits for the payment. HTTP and MCP have no such message: the
@@ -185,9 +193,99 @@ pub(crate) struct Pending {
     pub required: Required,
     pub call: Box<dyn PaidCall>,
     pub step_payment: StepPayment,
-    /// Who is asked: the allowance's approver, else the policy's.
+    /// The approvals still to be asked, in order; the first is the open
+    /// gate's. Every approver whose rule asks must say yes.
+    pub approvals: Vec<Approval>,
+    /// The approvals given, each with who gave it.
+    pub approved: Vec<Approval>,
+}
+
+/// The rule that asks an approver about a payment (RFC 0057 §8): a
+/// document allowance's own `approve-above` is the document's approver's;
+/// the document ceiling's `approve_above` is the ceiling's; every other
+/// trigger — an asset's `approve_above`, `approve: true`, outside text, a
+/// model's request, and an operator allowance's own tier — is the
+/// operator's (an operator allowance's approver, else
+/// `security.payments.approver`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tier {
+    Document,
+    Ceiling,
+    Operator,
+}
+
+impl Tier {
     #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    fn as_str(self) -> &'static str {
+        match self {
+            Tier::Document => "document",
+            Tier::Ceiling => "ceiling",
+            Tier::Operator => "operator",
+        }
+    }
+}
+
+/// One approver's approval: the tiers it answers for and why they ask;
+/// once given, who gave it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Approval {
     pub approver: String,
+    pub tiers: Vec<Tier>,
+    pub why: Vec<(Tier, String)>,
+    pub by: Option<String>,
+}
+
+/// The approvals `asks` (each tier with why it asks) need, `approver_of` the
+/// approver each tier names: one per approver, in the order document,
+/// ceiling, operator.
+fn group_approvals(asks: &[(Tier, String)], approver_of: &dyn Fn(Tier) -> String) -> Vec<Approval> {
+    let mut out: Vec<Approval> = Vec::new();
+    for tier in [Tier::Document, Tier::Ceiling, Tier::Operator] {
+        let why: Vec<(Tier, String)> = asks.iter().filter(|(t, _)| *t == tier).cloned().collect();
+        if why.is_empty() {
+            continue;
+        }
+        let approver = approver_of(tier);
+        match out.iter_mut().find(|a| a.approver == approver) {
+            Some(a) => {
+                a.tiers.push(tier);
+                a.why.extend(why);
+            }
+            None => out.push(Approval {
+                approver,
+                tiers: vec![tier],
+                why,
+                by: None,
+            }),
+        }
+    }
+    out
+}
+
+/// What of `needed` the approvals `given` do not cover: each tier needs a
+/// yes from the approver it names now.
+fn not_covered(needed: Vec<Approval>, given: &[Approval]) -> Vec<Approval> {
+    needed
+        .into_iter()
+        .filter_map(|mut a| {
+            let tiers: Vec<Tier> = a
+                .tiers
+                .iter()
+                .copied()
+                .filter(|t| {
+                    !given
+                        .iter()
+                        .any(|g| g.approver == a.approver && g.tiers.contains(t))
+                })
+                .collect();
+            if tiers.is_empty() {
+                return None;
+            }
+            a.why.retain(|(t, _)| tiers.contains(t));
+            a.tiers = tiers;
+            Some(a)
+        })
+        .collect()
 }
 
 /// A payment waiting for the approver.
@@ -534,7 +632,7 @@ impl Runtime {
                 return;
             }
         };
-        let host = resource_host(&required.url);
+        let host = call.resource_host();
         let chosen = {
             let held = self.spending.hold();
             let unders = unders(
@@ -573,66 +671,19 @@ impl Runtime {
                 return;
             }
         };
-        // Who is asked, and why.
-        let mut ask = Vec::new();
-        if choice.above_threshold
-            && let Some(a) = p.policy.assets.get(&choice.asset)
-            && let Some(t) = a.approve_above
-        {
-            ask.push(format!(
-                "{} is above approve_above {}",
-                a.show(choice.amount),
-                a.show(t)
-            ));
-        }
-        if choice.allowance_above
-            && let (Some(a), Some(c)) = (&allowance, choice.charge)
-            && let Some(t) = a.approve_above
-        {
-            ask.push(format!(
-                "{} is above allowance {}'s approve_above {}",
-                a.show(c),
-                a.id,
-                a.show(t)
-            ));
-        }
-        if choice.ceiling_above
-            && let (Some(a), Some(c)) = (&ceiling, choice.charge)
-            && let Some(t) = a.approve_above
-        {
-            ask.push(format!(
-                "{} is above the document ceiling {}'s approve_above {}",
-                a.show(c),
-                a.id,
-                a.show(t)
-            ));
-        }
-        if step_payment.approve {
-            ask.push("the step asks for approval of every payment (approve: true)".into());
-        }
-        if p.policy.ask_when_tainted {
-            let caller = self.step_caller(run, step);
-            let facts = self.caller_facts(&caller);
-            if facts.tainted {
-                ask.push(format!(
-                    "the run has read outside text ({})",
-                    facts.sources.join("; ")
-                ));
-            }
-            if self.model_asked(&caller) {
-                ask.push("a model asked for this run".into());
-            }
-        }
-        // The allowance's approver; when only the ceiling asks, the
-        // ceiling's; else the policy's.
-        let asks = if choice.ceiling_above && !choice.allowance_above {
-            ceiling.as_ref()
-        } else {
-            allowance.as_ref()
-        };
-        let approver = asks
-            .and_then(|a| a.approver.clone())
-            .unwrap_or_else(|| p.policy.approver.clone());
+        // Who is asked, and why: every approver whose rule asks.
+        let asks = self.asks(
+            run,
+            step,
+            &p.policy,
+            &choice,
+            &step_payment,
+            allowance.as_ref(),
+            ceiling.as_ref(),
+        );
+        let approvals = group_approvals(&asks, &|t| {
+            approver_for(t, &p.policy, allowance.as_ref(), ceiling.as_ref())
+        });
         let pending = Pending {
             run: run.to_string(),
             step: step.to_string(),
@@ -641,18 +692,106 @@ impl Runtime {
             required,
             call,
             step_payment,
-            approver,
+            approvals,
+            approved: Vec::new(),
         };
-        if ask.is_empty() {
-            self.pay(pending, None);
+        if pending.approvals.is_empty() {
+            self.pay(pending);
         } else {
-            self.ask_approver(pending, ask);
+            self.ask_approver(pending);
         }
+    }
+
+    /// Every rule that asks an approver about `choice`, with its tier and
+    /// why (RFC 0049 §4, RFC 0057 §5.1, §8).
+    #[allow(clippy::too_many_arguments)]
+    fn asks(
+        &self,
+        run: &str,
+        step: &str,
+        policy: &crate::payments::policy::Policy,
+        choice: &Choice,
+        step_payment: &StepPayment,
+        allowance: Option<&crate::spending::Allowance>,
+        ceiling: Option<&crate::spending::Allowance>,
+    ) -> Vec<(Tier, String)> {
+        let mut ask = Vec::new();
+        if choice.above_threshold
+            && let Some(a) = policy.assets.get(&choice.asset)
+            && let Some(t) = a.approve_above
+        {
+            ask.push((
+                Tier::Operator,
+                format!(
+                    "{} is above approve_above {}",
+                    a.show(choice.amount),
+                    a.show(t)
+                ),
+            ));
+        }
+        if choice.allowance_above
+            && let (Some(a), Some(c)) = (allowance, choice.charge)
+            && let Some(t) = a.approve_above
+        {
+            // A document allowance's own tier is its approver's; an
+            // operator allowance's, the operator's choice of approver.
+            let tier = if a.document.is_some() {
+                Tier::Document
+            } else {
+                Tier::Operator
+            };
+            ask.push((
+                tier,
+                format!(
+                    "{} is above allowance {}'s approve_above {}",
+                    a.show(c),
+                    a.id,
+                    a.show(t)
+                ),
+            ));
+        }
+        if choice.ceiling_above
+            && let (Some(a), Some(c)) = (ceiling, choice.charge)
+            && let Some(t) = a.approve_above
+        {
+            ask.push((
+                Tier::Ceiling,
+                format!(
+                    "{} is above the document ceiling {}'s approve_above {}",
+                    a.show(c),
+                    a.id,
+                    a.show(t)
+                ),
+            ));
+        }
+        if step_payment.approve {
+            ask.push((
+                Tier::Operator,
+                "the step asks for approval of every payment (approve: true)".into(),
+            ));
+        }
+        if policy.ask_when_tainted {
+            let caller = self.step_caller(run, step);
+            let facts = self.caller_facts(&caller);
+            if facts.tainted {
+                ask.push((
+                    Tier::Operator,
+                    format!(
+                        "the run has read outside text ({})",
+                        facts.sources.join("; ")
+                    ),
+                ));
+            }
+            if self.model_asked(&caller) {
+                ask.push((Tier::Operator, "a model asked for this run".into()));
+            }
+        }
+        ask
     }
 
     /// Reserve, record, sign and send: the ledger record and the audit
     /// record on the disk first, then a thread of its own.
-    fn pay(&mut self, pending: Pending, approved_by: Option<String>) {
+    fn pay(&mut self, pending: Pending) {
         let Pending {
             run,
             step,
@@ -661,8 +800,17 @@ impl Runtime {
             required,
             call,
             step_payment,
-            ..
+            approvals: _,
+            approved,
         } = pending;
+        // Who approved it: each approval with who gave it.
+        let approved_by = (!approved.is_empty()).then(|| {
+            approved
+                .iter()
+                .filter_map(|a| a.by.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
+        });
         let Some(p) = self.payments.clone() else {
             self.executing.remove(&format!("{run}/{step}"));
             return;
@@ -701,7 +849,7 @@ impl Runtime {
         };
         if approved_by.is_some() || allowance.is_some() {
             let now = now_ms();
-            let host = resource_host(&required.url);
+            let host = call.resource_host();
             let unders = match held.as_ref() {
                 Some(h) => unders(
                     &spending,
@@ -725,8 +873,45 @@ impl Runtime {
             };
             match again {
                 Ok(c) => {
+                    // Every tier as it is now: one a reload made ask, or
+                    // whose approver it moved, needs its approver's yes
+                    // before anything is paid (RFC 0057 §4.4, §8).
+                    let asks = self.asks(
+                        &run,
+                        &step,
+                        &p.policy,
+                        &c,
+                        &step_payment,
+                        allowance.as_ref(),
+                        ceiling.as_ref(),
+                    );
+                    let needed = not_covered(
+                        group_approvals(&asks, &|t| {
+                            approver_for(t, &p.policy, allowance.as_ref(), ceiling.as_ref())
+                        }),
+                        &approved,
+                    );
                     choice.charge = c.charge;
                     choice.ceiling = c.ceiling;
+                    choice.allowance_above = c.allowance_above;
+                    choice.ceiling_above = c.ceiling_above;
+                    choice.above_threshold = c.above_threshold;
+                    if !needed.is_empty() {
+                        drop(held);
+                        let pending = Pending {
+                            run,
+                            step,
+                            key,
+                            choice,
+                            required,
+                            call,
+                            step_payment,
+                            approvals: needed,
+                            approved,
+                        };
+                        self.ask_approver(pending);
+                        return;
+                    }
                 }
                 Err(passed) => {
                     drop(held);
@@ -969,10 +1154,17 @@ impl Runtime {
 
     /// Ask the approver about `pending`, on a task of their own; refused
     /// unsent when nobody can be asked.
-    fn ask_approver(&mut self, pending: Pending, why: Vec<String>) {
+    /// The first of `pending.approvals` is asked; the rest, one by one, as
+    /// each says yes.
+    fn ask_approver(&mut self, pending: Pending) {
+        let why: Vec<String> = pending
+            .approvals
+            .iter()
+            .flat_map(|a| a.why.iter().map(|(_, w)| w.clone()))
+            .collect();
         #[cfg(feature = "a2a")]
         if self.a2a_sink.is_some() {
-            self.open_payment_gate(pending, why);
+            self.open_payment_gate(pending);
             return;
         }
         let Pending {
@@ -997,12 +1189,17 @@ impl Runtime {
     /// The gate: a task owned by the approver, in `input-required`, agentd's
     /// words; the step suspended on it.
     #[cfg(feature = "a2a")]
-    fn open_payment_gate(&mut self, pending: Pending, why: Vec<String>) {
+    fn open_payment_gate(&mut self, pending: Pending) {
         use crate::a2a::tasks::{Link, State as TaskState};
         let Some(p) = self.payments.clone() else {
             return;
         };
-        let approver = pending.approver.clone();
+        let Some(asked) = pending.approvals.first().cloned() else {
+            return self.pay(pending);
+        };
+        let approver = asked.approver.clone();
+        let why: Vec<String> = asked.why.iter().map(|(_, w)| w.clone()).collect();
+        let tiers: Vec<&str> = asked.tiers.iter().map(|t| t.as_str()).collect();
         // A gate's id names its wait: with none, nobody can be asked.
         let id = match crate::sec::random::b64url_token(9) {
             Ok(id) => id,
@@ -1084,7 +1281,8 @@ impl Runtime {
         let t = json!({"run": run, "step": step, "workflow": wf, "task": task, "approver": approver,
                        "asset": c.asset, "amount": c.amount.to_string(), "payee": c.payee,
                        "network": c.network, "url": pending.call.shown(), "asked_because": why,
-                       "allowance": c.allowance,
+                       "allowance": c.allowance, "tiers": tiers,
+                       "approved_by": pending.approved.iter().filter_map(|a| a.by.clone()).collect::<Vec<_>>(),
                        "charge": c.charge.map(|v| crate::config::settings::payments::format_amount(v, crate::spending::SCALE))});
         self.step_log(&run, &step).info("payment.asked", t.clone());
         self.payment_audit("asked", t, None, trace.as_ref());
@@ -1129,7 +1327,7 @@ impl Runtime {
         let Some(approver) = self
             .payment_gates
             .get(id)
-            .map(|g| g.pending.approver.clone())
+            .and_then(|g| g.pending.approvals.first().map(|a| a.approver.clone()))
         else {
             return err_obj(::mcp::rpc::INVALID_PARAMS, "this approval has ended");
         };
@@ -1143,8 +1341,15 @@ impl Runtime {
         };
         let trace = g.trace.clone();
         let c = &g.pending.choice;
+        let tiers: Vec<&str> = g
+            .pending
+            .approvals
+            .first()
+            .map(|a| a.tiers.iter().map(|t| t.as_str()).collect())
+            .unwrap_or_default();
         let base = json!({"run": g.pending.run, "step": g.pending.step, "task": task, "approver": approver,
-                          "asset": c.asset, "amount": c.amount.to_string(), "payee": c.payee});
+                          "asset": c.asset, "amount": c.amount.to_string(), "payee": c.payee,
+                          "tiers": tiers});
         if !theirs {
             self.log.in_trace(trace.as_ref()).info(
                 "human.answer.not_addressed",
@@ -1174,25 +1379,11 @@ impl Runtime {
         if let Some(t) = self.tasks.get_mut(task) {
             t.record_inbound(message);
         }
-        // The approver as the allowance says now: a reload that named
-        // another, or removed the allowance, leaves the old approver's
-        // answer approving nothing (RFC 0057 §4.4).
-        let stale = g.pending.step_payment.allowance.as_deref().and_then(|aid| {
-            let now = match self.allowance_now(aid) {
-                Err(e) => return Some(e),
-                Ok(a) => a.approver.unwrap_or_else(|| {
-                    self.payments
-                        .as_ref()
-                        .map(|p| p.policy.approver.clone())
-                        .unwrap_or_default()
-                }),
-            };
-            (now != approver).then(|| {
-                format!(
-                    "allowance {aid}'s approver is now {now}, not {approver}: this answer approves nothing"
-                )
-            })
-        });
+        // The approver each tier this gate was opened for names as the
+        // settings say now: a reload that named another, or removed the
+        // allowance or the ceiling, leaves the old approver's answer
+        // approving nothing (RFC 0057 §4.4, §8).
+        let stale = self.stale_approval(&g.pending, &approver);
         let approved = decision == "approve" && stale.is_none();
         let note = match (&stale, approved) {
             (Some(why), _) => format!("declined: {why}; nothing was paid"),
@@ -1226,7 +1417,18 @@ impl Runtime {
             r.touch();
         }
         if approved {
-            self.pay(g.pending, Some(principal.id.clone()));
+            // This approver's yes is kept with who gave it; the next
+            // approver whose rule asks is asked, and only after every one
+            // said yes is the payment made (RFC 0057 §8).
+            let mut pending = g.pending;
+            let mut given = pending.approvals.remove(0);
+            given.by = Some(principal.id.clone());
+            pending.approved.push(given);
+            if pending.approvals.is_empty() {
+                self.pay(pending);
+            } else {
+                self.ask_approver(pending);
+            }
         } else {
             self.finish_step_pub(
                 &run,
@@ -1497,15 +1699,76 @@ fn unders<'a>(
         .collect()
 }
 
-/// The origin host of the resource a payment request names: what a
-/// document's allowance's payees are matched against (S29 §2).
-fn resource_host(url: &str) -> Option<String> {
+/// The approver `tier` names, as `allowance` (the step's) and `ceiling`
+/// say: a document allowance's own tier is its approver's — the principal
+/// the operator bound, else `security.payments.approver`; the ceiling's is
+/// the ceiling's; every other trigger is the operator's, which under an
+/// operator allowance is that allowance's approver (the operator chose
+/// it) and otherwise `security.payments.approver`.
+fn approver_for(
+    tier: Tier,
+    policy: &crate::payments::policy::Policy,
+    allowance: Option<&crate::spending::Allowance>,
+    ceiling: Option<&crate::spending::Allowance>,
+) -> String {
+    let named = match tier {
+        Tier::Document => allowance.and_then(|a| a.approver.clone()),
+        Tier::Ceiling => ceiling.and_then(|a| a.approver.clone()),
+        Tier::Operator => allowance
+            .filter(|a| a.document.is_none())
+            .and_then(|a| a.approver.clone()),
+    };
+    named.unwrap_or_else(|| policy.approver.clone())
+}
+
+/// The origin host of `url`, lower-cased: what a document's allowance's
+/// payees are matched against (S29 §2), for a URL agentd requested itself.
+pub(crate) fn origin_host(url: &str) -> Option<String> {
     crate::net::http::Url::parse(url)
         .ok()
         .map(|u| u.host.to_ascii_lowercase())
 }
 
 impl Runtime {
+    /// Why an answer from `approver` on the open gate of `pending` approves
+    /// nothing: a tier the gate was opened for names another approver now,
+    /// or its allowance or the ceiling is gone. `None` when it stands.
+    #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
+    fn stale_approval(&self, pending: &Pending, approver: &str) -> Option<String> {
+        let p = self.payments.as_ref()?;
+        let asked = pending.approvals.first()?;
+        let allowance = match pending
+            .step_payment
+            .allowance
+            .as_deref()
+            .map(|id| self.allowance_now(id))
+        {
+            None => None,
+            Some(Ok(a)) => Some(a),
+            Some(Err(e)) => return Some(e),
+        };
+        let ceiling = match self.ceiling_for(allowance.as_ref()) {
+            Ok(c) => c,
+            Err(e) => return Some(e),
+        };
+        asked.tiers.iter().find_map(|t| {
+            let now = approver_for(*t, &p.policy, allowance.as_ref(), ceiling.as_ref());
+            (now != approver).then(|| {
+                let whose = match (t, &allowance, &ceiling) {
+                    (Tier::Document, Some(a), _) => format!("allowance {}'s approver", a.id),
+                    (Tier::Ceiling, _, Some(c)) => {
+                        format!("the document ceiling {}'s approver", c.id)
+                    }
+                    (Tier::Operator, Some(a), _) if a.document.is_none() => {
+                        format!("allowance {}'s approver", a.id)
+                    }
+                    _ => "the approver (security.payments.approver)".to_string(),
+                };
+                format!("{whose} is now {now}, not {approver}: this answer approves nothing")
+            })
+        })
+    }
+
     /// The operator allowance a payment under `allowance` counts against
     /// too: `security.payments.document_ceiling`, for a document's
     /// allowance alone; `None` without one.

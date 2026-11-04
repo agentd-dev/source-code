@@ -1320,3 +1320,62 @@ fn a_delegation_that_may_not_pay_fails_on_a_peer_that_charges() {
     assert!(strict.seen().iter().all(|s| !s.body["method"].is_string()));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// RFC 0057 §8, review finding 2: an A2A peer names the resource it asks to
+/// be paid for, and nothing holds it to one — so an instruction document's
+/// allowance whose `payees` are domains cannot be enforced on a peer's
+/// task, and is refused `rail-cannot-enforce: payees`, however the peer
+/// names it (here the very domain the document lists). A document
+/// allowance without `payees` pays the peer, within the operator's payee
+/// list.
+#[test]
+fn a_document_allowances_payees_are_not_held_to_a_url_a_peer_names() {
+    for (payees, refused) in [("payees=\"merchant.example\"", true), ("", false)] {
+        let peer = Peer::start("10000", Merchant::Settles, false);
+        let (dir, _) = wallet("x402-a2a-doc-payees");
+        let setup = Setup {
+            peer: Some(&peer.url),
+            ..Setup::default()
+        };
+        std::fs::write(
+            format!("{dir}/doc.md"),
+            format!(
+                "---\nspec: \"1\"\n---\nYou buy reports.\n\n\
+                 ::wallet{{id=card account=ops rails=\"x402/2\"}}\n\n\
+                 :::allowance{{id=reports wallet=#card currency=USD max=0.05 budget=1 {payees}}}\nReports.\n:::\n\n\
+                 :::workflow{{id=buy dialect=\"instruction/workflow\"}}\n\
+                 name: buy\nsteps:\n  s: {{kind: once}}\n  \
+                 pay: {{kind: a2a.delegate, depends_on: [s], peer: merchant, objective: \"the report, please\", timeout: 20s, payment: {{allowance: reports}}}}\n  \
+                 f: {{kind: finish, depends_on: [pay], status: completed}}\n:::\n"
+            ),
+        )
+        .unwrap();
+        let cfg = config(&dir, &setup, "")
+            .replace(
+                "agent:\n  name: payer\n",
+                &format!(
+                    "agent:\n  name: payer\n  instruction: {dir}/doc.md\n  document_capabilities: [spending]\n"
+                ),
+            )
+            .replace(
+                "        decimals: 6\n",
+                "        decimals: 6\n        currency: USD\n",
+            )
+            .replace("workflows:\n", "");
+        let (code, log) = life("x402-a2a-doc-payees", &cfg);
+        assert!(code.is_some(), "{log}");
+        let e = step_done(&log, "pay");
+        if refused {
+            let err = e["err"].as_str().unwrap_or_default();
+            assert!(
+                err.contains("allowance doc:reports: rail-cannot-enforce: payees"),
+                "{e}"
+            );
+            assert!(peer.payments().is_empty(), "nothing was sent to pay");
+        } else {
+            assert_eq!(e["status"], "done", "{log}");
+            assert_eq!(peer.payments().len(), 1, "{log}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -608,6 +608,12 @@ impl super::payments::PaidCall for Request {
         crate::payments::x402::same_resource(&self.full_url(), url)
     }
 
+    /// The host of the URL this step requested: the payment request is held
+    /// to it ([`Self::is_resource`]).
+    fn resource_host(&self) -> Option<String> {
+        super::payments::origin_host(&self.full_url())
+    }
+
     fn shown(&self) -> String {
         crate::config::settings::url_locator(&self.full_url())
     }

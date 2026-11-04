@@ -313,19 +313,24 @@ pub fn judge(
         why.push(format!("{at}: payee {payee} is not one of its payees"));
     }
     // A document's payees narrow the operator's: the resource's origin host
-    // must be one of them, beside the operator's payee list.
-    if let Some(hosts) = a.document.as_ref().and_then(|d| d.hosts.as_ref())
-        && !host.is_some_and(|h| hosts.iter().any(|x| x.eq_ignore_ascii_case(h)))
-    {
-        why.push(format!(
-            "{at}: payee {} is not one of its payees ({})",
-            host.unwrap_or("with no resource"),
-            if hosts.is_empty() {
-                "none".to_string()
-            } else {
-                hosts.join(", ")
-            }
-        ));
+    // must be one of them, beside the operator's payee list. Only a host
+    // agentd requested itself is one: where the server names the resource
+    // (an MCP tool, an A2A peer's task), the list cannot be held.
+    if let Some(hosts) = a.document.as_ref().and_then(|d| d.hosts.as_ref()) {
+        let listed = if hosts.is_empty() {
+            "none".to_string()
+        } else {
+            hosts.join(", ")
+        };
+        match host {
+            None => why.push(format!(
+                "{at}: rail-cannot-enforce: payees — this payment is not for a URL agentd requested itself, so whose host it is cannot be held to the document's payees ({listed})"
+            )),
+            Some(h) if !hosts.iter().any(|x| x.eq_ignore_ascii_case(h)) => why.push(format!(
+                "{at}: payee {h} is not one of its payees ({listed})"
+            )),
+            Some(_) => {}
+        }
     }
     if charge > a.max {
         why.push(format!(
@@ -1019,7 +1024,7 @@ mod tests {
         );
         assert!(
             why(judge(&a, "weather", None, gbp("20"), none, now))
-                .contains("payee with no resource")
+                .contains("rail-cannot-enforce: payees")
         );
         assert!(
             why(judge(&a, "weather", Some("shop.example.com"), gbp("61"), none, now)).contains(

@@ -274,10 +274,20 @@ impl Runtime {
         let wf = self
             .definition_for_run(run_id)
             .ok_or("payment: the run's definition is gone")?;
-        if !wf.configured || wf.document {
+        if !wf.configured {
             return Err(crate::config::settings::payments::not_configured(
                 &wf.name, step_id,
             ));
+        }
+        // A document's workflow pays only under one of the document's own
+        // allowances, which the `spending` grant alone gives it (RFC 0057
+        // §8); which one its step names is held to that when it is paid.
+        if wf.document
+            && !crate::config::settings::payments::document_may_pay(
+                &self.settings.security.payments,
+            )
+        {
+            return Err(crate::config::settings::payments::document_pays(&wf.name));
         }
         let key = crate::engine::run::idempotency_key(run_id, step_id);
         if let Some(r) = p.ledger().blocking(&key) {
@@ -479,8 +489,9 @@ impl Runtime {
         let Some(p) = self.payments.clone() else {
             return;
         };
-        let field = self
-            .definition_for_run(run)
+        let wf = self.definition_for_run(run);
+        let document = wf.as_ref().is_some_and(|w| w.document);
+        let field = wf
             .and_then(|wf| {
                 self.runs
                     .get(run)
@@ -491,6 +502,7 @@ impl Runtime {
         let step_payment = match crate::config::settings::payments::step_payment(
             &self.settings.security.payments,
             &field,
+            document,
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -514,17 +526,33 @@ impl Runtime {
                 return;
             }
         };
-        let usage = allowance
-            .as_ref()
-            .map(|a| self.spending.usage(&self.spending.hold(), a, now, None));
+        // A document's allowance counts against the operator's ceiling too.
+        let ceiling = match self.ceiling_for(allowance.as_ref()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.payment_refused(run, step, Some(first), e, target, Some(call));
+                return;
+            }
+        };
+        let host = resource_host(&required.url);
         let chosen = {
+            let held = self.spending.hold();
+            let unders = unders(
+                &self.spending,
+                &held,
+                allowance.as_ref(),
+                ceiling.as_ref(),
+                host.as_deref(),
+                now,
+            );
+            drop(held);
             let ledger = p.ledger();
             crate::payments::policy::choose(
                 &p.policy,
                 &step_payment,
                 &required.accepts,
                 &|asset, payee| ledger.spent(asset, run, payee, now),
-                under(allowance.as_ref(), usage, now),
+                &unders,
             )
         };
         let choice = match chosen {
@@ -568,6 +596,17 @@ impl Runtime {
                 a.show(t)
             ));
         }
+        if choice.ceiling_above
+            && let (Some(a), Some(c)) = (&ceiling, choice.charge)
+            && let Some(t) = a.approve_above
+        {
+            ask.push(format!(
+                "{} is above the document ceiling {}'s approve_above {}",
+                a.show(c),
+                a.id,
+                a.show(t)
+            ));
+        }
         if step_payment.approve {
             ask.push("the step asks for approval of every payment (approve: true)".into());
         }
@@ -584,8 +623,14 @@ impl Runtime {
                 ask.push("a model asked for this run".into());
             }
         }
-        let approver = allowance
-            .as_ref()
+        // The allowance's approver; when only the ceiling asks, the
+        // ceiling's; else the policy's.
+        let asks = if choice.ceiling_above && !choice.allowance_above {
+            ceiling.as_ref()
+        } else {
+            allowance.as_ref()
+        };
+        let approver = asks
             .and_then(|a| a.approver.clone())
             .unwrap_or_else(|| p.policy.approver.clone());
         let pending = Pending {
@@ -645,12 +690,29 @@ impl Runtime {
         };
         // The policy again, now: an approval does not outlast a cap another
         // payment reached while it was asked.
+        let ceiling = match self.ceiling_for(allowance.as_ref()) {
+            Ok(c) => c,
+            Err(e) => {
+                drop(held);
+                let why = format!("payment refused unsent: {e}");
+                self.payment_refused(&run, &step, None, why, target, Some(call));
+                return;
+            }
+        };
         if approved_by.is_some() || allowance.is_some() {
             let now = now_ms();
-            let usage = allowance
-                .as_ref()
-                .zip(held.as_ref())
-                .map(|(a, h)| spending.usage(h, a, now, None));
+            let host = resource_host(&required.url);
+            let unders = match held.as_ref() {
+                Some(h) => unders(
+                    &spending,
+                    h,
+                    allowance.as_ref(),
+                    ceiling.as_ref(),
+                    host.as_deref(),
+                    now,
+                ),
+                None => Vec::new(),
+            };
             let again = {
                 let ledger = p.ledger();
                 crate::payments::policy::choose(
@@ -658,11 +720,14 @@ impl Runtime {
                     &step_payment,
                     std::slice::from_ref(&choice.entry),
                     &|asset, payee| ledger.spent(asset, &run, payee, now),
-                    under(allowance.as_ref(), usage, now),
+                    &unders,
                 )
             };
             match again {
-                Ok(c) => choice.charge = c.charge,
+                Ok(c) => {
+                    choice.charge = c.charge;
+                    choice.ceiling = c.ceiling;
+                }
                 Err(passed) => {
                     drop(held);
                     let why = format!(
@@ -739,6 +804,7 @@ impl Runtime {
                 crate::config::settings::payments::format_amount(c, crate::spending::SCALE)
             }),
             currency: allowance.as_ref().map(|a| a.currency.clone()),
+            ceiling: choice.ceiling.clone(),
         };
         let mut t = record_target(&record);
         // Kept apart: a refusal reads the ledger again.
@@ -1328,11 +1394,14 @@ impl Runtime {
                 .map(|(id, _)| id.clone())
                 .collect();
             let allowances = self.allowances();
+            // Kept while the period of its allowance, or of the ceiling it
+            // counts against too, still counts it.
             let kept = |r: &Record| {
-                r.allowance
-                    .as_ref()
-                    .and_then(|id| allowances.get(id))
-                    .is_some_and(|a| a.holds(r.at_ms, now))
+                [&r.allowance, &r.ceiling].into_iter().any(|id| {
+                    id.as_ref()
+                        .and_then(|id| allowances.get(id))
+                        .is_some_and(|a| a.holds(r.at_ms, now))
+                })
             };
             if let Some(p) = &self.payments {
                 let n = p
@@ -1405,18 +1474,53 @@ impl Runtime {
     }
 }
 
-/// The allowance a step draws on, with what counts against it, as the
-/// policy reads it.
-fn under(
-    allowance: Option<&crate::spending::Allowance>,
-    usage: Option<crate::spending::Usage>,
+/// The allowance a step draws on and, for a document's, the operator's
+/// ceiling after it — each with what counts against it, `held` the
+/// spending ledger's charges — as the policy reads them.
+fn unders<'a>(
+    spending: &crate::spending::Spending,
+    held: &crate::spending::Charges,
+    allowance: Option<&'a crate::spending::Allowance>,
+    ceiling: Option<&'a crate::spending::Allowance>,
+    host: Option<&'a str>,
     now_ms: u64,
-) -> Option<crate::payments::policy::Under<'_>> {
-    allowance.map(|a| crate::payments::policy::Under {
-        allowance: a,
-        usage: usage.unwrap_or_default(),
-        now_ms,
-    })
+) -> Vec<crate::payments::policy::Under<'a>> {
+    allowance
+        .into_iter()
+        .chain(ceiling)
+        .map(|a| crate::payments::policy::Under {
+            allowance: a,
+            usage: spending.usage(held, a, now_ms, None),
+            now_ms,
+            host,
+        })
+        .collect()
+}
+
+/// The origin host of the resource a payment request names: what a
+/// document's allowance's payees are matched against (S29 §2).
+fn resource_host(url: &str) -> Option<String> {
+    crate::net::http::Url::parse(url)
+        .ok()
+        .map(|u| u.host.to_ascii_lowercase())
+}
+
+impl Runtime {
+    /// The operator allowance a payment under `allowance` counts against
+    /// too: `security.payments.document_ceiling`, for a document's
+    /// allowance alone; `None` without one.
+    fn ceiling_for(
+        &self,
+        allowance: Option<&crate::spending::Allowance>,
+    ) -> Result<Option<crate::spending::Allowance>, String> {
+        match (
+            allowance.filter(|a| a.document.is_some()),
+            &self.settings.security.payments.document_ceiling,
+        ) {
+            (Some(_), Some(id)) => self.allowance_now(id).map(Some),
+            _ => Ok(None),
+        }
+    }
 }
 
 /// Why a request with this record is never paid again.
@@ -1438,14 +1542,18 @@ fn never_twice(r: &Record) -> String {
 
 /// What every record of a payment names.
 fn record_target(r: &Record) -> Value {
-    json!({"request": r.request, "attempt": r.attempt, "run": r.run, "step": r.step,
+    let mut v = json!({"request": r.request, "attempt": r.attempt, "run": r.run, "step": r.step,
            "workflow": r.workflow, "wallet": r.wallet, "network": r.network, "asset": r.asset,
            "asset_id": r.asset_id, "payee": r.payee, "pay_to": r.pay_to, "amount": r.amount,
            "nonce": r.nonce, "valid_before": r.valid_before, "url": r.url, "state": r.state.as_str(),
            "transaction": r.transaction, "payer": r.payer, "error_reason": r.error_reason,
            "approved_by": r.approved_by, "allowance": r.allowance, "charge": r.charge,
            "currency": r.currency,
-           "tier": if r.approved_by.is_some() { "approved" } else { "auto" }})
+           "tier": if r.approved_by.is_some() { "approved" } else { "auto" }});
+    if let Some(c) = &r.ceiling {
+        v["ceiling"] = json!(c);
+    }
+    v
 }
 
 /// What the approver reads: agentd's words, the server's quoted.

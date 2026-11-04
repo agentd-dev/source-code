@@ -177,6 +177,11 @@ pub struct Choice {
     pub charge: Option<u128>,
     /// Above the allowance's `approve_above`.
     pub allowance_above: bool,
+    /// The operator allowance a document's allowance's payment counts
+    /// against too (`security.payments.document_ceiling`), and whether it
+    /// is above that one's `approve_above`.
+    pub ceiling: Option<String>,
+    pub ceiling_above: bool,
 }
 
 /// An entry passed over, and every reason.
@@ -199,18 +204,22 @@ pub struct Under<'a> {
     pub allowance: &'a crate::spending::Allowance,
     pub usage: crate::spending::Usage,
     pub now_ms: u64,
+    /// The origin host of the resource paid for: what a document's
+    /// allowance's payees are matched against.
+    pub host: Option<&'a str>,
 }
 
 /// The first entry of `accepts` the step and the policy allow, or why each
 /// was passed over. `spent` is what the ledger counts for an asset and a
-/// payee; `under`, the allowance the step draws on, whose checks every
-/// entry is held to as well.
+/// payee; `under`, the allowance the step draws on and, for a document's,
+/// the operator's ceiling after it (RFC 0057 §8): every entry is held to
+/// each of them as well.
 pub fn choose(
     policy: &Policy,
     step: &StepPayment,
     accepts: &[Value],
     spent: &dyn Fn(&str, &Account) -> Spent,
-    under: Option<Under<'_>>,
+    under: &[Under<'_>],
 ) -> Result<Choice, Vec<Passed>> {
     let mut passed = Vec::new();
     for (index, v) in accepts.iter().enumerate() {
@@ -228,7 +237,7 @@ fn one(
     index: usize,
     v: &Value,
     spent: &dyn Fn(&str, &Account) -> Spent,
-    under: Option<Under<'_>>,
+    under: &[Under<'_>],
 ) -> Result<Choice, Vec<String>> {
     let e = Entry::parse(v).map_err(|e| vec![format!("malformed: {e}")])?;
     let mut why = Vec::new();
@@ -401,7 +410,8 @@ fn one(
     // The allowance: it narrows, never widens (RFC 0057 §4.1).
     let mut charge = None;
     let mut allowance_above = false;
-    if let Some(u) = under {
+    let mut ceiling_above = false;
+    for (i, u) in under.iter().enumerate() {
         let al = u.allowance;
         let at = format!("allowance {}", al.id);
         if let Some(l) = &al.wallets
@@ -425,10 +435,14 @@ fn one(
                 Some(_) => match crate::spending::to_currency(amount, a.decimals) {
                     None => why.push(format!("{at}: {} is past what it can count", a.show(amount))),
                     Some(c) => {
-                        charge = Some(c);
+                        if i == 0 {
+                            charge = Some(c);
+                        }
                         if let Some(p) = payee {
-                            match crate::spending::judge(al, &p.name, c, u.usage, u.now_ms) {
-                                Ok(above) => allowance_above = above,
+                            match crate::spending::judge(al, &p.name, u.host, c, u.usage, u.now_ms)
+                            {
+                                Ok(above) if i == 0 => allowance_above = above,
+                                Ok(above) => ceiling_above |= above,
                                 Err(reasons) => why.extend(reasons),
                             }
                         }
@@ -456,9 +470,11 @@ fn one(
         terms,
         max_timeout: e.max_timeout,
         above_threshold: a.approve_above.is_some_and(|t| amount > t),
-        allowance: under.map(|u| u.allowance.id.clone()),
+        allowance: under.first().map(|u| u.allowance.id.clone()),
         charge,
         allowance_above,
+        ceiling: under.get(1).map(|u| u.allowance.id.clone()),
+        ceiling_above,
     })
 }
 
@@ -510,7 +526,7 @@ pub(crate) mod tests {
     /// above `approve_above` it says so.
     #[test]
     fn an_entry_within_the_policy_is_chosen() {
-        let c = choose(&policy(), &step("0.10"), &[entry("40000")], &none, None).unwrap();
+        let c = choose(&policy(), &step("0.10"), &[entry("40000")], &none, &[]).unwrap();
         assert_eq!(c.amount, 40_000);
         assert!(matches!(c.token, Token::Evm { chain_id: 8453, .. }));
         assert_eq!(c.payee, "weather");
@@ -522,7 +538,7 @@ pub(crate) mod tests {
             }
         );
         assert!(!c.above_threshold);
-        let c = choose(&policy(), &step("0.10"), &[entry("60000")], &none, None).unwrap();
+        let c = choose(&policy(), &step("0.10"), &[entry("60000")], &none, &[]).unwrap();
         assert!(c.above_threshold, "0.06 is above 0.05");
     }
 
@@ -537,7 +553,7 @@ pub(crate) mod tests {
             &step("0.10"),
             &[other, entry("2000")],
             &none,
-            None,
+            &[],
         )
         .unwrap();
         assert_eq!(r.index, 1);
@@ -548,7 +564,7 @@ pub(crate) mod tests {
     fn every_reason_is_named() {
         let p = policy();
         let refused = |e: Value, s: &StepPayment, spent: &dyn Fn(&str, &Account) -> Spent| {
-            let r = choose(&p, s, &[e], spent, None).unwrap_err();
+            let r = choose(&p, s, &[e], spent, &[]).unwrap_err();
             r[0].reasons.join("; ")
         };
         let with = |f: &dyn Fn(&mut Value)| {
@@ -629,12 +645,12 @@ pub(crate) mod tests {
             run: 150_000,
             ..Spent::default()
         };
-        assert!(choose(&p, &s, &[entry("100000")], &at, None).is_ok());
+        assert!(choose(&p, &s, &[entry("100000")], &at, &[]).is_ok());
         // A payee held to other assets.
         let mut held = policy();
         held.payees.get_mut("weather").unwrap().assets = Some(vec!["eurc".into()]);
         assert!(
-            choose(&held, &s, &[entry("1000")], &none, None).unwrap_err()[0].reasons[0]
+            choose(&held, &s, &[entry("1000")], &none, &[]).unwrap_err()[0].reasons[0]
                 .contains("not to be paid in")
         );
     }
@@ -671,8 +687,9 @@ pub(crate) mod tests {
                 allowance: al,
                 usage: u,
                 now_ms: now,
+                host: None,
             };
-            choose(p, &s, &[e], &none, Some(under)).unwrap_err()[0]
+            choose(p, &s, &[e], &none, &[under]).unwrap_err()[0]
                 .reasons
                 .join("; ")
         };
@@ -686,22 +703,37 @@ pub(crate) mod tests {
                 .contains("asset usdc-base is EUR, the allowance USD")
         );
         p.assets.get_mut("usdc-base").unwrap().currency = Some("USD".into());
-        fn under(al: &Allowance, usage: Usage, now_ms: u64) -> Option<Under<'_>> {
-            Some(Under {
+        fn under(al: &Allowance, usage: Usage, now_ms: u64) -> [Under<'_>; 1] {
+            [Under {
                 allowance: al,
                 usage,
                 now_ms,
-            })
+                host: None,
+            }]
         }
         // Within it: the charge in dollars, and the tiers apart.
-        let c = choose(&p, &s, &[entry("20000")], &none, under(&al, none_used, now)).unwrap();
+        let c = choose(
+            &p,
+            &s,
+            &[entry("20000")],
+            &none,
+            &under(&al, none_used, now),
+        )
+        .unwrap();
         assert_eq!(c.allowance.as_deref(), Some("api"));
         assert_eq!(
             c.charge,
             Some(crate::spending::to_currency(20_000, 6).unwrap())
         );
         assert!(!c.allowance_above && !c.above_threshold);
-        let c = choose(&p, &s, &[entry("40000")], &none, under(&al, none_used, now)).unwrap();
+        let c = choose(
+            &p,
+            &s,
+            &[entry("40000")],
+            &none,
+            &under(&al, none_used, now),
+        )
+        .unwrap();
         assert!(c.allowance_above, "0.04 is above the allowance's 0.03");
         assert!(!c.above_threshold, "and not above the asset's 0.05");
         let spent = Usage {

@@ -1434,7 +1434,7 @@ impl Supervisor {
                 self.spending
                     .usage(&held, &allowance, now, Some((&company.name, id)))
             };
-            match crate::spending::judge(&allowance, &company.name, a, usage, now) {
+            match crate::spending::judge(&allowance, &company.name, None, a, usage, now) {
                 Ok(over) => above = over,
                 Err(why) => return Ok(Prepared::Refused(why.join("; "))),
             }

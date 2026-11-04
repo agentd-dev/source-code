@@ -1,0 +1,274 @@
+{
+  "about": "agentd's source-level cases for S29 (wallet, allowance), written against RFC-0041 \u00a73.2 and \u00a710.2 as drafted 2026-11-03. Each case is a source and the verdict agentd expects; the vectors themselves are the reference implementation's output. Diagnostic codes other than reference-missing and allowance-widened are agentd's proposals. Spelled in the first edition: `extends` is a list of `{uri, as}` records, and a `${parameter}` attribute value is quoted. An extending document's allowance with an inherited id narrows that one in its place (compared as a `replace` patch).",
+  "cases": [
+    {
+      "name": "valid/minimal",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/two-wallets",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=\"#card,#credits\" currency=GBP max=120 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/currency-usd",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=USD max=120 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/max-decimal",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=119.99 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/max-equals-budget",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=400 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/per-day",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=day}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/per-week",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=week}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/per-month",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/per-quarter",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=quarter}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/per-year",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=year}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/per-once",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=once}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/per-omitted",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/times",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month times=10}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/payees-domains",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month payees=\"tesco.com,ocado.com\"}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/payees-service-ref",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month payees=\"&shop\"}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/payees-mixed",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month payees=\"tesco.com,&shop\"}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/payees-omitted",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/categories",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month categories=\"groceries,household\"}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/window",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month from=2026-11-01T00:00:00Z until=2026-12-01T00:00:00Z}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/from-only",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month from=2026-11-01T00:00:00Z}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/approve-above",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/approve-above-equals-max",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=120 approver=#nataliia}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/approver-role",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=owner}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "valid/parameter-amount",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=\"${grocery_max}\" budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics for the allowance"
+    },
+    {
+      "name": "invalid/max-over-budget",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=500 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-max-over-budget"
+    },
+    {
+      "name": "invalid/approve-above-over-max",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=150 approver=#nataliia}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-approve-above-over-max"
+    },
+    {
+      "name": "invalid/per-unknown",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=fortnight}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-per-unknown"
+    },
+    {
+      "name": "invalid/currency-lowercase",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=gbp max=120 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-currency-invalid"
+    },
+    {
+      "name": "invalid/currency-not-iso",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=POUNDS max=120 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-currency-invalid"
+    },
+    {
+      "name": "invalid/wallet-missing",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#nocard currency=GBP max=120 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "reference-missing"
+    },
+    {
+      "name": "invalid/approver-missing",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nobody}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "reference-missing"
+    },
+    {
+      "name": "invalid/payees-unparsable",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month payees=\"tesco.com,,\"}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-payees-invalid"
+    },
+    {
+      "name": "invalid/payees-service-missing",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month payees=\"&noshop\"}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "reference-missing"
+    },
+    {
+      "name": "invalid/window-inverted",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month from=2026-12-01T00:00:00Z until=2026-11-01T00:00:00Z}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-window-inverted"
+    },
+    {
+      "name": "invalid/amount-negative",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=-5 budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-amount-invalid"
+    },
+    {
+      "name": "invalid/approver-is-the-agent",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::agent{id=helper title=\"Helper\" protocol=a2a src=\"https://example.org/.well-known/agent-card.json\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#helper}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-approver-not-person"
+    },
+    {
+      "name": "inherit/narrowed",
+      "sources": {
+        "https://example.org/instructions/org-policy": "---\nspec: \"1\"\nid: https://example.org/instructions/org-policy\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Org policy\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nOrg ceiling.\n:::\n"
+      },
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nextends:\n  - { uri: https://example.org/instructions/org-policy, as: base }\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=100 budget=300 per=month approve-above=40 approver=#nataliia}\nNarrowed.\n:::\n",
+      "expect": "no diagnostics (every number lowered)"
+    },
+    {
+      "name": "inherit/widened-max",
+      "sources": {
+        "https://example.org/instructions/org-policy": "---\nspec: \"1\"\nid: https://example.org/instructions/org-policy\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Org policy\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nOrg ceiling.\n:::\n"
+      },
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nextends:\n  - { uri: https://example.org/instructions/org-policy, as: base }\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=150 budget=400 per=month approve-above=60 approver=#nataliia}\nNarrowed.\n:::\n",
+      "expect": "allowance-widened (max raised)"
+    },
+    {
+      "name": "inherit/widened-approve-above",
+      "sources": {
+        "https://example.org/instructions/org-policy": "---\nspec: \"1\"\nid: https://example.org/instructions/org-policy\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Org policy\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nOrg ceiling.\n:::\n"
+      },
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nextends:\n  - { uri: https://example.org/instructions/org-policy, as: base }\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=100 approver=#nataliia}\nNarrowed.\n:::\n",
+      "expect": "allowance-widened (approve-above raised: more pays without asking)"
+    },
+    {
+      "name": "inherit/widened-payees-dropped",
+      "sources": {
+        "https://example.org/instructions/org-policy": "---\nspec: \"1\"\nid: https://example.org/instructions/org-policy\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Org policy\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month payees=\"tesco.com\" approve-above=60 approver=#nataliia}\nOrg ceiling.\n:::\n"
+      },
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nextends:\n  - { uri: https://example.org/instructions/org-policy, as: base }\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nNarrowed.\n:::\n",
+      "expect": "allowance-widened (the payee list removed = any payee)"
+    },
+    {
+      "name": "valid/window-dates",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month from=2026-11-01 until=2027-02-28}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics; whole days: from 2026-11-01T00:00:00Z, through the end of 2027-02-28 (before 2027-03-01T00:00:00Z), UTC unless the host states a zone"
+    },
+    {
+      "name": "valid/max-omitted",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP budget=400 per=month}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics; one payment is limited by the budget alone"
+    },
+    {
+      "name": "valid/approve-above-zero",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=0 approver=#nataliia}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no diagnostics; every payment asks"
+    },
+    {
+      "name": "invalid/unbounded",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "allowance-unbounded"
+    },
+    {
+      "name": "valid/approve-above-without-approver",
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60}\nThe weekly shop and household basics.\n:::\n",
+      "expect": "no reader diagnostic; the host's own approver answers above approve-above (a host with none refuses those payments)"
+    },
+    {
+      "name": "inherit/widened-per",
+      "sources": {
+        "https://example.org/instructions/org-policy": "---\nspec: \"1\"\nid: https://example.org/instructions/org-policy\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Org policy\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nOrg ceiling.\n:::\n"
+      },
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nextends:\n  - { uri: https://example.org/instructions/org-policy, as: base }\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=year approve-above=60 approver=#nataliia}\nNarrowed.\n:::\n",
+      "expect": "allowance-widened (per changed: month \u2192 year with the same budget is 12x the spend; see review point 3)"
+    },
+    {
+      "name": "inherit/widened-currency",
+      "sources": {
+        "https://example.org/instructions/org-policy": "---\nspec: \"1\"\nid: https://example.org/instructions/org-policy\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Org policy\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nOrg ceiling.\n:::\n"
+      },
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nextends:\n  - { uri: https://example.org/instructions/org-policy, as: base }\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=USD max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nNarrowed.\n:::\n",
+      "expect": "allowance-widened (currency changed: limits no longer comparable)"
+    },
+    {
+      "name": "inherit/widened-wallet-added",
+      "sources": {
+        "https://example.org/instructions/org-policy": "---\nspec: \"1\"\nid: https://example.org/instructions/org-policy\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Org policy\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nOrg ceiling.\n:::\n"
+      },
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nextends:\n  - { uri: https://example.org/instructions/org-policy, as: base }\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=\"#card,#credits\" currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nNarrowed.\n:::\n",
+      "expect": "allowance-widened (a wallet added)"
+    },
+    {
+      "name": "inherit/widened-approver-replaced",
+      "sources": {
+        "https://example.org/instructions/org-policy": "---\nspec: \"1\"\nid: https://example.org/instructions/org-policy\ntitle: Household\nversion: \"2026-11-04\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Org policy\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=#nataliia}\nOrg ceiling.\n:::\n"
+      },
+      "source": "---\nspec: \"1\"\nid: https://example.org/instructions/household\ntitle: Household\nversion: \"2026-11-04\"\nextends:\n  - { uri: https://example.org/instructions/org-policy, as: base }\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\n# Household\n\n::person{id=nataliia title=\"Nataliia\" role=owner account=personal}\n\n::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n::wallet{id=credits title=\"API credits\" account=ops rails=\"x402/2\"}\n\n::service{id=shop title=\"Shop\" src=\"https://shop.example.com\"}\n\n:::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=120 budget=400 per=month approve-above=60 approver=owner}\nNarrowed.\n:::\n",
+      "expect": "allowance-widened (the approver replaced, not added; see review point 4)"
+    }
+  ]
+}

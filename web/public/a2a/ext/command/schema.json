@@ -2919,6 +2919,10 @@
                   "currency": {
                     "type": "string"
                   },
+                  "document": {
+                    "description": "a document's allowance: the document's URI",
+                    "type": "string"
+                  },
                   "id": {
                     "type": "string"
                   },
@@ -2953,6 +2957,13 @@
                     "type": [
                       "string",
                       "null"
+                    ]
+                  },
+                  "source": {
+                    "description": "the operator's security.payments.allowances, or an instruction document's own allowance (doc:<id>, RFC 0057 §8)",
+                    "enum": [
+                      "operator",
+                      "document"
                     ]
                   },
                   "spent": {

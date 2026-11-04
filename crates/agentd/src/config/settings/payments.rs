@@ -64,8 +64,39 @@ pub struct Payments {
     pub rpc: BTreeMap<String, String>,
     /// What agentd may spend, on what, over what period, and who approves
     /// (RFC 0057), by id. Reloadable: the rest of `security.payments` is
-    /// restart-only.
+    /// restart-only. An instruction document's own allowances join them
+    /// under the `spending` grant as `doc:<id>` ([`document_allowances`]),
+    /// derived at every load, never written here.
     pub allowances: BTreeMap<String, Allowance>,
+    /// Who answers for a person or a role an instruction document's
+    /// allowance names as its `approver` (RFC 0057 §8): its id, without the
+    /// `#`, to `operator` or one principal id. Reloadable.
+    pub approvers: BTreeMap<String, String>,
+    /// An operator allowance every payment under a document's allowance
+    /// also counts against and must pass: the cap on all document spending
+    /// together (RFC 0057 §8). Unset, the asset caps are the ceiling.
+    /// Reloadable.
+    pub document_ceiling: Option<String>,
+}
+
+/// Where a `doc:<id>` allowance came from, and what of it the operator's
+/// fields cannot say — DERIVED from the instruction document at load, never
+/// a config key (RFC 0057 §8).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DocumentOrigin {
+    /// The document's URI: its path, URL, `oci:` reference or registry
+    /// resource.
+    pub uri: String,
+    /// The allowance's id in the document.
+    pub id: String,
+    pub line: usize,
+    /// Its `payees`, each the origin host a paid resource must have (a
+    /// domain as written, an `&service`'s `src` host); `None`, every payee
+    /// the operator allows.
+    pub hosts: Option<Vec<String>>,
+    /// Its `approver`, when the operator bound none to it
+    /// (`security.payments.approvers`): it pays only up to `approve-above`.
+    pub approver_unbound: Option<String>,
 }
 
 /// `security.payments.allowances.<id>` (RFC 0057 §3): every amount a
@@ -100,6 +131,10 @@ pub struct Allowance {
     pub approve_above: Option<String>,
     /// `operator` or a principal id; default `security.payments.approver`.
     pub approver: Option<String>,
+    /// An instruction document's allowance: where it came from. Never read
+    /// from the configuration.
+    #[serde(skip)]
+    pub document: Option<DocumentOrigin>,
 }
 
 /// `security.payments.signer`.
@@ -459,6 +494,34 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
     if let Some(e) = approver_refusal("security.payments.approver", p.approver()) {
         err(e);
     }
+    // The people and roles a document's allowance may name as its approver,
+    // bound to whoever answers for them — a person, never an agent.
+    for (name, principal) in &p.approvers {
+        let at = format!("security.payments.approvers.{name}");
+        if name.is_empty() || name.starts_with('#') {
+            err(format!(
+                "{at}: an approver is bound by the id a document's allowance names, without the `#`"
+            ));
+        }
+        if let Some(e) = approver_refusal(&at, principal) {
+            err(e);
+        } else if principal.starts_with("agent:") {
+            err(format!(
+                "{at}: {principal:?} is an agent, and an agent never approves a payment (S29 §2) — bind a person"
+            ));
+        }
+    }
+    if let Some(c) = &p.document_ceiling {
+        match p.allowances.get(c) {
+            None => err(format!(
+                "security.payments.document_ceiling: {c:?} is not a security.payments.allowances entry"
+            )),
+            Some(a) if a.document.is_some() => err(format!(
+                "security.payments.document_ceiling: {c:?} is an instruction document's own allowance; the ceiling is the operator's"
+            )),
+            Some(_) => {}
+        }
+    }
     if let Some(t) = p.approval_timeout
         && (t.0 < std::time::Duration::from_secs(1)
             || t.0 > std::time::Duration::from_secs(7 * 86400))
@@ -702,7 +765,7 @@ fn validate_allowances(s: &Settings, d: &mut Diagnostics) {
     for (id, a) in &p.allowances {
         let at = format!("security.payments.allowances.{id}");
         let mut err = |m: String| d.errors.push(m);
-        if !is_name(id) {
+        if a.document.is_none() && !is_name(id) {
             err(format!(
                 "{at}: an allowance's id is 1 to 32 of a-z, 0-9, - and _"
             ));
@@ -820,11 +883,279 @@ pub fn not_configured(workflow: &str, step: &str) -> String {
     )
 }
 
-/// The refusal of an instruction document's workflow that would pay.
+/// The refusal of an instruction document's workflow that would pay with no
+/// allowance of its own to pay under.
 pub fn document_pays(workflow: &str) -> String {
     format!(
-        "workflow {workflow:?}: an instruction document's workflow has a step with a payment — a served document configures no payment (RFC 0042; RFC 0049 D2), only the operator's own configuration declares a paying step"
+        "workflow {workflow:?}: an instruction document's workflow has a step with a payment — a served document configures no payment (RFC 0042; RFC 0049 D2) unless the operator grants it `spending` (`agent.document_capabilities: [spending]`) and the step pays under one of the document's own allowances (`payment: {{allowance: <id>}}`, RFC 0057 §8)"
     )
+}
+
+/// Whether an instruction document's workflows may pay at all: the document
+/// has an allowance in force, which only the `spending` grant gives it.
+pub fn document_may_pay(p: &Payments) -> bool {
+    p.allowances.values().any(|a| a.document.is_some())
+}
+
+/// The allowances an instruction document's wallets and allowances become
+/// (RFC 0057 §8), against the operator's policy `p`, each `doc:<id>`; what
+/// is held is said in `warnings`, and nothing is paid under it.
+///
+/// - A wallet names an operator wallet by its `account`; one that names
+///   none, or whose `rails` leave out x402 version 2 — the one agentd pays
+///   with — is held.
+/// - An allowance maps field for field, every limit its own; `max` absent
+///   is its `budget`; a date-only `from`/`until` is whole days in UTC. Its
+///   `payees` are origin hosts — a domain as written, an `&service`'s
+///   `src` host — matched beside the operator's payee list, never instead
+///   of it. Its `approver` is whoever the operator bound to that id
+///   (`security.payments.approvers`); unbound, it pays only up to
+///   `approve-above`.
+/// - It narrows: one that draws on no wallet agentd pays from is held.
+pub fn document_allowances(
+    p: &Payments,
+    sp: &crate::config::idoc::DocumentSpending,
+    uri: &str,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, Allowance> {
+    let held = |line: usize, what: String, why: String, code: &str| {
+        format!(
+            "agent.instruction: line {line}: {what} is not activated: {why}; it is delivered as text only, and nothing is paid under it ({code})"
+        )
+    };
+    let mut wallets: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    for w in &sp.wallets {
+        match document_wallet(p, w) {
+            Ok(name) => {
+                wallets.insert(&w.id, Some(name));
+            }
+            Err((why, code)) => {
+                warnings.push(held(w.line, format!("wallet {:?}", w.id), why, code));
+                wallets.insert(&w.id, None);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for a in &sp.allowances {
+        let what = format!("allowance {:?}", a.id);
+        let id = format!("{DOCUMENT_PREFIX}{}", a.id);
+        match document_allowance(p, a, &wallets, &sp.services, uri, warnings) {
+            Ok(cfg) => match crate::spending::Allowance::from_settings(&id, &cfg) {
+                Ok(_) => {
+                    out.insert(id, cfg);
+                }
+                Err(e) => warnings.push(held(a.line, what, e, crate::config::idoc::HOST_POLICY)),
+            },
+            Err(why) => warnings.push(held(a.line, what, why, crate::config::idoc::HOST_POLICY)),
+        }
+    }
+    out
+}
+
+/// The operator wallet a document's `::wallet` picks, or why none — with
+/// the diagnostic code that says so.
+fn document_wallet<'p>(
+    p: &'p Payments,
+    w: &crate::config::idoc::DocumentWallet,
+) -> Result<&'p str, (String, &'static str)> {
+    let policy = crate::config::idoc::HOST_POLICY;
+    let Some(account) = w.account.as_deref() else {
+        return Err((
+            "a wallet names the operator's wallet it is by `account`".into(),
+            policy,
+        ));
+    };
+    let Some((name, _)) = p.wallets.get_key_value(account) else {
+        return Err((
+            format!(
+                "its account {account:?} is not one of the operator's wallets (security.payments.wallets)"
+            ),
+            policy,
+        ));
+    };
+    if w.rails.is_empty() {
+        return Ok(name);
+    }
+    let mut x402 = Vec::new();
+    for r in &w.rails {
+        if !instruction_md::allowance::protocol_ok(r) {
+            return Err((
+                format!("its rail {r:?} is not a protocol name, optionally with versions (S28)"),
+                policy,
+            ));
+        }
+        let (proto, versions) = match r.split_once('/') {
+            Some((n, v)) => (n, Some(v)),
+            None => (r.as_str(), None),
+        };
+        if proto == "x402" {
+            x402.push(versions);
+        }
+    }
+    // A bare `x402` is every version its binding marks stable — 2 (S28 §1).
+    if x402
+        .iter()
+        .any(|v| v.is_none_or(|v| v.split(',').any(|x| x == "2")))
+    {
+        return Ok(name);
+    }
+    if x402.is_empty() {
+        return Err((
+            format!(
+                "its rails ({}) name no rail agentd pays on: agentd pays with x402 version 2",
+                w.rails.join(", ")
+            ),
+            policy,
+        ));
+    }
+    Err((
+        format!(
+            "its rails name x402 {} only, and agentd pays with x402 version 2",
+            x402.iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        "protocol-unsupported",
+    ))
+}
+
+/// One document allowance as an operator allowance would say it, or why it
+/// is held.
+fn document_allowance(
+    p: &Payments,
+    a: &crate::config::idoc::DocumentAllowance,
+    wallets: &BTreeMap<&str, Option<&str>>,
+    services: &BTreeMap<String, String>,
+    uri: &str,
+    warnings: &mut Vec<String>,
+) -> Result<Allowance, String> {
+    use instruction_md::allowance::{instant, list};
+    let text = |k: &str| match a.attrs.get(k) {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    let listed = |k: &str| -> Option<Vec<String>> {
+        a.attrs.contains_key(k).then(|| {
+            list(a.attrs.get(k))
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+    };
+    if p.wallets.is_empty() {
+        return Err(
+            "agentd pays from the operator's wallets, and security.payments names none".into(),
+        );
+    }
+    if let Some(v) = a
+        .attrs
+        .values()
+        .find_map(|v| v.as_str().filter(|s| s.contains("${")).map(str::to_string))
+    {
+        return Err(format!("{v:?} did not resolve to a value"));
+    }
+    let wallets = match listed("wallet") {
+        None => None,
+        Some(refs) => {
+            let mapped: Vec<String> = refs
+                .iter()
+                .filter_map(|r| {
+                    let id = r.trim_start_matches('#');
+                    wallets.get(id).copied().flatten().map(str::to_string)
+                })
+                .collect();
+            if mapped.is_empty() {
+                return Err(format!(
+                    "it draws on {}, and none is an operator wallet agentd pays from",
+                    refs.join(", ")
+                ));
+            }
+            Some(mapped)
+        }
+    };
+    let budget = text("budget").ok_or("it has no budget")?;
+    let hosts = listed("payees").map(|ps| {
+        ps.iter()
+            .filter_map(|py| match py.strip_prefix('&') {
+                Some(svc) => {
+                    let host = services
+                        .get(svc)
+                        .and_then(|src| crate::net::http::Url::parse(src).ok())
+                        .map(|u| u.host.to_ascii_lowercase());
+                    if host.is_none() {
+                        warnings.push(format!(
+                            "agent.instruction: line {}: allowance {:?}: its payee {py} names a service with no URL (`src`), so no payment matches it ({})",
+                            a.line, a.id, crate::config::idoc::HOST_POLICY
+                        ));
+                    }
+                    host
+                }
+                None => Some(py.to_ascii_lowercase()),
+            })
+            .collect()
+    });
+    let window = |k: &str, until: bool| -> Result<Option<String>, String> {
+        text(k)
+            .map(|v| {
+                instant(&v, until)
+                    .and_then(|ms| u64::try_from(ms).ok())
+                    .map(rfc3339_millis)
+                    .ok_or_else(|| format!("{k}={v} is not a date or an RFC 3339 instant"))
+            })
+            .transpose()
+    };
+    let (approver, approver_unbound) = match text("approver") {
+        None => (None, None),
+        Some(r) => {
+            let key = r.trim_start_matches('#').to_string();
+            match p.approvers.get(&key) {
+                Some(principal) => (Some(principal.clone()), None),
+                None => {
+                    warnings.push(format!(
+                        "agent.instruction: line {}: allowance {:?}: its approver {r} is not bound (security.payments.approvers.{key}): it pays only up to approve-above, and refuses above it (approver-unbound)",
+                        a.line, a.id
+                    ));
+                    (None, Some(key))
+                }
+            }
+        }
+    };
+    Ok(Allowance {
+        title: text("title"),
+        currency: text("currency").unwrap_or_default(),
+        wallets,
+        max: text("max").or_else(|| Some(budget.clone())),
+        budget: Some(budget),
+        per: text("per"),
+        times: text("times")
+            .map(|t| {
+                t.parse::<u32>()
+                    .map_err(|_| format!("times={t} is not a whole number agentd can count"))
+            })
+            .transpose()?,
+        payees: None,
+        categories: listed("categories").unwrap_or_default(),
+        from: window("from", false)?,
+        until: window("until", true)?,
+        approve_above: text("approve-above"),
+        approver,
+        document: Some(DocumentOrigin {
+            uri: uri.to_string(),
+            id: a.id.clone(),
+            line: a.line,
+            hosts,
+            approver_unbound,
+        }),
+    })
+}
+
+/// An epoch-milliseconds instant in RFC 3339, to the millisecond.
+fn rfc3339_millis(ms: u64) -> String {
+    let s = crate::spending::rfc3339(ms);
+    format!("{}.{:03}Z", s.trim_end_matches('Z'), ms % 1000)
 }
 
 /// A step's `payment`, read against the policy.
@@ -839,19 +1170,58 @@ pub struct StepPayment {
     pub allowance: Option<String>,
 }
 
-/// Read a step's `payment` against the policy `p`.
-pub fn step_payment(p: &Payments, v: &Value) -> Result<StepPayment, String> {
+/// The prefix of an instruction document's own allowances in the spending
+/// engine (RFC 0057 §8): `doc:<id>`, which no operator id can be.
+pub const DOCUMENT_PREFIX: &str = "doc:";
+
+/// Read a step's `payment` against the policy `p`. `document`: the step is
+/// an instruction document's, which pays only under one of the document's
+/// own allowances (RFC 0057 §8) — named by its id in the document
+/// (`{allowance: groceries}`, or `doc:groceries`) — and picks no wallet of
+/// its own.
+pub fn step_payment(p: &Payments, v: &Value, document: bool) -> Result<StepPayment, String> {
     let o = v.as_object().ok_or("payment is an object")?;
+    if document {
+        if o.contains_key("wallet") {
+            return Err("payment.wallet: an instruction document's paying step picks no wallet — it pays from its allowance's (`:::allowance{wallet=…}`)".into());
+        }
+        if !o.contains_key("allowance") {
+            return Err("payment.allowance is not set: an instruction document's paying step pays only under one of the document's own allowances (RFC 0057 §8)".into());
+        }
+    }
     let allowance = match o.get("allowance") {
         None => None,
-        Some(Value::String(id)) => match p.allowances.get(id) {
-            Some(a) => Some((id.clone(), a)),
-            None => {
-                return Err(format!(
-                    "payment.allowance {id:?} is not a security.payments.allowances entry"
-                ));
+        Some(Value::String(written)) => {
+            let id = if document && !written.starts_with(DOCUMENT_PREFIX) {
+                format!("{DOCUMENT_PREFIX}{written}")
+            } else {
+                written.clone()
+            };
+            match p.allowances.get(&id) {
+                Some(a) if a.document.is_some() != document => {
+                    return Err(if document {
+                        format!(
+                            "payment.allowance {written:?} is the operator's; an instruction document's paying step pays only under one of the document's own allowances"
+                        )
+                    } else {
+                        format!(
+                            "payment.allowance {id:?} is an instruction document's own allowance; only that document's workflows pay under it"
+                        )
+                    });
+                }
+                Some(a) => Some((id, a)),
+                None if document => {
+                    return Err(format!(
+                        "payment.allowance {written:?} is not one of the instruction document's own allowances in force (a `:::allowance` under the `spending` grant)"
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "payment.allowance {id:?} is not a security.payments.allowances entry"
+                    ));
+                }
             }
-        },
+        }
         Some(_) => return Err("payment.allowance is an allowance's id".into()),
     };
     let wallet = match (o.get("wallet").and_then(Value::as_str), &allowance) {
@@ -971,7 +1341,7 @@ pub fn workflow_refusals(s: &Settings, w: &crate::engine::model::Workflow) -> Ve
             ));
             continue;
         }
-        if let Err(e) = step_payment(&s.security.payments, &field) {
+        if let Err(e) = step_payment(&s.security.payments, &field, w.document) {
             out.push(format!("{at}: {e}"));
         }
     }
@@ -1308,15 +1678,16 @@ workflows:
                 "any": {"currency": "USD", "max": "1", "budget": "1"}}
         }))
         .unwrap();
-        let s = step_payment(&p, &json!({"allowance": "api"})).unwrap();
+        let s = step_payment(&p, &json!({"allowance": "api"}), false).unwrap();
         assert_eq!(s.wallet, "ops");
         assert_eq!(s.max, vec![("usdc".to_string(), 50_000)], "rounded down");
         assert_eq!(s.allowance.as_deref(), Some("api"));
-        let e = step_payment(&p, &json!({"allowance": "any"})).unwrap_err();
+        let e = step_payment(&p, &json!({"allowance": "any"}), false).unwrap_err();
         assert!(e.contains("draws on 2 wallets"), "{e}");
-        let e = step_payment(&p, &json!({"allowance": "api", "wallet": "cold"})).unwrap_err();
+        let e =
+            step_payment(&p, &json!({"allowance": "api", "wallet": "cold"}), false).unwrap_err();
         assert!(e.contains("not one of allowance \"api\"'s wallets"), "{e}");
-        assert!(step_payment(&p, &json!({"allowance": "any", "wallet": "cold"})).is_ok());
+        assert!(step_payment(&p, &json!({"allowance": "any", "wallet": "cold"}), false).is_ok());
     }
 
     /// Paying steps are found at any depth, in the definition and its JSON.
@@ -1450,12 +1821,14 @@ workflows:
         let local = with(&|v| v["rpc"][MAINNET] = json!("http://127.0.0.1:8899"));
         assert!(errors(&local).is_empty(), "{:?}", errors(&local));
         let p: Payments = serde_json::from_value(base).unwrap();
-        assert!(step_payment(&p, &json!({"wallet": "sol", "max": "0.05 usdc-sol"})).is_ok());
-        let e = step_payment(&p, &json!({"wallet": "ops", "max": "0.05 usdc-sol"})).unwrap_err();
+        assert!(step_payment(&p, &json!({"wallet": "sol", "max": "0.05 usdc-sol"}), false).is_ok());
+        let e =
+            step_payment(&p, &json!({"wallet": "ops", "max": "0.05 usdc-sol"}), false).unwrap_err();
         assert!(e.contains("solana chains") && e.contains("eip155"), "{e}");
         let e = step_payment(
             &p,
             &json!({"wallet": "sol", "max": ["0.05 usdc-sol", "0.05 usdc-base"]}),
+            false,
         )
         .unwrap_err();
         assert!(e.contains("usdc-base"), "{e}");
@@ -1488,6 +1861,299 @@ workflows:
             assert!(pays_json(&def(&step)), "{kind}");
             step.as_object_mut().unwrap().remove("payment");
             assert!(!pays_json(&def(&step)), "{kind}");
+        }
+    }
+
+    // ---- A document's own allowances (RFC 0057 §8) -----------------------
+
+    /// The operator's side: the wallets `household` and `ops`, and who
+    /// answers for `nataliia` and the role `owner`.
+    fn operator() -> Payments {
+        serde_json::from_value(serde_json::json!({
+            "wallets": {"household": {"key_file": "/h"}, "ops": {"key_file": "/o"}},
+            "approvers": {"nataliia": "user:nataliia", "owner": "user:nataliia"},
+        }))
+        .unwrap()
+    }
+
+    /// `text`, read under the `spending` grant and mapped against `p`.
+    fn mapped(p: &Payments, text: &str) -> (BTreeMap<String, Allowance>, Vec<String>) {
+        let granted = std::collections::BTreeSet::from([crate::config::idoc::SPENDING.into()]);
+        let ex = crate::config::idoc::extract(text, &granted).unwrap();
+        let mut warnings = ex.warnings.clone();
+        let out = match &ex.spending {
+            Some(sp) => document_allowances(p, sp, "household.md", &mut warnings),
+            None => BTreeMap::new(),
+        };
+        (out, warnings)
+    }
+
+    /// A document's allowance maps field for field under `doc:<id>`: its
+    /// wallet is the operator's wallet its `account` names, `max` absent is
+    /// the budget, a date-only window is whole days in UTC, its payees are
+    /// origin hosts, and its approver is who the operator bound.
+    #[test]
+    fn a_documents_allowance_maps_onto_the_operators_policy() {
+        let doc = "::person{id=nataliia title=\"Nataliia\"}\n\n\
+            ::wallet{id=card account=household rails=\"x402/2,acp\"}\n\n\
+            ::service{id=shop src=\"https://Shop.Example.com/api\"}\n\n\
+            :::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP budget=400 per=month times=8 payees=\"tesco.com,&shop\" approve-above=60 approver=#nataliia from=2026-11-01 until=2027-02-28}\n\
+            The weekly shop.\n:::\n";
+        let (out, warnings) = mapped(&operator(), doc);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let a = &out["doc:groceries"];
+        assert_eq!(a.wallets, Some(vec!["household".to_string()]));
+        assert_eq!(a.max.as_deref(), Some("400"), "max absent is the budget");
+        assert_eq!(a.per.as_deref(), Some("month"));
+        assert_eq!(a.times, Some(8));
+        assert_eq!(a.from.as_deref(), Some("2026-11-01T00:00:00.000Z"));
+        assert_eq!(
+            a.until.as_deref(),
+            Some("2027-03-01T00:00:00.000Z"),
+            "through the end of the day"
+        );
+        assert_eq!(a.approver.as_deref(), Some("user:nataliia"));
+        assert_eq!(a.payees, None, "never the operator's payee names");
+        let d = a.document.as_ref().unwrap();
+        assert_eq!(
+            d.hosts,
+            Some(vec![
+                "tesco.com".to_string(),
+                "shop.example.com".to_string()
+            ])
+        );
+        assert_eq!(d.uri, "household.md");
+        assert_eq!(d.approver_unbound, None);
+        crate::spending::Allowance::from_settings("doc:groceries", a).unwrap();
+    }
+
+    /// What the operator has not got is held, said: a wallet whose account
+    /// names no operator wallet, one whose rails leave out x402 or name
+    /// only x402 version 1 (`protocol-unsupported`), an allowance that then
+    /// draws on no wallet; an approver nobody is bound to pays only up to
+    /// approve-above (`approver-unbound`).
+    #[test]
+    fn what_the_operator_has_not_got_is_held_and_said() {
+        let doc = "::person{id=mira title=\"Mira\"}\n\n\
+            ::wallet{id=a account=nowhere}\n\n\
+            ::wallet{id=b account=ops rails=\"x402/1\"}\n\n\
+            ::wallet{id=c account=ops rails=\"acp,ap2/0.2\"}\n\n\
+            ::wallet{id=d account=ops rails=x402}\n\n\
+            :::allowance{id=none wallet=\"#a,#b,#c\" currency=USD budget=10}\n:::\n\n\
+            :::allowance{id=some wallet=\"#b,#d\" currency=USD budget=10 approve-above=2 approver=#mira}\n:::\n";
+        let (out, warnings) = mapped(&operator(), doc);
+        let said = warnings.join("\n");
+        assert!(
+            said.contains("wallet \"a\" is not activated: its account \"nowhere\" is not one of the operator's wallets")
+                && said.contains("(host-policy)"),
+            "{said}"
+        );
+        assert!(
+            said.contains("wallet \"b\" is not activated: its rails name x402 1 only, and agentd pays with x402 version 2")
+                && said.contains("(protocol-unsupported)"),
+            "{said}"
+        );
+        assert!(
+            said.contains("wallet \"c\" is not activated: its rails (acp, ap2/0.2) name no rail agentd pays on"),
+            "{said}"
+        );
+        assert!(
+            said.contains("allowance \"none\" is not activated: it draws on #a, #b, #c, and none is an operator wallet"),
+            "{said}"
+        );
+        assert!(!out.contains_key("doc:none"));
+        let some = &out["doc:some"];
+        assert_eq!(
+            some.wallets,
+            Some(vec!["ops".to_string()]),
+            "a bare x402 is version 2"
+        );
+        assert_eq!(
+            some.document.as_ref().unwrap().approver_unbound.as_deref(),
+            Some("mira")
+        );
+        assert!(
+            said.contains("allowance \"some\": its approver #mira is not bound (security.payments.approvers.mira)")
+                && said.contains("(approver-unbound)"),
+            "{said}"
+        );
+        // An operator with no wallet at all: every allowance is held.
+        let (none, warnings) = mapped(&Payments::default(), doc);
+        assert!(none.is_empty());
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("security.payments names none")),
+            "{warnings:?}"
+        );
+    }
+
+    /// A document's step pays only under one of the document's own
+    /// allowances, named by its id there, and picks no wallet; an operator
+    /// step never pays under a document's allowance.
+    #[test]
+    fn a_document_step_pays_only_under_its_own_allowance() {
+        let mut p = operator();
+        p.allowances.insert(
+            "api".into(),
+            Allowance {
+                currency: "USD".into(),
+                max: Some("1".into()),
+                budget: Some("1".into()),
+                wallets: Some(vec!["ops".into()]),
+                ..Default::default()
+            },
+        );
+        p.allowances.insert(
+            "doc:groceries".into(),
+            Allowance {
+                currency: "USD".into(),
+                max: Some("1".into()),
+                budget: Some("1".into()),
+                wallets: Some(vec!["household".into()]),
+                document: Some(DocumentOrigin::default()),
+                ..Default::default()
+            },
+        );
+        let step = |v: Value, document: bool| step_payment(&p, &v, document);
+        let e = step(serde_json::json!({"allowance": "groceries"}), true).unwrap_err();
+        assert!(
+            e.contains("no asset on wallet \"household\""),
+            "resolves to doc:groceries: {e}"
+        );
+        let e = step(serde_json::json!({"allowance": "doc:groceries"}), true).unwrap_err();
+        assert!(e.contains("no asset on wallet"), "{e}");
+        for (v, want) in [
+            (
+                serde_json::json!({"allowance": "api"}),
+                "is not one of the instruction document's own allowances",
+            ),
+            (
+                serde_json::json!({"allowance": "groceries", "wallet": "household"}),
+                "picks no wallet",
+            ),
+            (
+                serde_json::json!({"wallet": "ops", "max": "0.1 usdc"}),
+                "picks no wallet",
+            ),
+            (
+                serde_json::json!({"max": "0.1 usdc"}),
+                "pays only under one of the document's own allowances",
+            ),
+        ] {
+            let e = step(v.clone(), true).unwrap_err();
+            assert!(e.contains(want), "{v}: {e}");
+        }
+        let e = step(serde_json::json!({"allowance": "doc:groceries"}), false).unwrap_err();
+        assert!(
+            e.contains("only that document's workflows pay under it"),
+            "{e}"
+        );
+        assert!(document_may_pay(&p));
+        p.allowances.remove("doc:groceries");
+        assert!(!document_may_pay(&p));
+    }
+
+    /// agentd's S29 cases (the source the specification's vectors were
+    /// built from), through agentd's reader and mapping: every valid one
+    /// maps to `doc:groceries`; every invalid one refuses the document with
+    /// the code expected; and an inheritance case — which agentd cannot
+    /// compose — keeps its allowance as text, while the SDK composing it
+    /// with its base reaches the verdict the case expects.
+    #[test]
+    fn agentds_s29_cases_read_as_expected() {
+        let cases: Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/s29-cases.json")).unwrap();
+        let cases = cases["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 49);
+        let granted = std::collections::BTreeSet::from([crate::config::idoc::SPENDING.into()]);
+        for c in cases {
+            let name = c["name"].as_str().unwrap();
+            let expect = c["expect"].as_str().unwrap();
+            let source = c["source"].as_str().unwrap();
+            let read = crate::config::idoc::extract(source, &granted);
+            if name.starts_with("invalid/") {
+                let errs = read.expect_err(name);
+                assert!(
+                    errs.iter().any(|e| e.code == expect),
+                    "{name}: expected {expect}, got {errs:?}"
+                );
+                continue;
+            }
+            let ex = read.unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            if name.starts_with("inherit/") {
+                assert!(ex.spending.is_none(), "{name}: held");
+                assert!(
+                    ex.warnings.iter().any(|w| w.contains("`extends` another")),
+                    "{name}: {:?}",
+                    ex.warnings
+                );
+                let sources: std::collections::HashMap<String, instruction_md::Source> =
+                    c["sources"]
+                        .as_object()
+                        .unwrap()
+                        .iter()
+                        .map(|(uri, text)| {
+                            (
+                                uri.clone(),
+                                instruction_md::Source {
+                                    uri: uri.clone(),
+                                    text: text.as_str().unwrap().into(),
+                                    version: String::new(),
+                                },
+                            )
+                        })
+                        .collect();
+                let res = instruction_md::resolve_with(
+                    source,
+                    &sources,
+                    &instruction_md::ResolveOptions::default(),
+                );
+                let widened = res
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "allowance-widened");
+                assert_eq!(
+                    widened,
+                    expect.starts_with("allowance-widened"),
+                    "{name}: {:?}",
+                    res.diagnostics
+                );
+                continue;
+            }
+            let mut warnings = Vec::new();
+            let out = document_allowances(
+                &operator(),
+                ex.spending.as_ref().expect(name),
+                "household.md",
+                &mut warnings,
+            );
+            let a = out
+                .get("doc:groceries")
+                .unwrap_or_else(|| panic!("{name}: {warnings:?}"));
+            assert!(warnings.is_empty(), "{name}: {warnings:?}");
+            match name {
+                "valid/parameter-amount" => assert_eq!(a.max.as_deref(), Some("120")),
+                "valid/max-omitted" => assert_eq!(a.max.as_deref(), Some("400")),
+                "valid/two-wallets" => assert_eq!(
+                    a.wallets,
+                    Some(vec!["household".to_string(), "ops".to_string()])
+                ),
+                "valid/window-dates" => {
+                    assert_eq!(a.from.as_deref(), Some("2026-11-01T00:00:00.000Z"));
+                    assert_eq!(a.until.as_deref(), Some("2027-03-01T00:00:00.000Z"));
+                }
+                "valid/approver-role" => assert_eq!(a.approver.as_deref(), Some("user:nataliia")),
+                "valid/approve-above-without-approver" => {
+                    assert_eq!(a.approver, None, "the host's own approver");
+                    assert_eq!(a.document.as_ref().unwrap().approver_unbound, None);
+                }
+                "valid/payees-service-ref" => assert_eq!(
+                    a.document.as_ref().unwrap().hosts,
+                    Some(vec!["shop.example.com".to_string()])
+                ),
+                _ => {}
+            }
         }
     }
 }

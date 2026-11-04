@@ -186,6 +186,10 @@ pub struct Allowance {
     pub until_ms: Option<u64>,
     pub approve_above: Option<u128>,
     pub approver: Option<String>,
+    /// An instruction document's allowance (RFC 0057 §8): where it came
+    /// from, the origin hosts its payees name, and its approver when the
+    /// operator bound none.
+    pub document: Option<cfg::DocumentOrigin>,
 }
 
 impl Allowance {
@@ -227,6 +231,7 @@ impl Allowance {
             until_ms: time("until", &a.until)?,
             approve_above: amount("approve_above", &a.approve_above)?,
             approver: a.approver.clone(),
+            document: a.document.clone(),
         })
     }
 
@@ -273,10 +278,13 @@ impl Usage {
 
 /// A charge of `charge` (at [`SCALE`]) to `payee` held to `a`, with `usage`
 /// already counted, at `now_ms`: whether it is above `approve_above`, or
-/// every limit it is past, each reason naming the allowance.
+/// every limit it is past, each reason naming the allowance. `host` is the
+/// origin host of the resource paid for, which a document's allowance's
+/// payees are matched against (S29 §2); `None` on a rail with no resource.
 pub fn judge(
     a: &Allowance,
     payee: &str,
+    host: Option<&str>,
     charge: u128,
     usage: Usage,
     now_ms: u64,
@@ -304,6 +312,21 @@ pub fn judge(
     {
         why.push(format!("{at}: payee {payee} is not one of its payees"));
     }
+    // A document's payees narrow the operator's: the resource's origin host
+    // must be one of them, beside the operator's payee list.
+    if let Some(hosts) = a.document.as_ref().and_then(|d| d.hosts.as_ref())
+        && !host.is_some_and(|h| hosts.iter().any(|x| x.eq_ignore_ascii_case(h)))
+    {
+        why.push(format!(
+            "{at}: payee {} is not one of its payees ({})",
+            host.unwrap_or("with no resource"),
+            if hosts.is_empty() {
+                "none".to_string()
+            } else {
+                hosts.join(", ")
+            }
+        ));
+    }
     if charge > a.max {
         why.push(format!(
             "{at}: max {}, this payment {}",
@@ -329,8 +352,23 @@ pub fn judge(
             usage.payments
         ));
     }
+    let above = a.approve_above.filter(|t| charge > *t);
+    // Nobody the operator bound answers for a document's approver: what
+    // would need them is refused (RFC 0057 §9.4).
+    if let (Some(t), Some(name)) = (
+        above,
+        a.document
+            .as_ref()
+            .and_then(|d| d.approver_unbound.as_deref()),
+    ) {
+        why.push(format!(
+            "{at}: approver-unbound: this payment {} is above approve-above {}, and its approver {name} is not bound (security.payments.approvers.{name}), so nobody can approve it",
+            format_amount(charge, SCALE),
+            a.show(t)
+        ));
+    }
     if why.is_empty() {
-        Ok(a.approve_above.is_some_and(|t| charge > t))
+        Ok(above.is_some())
     } else {
         Err(why)
     }
@@ -608,7 +646,7 @@ impl Spending {
         let a = self.allowance(id).map_err(|e| vec![e])?;
         let a = &a;
         let usage = self.usage(&held, a, now_ms, None);
-        let above = judge(a, company, amount, usage, now_ms)?;
+        let above = judge(a, company, None, amount, usage, now_ms)?;
         let c = Charge {
             company: company.to_string(),
             operation: operation.to_string(),
@@ -724,7 +762,7 @@ impl Spending {
             .map(|a| {
                 let u = self.usage(&held, a, now_ms, None);
                 let start = period_start(a.per, now_ms);
-                json!({
+                let mut v = json!({
                     "id": a.id,
                     "title": a.title,
                     "currency": a.currency,
@@ -738,7 +776,13 @@ impl Spending {
                     "approve_above": a.approve_above.map(|v| format_amount(v, SCALE)),
                     "payments": u.payments,
                     "times": a.times,
-                })
+                    "source": if a.document.is_some() { "document" } else { "operator" },
+                });
+                // A document's allowance (RFC 0057 §8): which document.
+                if let Some(d) = &a.document {
+                    v["document"] = json!(d.uri);
+                }
+                v
             })
             .collect();
         json!({"allowances": list})
@@ -771,6 +815,17 @@ pub fn changed_fields(old: &cfg::Allowance, new: &cfg::Allowance) -> Vec<&'stati
         approve_above,
         approver
     );
+    // A document's allowance: its payees are origin hosts, and an approver
+    // the operator bound or unbound moves who answers.
+    let (was, now) = (old.document.as_ref(), new.document.as_ref());
+    if was.map(|d| &d.hosts) != now.map(|d| &d.hosts) && !out.contains(&"payees") {
+        out.push("payees");
+    }
+    if was.map(|d| &d.approver_unbound) != now.map(|d| &d.approver_unbound)
+        && !out.contains(&"approver")
+    {
+        out.push("approver");
+    }
     out
 }
 
@@ -929,6 +984,63 @@ mod tests {
         parse_amount(s, SCALE).unwrap()
     }
 
+    /// A document's allowance (RFC 0057 §8): its payees are the paid
+    /// resource's origin host, matched exactly; and above approve-above,
+    /// with nobody bound to its approver, it refuses `approver-unbound` —
+    /// below it, it pays.
+    #[test]
+    fn a_documents_allowance_holds_its_hosts_and_its_unbound_approver() {
+        let mut a = groceries();
+        a.id = "doc:groceries".into();
+        a.payees = None;
+        a.document = Some(cfg::DocumentOrigin {
+            hosts: Some(vec!["shop.example.com".into()]),
+            approver_unbound: Some("nataliia".into()),
+            ..Default::default()
+        });
+        let now = ms("2026-11-03T10:00:00Z");
+        let none = Usage::default();
+        let why = |r: Result<bool, Vec<String>>| r.unwrap_err().join("; ");
+        assert_eq!(
+            judge(
+                &a,
+                "weather",
+                Some("Shop.Example.com"),
+                gbp("20"),
+                none,
+                now
+            ),
+            Ok(false)
+        );
+        assert!(
+            why(judge(&a, "weather", Some("evil.example.com"), gbp("20"), none, now)).contains(
+                "allowance doc:groceries: payee evil.example.com is not one of its payees (shop.example.com)"
+            )
+        );
+        assert!(
+            why(judge(&a, "weather", None, gbp("20"), none, now))
+                .contains("payee with no resource")
+        );
+        assert!(
+            why(judge(&a, "weather", Some("shop.example.com"), gbp("61"), none, now)).contains(
+                "allowance doc:groceries: approver-unbound: this payment 61 is above approve-above 60 GBP"
+            )
+        );
+        // Bound, the same payment asks.
+        a.document.as_mut().unwrap().approver_unbound = None;
+        assert_eq!(
+            judge(
+                &a,
+                "weather",
+                Some("shop.example.com"),
+                gbp("61"),
+                none,
+                now
+            ),
+            Ok(true)
+        );
+    }
+
     /// Each limit an allowance sets, its reason naming the allowance and the
     /// limit; within them, whether the charge is above `approve_above`.
     #[test]
@@ -936,24 +1048,24 @@ mod tests {
         let a = groceries();
         let now = ms("2026-11-03T10:00:00Z");
         let none = Usage::default();
-        assert_eq!(judge(&a, "tesco", gbp("20"), none, now), Ok(false));
-        assert_eq!(judge(&a, "tesco", gbp("60"), none, now), Ok(false));
-        assert_eq!(judge(&a, "tesco", gbp("60.01"), none, now), Ok(true));
+        assert_eq!(judge(&a, "tesco", None, gbp("20"), none, now), Ok(false));
+        assert_eq!(judge(&a, "tesco", None, gbp("60"), none, now), Ok(false));
+        assert_eq!(judge(&a, "tesco", None, gbp("60.01"), none, now), Ok(true));
         let why = |r: Result<bool, Vec<String>>| r.unwrap_err().join("; ");
         let spent = Usage {
             spent: gbp("385"),
             payments: 2,
         };
         assert_eq!(
-            why(judge(&a, "tesco", gbp("20"), spent, now)),
+            why(judge(&a, "tesco", None, gbp("20"), spent, now)),
             "allowance groceries: budget 400 GBP per month, 385 spent, this payment 20"
         );
         assert!(
-            judge(&a, "tesco", gbp("15"), spent, now).is_ok(),
+            judge(&a, "tesco", None, gbp("15"), spent, now).is_ok(),
             "at the budget is within it"
         );
         assert!(
-            why(judge(&a, "tesco", gbp("130"), none, now))
+            why(judge(&a, "tesco", None, gbp("130"), none, now))
                 .contains("max 120 GBP, this payment 130")
         );
         let three = Usage {
@@ -961,39 +1073,41 @@ mod tests {
             payments: 3,
         };
         assert!(
-            why(judge(&a, "tesco", gbp("1"), three, now)).contains("times 3 per month, 3 made")
+            why(judge(&a, "tesco", None, gbp("1"), three, now))
+                .contains("times 3 per month, 3 made")
         );
         assert!(
-            why(judge(&a, "aldi", gbp("1"), none, now))
+            why(judge(&a, "aldi", None, gbp("1"), none, now))
                 .contains("payee aldi is not one of its payees")
         );
         let mut cat = groceries();
         cat.categories = vec!["food".into()];
         assert!(
-            why(judge(&cat, "tesco", gbp("1"), none, now))
+            why(judge(&cat, "tesco", None, gbp("1"), none, now))
                 .contains("rail-cannot-enforce: categories")
         );
         let mut window = groceries();
         window.from_ms = Some(ms("2026-12-01T00:00:00Z"));
         assert!(
-            why(judge(&window, "tesco", gbp("1"), none, now))
+            why(judge(&window, "tesco", None, gbp("1"), none, now))
                 .contains("from 2026-12-01T00:00:00Z, not yet")
         );
         window.from_ms = None;
         window.until_ms = Some(ms("2026-11-01T00:00:00Z"));
         assert!(
-            why(judge(&window, "tesco", gbp("1"), none, now))
+            why(judge(&window, "tesco", None, gbp("1"), none, now))
                 .contains("until 2026-11-01T00:00:00Z, past")
         );
         // Every reason at once.
-        let all = why(judge(&a, "aldi", gbp("500"), three, now));
+        let all = why(judge(&a, "aldi", None, gbp("500"), three, now));
         for want in ["payee", "max", "budget", "times"] {
             assert!(all.contains(want), "{want}: {all}");
         }
         let mut once = groceries();
         once.per = Per::Once;
         assert!(
-            why(judge(&once, "tesco", gbp("20"), spent, now)).contains("budget 400 GBP in all")
+            why(judge(&once, "tesco", None, gbp("20"), spent, now))
+                .contains("budget 400 GBP in all")
         );
     }
 

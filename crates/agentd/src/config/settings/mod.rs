@@ -6928,6 +6928,7 @@ impl Settings {
         let mut skill_fetches = Vec::new();
         let mut folded_servers = FoldedServers::default();
         let mut document_agents: Vec<DocumentTemplate> = Vec::new();
+        let mut document_spending: Option<(crate::config::idoc::DocumentSpending, String)> = None;
         // The document whose machinery folds: the instruction itself — an
         // instruction/1 document, read by the instruction.md SDK, the ONLY
         // surface extraction runs on (conversation text is never parsed) —
@@ -6984,6 +6985,20 @@ impl Settings {
             skill_fetches = f.skill_fetches;
             folded_servers = f.servers;
             document_agents = f.agents;
+            // Its wallets and allowances, under the `spending` grant, map
+            // once the operator's policy is typed (RFC 0057 §8).
+            document_spending = f.extraction.spending.clone().map(|sp| {
+                let uri = match (&instruction, resource) {
+                    (Some(i), true) => i.clone(),
+                    _ => instruction_origin
+                        .as_ref()
+                        .map(|o| o.uri.clone())
+                        .or_else(|| instruction_spec.url.clone())
+                        .or_else(|| instruction_path.clone())
+                        .unwrap_or_else(|| "agent.instruction".into()),
+                };
+                (sp, uri)
+            });
             idoc_extraction = Some(f.extraction);
         }
         // `agent.prompt` is a document too — a one-shot task is as likely to
@@ -7103,6 +7118,19 @@ impl Settings {
             if let Some(t) = settings.subagents.templates.get_mut(&name) {
                 t.document = Some(origin);
             }
+        }
+        // A document's allowances join the operator's in the one spending
+        // engine through their own channel — `security` stays operator
+        // configuration a `:::config` may not write — each `doc:<id>`, so
+        // none is ever an operator's (RFC 0057 §8).
+        if let Some((sp, uri)) = &document_spending {
+            let mapped = payments::document_allowances(
+                &settings.security.payments,
+                sp,
+                uri,
+                &mut instruction_warnings,
+            );
+            settings.security.payments.allowances.extend(mapped);
         }
         // Workflows were spliced into the document before deserialization, so
         // they are already in `settings`; carry the skills and the extended-
@@ -11642,14 +11670,19 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 err(&mut d, msg);
             }
         }
-        // A served document configures no payment (RFC 0042, RFC 0049 D2).
-        if s.agent.document_workflows.contains(&i) && payments::pays_json(w) {
+        // A served document configures no payment (RFC 0042, RFC 0049 D2)
+        // but under one of its own allowances, which the `spending` grant
+        // gives it (RFC 0057 §8): its steps are held to that below.
+        if s.agent.document_workflows.contains(&i)
+            && payments::pays_json(w)
+            && !payments::document_may_pay(&s.security.payments)
+        {
             let name = w.get("name").and_then(Value::as_str).unwrap_or("?");
             err(&mut d, payments::document_pays(name));
         }
     }
     let mut parsed = Vec::new();
-    for w in &s.workflows {
+    for (i, w) in s.workflows.iter().enumerate() {
         // A reference — file, uri, url or dir — has no definition inline; the
         // local ones are read below.
         if w.get("steps").is_none() {
@@ -11672,7 +11705,10 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         match crate::engine::model::parse_workflow(w) {
             // The parser's messages already name the workflow and the step.
             Err(errs) => d.errors.extend(errs),
-            Ok(w) => parsed.push(w),
+            Ok(mut w) => {
+                w.document = s.agent.document_workflows.contains(&i);
+                parsed.push(w)
+            }
         }
         // Fan-out is checked HERE rather than in the parser because the ceiling
         // is a config value the parser cannot see.
@@ -11755,7 +11791,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 d.errors.extend(refused);
                 continue;
             }
-            if payments::pays_json(&def) {
+            if payments::pays_json(&def) && !payments::document_may_pay(&s.security.payments) {
                 let name = def.get("name").and_then(Value::as_str).unwrap_or("?");
                 d.errors.push(payments::document_pays(name));
                 continue;
@@ -11763,12 +11799,13 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
         }
         match crate::engine::model::parse_workflow(&def) {
             Err(errs) => d.errors.extend(errs),
-            Ok(w) => match defined.get(&w.name) {
+            Ok(mut w) => match defined.get(&w.name) {
                 Some(first) => d
                     .errors
                     .push(duplicate_workflow(&w.name, first, &doc.source)),
                 None => {
                     defined.insert(w.name.clone(), doc.source);
+                    w.document = doc.from_document;
                     parsed.push(w);
                 }
             },
@@ -12607,6 +12644,11 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     // charge, and when an approval is answered (RFC 0057 §4): a lowered
     // budget stops the next payment.
     "security.payments.allowances",
+    // Read with the allowances: who answers for a document's approver, and
+    // the operator allowance every document payment counts against too
+    // (RFC 0057 §8).
+    "security.payments.approvers",
+    "security.payments.document_ceiling",
     "skills.dir",
     "skills.inline",
     "skills.max_bytes",

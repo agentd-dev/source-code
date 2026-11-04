@@ -28,6 +28,11 @@ impl Runtime {
     pub(crate) fn allowance_now(&self, id: &str) -> Result<Allowance, String> {
         match self.settings.security.payments.allowances.get(id) {
             Some(a) => Allowance::from_settings(id, a),
+            None if id.starts_with(crate::config::settings::payments::DOCUMENT_PREFIX) => {
+                Err(format!(
+                    "allowance {id}: it is no longer one of the instruction document's allowances, so nothing is paid under it"
+                ))
+            }
             None => Err(format!(
                 "allowance {id}: it is no longer a security.payments.allowances entry, so nothing is paid under it"
             )),
@@ -68,10 +73,16 @@ impl Runtime {
             match was.get(id) {
                 Some(b) if b == a => {}
                 Some(b) => {
+                    // A document's allowance that only moved to another line
+                    // of its document did not change.
+                    let fields = crate::spending::changed_fields(b, a);
+                    if fields.is_empty() {
+                        continue;
+                    }
                     moved = true;
                     self.log.info(
                         "payment.allowance.changed",
-                        json!({"id": id, "fields": crate::spending::changed_fields(b, a)}),
+                        json!({"id": id, "fields": fields}),
                     );
                 }
                 None => {

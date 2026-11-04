@@ -1147,6 +1147,12 @@ pub(super) fn validate(s: &Settings, d: &mut Diagnostics) {
                     "{at}.allowance: {:?} is not a security.payments.allowances entry",
                     sp.allowance
                 )),
+                // A Company's operations are charged to the operator's
+                // allowances alone (RFC 0057 §8).
+                Some(a) if a.document.is_some() => err(format!(
+                    "{at}.allowance: {:?} is an instruction document's own allowance, which no Company's operation is charged to",
+                    sp.allowance
+                )),
                 Some(a)
                     if a.payees
                         .as_ref()

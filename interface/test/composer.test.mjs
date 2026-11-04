@@ -127,7 +127,8 @@ test('the /allowances note: one block per allowance, values inert', () => {
     allowancesNote({
       allowances: [
         { id: 'groceries', title: 'Weekly\u001b[2J shop', currency: 'GBP', period: 'month', period_start: '2026-11-01T00:00:00Z', spent: '385', budget: '400', left: '15', max: '50', approve_above: '30', payments: 3, times: 10 },
-        { id: 'domains', title: null, currency: 'USD', period: 'once', period_start: null, spent: '0', budget: '100', left: '100', max: '20', approve_above: null, payments: 0, times: null },
+        { id: 'domains', title: null, currency: 'USD', period: 'once', period_start: null, spent: '0', budget: '100', left: '100', max: '20', approve_above: null, payments: 0, times: null, source: 'operator' },
+        { id: 'doc:data', title: 'Data', currency: 'USD', period: 'month', period_start: '2026-11-01T00:00:00Z', spent: '0.03', budget: '0.05', left: '0.02', max: '0.05', approve_above: null, payments: 1, times: null, source: 'document', document: 'https://docs.example/buyer\u001b[2J.md' },
       ],
     }),
     [
@@ -138,6 +139,10 @@ test('the /allowances note: one block per allowance, values inert', () => {
       'domains  USD',
       '  this period: per once',
       '  spent 0 / 100',
+      'doc:data · Data  USD',
+      '  this period: per month since 2026-11-01T00:00:00Z',
+      '  spent 0.03 / 0.05',
+      '  from the instruction document https://docs.example/buyer\\u001b[2J.md',
     ].join('\n'),
   );
 });

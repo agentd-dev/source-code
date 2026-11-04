@@ -113,6 +113,11 @@ pub struct Record {
     pub charge: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
+    /// The operator allowance a payment under an instruction document's
+    /// allowance counts against too (`security.payments.document_ceiling`,
+    /// RFC 0057 §8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceiling: Option<String>,
 }
 
 impl Record {
@@ -270,7 +275,7 @@ impl Ledger {
     ) -> crate::spending::Usage {
         let mut u = crate::spending::Usage::default();
         for r in self.records.values().filter(|r| {
-            r.allowance.as_deref() == Some(allowance)
+            (r.allowance.as_deref() == Some(allowance) || r.ceiling.as_deref() == Some(allowance))
                 && r.currency.as_deref() == Some(currency)
                 && r.at_ms >= since
                 && r.counts(now_ms)
@@ -368,6 +373,7 @@ mod tests {
             allowance: None,
             charge: None,
             currency: None,
+            ceiling: None,
         }
     }
 
@@ -486,6 +492,20 @@ mod tests {
         );
         let u = l.allowance_usage("api", "USD", now - DAY_MS, now);
         assert_eq!(u.payments, 1, "the period starts after k");
+        // A payment under a document's allowance counts against the
+        // operator's ceiling too (RFC 0057 §8).
+        let mut doc = record("n", "run5", 1, State::Settled, now);
+        doc.asset = "usdc-x".into();
+        doc.allowance = Some("doc:groceries".into());
+        doc.ceiling = Some("api".into());
+        doc.charge = Some("0.25".into());
+        doc.currency = Some("USD".into());
+        l.put(doc).unwrap();
+        assert_eq!(l.allowance_usage("api", "USD", 0, now).payments, 3);
+        assert_eq!(
+            l.allowance_usage("doc:groceries", "USD", 0, now).payments,
+            1
+        );
         let payee = Account::parse("0x209693Bc6afc0C5328bA36FaF03C514EF312287C").unwrap();
         let s = l.spent("usdc-base", "run1", &payee, now);
         assert_eq!(s.run, 300);

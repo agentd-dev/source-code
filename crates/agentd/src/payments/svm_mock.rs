@@ -258,7 +258,7 @@ mod tests {
         let required = json!({"x402Version": 2, "resource": {"url": "https://api.example/data"},
                               "accepts": [entry.clone()]});
         let choice =
-            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, None).unwrap();
+            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, &[]).unwrap();
         let crate::payments::scheme::Terms::Svm(terms) = &choice.terms else {
             panic!("a Solana entry's terms");
         };
@@ -327,7 +327,7 @@ mod tests {
         let required = json!({"x402Version": 2, "resource": {"url": "https://api.example/data"},
                               "accepts": [entry.clone()]});
         let choice =
-            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, None).unwrap();
+            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, &[]).unwrap();
         let crate::payments::scheme::Terms::Svm(terms) = &choice.terms else {
             panic!("a Solana entry's terms");
         };
@@ -460,7 +460,7 @@ mod tests {
                               "accepts": [entry.clone()]});
         let pol = policy::Policy::from_settings(&p).unwrap();
         let choice =
-            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, None).unwrap();
+            policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, &[]).unwrap();
         let crate::payments::scheme::Terms::Svm(terms) = &choice.terms else {
             panic!("a Solana entry's terms");
         };
@@ -514,7 +514,7 @@ mod tests {
         let mint = Pubkey::parse(USDC).unwrap();
         let pay_to = Pubkey::parse(PAY_TO).unwrap();
         let entry = sponsor.entry(MAINNET, &mint, &pay_to, 40_000, None, None);
-        let ok = policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, None).unwrap();
+        let ok = policy::choose(&pol, &step(), std::slice::from_ref(&entry), &none, &[]).unwrap();
         let crate::payments::scheme::Terms::Svm(t) = &ok.terms else {
             panic!("a Solana entry's terms");
         };
@@ -524,7 +524,7 @@ mod tests {
             "no blockhash: the RPC is asked"
         );
         let refused = |e: Value, pol: &policy::Policy| {
-            policy::choose(pol, &step(), &[e], &none, None).unwrap_err()[0]
+            policy::choose(pol, &step(), &[e], &none, &[]).unwrap_err()[0]
                 .reasons
                 .join("; ")
         };
@@ -572,6 +572,7 @@ mod tests {
         let e = crate::config::settings::payments::step_payment(
             &evm,
             &json!({"wallet": "sol", "max": "0.05 usdc-sol"}),
+            false,
         )
         .unwrap_err();
         assert!(e.contains("solana chains"), "{e}");

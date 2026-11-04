@@ -16,6 +16,7 @@
 //! | `:::config{dialect="agentd/config"}` | the document's configuration fragment, held to the document boundary downstream |
 //! | `:::skill{id trigger}` with a body and no `src` | an inline skill in the catalogue |
 //! | `::person`, `::role` | a person a workflow's `human` step may be addressed to (`to: <id>`) |
+//! | `::wallet{account rails}`, `:::allowance{id …}` | under the [`SPENDING`] grant, an operator wallet the document picks by `account`, and an allowance `doc:<id>` in agentd's spending engine (RFC 0057 §8; [`DocumentSpending`]) |
 //!
 //! Everything else is guidance and reaches the model only as text. A
 //! connected object agentd will not activate — one outside its grants, one
@@ -45,13 +46,19 @@ pub const IDENTITY: &str = "identity";
 /// The grant a document needs for the agents it defines to become agentd's
 /// subagents (RFC 0056).
 pub const AGENTS: &str = "agents";
+/// The grant a document needs for its wallets and allowances to be paid
+/// under (RFC 0057 §8, S29 §7).
+pub const SPENDING: &str = "spending";
 /// agentd's document grants (`agent.document_capabilities`). instruction/1
 /// grants nothing by itself (§19): these are the host's.
-pub const FAMILIES: &[&str] = &[INTERFACE, IDENTITY, AGENTS];
+pub const FAMILIES: &[&str] = &[INTERFACE, IDENTITY, AGENTS, SPENDING];
+/// The grants that, over the wire, need a verified pin whose author
+/// signature attests them ([`Admission`]).
+pub const ATTESTED_OVER_THE_WIRE: &[&str] = &[AGENTS, SPENDING];
 /// The grants a document that arrived over the wire never uses, whatever
-/// the operator granted or its author signed (§7.8). `agents` is not one:
-/// over the wire it needs a verified pin whose signature attests it
-/// ([`Admission`]).
+/// the operator granted or its author signed (§7.8). `agents` and
+/// `spending` are not: over the wire each needs a verified pin whose
+/// signature attests it ([`Admission`]).
 pub const WIRE_FLOOR: &[&str] = &[IDENTITY];
 
 /// Every grant agentd knows.
@@ -131,12 +138,101 @@ pub struct Parsed {
     /// The SDK's diagnostics — the reader's, the inline checks', the
     /// workflow bodies' and the 1.1 lines' — none of them an error.
     pub diagnostics: Vec<Diagnostic>,
+    /// Each `allowance`'s attributes as the SDK composed them, by the line
+    /// it opens on: its `${parameter}` amounts resolved (S29 §2). Empty
+    /// when the document has none.
+    pub allowances: BTreeMap<u32, Map<String, Value>>,
+    /// The agent text as the SDK composed it, when an allowance's amount
+    /// is a `${parameter}`: the reader's text leaves it unresolved in the
+    /// allowance's sentence, and S29 §6 delivers amounts as they resolve.
+    composed_text: Option<String>,
+}
+
+/// The diagnostics only composition raises about an allowance (S29 §4):
+/// its values once parameters resolve, and what its `wallet`, `approver`
+/// and `&service` payees name.
+fn allowance_code(code: &str) -> bool {
+    code.starts_with("allowance-") || code == "reference-missing" || code == "reference-kind"
+}
+
+/// What [`compose_allowances`] found.
+#[derive(Default)]
+struct Composed {
+    /// Each allowance's attributes, by the line it opens on.
+    allowances: BTreeMap<u32, Map<String, Value>>,
+    /// The composer's errors about an allowance.
+    errors: Vec<Diagnostic>,
+    /// The composed agent text ([`Parsed::composed_text`]).
+    text: Option<String>,
+}
+
+/// The SDK's composition of a document that has allowances, with nothing
+/// to compose it with — agentd loads no base and no include — for what the
+/// reader alone cannot say of them: each allowance's resolved attributes,
+/// by its line, and the composer's errors about it. Nothing for a document
+/// with none.
+fn compose_allowances(text: &str, reading: &Reading) -> Composed {
+    let mut lines = BTreeSet::new();
+    let mut pending = false;
+    instruction_md::walk(&reading.document.body, &mut |n, _| {
+        if n.kind == "allowance"
+            && let Some(r) = n.range
+        {
+            lines.insert(r.start);
+            pending |= n
+                .attrs
+                .values()
+                .any(|v| v.as_str().is_some_and(|s| s.contains("${")));
+        }
+        true
+    });
+    if lines.is_empty() {
+        return Composed::default();
+    }
+    let res = instruction_md::resolve_with(
+        text,
+        &std::collections::HashMap::new(),
+        &instruction_md::ResolveOptions::default(),
+    );
+    let mut resolved = BTreeMap::new();
+    instruction_md::walk(&res.resolved.body, &mut |n, _| {
+        if n.kind == "allowance"
+            && let Some(r) = n.range
+            && lines.contains(&r.start)
+        {
+            resolved.entry(r.start).or_insert_with(|| n.attrs.clone());
+        }
+        true
+    });
+    // The composed text only where the reader's would deliver an amount
+    // unresolved, and only for a document that composes nothing agentd
+    // leaves unloaded.
+    let composes = reading.document.metadata.front.get("extends").is_some();
+    let composed_text = (pending && !composes).then(|| res.text.clone());
+    let errors = res
+        .diagnostics
+        .into_iter()
+        .filter(|d| {
+            d.is_error()
+                && d.uri.is_empty()
+                && allowance_code(d.code)
+                && d.line().is_some_and(|l| lines.contains(&l))
+        })
+        .collect();
+    Composed {
+        allowances: resolved,
+        errors,
+        text: composed_text,
+    }
 }
 
 impl Parsed {
-    /// The agent text (`instruction-text/1`), declared defaults substituted.
+    /// The agent text (`instruction-text/1`), declared defaults substituted
+    /// — in an allowance's sentence too ([`Parsed::composed_text`]).
     pub fn text(&self) -> String {
-        self.reading.text(None)
+        self.composed_text
+            .clone()
+            .unwrap_or_else(|| self.reading.text(None))
     }
 }
 
@@ -145,10 +241,26 @@ impl Parsed {
 /// lines written in the 1.1 syntax (`legacy_diagnostics`, an error: a 1.1
 /// `:::!kind` block is prose to this reader, and delivering it would deliver
 /// what its author did not mean). An error refuses the whole document;
-/// warnings are kept on the result.
+/// warnings are kept on the result. A document with allowances is composed
+/// too ([`compose_allowances`]), and the composer's errors about an
+/// allowance refuse it as the reader's do: an allowance that does not read
+/// is a document that should not be delivered, whatever is granted.
 pub fn parse(text: &str) -> Result<Parsed, Vec<Refusal>> {
     let reading = instruction_md::read(text, &ReadOptions::default());
     let mut diagnostics = instruction_md::check_reading(&reading);
+    let Composed {
+        allowances,
+        errors: composed,
+        text: composed_text,
+    } = compose_allowances(text, &reading);
+    for d in composed {
+        if !diagnostics
+            .iter()
+            .any(|x| x.code == d.code && x.line() == d.line())
+        {
+            diagnostics.push(d);
+        }
+    }
     diagnostics.extend(instruction_md::legacy_diagnostics(text));
     diagnostics.sort_by_key(|d| d.line().unwrap_or(0));
     let errors: Vec<Refusal> = diagnostics
@@ -160,6 +272,8 @@ pub fn parse(text: &str) -> Result<Parsed, Vec<Refusal>> {
         Ok(Parsed {
             reading,
             diagnostics,
+            allowances,
+            composed_text,
         })
     } else {
         Err(errors)
@@ -264,9 +378,45 @@ pub struct Extraction {
     /// declares, wherever it stands: the names its agents' text may refer to
     /// ([`extract_knowing`]).
     pub known: Vec<(String, String)>,
+    /// The document's wallets and allowances, under the [`SPENDING`] grant
+    /// (RFC 0057 §8); `None` when it has none or may not use them.
+    pub spending: Option<DocumentSpending>,
     /// The SDK's warnings and agentd's host-policy diagnostics, each
     /// `line N: message (code)`.
     pub warnings: Vec<String>,
+}
+
+/// A document's wallets and allowances, as it wrote them (S29), under the
+/// [`SPENDING`] grant. What they become is the operator's to say: the
+/// configuration maps each wallet onto an operator wallet by its `account`
+/// and each allowance into the spending engine as `doc:<id>`
+/// (`config::settings::payments::document_allowances`).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DocumentSpending {
+    pub wallets: Vec<DocumentWallet>,
+    pub allowances: Vec<DocumentAllowance>,
+    /// Each `service`'s `src`, by its id: what an allowance's `&service`
+    /// payee names.
+    pub services: BTreeMap<String, String>,
+}
+
+/// A `::wallet`: the operator's wallet it picks (`account`), and the rails
+/// it may be used on (S28 protocol values; none is every rail).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentWallet {
+    pub id: String,
+    pub account: Option<String>,
+    pub rails: Vec<String>,
+    pub line: usize,
+}
+
+/// A `:::allowance`: its id, and its attributes as the SDK composed them —
+/// every `${parameter}` resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentAllowance {
+    pub id: String,
+    pub attrs: Map<String, Value>,
+    pub line: usize,
 }
 
 /// The host-policy diagnostic code (§17, §18: a host's policy, distinct from
@@ -379,9 +529,10 @@ impl Admission<'_> {
                  declare it in the operator's configuration"
             ));
         }
-        // Over the wire, the agents a document defines run only when the
-        // publisher the operator pinned stands behind them.
-        if self.over_the_wire && grant == AGENTS {
+        // Over the wire, the agents a document defines run, and its
+        // allowances are paid under, only when the publisher the operator
+        // pinned stands behind them.
+        if self.over_the_wire && ATTESTED_OVER_THE_WIRE.contains(&grant) {
             match self.attested {
                 None => {
                     return Err(format!(
@@ -558,6 +709,7 @@ fn fold_knowing(
         admission,
         parameters: parsed.reading.document.metadata.front.get("parameters"),
         cuts,
+        spending: DocumentSpending::default(),
     };
     for o in instruction_md::connected_objects(body) {
         if matches!(o.kind, "person" | "role" | "agent")
@@ -580,6 +732,35 @@ fn fold_knowing(
             f.block(&b);
         }
     }
+    // The allowances at the top level and in layout, as the configuration
+    // blocks are: one inside an agent is that agent's, and one inside an
+    // example is the example's.
+    instruction_md::walk(body, &mut |n, parents| {
+        if n.kind == "allowance"
+            && parents.iter().all(|p| instruction_md::is_layout(&p.kind))
+            && let Some(id) = n.attrs.get("id").and_then(Value::as_str)
+        {
+            let start = n.range.map_or(0, |r| r.start);
+            f.spending.allowances.push(DocumentAllowance {
+                id: id.to_string(),
+                attrs: parsed
+                    .allowances
+                    .get(&start)
+                    .cloned()
+                    .unwrap_or_else(|| n.attrs.clone()),
+                line: start as usize,
+            });
+        }
+        true
+    });
+    let extends = parsed
+        .reading
+        .document
+        .metadata
+        .front
+        .get("extends")
+        .is_some();
+    f.spend(extends);
     if f.errs.is_empty() {
         Ok(f.out)
     } else {
@@ -597,9 +778,81 @@ struct Folder<'a> {
     /// The line ranges of the agents nested in each agent, by the id of the
     /// one they are nested in: cut out of its instruction.
     cuts: BTreeMap<String, Vec<(usize, usize)>>,
+    /// The wallets, allowances and services read so far ([`Folder::spend`]).
+    spending: DocumentSpending,
 }
 
 impl Folder<'_> {
+    /// The document's wallets and allowances: under the [`SPENDING`] grant,
+    /// handed to the configuration to map; without it — or over the wire
+    /// without a pin that attests it — delivered as text only, nothing paid
+    /// under them, and said once. A document that `extends` another keeps
+    /// its allowances as text too: agentd composes no base, so it cannot
+    /// hold an allowance to the one it narrows (S29 §5).
+    fn spend(&mut self, extends: bool) {
+        let sp = std::mem::take(&mut self.spending);
+        if sp.wallets.is_empty() && sp.allowances.is_empty() {
+            return;
+        }
+        let refused = self.admission.admits(SPENDING).err().or_else(|| {
+            (extends && !sp.allowances.is_empty()).then(|| {
+                "the document `extends` another, and agentd composes no base, so it cannot \
+                 check that an allowance only narrows the one it inherits (S29 §5)"
+                    .to_string()
+            })
+        });
+        let Some(why) = refused else {
+            self.out.spending = Some(sp);
+            return;
+        };
+        let mut named: Vec<String> = sp
+            .allowances
+            .iter()
+            .map(|a| format!("allowance {:?}", a.id))
+            .collect();
+        named.extend(sp.wallets.iter().map(|w| format!("wallet {:?}", w.id)));
+        let line = sp
+            .allowances
+            .iter()
+            .map(|a| a.line)
+            .chain(sp.wallets.iter().map(|w| w.line))
+            .min()
+            .unwrap_or(0);
+        for a in &sp.allowances {
+            self.declare("allowance", &a.attrs, a.line);
+        }
+        for w in &sp.wallets {
+            let mut attrs = Map::new();
+            attrs.insert("id".into(), w.id.clone().into());
+            if let Some(a) = &w.account {
+                attrs.insert("account".into(), a.clone().into());
+            }
+            if !w.rails.is_empty() {
+                attrs.insert("rails".into(), w.rails.clone().into());
+            }
+            self.declare("wallet", &attrs, w.line);
+        }
+        self.out.warnings.push(format!(
+            "line {line}: {} {} delivered as text only, and nothing is paid under {}: {why} ({HOST_POLICY})",
+            named.join(", "),
+            if named.len() == 1 { "is" } else { "are" },
+            if named.len() == 1 { "it" } else { "them" },
+        ));
+    }
+
+    /// A `::wallet`: recorded, and handed on under the grant
+    /// ([`Folder::spend`]).
+    fn wallet(&mut self, o: &ConnectedObject<'_>) {
+        let Some(id) = o.id else { return };
+        let line = o.location.line().unwrap_or(0) as usize;
+        self.spending.wallets.push(DocumentWallet {
+            id: id.to_string(),
+            account: o.attr("account").map(str::to_string),
+            rails: o.list("rails").into_iter().map(str::to_string).collect(),
+            line,
+        });
+    }
+
     fn host_policy(&mut self, kind: &str, id: Option<&str>, line: usize, message: String) {
         let id = id.map_or_else(String::new, |i| format!(" {i:?}"));
         self.out.warnings.push(format!(
@@ -635,8 +888,16 @@ impl Folder<'_> {
                 }
             }
             "tool" | "service" | "source" => {
+                if o.kind == "service"
+                    && let (Some(id), Some(src)) = (o.id, o.src)
+                {
+                    self.spending
+                        .services
+                        .insert(id.to_string(), src.to_string());
+                }
                 self.declare(o.kind, o.attrs, o.location.line().unwrap_or(0) as usize);
             }
+            "wallet" => self.wallet(o),
             _ => {}
         }
     }
@@ -1000,9 +1261,23 @@ pub fn machinery_digest(ex: &Extraction) -> Option<String> {
         && ex.declarations.is_empty()
         && ex.people.is_empty()
         && ex.agents.is_empty()
+        && ex.spending.is_none()
     {
         return None;
     }
+    // A re-release that changes only an allowance moves the digest too: the
+    // reload applies it at once (RFC 0057 §4.4).
+    let spending = ex.spending.as_ref().map(|sp| {
+        serde_json::json!({
+            "wallets": sp.wallets.iter().map(|w| {
+                serde_json::json!({"id": w.id, "account": w.account, "rails": w.rails})
+            }).collect::<Vec<_>>(),
+            "allowances": sp.allowances.iter().map(|a| {
+                serde_json::json!({"id": a.id, "attrs": a.attrs})
+            }).collect::<Vec<_>>(),
+            "services": sp.services,
+        })
+    });
     let skills: Vec<Value> = ex
         .skills
         .iter()
@@ -1015,7 +1290,7 @@ pub fn machinery_digest(ex: &Extraction) -> Option<String> {
                                "when_to_use": s.when_to_use, "src": s.src})
         }))
         .collect();
-    let all = serde_json::json!({
+    let mut all = serde_json::json!({
         "config": ex.config,
         "workflows": ex.workflows,
         "skills": skills,
@@ -1026,6 +1301,9 @@ pub fn machinery_digest(ex: &Extraction) -> Option<String> {
                                "reports_to": a.reports_to})
         }).collect::<Vec<_>>(),
     });
+    if let Some(s) = spending {
+        all["spending"] = s;
+    }
     Some(instruction_md::digest(all.to_string().as_bytes()))
 }
 
@@ -1565,5 +1843,158 @@ mod tests {
             serde_json::json!(["start"])
         );
         crate::engine::model::parse_workflow(&ex.workflows[0]).unwrap();
+    }
+
+    // ---- A document's wallets and allowances (RFC 0057 §8, S29) ----------
+
+    const HOUSEHOLD: &str = "---\nspec: \"1\"\nparameters:\n  grocery_max: { type: number, default: 120 }\n---\n\
+        # Household\n\n\
+        ::person{id=nataliia title=\"Nataliia\" role=owner}\n\n\
+        ::wallet{id=card title=\"Household card\" account=household rails=\"x402/2,acp\"}\n\n\
+        ::service{id=shop title=\"Shop\" src=\"https://shop.example.com/api\"}\n\n\
+        :::allowance{id=groceries title=\"Groceries\" wallet=#card currency=GBP max=\"${grocery_max}\" budget=400 per=month payees=\"tesco.com,&shop\" approve-above=60 approver=#nataliia}\n\
+        The weekly shop.\n:::\n";
+
+    fn spending() -> BTreeSet<String> {
+        BTreeSet::from([SPENDING.to_string()])
+    }
+
+    /// Without the grant a document's wallets and allowances are delivered
+    /// as text — the SDK's one sentence — nothing is handed on to be paid
+    /// under, and the load says so once, naming the grant.
+    #[test]
+    fn without_the_spending_grant_allowances_are_text_only() {
+        let ex = extract(HOUSEHOLD, &BTreeSet::new()).unwrap();
+        assert!(ex.spending.is_none());
+        let said: Vec<&String> = ex
+            .warnings
+            .iter()
+            .filter(|w| w.contains("delivered as text only"))
+            .collect();
+        assert_eq!(said.len(), 1, "{:?}", ex.warnings);
+        assert!(
+            said[0].contains("allowance \"groceries\", wallet \"card\"")
+                && said[0].contains(
+                    "needs the `spending` grant (`agent.document_capabilities: [spending]`)"
+                )
+                && said[0].ends_with("(host-policy)"),
+            "{}",
+            said[0]
+        );
+        assert!(
+            ex.cleaned.contains(
+                "Allowance \"Groceries\" (#groceries): pay from #card in GBP; at most 120 per payment and 400 per calendar month (UTC)"
+            ),
+            "{}",
+            ex.cleaned
+        );
+        assert_eq!(ex.declarations["allowance"].len(), 1);
+        assert_eq!(ex.declarations["wallet"].len(), 1);
+    }
+
+    /// Under the grant they are handed on as written, each amount as its
+    /// parameter resolved, with the services an `&service` payee names.
+    #[test]
+    fn under_the_grant_allowances_are_handed_on_resolved() {
+        let ex = extract(HOUSEHOLD, &spending()).unwrap();
+        let sp = ex.spending.expect("handed on");
+        assert_eq!(sp.allowances.len(), 1);
+        let a = &sp.allowances[0];
+        assert_eq!(a.id, "groceries");
+        assert_eq!(a.attrs["max"], "120", "the parameter resolved");
+        assert_eq!(a.attrs["approver"], "#nataliia");
+        assert_eq!(
+            sp.wallets,
+            vec![DocumentWallet {
+                id: "card".into(),
+                account: Some("household".into()),
+                rails: vec!["x402/2".into(), "acp".into()],
+                line: 10,
+            }]
+        );
+        assert_eq!(sp.services["shop"], "https://shop.example.com/api");
+        assert!(!ex.declarations.contains_key("wallet"));
+        assert!(
+            ex.warnings.iter().all(|w| !w.contains("text only")),
+            "{:?}",
+            ex.warnings
+        );
+    }
+
+    /// Over the wire `spending` is `agents`' rule: a pinned publisher whose
+    /// author signature attests it, or text only, said why.
+    #[test]
+    fn over_the_wire_spending_needs_a_pin_that_attests_it() {
+        for (attested, why) in [
+            (None, "is not verified"),
+            (Some(vec![AGENTS.to_string()]), "attests [\"agents\"]"),
+        ] {
+            let ex = extract_from_wire(HOUSEHOLD, &spending(), attested.as_deref()).unwrap();
+            assert!(ex.spending.is_none());
+            assert!(
+                ex.warnings
+                    .iter()
+                    .any(|w| w.contains("text only") && w.contains(why)),
+                "{why}: {:?}",
+                ex.warnings
+            );
+        }
+        let ex = extract_from_wire(HOUSEHOLD, &spending(), Some(&[SPENDING.to_string()])).unwrap();
+        assert!(ex.spending.is_some(), "{:?}", ex.warnings);
+    }
+
+    /// What only composition says of an allowance — a wallet it names that
+    /// is not there, an agent as its approver — refuses the document as a
+    /// reader error does, naming the line and the code.
+    #[test]
+    fn a_composers_error_about_an_allowance_refuses_the_document() {
+        let missing = HOUSEHOLD.replace("wallet=#card currency", "wallet=#nocard currency");
+        let errs = extract(&missing, &spending()).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.code == "reference-missing" && e.line == Some(14)),
+            "{errs:?}"
+        );
+        let agent = HOUSEHOLD
+            .replace(
+                "::service",
+                "::agent{id=helper title=\"Helper\" protocol=a2a endpoint=\"https://h.example/a2a\"}\n\n::service",
+            )
+            .replace("approver=#nataliia", "approver=#helper");
+        let errs = extract(&agent, &spending()).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.code == "allowance-approver-not-person"),
+            "{errs:?}"
+        );
+        // Without the grant too: the document should not be delivered.
+        assert!(extract(&missing, &BTreeSet::new()).is_err());
+    }
+
+    /// A document that `extends` another keeps its allowances as text:
+    /// agentd composes no base to hold one to.
+    #[test]
+    fn a_document_that_extends_keeps_its_allowances_as_text() {
+        let doc = HOUSEHOLD.replace(
+            "spec: \"1\"\n",
+            "spec: \"1\"\nextends:\n  - { uri: https://example.org/base, as: base }\n",
+        );
+        let ex = extract(&doc, &spending()).unwrap();
+        assert!(ex.spending.is_none());
+        assert!(
+            ex.warnings.iter().any(|w| w.contains("`extends` another")),
+            "{:?}",
+            ex.warnings
+        );
+    }
+
+    /// An allowance moves the machinery digest, so a re-release that changes
+    /// only an allowance is applied.
+    #[test]
+    fn an_allowance_moves_the_machinery_digest() {
+        let a = extract(HOUSEHOLD, &spending()).unwrap();
+        let b = extract(&HOUSEHOLD.replace("budget=400", "budget=300"), &spending()).unwrap();
+        assert_ne!(machinery_digest(&a), machinery_digest(&b));
+        assert!(machinery_digest(&a).is_some());
     }
 }

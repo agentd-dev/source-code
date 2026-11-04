@@ -595,8 +595,10 @@ export async function runAuthCommand(
  * The `/allowances` note: each allowance the `payment.allowances` reply
  * lists, as a short block — its id and title, currency, this period (per and
  * since when), spent of budget, payments of times when a count is set, and
- * the amount above which a payment asks first. Every value is shown inert:
- * a title is whatever the operator's configuration says.
+ * the amount above which a payment asks first. An instruction document's own
+ * allowance (`source: document`, RFC 0057 §8) says which document it is
+ * from. Every value is shown inert: a title is whatever the operator's
+ * configuration — or the document — says.
  */
 export function allowancesNote(reply: Json): string {
   const list = rows(field(reply, 'allowances'));
@@ -613,7 +615,10 @@ export function allowancesNote(reply: Json): string {
       `  spent ${shown(field(a, 'spent'))} / ${shown(field(a, 'budget'))}` +
       (typeof times === 'number' ? ` · payments ${shown(field(a, 'payments'))} / ${times}` : '') +
       (above !== undefined ? ` · asks above ${inert(above)}` : '');
-    return [head, when, spend].join('\n');
+    const doc = text(field(a, 'document'));
+    const from =
+      text(field(a, 'source')) === 'document' ? [`  from the instruction document${doc !== undefined ? ` ${inert(doc)}` : ''}`] : [];
+    return [head, when, spend, ...from].join('\n');
   });
   return `allowances:\n${blocks.join('\n')}`;
 }

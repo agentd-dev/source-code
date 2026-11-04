@@ -3490,12 +3490,13 @@
           "type": "string"
         },
         "document_capabilities": {
-          "description": "the grants this agent's instruction document may use beyond the default: identity admits its A2A agents (::agent → a2a.peers), interface a workflow that opens an inbound route, agents the agents it defines for agentd to run (::::agent with a body and no protocol → subagents.templates; over the wire only from a pinned publisher whose signature attests agents). Empty admits guidance, :::mcp, :::workflow, :::config, :::skill and ::person. Fail-closed, restart-only.",
+          "description": "the grants this agent's instruction document may use beyond the default: identity admits its A2A agents (::agent → a2a.peers), interface a workflow that opens an inbound route, agents the agents it defines for agentd to run (::::agent with a body and no protocol → subagents.templates; over the wire only from a pinned publisher whose signature attests agents), spending its wallets and allowances (::wallet → an operator wallet by account, :::allowance → an allowance doc:<id> its own workflows pay under; over the wire only from a pinned publisher whose signature attests spending). Empty admits guidance, :::mcp, :::workflow, :::config, :::skill and ::person. Fail-closed, restart-only.",
           "items": {
             "enum": [
               "interface",
               "identity",
-              "agents"
+              "agents",
+              "spending"
             ]
           },
           "type": "array"
@@ -3705,7 +3706,8 @@
                             "compute",
                             "infra",
                             "compose",
-                            "agents"
+                            "agents",
+                            "spending"
                           ]
                         },
                         "type": "array"
@@ -5764,6 +5766,13 @@
               "description": "who approves a payment the policy asks about: `operator` (default: any operator principal) or one principal id `<role>:<id>`, the only one who can — no judge answers, and no operator but the approver",
               "type": "string"
             },
+            "approvers": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "who answers for a person or a role an instruction document's allowance names as its approver (RFC 0057 §8): the id it names, without the `#`, to `operator` or one principal id `<role>:<id>` — never an agent. An allowance whose approver is not bound here pays only up to its approve-above. Reloadable",
+              "type": "object"
+            },
             "ask_when_tainted": {
               "description": "a payment from work that has read outside text, or that a model asked for, is asked of the approver whatever its amount; default true",
               "type": "boolean"
@@ -5836,6 +5845,10 @@
               },
               "description": "the assets agentd pays in, by name; amounts of two assets are never added",
               "type": "object"
+            },
+            "document_ceiling": {
+              "description": "a security.payments.allowances id: every payment under an instruction document's own allowance (agent.document_capabilities: [spending]) also counts against this operator allowance and must pass it, so all document spending together is capped. Unset, the asset caps are the ceiling. Reloadable",
+              "type": "string"
             },
             "key_custody": {
               "description": "who holds the wallet keys: agentd, each key file sealed under seal_key (local, the default), or the external signer (external, with signer and no seal_key)",

@@ -1427,6 +1427,8 @@ pub fn allowances_output() -> Value {
             "approve_above": {"type": ["string", "null"]},
             "payments": {"type": "integer"},
             "times": optional("integer"),
+            "source": {"enum": ["operator", "document"], "description": "the operator's security.payments.allowances, or an instruction document's own allowance (doc:<id>, RFC 0057 §8)"},
+            "document": {"type": "string", "description": "a document's allowance: the document's URI"},
         }}}}})
 }
 

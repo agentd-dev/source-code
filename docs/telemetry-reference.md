@@ -705,7 +705,7 @@ makes public once a payment settles, is in each.
 | `payment.unknown` | warn | as `payment.settled` | What landed is not known: no answer, a timeout, a 5xx, `settlement_pending`, an answer with no settlement. The request is never paid again. |
 | `payment.ledger.restored` | warn | `amount`, `asset`, `msg`, `nonce`, `payee`, `request`, `run`, `state`, `step`, `workflow` | At start: a payment was out when the last life stopped. Its outcome is unknown from here on. Also an audit record, `payment` (`unknown`). |
 | `payment.ledger.swept` | info | `records` | Records past every cap's window and every authorization's validity, of runs no longer live, and past the period of any allowance they name, were forgotten. |
-| `payment.allowance.changed` | info | `id`, `fields` or `added` | A reload changed an allowance — the fields that changed — or added one. Applied at once. |
+| `payment.allowance.changed` | info | `id`, `fields` or `added` | A reload changed an allowance — the fields that changed — or added one. Applied at once. An instruction document's own allowance is `doc:<id>`, and a re-release of the document that changes it is said the same way. |
 | `payment.allowance.removed` | info | `id` | A reload removed an allowance no workflow step names. |
 | `payment.allowance.charged` | info | `account`, `allowance`, `charge`, `company`, `currency`, `operation_id`, `state` | A Company operation's charge to its allowance: `confirmed`, `unknown` (counted) or `refused` (the Company did not take the confirm; not counted). Also an audit record, `company.operation` (`charged`). |
 | `payment.allowance.credited` | info | `company`, `operation_id` | The Company confirmed a cancellation agentd asked for: the operation's charge is credited back. |

@@ -5,6 +5,38 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Added.**
+
+- **A served document's own wallets and allowances (RFC 0057 phase C).**
+  Under a new document grant, `agent.document_capabilities: [spending]`
+  (off by default; over `url:`, `oci:` or `mcp:` only from a pinned
+  publisher whose author signature attests `spending`, as `agents`), an
+  instruction document's `::wallet{account=…}` picks one of the operator's
+  wallets, on x402 version 2, and each `:::allowance{id=…}` becomes the
+  allowance `doc:<id>` in the same spending engine and ledger as the
+  operator's. The document's own workflows pay under it with
+  `payment: {allowance: <id>}`, and read what is left with
+  `{kind: tool, name: payment.allowances}`. It only narrows: every asset
+  cap, the operator's payee list and the step's `max` still hold; its
+  payees are matched against the paid resource's origin host; and the new
+  `security.payments.document_ceiling` holds all document spending to one
+  operator allowance. A document's `approver=#person` is answered by the
+  principal the operator binds in the new `security.payments.approvers`;
+  unbound, the allowance pays only up to `approve-above`
+  (`approver-unbound`). Without the grant the allowances are delivered as
+  text and nothing is paid under them, said once. A re-release that changes
+  an allowance applies at once, counting what was spent. `payments.allowances`
+  and `payment.allowances` mark each allowance `source: operator` or
+  `source: document`, with the document's URI, and the TUI's `/allowances`
+  says which document. Not for a Company's operations, and a document's
+  receipts are not in the registry's consumer report.
+- **instruction-md 0.2.** The official instruction.md SDK, with the
+  `wallet` and `allowance` kinds (S29) and protocol names on every connected
+  kind (S28). Every existing document reads as before; an allowance's
+  reader or composer error refuses the document, as any reader error does.
+
 ## v1.25.0 — talk to a subagent, read its log
 
 The TUI completes with `→`, and a subagent's view holds a message field,

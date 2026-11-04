@@ -49,6 +49,8 @@ whose body is guidance.
 | `:::config{id dialect="agentd/config"}` | the document's configuration fragment, merged under the operator's | none |
 | `:::skill{id title trigger}` with a body, no `src` | an inline skill named `id`: `description` (or `title`) and `trigger` | none |
 | `::person{id}`, `::role{id}` | a person a `human` step may be addressed to: `to: <id>` or `to: "#<id>"` is answered by the operators | none |
+| `::wallet{id account rails}` | the operator's `security.payments.wallets` entry named `account`; `rails` empty is any rail, otherwise it must name x402 version 2 (`x402`, `x402/2`) | `spending` |
+| `:::allowance{id wallet currency max budget per times payees categories from until approve-above approver}` | a `security.payments.allowances` entry `doc:<id>`, its amounts as parameters resolve: `wallet` → the operator wallets its `::wallet`s pick, `max` absent → `budget`, a date-only `from`/`until` → whole UTC days, `payees` → origin hosts (a domain; an `&service`'s `src` host), `approver` → the principal `security.payments.approvers` binds to it. Its body is delivered as text | `spending` |
 
 Every other block is guidance, delivered as agent text and configuring
 nothing: rules, policies, context, examples, layout, resources, data,
@@ -73,6 +75,9 @@ unresolved, and is reported as a host-policy diagnostic (§17): a
 | `:::mcp` with neither a `src` nor both `registry` and `server` | agentd dials a server by its URL, or by a registry the operator trusts and the server's name there |
 | `:::workflow` or `:::config` in another dialect | agentd runs `instruction/workflow` and reads `agentd/config` |
 | `:::skill` with a `src` that is not a `SKILL.md` on GitHub | packaged skills come from the configuration's `skills:` |
+| `::wallet` and `:::allowance` without the `spending` grant; from a document that arrived over the wire, one not verified against a pinned publisher or whose signature does not attest `spending`; an allowance in a document that `extends` another | the grant; a wire document's allowances are paid under only from a publisher the operator pinned; agentd composes no base to hold an inherited allowance to. Said once for the document, and delivered as the SDK's sentence |
+| `::wallet` whose `account` names no operator wallet, or whose `rails` leave out x402 (`host-policy`) or name only `x402/1` (`protocol-unsupported`) | agentd pays from the operator's wallets, with x402 version 2 |
+| `:::allowance` that draws on no wallet agentd pays from, or under an operator with no wallet | a document picks among the operator's wallets and adds none |
 
 `::tool`, `::service`, `::source`, and every object above, are listed by kind
 under `document.declarations` in `agentd --capabilities`.
@@ -105,6 +110,7 @@ default. `instruction/1` grants nothing by itself; these are agentd's.
 | `identity` | `::agent` → `a2a.peers` |
 | `interface` | a workflow with a `webhook` start or a `wait {on: webhook}`, however the document writes it |
 | `agents` | `::::agent` with a body and no `protocol` → `subagents.templates` |
+| `spending` | `::wallet` → an operator wallet, `:::allowance` → `doc:<id>` in `security.payments.allowances`, which only the document's own workflows pay under (`payment: {allowance: <id>}`) |
 
 A document that arrived over the wire (`url:`, `oci:`, `mcp:`) never uses
 `identity`, whatever the operator granted or the author signed. Nor may it
@@ -113,7 +119,8 @@ write `a2a.peers` through a `:::config`, or name a secret
 the machinery of an agent it defines: the load is refused, since the secret
 would go wherever the document points it. It uses `agents` only when it
 verified against a pinned publisher (`agent.instruction.trust`) and the
-author's signature attests `agents`.
+author's signature attests `agents`, and `spending` only when it attests
+`spending`.
 
 An agent written inside another agent's body, with a longer outer fence,
 is a report: its own template, labelled `reports_to` with the agent it is

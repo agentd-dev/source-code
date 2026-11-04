@@ -174,19 +174,23 @@ instruction.md's RFC-0041 states the limits a person means for an agent's
 spending once, above the payment protocols: a most per payment, a budget
 per period, a count, a window, the payees, and who approves above an
 amount. agentd enforces them as allowances, across the rails it pays on.
-The RFC is a draft in instruction.md, and its document form is not in the
-specification yet.
+The RFC is accepted in instruction.md, and its document form — the `wallet`
+and `allowance` kinds (proposal S29, with S28's protocol names for a
+wallet's rails) — is read by the official SDK, `instruction-md` 0.2.
 
 | | Support |
 |---|---|
 | Allowances | `security.payments.allowances`, in the operator's configuration: `max`, `budget` per `day`, `week`, `month`, `quarter`, `year` or `once` (UTC calendar periods), `times`, `from` and `until`, `payees`, `approve_above` and its `approver`. Amounts are money in an ISO 4217 currency, counted exactly, per allowance and period, and a change applies on reload. |
-| Rails | [x402](#x402) (an asset is usable when it says which currency it is) and a [Company's priced operations](act-at-companies.md#spending-at-a-company), which the User still approves. |
+| A document's wallets and allowances | `::wallet{account rails}` and `:::allowance{…}` under the operator's `spending` grant (over the wire, only from a pinned publisher whose signature attests `spending`): the wallet is one of the operator's, by `account`, on x402 version 2; the allowance is `doc:<id>`, every attribute mapped, which the document's own workflows pay under. It narrows every operator limit and never adds a wallet, a payee or an approver ([Allowances in an instruction document](pay-with-x402.md#allowances-in-an-instruction-document)). |
+| Rails | [x402](#x402) (an asset is usable when it says which currency it is) and a [Company's priced operations](act-at-companies.md#spending-at-a-company), which the User still approves. A document's allowance is x402 only. |
 | Refusals | a payment past a limit, or under a limit no rail can enforce (`categories`; `rail-cannot-enforce`), is refused, naming the allowance and the limit. |
 | Planned | AP2, ACP with Shared Payment Tokens, and MPP, as further rails under the same allowances. agentd doesn't speak them yet. |
 
-**Not supported:** a document's own wallets and allowances (they wait on the
-specification); converting between currencies; `categories`, which no rail
-agentd pays on can enforce.
+**Not supported:** converting between currencies; `categories`, which no
+rail agentd pays on can enforce; a document's allowance for a Company's
+operations; an allowance inherited through `extends` (agentd composes no
+base, so such an allowance is text only); receipts in the registry's
+consumer report.
 [Allowances](pay-with-x402.md#allowances) is the guide, and
 [RFC 0057](../rfcs/0057-spending-controls.md) the design.
 

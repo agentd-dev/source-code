@@ -150,6 +150,8 @@ diagnostic's code. A warning is said and the document loads. The common ones:
 | `:::config` setting `document_capabilities` | `a config block may not write document_capabilities` (`self-grant`) | Grants are the operator's. |
 | `::agent{…}` without the grant | a warning: `agent "x" is not activated: needs the identity grant (host-policy)` | Grant it; see [Grant what a document may use](#grant-what-a-document-may-use). |
 | `::::agent{id=x}` with a body and no `protocol`, without the grant | a warning: `agent "x" is not activated: an agent agentd runs itself needs the agents grant (host-policy)` | Grant `agents`; see [A document's own agents](delegate-subagents.md#a-documents-own-agents). |
+| `:::allowance{id=x}` or `::wallet{…}` without the grant | a warning, once: `allowance "x", wallet "card" are delivered as text only, and nothing is paid under them: needs the spending grant (host-policy)`; a paying step in its workflow refuses the load | Grant `spending`; see [Allowances in an instruction document](pay-with-x402.md#allowances-in-an-instruction-document). |
+| `:::allowance{…}` with `max` above `budget`, an unknown `per`, a `wallet=#x` that names nothing, an agent as `approver` | the SDK's `allowance-max-over-budget`, `allowance-per-unknown`, `reference-missing`, `allowance-approver-not-person`: the document is refused, as for any reader error | Fix the allowance. |
 | `::::agent{id=x}` when the operator has a template `x` | a warning: `agent "x" is not activated: the operator's subagents.templates has a template of that name, and the operator's stands` (`host-policy`) | Nothing, if the operator's `x` is meant; otherwise rename the agent. |
 | `:::mcp{id=fs …}` when the operator has a server `fs` at another endpoint | a warning: `mcp server "fs" (…) is not activated: the operator's mcp.servers has a server of that name at another endpoint, and the operator's stands` (`host-policy`) | Nothing, if the operator's `fs` is meant; otherwise rename the block. A document adds servers; it never re-points one. |
 | `:::workflow{id=w …}` when the operator defines a workflow `w` | a warning: `workflow "w" is not activated: the operator defines a workflow of that name, and the operator's stands` (`host-policy`) | Nothing, if the operator's `w` is meant; otherwise rename the block. |
@@ -592,7 +594,7 @@ so a pinned document verifies after it is decrypted.
 `instruction/1` grants nothing by itself: a declaration states intent, and the
 host decides what it may become. agentd activates, with no grant, the
 guidance and the blocks every document may use: `:::mcp`, `:::workflow`,
-`:::config`, `:::skill` and `::person`. Three grants, named in
+`:::config`, `:::skill` and `::person`. Four grants, named in
 `agent.document_capabilities`, admit more:
 
 | Grant | Admits |
@@ -600,6 +602,7 @@ guidance and the blocks every document may use: `:::mcp`, `:::workflow`,
 | `identity` | `::agent{protocol=a2a …}`: the agent becomes an `a2a.peers` entry a workflow can `a2a.send` to |
 | `interface` | a workflow that opens an inbound route on the operator's webhook listener: a `webhook` start, or a `wait {on: webhook}` |
 | `agents` | `::::agent{id=…} … ::::` with no `protocol`, `src` or `endpoint`: an agent agentd runs itself, as a subagent template whose instruction is the body ([A document's own agents](delegate-subagents.md#a-documents-own-agents)) |
+| `spending` | `::wallet{account=…}`, one of the operator's `security.payments.wallets` picked by its name, and `:::allowance{id=…}`, an allowance `doc:<id>` the document's own workflows pay under — within every limit the operator's spend policy sets ([Allowances in an instruction document](pay-with-x402.md#allowances-in-an-instruction-document)) |
 
 This document declares a person and an A2A agent and addresses a workflow to
 both. Save it as `deploy.md`:
@@ -676,7 +679,9 @@ document may use: a `:::config` that writes `a2a.peers`, or a secret named in
 a header or a step, refuses it, in the document or in the body of an agent it
 defines. It uses the `agents` grant only when it verified against a pinned
 publisher and the author's signature attests `agents`; an unpinned or
-unsigned document's agents stay text, said. A `url:` or `oci:` document is refused at
+unsigned document's agents stay text, said. The `spending` grant follows the
+same rule: its wallets and allowances are paid under only when the author's
+signature attests `spending`. A `url:` or `oci:` document is refused at
 load, exit `2`; an `mcp:` document when it is read, exit `6` at startup, and
 on an update the running text stays.
 
@@ -690,7 +695,8 @@ on an update the running text stays.
 | The document and the operator both name the turn model | The operator's wins; the document's is dropped. | Name models in the document and leave `--model` unset, or the reverse. |
 | A document changes `store.kind` or `lifecycle.run_until` | The change needs a restart, as in a config file. | Restart after the edit. |
 | An `::include` or `extends` in the document | agentd delivers the document as read; what it composes is not loaded. | Inline the text, or serve the document from a registry that resolves it. |
-| A misspelled grant in `document_capabilities` | It grants nothing. | Use `identity`, `interface` or `agents`. |
+| A misspelled grant in `document_capabilities` | It grants nothing. | Use `identity`, `interface`, `agents` or `spending`. |
+| An `:::allowance` in a document that `extends` another | It stays text: agentd loads no base, so it cannot check that the allowance only narrows the one it inherits. | Write the allowance in the document agentd reads. |
 | A trust pin's key file path is wrong | The pin cannot be enforced; under `warn` the document loads unverified. | `unenforceable: refuse`. |
 | A document's `:::mcp` server | It counts as `untrusted_input`: what it answers taints the work that reads it. `trusted` on it is refused. | Declare the server in the operator's `mcp.servers` with its tags (`connect: on_use` dials it only when needed). The document's `:::mcp` whose `src` matches that endpoint is then the operator's server, with its tags. |
 | An `instruction/workflow` step a host does not run | `--validate-config` refuses the workflow, naming the step (an `event` start on an event agentd does not raise, a `wait` with no `on`). | Use the node forms in [the node registry](node-registry.md). |

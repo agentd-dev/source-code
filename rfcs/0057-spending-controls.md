@@ -1,7 +1,8 @@
 # RFC 0057: Spending controls — allowances
 
-**Status:** Accepted 2026-11-03 by the user (decisions in §9); phases A–B
-implemented, phase C waits on the specification
+**Status:** Accepted 2026-11-03 by the user (decisions in §9); phases A–C
+implemented (phase C on `instruction-md` 0.2, S28 and S29); a document's
+receipts in the consumer report are not done (§8)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-11-03
 **Builds on:** RFC 0049 (x402 payments: wallets, assets, payees, the
@@ -213,26 +214,68 @@ within" an allowance.
 
 ## 8. Phase C: a document's allowances
 
-Waiting on instruction.md proposal S29 (the `wallet` and `allowance` kinds)
-in the official SDK; agentd reads documents only through it. Then:
+Built on instruction.md proposal S29 (the `wallet` and `allowance` kinds)
+and S28 (protocol names for a wallet's `rails`) in the official SDK,
+`instruction-md` 0.2; agentd reads documents only through it
+(`config::idoc`), and maps what it reads in
+`config::settings::payments::document_allowances`.
 
 - **Grant.** `agent.document_capabilities: [spending]`, off by default.
   Over `url:`, `oci:` or `mcp:` it needs a trust pin and an author
-  signature attesting `spending`, as `agents` does (RFC 0056 §4). A
-  document arriving any other way never spends.
+  signature attesting `spending`, as `agents` does (RFC 0056 §4;
+  `idoc::ATTESTED_OVER_THE_WIRE`). Without the grant, or over the wire
+  without the attestation, the wallets and allowances are delivered as
+  text only — the SDK's sentence — nothing is paid under them, and the
+  load says so once, naming why.
 - **Mapping.** A document's `::wallet{account=…}` names an operator wallet
-  by `account`; one that names none is held, said. A `:::allowance`
-  becomes an allowance under the document's namespace (`doc:<id>`), whose
-  every limit narrows the operator allowances and caps it draws on. It
-  never adds a payee or a wallet the operator didn't allow.
-- **Approvers.** The document's `approver=#person` is bound by the operator
-  to a principal: `security.payments.approvers: {nataliia: <principal>}`.
-  An allowance whose approver isn't bound pays only below `approve_above`,
-  and the load warns `approver-unbound`. The agent is never the approver.
+  by `account`; one that names none is held, said (`host-policy`). Its
+  `rails`, empty, are any rail; otherwise they must name x402 version 2
+  (`x402`, `x402/2`), and `x402/1` alone is held, `protocol-unsupported`.
+  A `:::allowance` becomes an allowance under the document's namespace
+  (`doc:<id>`) in the same engine and ledger, keyed by its id, so a
+  re-release never resets spend. Its amounts are read as parameters
+  resolve; `max` absent is the budget; a date-only window is whole days in
+  UTC (the SDK's `instant`); its `payees` are origin hosts (a domain as
+  written, an `&service`'s `src` host), matched against the paid
+  resource's host beside the operator's payee list, never instead of it;
+  `categories` is refused on x402, `rail-cannot-enforce`. It never adds a
+  payee or a wallet the operator didn't allow: one that draws on no
+  operator wallet is held.
+- **Reader errors.** An SDK error about an allowance (`allowance-*`,
+  `reference-missing`, `reference-kind`) — the reader's, or the composer's
+  once parameters resolve — refuses the document, as every reader error
+  does. A document that `extends` another keeps its allowances as text:
+  agentd composes no base, so it cannot check that one only narrows what it
+  inherits, and `allowance-widened` cannot arise.
+- **It only narrows.** Every asset cap, the operator's payee list and the
+  step's `max` hold. `security.payments.document_ceiling` (operator-only,
+  reloadable) names an operator allowance every document payment also
+  counts against and must pass (the ledger record names it, `ceiling`);
+  unset, the asset caps are the ceiling.
+- **Approvers.** The document's `approver=#person` (or a role's name) is
+  bound by the operator to a principal:
+  `security.payments.approvers: {nataliia: <principal>}`, never an `agent:`
+  one. An allowance whose approver isn't bound pays only up to
+  `approve-above`, refuses above it `approver-unbound`, and the load warns
+  once. `approve-above` with no approver asks `security.payments.approver`.
+  The agent is never the approver.
 - **Paying from a document.** A document's workflow with a paying step is
-  refused today (RFC 0049 D2). Under the grant, it is allowed only when the
-  step names a document allowance.
-- **Receipts** go into the consumer report the registry reads.
+  refused (RFC 0049 D2) unless the document has an allowance in force; its
+  step must then name one of them (`payment: {allowance: <id>}`, read as
+  `doc:<id>`) and no wallet. A document step naming an operator allowance is
+  refused, and the operator's workflows never pay under a `doc:` one.
+- **Reload.** A re-release that changes an allowance applies at once
+  (`payment.allowance.changed`, its `doc:` id); one that removes it fails
+  the load of a step naming it, and an approval pending under it is refused
+  when answered (`payment.allowance.removed`).
+- **Observability.** `payments.allowances`, the `payment.allowances` op and
+  tool mark each allowance `source: operator` or `source: document`, with
+  the document's URI.
+- **Not a Company's.** The Personal Agent Protocol work is parked: a
+  document's allowance is not usable for a Company's operations
+  (`companies.<name>.spending` naming one is refused).
+- **Receipts** in the consumer report the registry reads: **not done** —
+  the registry doesn't accept them yet.
 
 ## 9. Decisions (the user, 2026-11-03)
 
@@ -254,7 +297,8 @@ in the official SDK; agentd reads documents only through it. Then:
   x402 under an allowance, live reload of `allowances`, the status and the
   `payment.allowances` read, docs.
 - **B.** A Company's priced operations against an allowance.
-- **C.** A document's wallets and allowances, after S29 (§8).
+- **C.** A document's wallets and allowances, on S29 (§8). Implemented;
+  receipts in the consumer report are not.
 
 ## 11. Limits
 

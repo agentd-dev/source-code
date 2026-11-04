@@ -1939,8 +1939,22 @@ before anything is signed:
   tool that charges reads the payment request as the tool's error); a model reaches one only by starting a workflow the operator
   exposed as a tool, and such a run asks the approver unless
   `ask_when_tainted` is off. An instruction
-  document's paying step is refused at load, and a definition
-  `workflow.create` or `workflow.update` stored fails the step unpaid.
+  document's paying step is refused at load — unless the operator grants
+  the document `spending` and the step pays under the document's own
+  allowance, below — and a definition `workflow.create` or
+  `workflow.update` stored fails the step unpaid.
+- **A document's allowances only narrow.** Under the operator's `spending`
+  grant (over the wire, only from a pinned publisher whose author signature
+  attests `spending`), a document's `:::allowance` becomes `doc:<id>`: its
+  own workflows may pay under it, and nothing else. It adds no wallet (a
+  `::wallet` picks one of the operator's by name), no payee (its payees are
+  matched against the paid resource's host, beside the operator's payee
+  list), no cap (every asset cap and the step's `max` still hold, and
+  `security.payments.document_ceiling` holds all document spending to one
+  operator allowance) and no approver (its `#person` is answered only by
+  the principal the operator binds in `security.payments.approvers`, never
+  an agent; unbound, nothing above `approve-above` is paid). A document
+  without the grant is text, and its paying step refuses the load.
 - **The approver's gate.** Above `approve_above`, for a step that says
   `approve: true`, and — with `ask_when_tainted`, the default — for work
   that has read outside text or that a model asked for, the payment waits

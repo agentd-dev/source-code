@@ -325,7 +325,7 @@ behaves.
 | `agent.ask_human_fallback` | `fail \| wait \| auto` | `fail` | live · doc | What an `ask_human` does when it does not open a gate: fail at once, park until its timeout, or let the judge answer. `auto` also answers an unaddressed gate that times out. No judge answers an ask whose run, subagent or peer conversation carries outside input; the ask fails (`human.judge.withheld`). `pause` and `idle` are accepted for `wait`, `finish` and `stop` for `fail`. |
 | `agent.ask_human_unowned` | `gate \| fallback` | `fallback` | live · doc | What an ask nobody owns does (one raised by a schedule, webhook, stream or subagent): open a gate task on the A2A listener (`gate`, needs `a2a.listen`), or apply `ask_human_fallback`. |
 | `agent.gate_channels` | map: workflow → step path → channel | `{}` | live · op | The channel a configured workflow's gate is announced on, where no instruction document declared one. |
-| `agent.document_capabilities` | list of `identity \| interface \| agents` | `[]` | restart · op | What the instruction document may activate beyond the default: `identity` admits its A2A agents (`::agent` → `a2a.peers`), `interface` a workflow that opens a webhook route, `agents` the agents it defines for agentd to run (`::::agent` with no `protocol` → `subagents.templates`; over the wire only from a pinned publisher whose signature attests `agents`). See [Instruction document reference](directives-reference.md#grants). |
+| `agent.document_capabilities` | list of `identity \| interface \| agents \| spending` | `[]` | restart · op | What the instruction document may activate beyond the default: `identity` admits its A2A agents (`::agent` → `a2a.peers`), `interface` a workflow that opens a webhook route, `agents` the agents it defines for agentd to run (`::::agent` with no `protocol` → `subagents.templates`; over the wire only from a pinned publisher whose signature attests `agents`), `spending` its wallets and allowances (`::wallet` → an operator wallet, `:::allowance` → `doc:<id>`, which its own workflows pay under; over the wire only from a pinned publisher whose signature attests `spending`; [Allowances in an instruction document](pay-with-x402.md#allowances-in-an-instruction-document)). See [Instruction document reference](directives-reference.md#grants). |
 
 ### The instruction source
 
@@ -1774,6 +1774,8 @@ reload swaps whole or not at all ([Reload classes](#reload-classes)).
 | `security.payments.allowances.<id>.approve_above` | decimal | — | Above it, up to `max`, the approver is asked each time. At most `max`. |
 | `security.payments.allowances.<id>.approver` | `operator` or a principal id | `security.payments.approver` | Who answers when an x402 payment under it is asked about. |
 | `security.payments.allowances.<id>.title` | string | — | A label for receipts, gates and the status document. |
+| `security.payments.approvers.<id>` | `operator` or a principal id | — | Who answers for the person or role `<id>` an instruction document's allowance names as its `approver` (`approver=#nataliia` binds `nataliia`). Never an `agent:` principal. An allowance whose approver is not bound pays only up to its `approve-above` (`approver-unbound`). Live. |
+| `security.payments.document_ceiling` | an allowance id | — | One of the operator's allowances that every payment under an instruction document's own allowance also counts against and must pass: the cap on all document spending together. Unset, the asset caps are the ceiling. Live. |
 | `security.payments.payees.<name>.address` | address | required | The address paid (`payTo`): an EVM address — a mixed-case one is held to its EIP-55 checksum — or a Solana address in base58. |
 | `security.payments.payees.<name>.assets` | list of asset names | every asset | The assets it may be paid in, each on the address's chain family. |
 | `security.payments.rpc.<network>` | URL | — | By Solana network (CAIP-2), the RPC endpoint asked for a recent blockhash (`getLatestBlockhash`) when a server's entry gives none: `https://`, or `http://` to this host, its `{{secret:NAME}}` references resolved when it is dialled. A network no asset is on is refused. |
@@ -1805,10 +1807,17 @@ Company's operations with `companies.<name>.spending`.
 A step pays only with its own `payment` field — `{wallet, max, approve?}`
 on an `http`, `mcp.tool`, `a2a.send` or `a2a.delegate` step ([node
 registry](node-registry.md#http)) — which is
-literal and names a wallet and assets of the policy; an instruction
-document's workflow with one is refused at load, and one `workflow.create`
-or `workflow.update` stored fails the step without paying. The guide is
-[Pay for things with x402](pay-with-x402.md).
+literal and names a wallet and assets of the policy; one `workflow.create`
+or `workflow.update` stored fails the step without paying. An instruction
+document's workflow with one is refused at load unless the operator grants
+the document `spending` (`agent.document_capabilities: [spending]`) and the
+step pays under one of the document's own allowances — `doc:<id>`, mapped
+from its `:::allowance` — with no wallet of its own.
+`security.payments.approvers` and `security.payments.document_ceiling` are
+live · op, like `allowances`: who answers for a document's approver, and
+the operator allowance all document spending counts against too
+([Allowances in an instruction document](pay-with-x402.md#allowances-in-an-instruction-document)).
+The guide is [Pay for things with x402](pay-with-x402.md).
 
 ## vars
 
@@ -1899,7 +1908,8 @@ Every other path is applied live, as follows:
 | `workflows` | Definitions are read and parsed before anything is dialed, then reloaded and re-armed. Live runs stay pinned to the definition they started on; a changed definition whose `schedule` node is unchanged keeps its next deadline. A definition the agent stored that names something the reload removed is left out (`workflow.stored.invalid`) and kept in the store. |
 | `a2a.principals` | Recompiled and swapped into the live listener, so a demotion or a rotated `bearer_ref` applies to the next request. |
 | `security.policies` | Swapped whole at the next call (`security.policies.reloaded`); a list that does not load, or whose rules could hold a tool a running turn or subagent dials itself, refuses the reload and the old one stands. A gate already open keeps the rule that raised it. |
-| `security.payments.allowances` | Read at every payment, every Company charge and every answered approval: a change applies at once (`payment.allowance.changed`, `payment.allowance.removed`). A reload that removes an allowance a workflow step names is refused, and the old configuration stays. Every other `security.payments` path is a restart. |
+| `security.payments.allowances` | Read at every payment, every Company charge and every answered approval: a change applies at once (`payment.allowance.changed`, `payment.allowance.removed`). A reload that removes an allowance a workflow step names is refused, and the old configuration stays. An instruction document's allowances (`doc:<id>`) follow a re-release of the document the same way. Every other `security.payments` path is a restart. |
+| `security.payments.approvers`, `security.payments.document_ceiling` | Read with the allowances: a document allowance's approver binds, and every document payment is held to the ceiling, from the next payment. |
 | `identity.delegation` templates, pins, first binding, consent timing | Taken at once: a narrowed template holds every grant it allowed to the new ceilings at the next call; a removed template, a server removed from one, a changed or removed pin and first binding turned off revoke the grants they allowed — at the IdP, tombstoned, off the loop — and drop the IdP proofs of those device names' sessions (`delegation.bindings.cleared`). A template's `unattended` and `unattended_tools` hold every firing from its next call. |
 | a workflow's `act_for`, and the definition it is in | A firing acts only while its workflow's digest is the one the person consented to when they last signed in: a changed definition's firings start nothing (`start.unattended.suspended`) until they sign in again. A firing already running keeps the definition it started on. |
 | `a2a.cors.origins` | Replaced in the live listener; removing an origin revokes it. |

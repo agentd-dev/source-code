@@ -213,8 +213,7 @@
   {
     "name": "Spending allowances",
     "version": "RFC-0041",
-    "mark": "draft",
-    "full": "instruction.md RFC-0041 allowances: a most per payment, a budget per period, a count, a window and the payees, with an approver above an amount, enforced across x402 and a Company's priced operations",
+    "full": "instruction.md RFC-0041 allowances: a most per payment, a budget per period, a count, a window and the payees, with an approver above an amount, enforced across x402 and a Company's priced operations — set by the operator, or by an instruction document's own wallets and allowances under the spending grant",
     "href": "/docs/interoperability/#spending-allowances",
     "tier": 2
   },

@@ -361,6 +361,121 @@ in the operator's `payment.allowances` op. A workflow reads it with a tool
 step, `{kind: tool, name: payment.allowances}`, and can branch before it
 tries. Nothing in a workflow changes an allowance.
 
+### Allowances in an instruction document
+
+An [instruction document](instruction-documents.md) can say what its own
+work may spend: a `::wallet` picks one of your wallets, and an
+`:::allowance` sets the limits ([S29](https://instruction.md)). You grant
+it, and your policy still bounds every payment:
+
+```yaml
+# fragment: added to the spend policy above
+agent:
+  instruction: ./buyer.md
+  document_capabilities: [spending]      # off by default
+security:
+  payments:
+    approvers:
+      nataliia: "user:nataliia"          # who answers for the document's #nataliia
+    document_ceiling: documents          # optional: every document payment counts here too
+    allowances:
+      documents: {currency: USD, max: "1", budget: "50", per: month}
+```
+
+```markdown
+---
+spec: "1"
+parameters:
+  data_max: { type: number, default: 0.5 }
+---
+
+::person{id=nataliia title="Nataliia"}
+
+::wallet{id=card title="Data card" account=ops rails="x402/2"}
+
+::service{id=quotes title="Quotes" src="https://api.example/quote"}
+
+:::allowance{id=data title="Market data" wallet=#card currency=USD max="${data_max}" budget=30 per=month payees="&quotes" approve-above=0.2 approver=#nataliia}
+Quotes for the morning brief, nothing else.
+:::
+
+:::workflow{id=quote dialect="instruction/workflow"}
+name: quote
+steps:
+  s: {kind: schedule, cron: "0 7 * * 1-5"}
+  left: {kind: tool, name: payment.allowances, depends_on: [s]}
+  get:
+    kind: http
+    depends_on: [left]
+    when: "steps.left.output.allowances.exists(a, a.id == 'doc:data' && double(a.left) >= 0.5)"
+    url: "https://api.example/quote"
+    payment: {allowance: data}
+  done: {kind: finish, depends_on: [left, get]}
+:::
+```
+
+The workflow reads what is left of `doc:data` with the `payment.allowances`
+tool and buys only while a whole payment fits; with less, `get` is pruned
+and the run ends.
+
+What it becomes:
+
+- **The grant.** Without `spending` in `agent.document_capabilities`, the
+  allowance and the wallet are delivered as text only — the SDK's one
+  sentence — nothing is paid under them, and the load says so once,
+  naming the grant. A document from `url:`, `oci:` or `mcp:` uses the grant
+  only when it verified against a publisher you pinned
+  (`agent.instruction.trust`) and its author signature attests `spending`,
+  as for [`agents`](delegate-subagents.md#a-documents-own-agents);
+  otherwise it is text only, and the load says why.
+- **Wallets.** `account` names one of your `security.payments.wallets`.
+  One that names none is held, said (`host-policy`). `rails` empty means
+  any rail; otherwise it must include x402 (`x402` or `x402/2`): agentd
+  pays x402 version 2 only, so a wallet whose rails say `x402/1` alone is
+  held, `protocol-unsupported`.
+- **Allowances** become `doc:<id>` in the same engine and ledger as yours —
+  `doc:data` here — so none ever collides with an operator allowance, and
+  a re-release never resets what was spent. `max` absent is the budget;
+  `per` defaults to `once`; a date-only `from`/`until` is whole days in
+  UTC; `categories` is refused on x402, `rail-cannot-enforce`. An
+  allowance with a reader error (`allowance-*`, `reference-missing`)
+  refuses the document, as any reader error does.
+- **Payees** are origin hosts: a domain matches the paid resource's host
+  exactly, an `&service` the host of its `src`. A document's payee is only
+  ever matched among your payees: a payment must pass your payee list (by
+  address) and the document's (by host).
+- **It only narrows.** Every asset cap (`per_payment`, `per_run`,
+  `per_day`, `per_payee`), your payee list and the step's `max` still hold.
+  `security.payments.document_ceiling` names one of your allowances that
+  every payment under any document allowance also counts against and must
+  pass, so all document spending together is capped. Unset, the asset caps
+  are the ceiling.
+- **Approvers.** `approver=#nataliia` (or a role's name) is whoever you bind
+  in `security.payments.approvers` — a person, never an agent. Unbound, the
+  allowance pays only up to `approve-above` and refuses above it,
+  `approver-unbound`; the load warns once. `approve-above` with no approver
+  asks `security.payments.approver`.
+- **Paying from the document.** The document's own workflow may pay only
+  under one of its own allowances: `payment: {allowance: data}` (or
+  `doc:data`). A step naming one of your allowances, or giving its own
+  wallet, is refused at load; one with no allowance is refused as before
+  ([RFC 0049 D2](../rfcs/0049-paying-for-things.md)). Your workflows never
+  pay under a document's allowance.
+- **Live.** A re-release that changes the allowance applies at once,
+  counting what was spent (`payment.allowance.changed` with `doc:data`);
+  one that removes it fails the load of steps that name it, and an
+  approval still pending under it is refused when it is answered
+  (`payment.allowance.removed`).
+- **Seen.** `payments.allowances` in the status document, the
+  `payment.allowances` op and the tool list it with `source: document` and
+  the document's URI; the TUI's `/allowances` says which document.
+
+A document allowance is not usable for a [Company's
+operations](act-at-companies.md#spending-at-a-company): `companies.<name>.spending`
+names your allowances only. A document that `extends` another keeps its
+allowances as text, since agentd loads no base to check that they only
+narrow it.
+
 ## Keep the key with a signer
 
 With `key_custody: external`, agentd holds no wallet key. A wallet names a

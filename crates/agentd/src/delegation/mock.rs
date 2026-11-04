@@ -173,6 +173,12 @@ fn unattended_knobs() -> Value {
         "tools_list_error": false,
         // The next `tools/list` gets no answer: its connection is closed.
         "tools_list_drop_once": false,
+        // The next this many `tools/list` are answered `429` with this
+        // `Retry-After` (seconds).
+        "tools_list_429_times": 0,
+        "tools_list_retry_after": 1,
+        // The next `notifications/initialized` is answered `401`.
+        "initialized_401_once": false,
     })
 }
 
@@ -1547,6 +1553,17 @@ fn take_once(state: &Arc<Mutex<State>>, knob: &str) -> bool {
     set
 }
 
+/// Whether the count `knob` is above zero, counting it down: a fault the
+/// mock plays that many times.
+fn take_count(state: &Arc<Mutex<State>>, knob: &str) -> bool {
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let left = s.knob(knob).as_u64().unwrap_or(0);
+    if left > 0 {
+        s.knobs[knob] = json!(left - 1);
+    }
+    left > 0
+}
+
 /// The MCP server's `tools/list` result.
 fn tools_listed() -> Value {
     json!({"tools": [
@@ -1630,11 +1647,14 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
         }
         None => scheme == "Bearer",
     };
+    // A token lives its whole `expires_in`: `exp` is whole seconds, and a
+    // token minted late in one lives through the second it expires in,
+    // never less than it was issued for.
     let at = s
         .ats
         .get(&token)
         .cloned()
-        .filter(|a| a.resource == url && a.exp > now() && proven(a));
+        .filter(|a| a.resource == url && a.exp >= now() && proven(a));
     let Some(at) = at.filter(|_| !s.flag("mcp_reject") && !reject_once) else {
         if reject_once {
             s.knobs["mcp_reject_once"] = json!(false);
@@ -1685,6 +1705,28 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
                                           "error": {"code": -32601, "message": "Method not found"}})),
         // Closed unanswered, once: the client sees its connection fail.
         "tools/list" if take_once(state, "tools_list_drop_once") => {}
+        // Throttled, this many times: `429` with the knob's `Retry-After`.
+        "tools/list" if take_count(state, "tools_list_429_times") => {
+            std::thread::sleep(std::time::Duration::from_millis(slow_list));
+            let wait = state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .knob("tools_list_retry_after")
+                .as_u64()
+                .unwrap_or(1);
+            write(stream, 429, &[("Retry-After", wait.to_string())], b"")
+        }
+        // The token refused once at the handshake's last message, as one
+        // that expired mid-handshake is.
+        "notifications/initialized" if take_once(state, "initialized_401_once") => write(
+            stream,
+            401,
+            &[(
+                "WWW-Authenticate",
+                format!("Bearer error=\"invalid_token\", resource_metadata=\"{prm}\""),
+            )],
+            b"",
+        ),
         "tools/list" if slow_list > 0 || list_error => {
             std::thread::sleep(std::time::Duration::from_millis(slow_list));
             if list_error {

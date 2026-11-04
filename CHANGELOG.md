@@ -40,12 +40,24 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   child's task to its answer, off the loop, and records it as the child's
   `reply`: `subagent.status` carries it, the feed's `updated` moves, and a
   `subagent.turn` line with `tier: instance` says so. The child's `result`
-  stays its own report, the one a `sync` spawn waits for.
+  stays its own report, the one a `sync` spawn waits for. The reply kept is
+  the newest send's, and `reply_to` names that send by the id its answer
+  gave the caller (the A2A task of the command, else the tool's
+  `message_id`): an older send's slower answer never takes its place. One
+  thread per child carries its sends in order and reads the newest's
+  answer, looking after 500 ms and then at twice the wait up to 5 s; at most
+  32 children's answers are read at once, and a send past that still goes,
+  its answer saying `followed: false`.
 - **`subagent.log {handle, lines?, after?}`**, an operator-only read op and
   a read-only tool for the root and workflows: the newest lines of one
   child's log (200 by default, at most 1000) and a cursor to read on from.
   An instance child's come from its own log file, the path its parent
-  recorded, at most its last 256 KiB; a flat worker's are this daemon's
+  recorded, at most its last 256 KiB, and only from the file the parent
+  opened for it at spawn: a symlink, a FIFO or another file the child puts
+  at that path is refused without being opened through or waited on, and
+  a failed child's exit cause is read by the same rule. Only whole lines
+  come back; a line longer than the window is passed over as one
+  `{"truncated": true, "bytes": N}` line. A flat worker's are this daemon's
   lines about it from the in-memory log ring, while one is kept
   (`a2a.introspection.enabled`). The lines are agentd's JSON lines as
   written. In the TUI, `l` on a child's detail view opens a log pane that
@@ -69,8 +81,15 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   once. The fetch itself, made once before, is tried again after a
   transient failure — a connection that failed or timed out, a `429` or
   `5xx`, an IdP that did not answer — after 250 ms, 1 s and 4 s, each
-  logged as `delegation.catalogue.retry`; a `4xx`, a refused credential
-  or the server's own error answer fails it at once.
+  logged as `delegation.catalogue.retry`; a `429` or `503` with
+  `Retry-After` is waited at least that long, on the same connection, and
+  one asking for longer than the retries have left fails it at once (`the
+  server asked for no request for Ns`). A `4xx`, a refused credential —
+  a `401` or `403` agentd's transport saw under the SDK's "transport
+  channel closed" included — the server's own error answer, or a build
+  without what the endpoint needs fails it at once. Two sign-ins at once
+  leave no step waiting on a listing nobody finishes, and a step's wait
+  for the list is forgotten when it ends.
 
 ## v1.24.0 — the org chart
 

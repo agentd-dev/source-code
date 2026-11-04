@@ -334,11 +334,36 @@ const CATALOGUE_RETRY: [Duration; 3] = [
     Duration::from_secs(4),
 ];
 
+/// What the MCP transport's `Unsupported` says: the build lacks the
+/// feature the endpoint needs (`mcp-http: https:// MCP requires building
+/// with --features tls`). Permanent.
+const UNSUPPORTED_BUILD: &str = "requires building with --features";
+
+/// A tool-list fetch that failed ([`Delegation::list_with_grant`]): why,
+/// and — when the server answered `429` or `503` with a `Retry-After` —
+/// its status and the wait it asked for.
+struct Unlisted {
+    error: DelegationError,
+    asked: Option<(u16, Duration)>,
+}
+
+impl From<DelegationError> for Unlisted {
+    fn from(error: DelegationError) -> Unlisted {
+        Unlisted { error, asked: None }
+    }
+}
+
 /// Whether a failed tool-list fetch may succeed if tried again: the IdP
 /// did not answer the mint, or the server's connection failed — refused,
 /// reset or closed, timed out, answered no JSON-RPC response, or answered
-/// `429` or a `5xx`. A `4xx`, a refused credential, or the server's own
-/// JSON-RPC error answer is not: trying again would be answered the same.
+/// `429` or a `5xx`. A `4xx`, a refused credential, the server's own
+/// JSON-RPC error answer, or a build without what the endpoint needs (the
+/// transport's `Unsupported`) is not: trying again would end the same.
+///
+/// rmcp says every failure to send `notifications/initialized` — a refused
+/// token among them — as `Transport channel closed`: the status under it
+/// is read from the transport ([`Entry::refused`]) before this is asked,
+/// and a refusal is not retried ([`Delegation::list_with_grant`]).
 fn transient_listing(e: &DelegationError) -> bool {
     match e.code {
         Code::IdpUnavailable => true,
@@ -353,7 +378,10 @@ fn transient_listing(e: &DelegationError) -> bool {
                     .unwrap_or(0);
                 return status == 429 || (500..600).contains(&status);
             }
-            if m.contains("not sent, no credential") || m.contains("no GET SSE") {
+            if m.contains("not sent, no credential")
+                || m.contains("no GET SSE")
+                || m.contains(UNSUPPORTED_BUILD)
+            {
                 return false;
             }
             [
@@ -949,11 +977,19 @@ struct Held {
 /// `WWW-Authenticate`.
 type Refused401 = Arc<Mutex<Option<(u16, Option<String>)>>>;
 
+/// The last `429` or `503` a server answered with a `Retry-After`: its
+/// status and the wait it asked for.
+type AskedWait = Arc<Mutex<Option<(u16, Duration)>>>;
+
 /// One pool entry: the token, and the connection that presents it.
 struct Entry {
     token: Arc<Mutex<Option<Held>>>,
     /// The last status the server refused a request with.
     refused: Refused401,
+    /// The last wait the server asked for. Read from the transport's own
+    /// answer, as `refused` is, so a failure the SDK says as its channel
+    /// closing still says what the server answered.
+    asked_wait: AskedWait,
     client: Mutex<Option<Arc<::mcp::client::McpClient>>>,
     used_ms: Mutex<u64>,
 }
@@ -964,6 +1000,7 @@ struct Entry {
 struct Signer {
     token: Arc<Mutex<Option<Held>>>,
     refused: Refused401,
+    asked_wait: AskedWait,
     dpop: Option<SignerDpop>,
 }
 
@@ -1028,6 +1065,9 @@ impl ::mcp::http::RequestSigner for Signer {
         if matches!(resp.status, 401 | 403) {
             *self.refused.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some((resp.status, resp.www_authenticate.clone()));
+        }
+        if let (429 | 503, Some(wait)) = (resp.status, resp.retry_after) {
+            *self.asked_wait.lock().unwrap_or_else(|e| e.into_inner()) = Some((resp.status, wait));
         }
         // The loop runs the ladder and dispatches again: the transport never
         // retries a delegated request by itself.
@@ -2466,6 +2506,7 @@ impl Delegation {
                 Arc::new(Entry {
                     token: Arc::default(),
                     refused: Arc::default(),
+                    asked_wait: Arc::default(),
                     client: Mutex::new(None),
                     used_ms: Mutex::new(0),
                 })
@@ -3847,6 +3888,7 @@ impl Delegation {
         let signer = Arc::new(Signer {
             token: Arc::clone(&entry.token),
             refused: Arc::clone(&entry.refused),
+            asked_wait: Arc::clone(&entry.asked_wait),
             dpop,
         });
         let mut client = ::mcp::client::McpClient::connect_signed(
@@ -3957,28 +3999,79 @@ impl Delegation {
         }
         // A transient failure is tried again, on this thread — the
         // enrolment's, never the loop's — while the server stays
-        // `Listing`, so a step waiting for it keeps waiting.
+        // `Listing`, so a step waiting for it keeps waiting. A server that
+        // asked for a wait (`Retry-After`) is waited at least that long;
+        // one that asked for longer than the retries have left is not
+        // asked again.
+        let mut left: Duration = CATALOGUE_RETRY.iter().sum();
         let mut out = self.list_with_grant(server, who);
-        for (n, wait) in CATALOGUE_RETRY.iter().enumerate() {
-            let Err(e) = &out else { break };
-            if !transient_listing(e) {
-                break;
-            }
+        for (n, base) in CATALOGUE_RETRY.iter().enumerate() {
+            let Err(failed) = &out else { break };
+            let wait = match failed.asked {
+                Some((status, asked)) if asked > left => {
+                    out = Err(Unlisted {
+                        error: refuse(
+                            Code::ResourceFault,
+                            format!(
+                                "{server}: tools/list: the server asked for no request for {}s (HTTP {status})",
+                                asked.as_secs_f64().ceil() as u64
+                            ),
+                        ),
+                        asked: None,
+                    });
+                    break;
+                }
+                Some((_, asked)) => asked.max(*base),
+                None if transient_listing(&failed.error) => *base,
+                None => break,
+            };
             self.log.warn(
                 "delegation.catalogue.retry",
-                json!({"server": server, "attempt": n + 2, "err": e.message}),
+                json!({"server": server, "attempt": n + 2, "err": failed.error.message,
+                       "wait_ms": wait.as_millis() as u64}),
             );
-            std::thread::sleep(*wait);
+            std::thread::sleep(wait);
+            left = left.saturating_sub(wait);
             out = self.list_with_grant(server, who);
         }
         self.listing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(server);
+        let out = out.map_err(|u| u.error);
         if let Err(e) = &out {
             self.catalogue_unfetched(server, &e.message);
         }
         out
+    }
+
+    /// Mark each of `servers` whose catalogue is empty and listed with a
+    /// first grant as being listed ([`CatalogueDue::Listing`]), and name
+    /// them: what an enrolment then lists ([`Delegation::fill_catalogue`]).
+    /// Looked at and marked under the one lock a listing keeps its
+    /// catalogue under and the loop clears the mark under, so a catalogue
+    /// kept after the look is kept after the mark too, and its landing
+    /// clears it: no mark outlives the listing it waits for.
+    pub(crate) fn mark_unlisted<'a>(
+        &self,
+        servers: impl IntoIterator<Item = &'a String>,
+    ) -> Vec<String> {
+        let mut due = self.catalogue_due.lock().unwrap_or_else(|e| e.into_inner());
+        let mut marked = Vec::new();
+        for server in servers {
+            let empty = self
+                .servers
+                .get(server)
+                .is_some_and(|s| s.tools_from == ToolsFrom::FirstGrant)
+                && self.catalogue(server).is_none();
+            #[cfg(test)]
+            tests::at_mark();
+            if empty {
+                due.insert(server.clone(), CatalogueDue::Listing);
+                marked.push(server.clone());
+            }
+        }
+        marked
     }
 
     /// Where `server`'s catalogue is while the loop holds none: being
@@ -4008,7 +4101,23 @@ impl Delegation {
             .remove(server);
     }
 
-    fn list_with_grant(&self, server: &str, who: &Who) -> Result<usize, DelegationError> {
+    /// Keep `server`'s listed catalogue `tools` (first grant), under the
+    /// lock its mark is set and cleared under ([`Delegation::mark_unlisted`]).
+    fn keep_catalogue(&self, server: &str, tools: &[::mcp::wire::Tool]) {
+        let Ok(v) = serde_json::to_value(tools) else {
+            return;
+        };
+        let _due = self.catalogue_due.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = self.durable.put(
+            crate::state::Kind::Cred,
+            &format!("{CATALOGUE}{server}"),
+            v,
+            None,
+        );
+    }
+
+    /// One listing of `server`'s tools ([`Delegation::fill_catalogue`]).
+    fn list_with_grant(&self, server: &str, who: &Who) -> Result<usize, Unlisted> {
         let Admitted {
             grant, who: as_now, ..
         } = self.admit_who(who.clone(), server)?;
@@ -4040,11 +4149,53 @@ impl Delegation {
             step: None,
         };
         self.token(s, &grant, &scopes, &entry, &c, firing.as_ref(), true)?;
-        let client = self.client(s, &entry, &grant)?;
+        // What the server answers this attempt, read from the transport:
+        // the SDK says a failed `notifications/initialized` as its channel
+        // closing, whatever the status under it was.
+        *entry.refused.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *entry.asked_wait.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let answered = |e: DelegationError| {
+            let asked = entry
+                .asked_wait
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            let refused = entry
+                .refused
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            match (refused, asked) {
+                // Refused: asking again would be answered the same.
+                (Some((status, _)), _) => Unlisted {
+                    error: refuse(
+                        Code::DelegationRejectedByResource,
+                        format!(
+                            "{server} refused the delegated token (HTTP {status}): {}",
+                            e.message
+                        ),
+                    ),
+                    asked: None,
+                },
+                // A wait asked for keeps the connection, and the wait the
+                // transport holds on it.
+                (None, Some(asked)) => Unlisted {
+                    error: e,
+                    asked: Some(asked),
+                },
+                (None, None) => {
+                    // A connection that failed is not the next attempt's.
+                    self.reset_client(&entry);
+                    Unlisted::from(e)
+                }
+            }
+        };
+        let client = self.client(s, &entry, &grant).map_err(answered)?;
         let tools = client.list_tools().map_err(|e| {
-            // A connection that failed is not the next attempt's.
-            self.reset_client(&entry);
-            refuse(Code::ResourceFault, format!("{server}: tools/list: {e}"))
+            answered(refuse(
+                Code::ResourceFault,
+                format!("{server}: tools/list: {e}"),
+            ))
         })?;
         if let Some(h) = entry
             .token
@@ -4054,15 +4205,8 @@ impl Delegation {
         {
             h.fresh = false;
         }
-        if s.tools_from == ToolsFrom::FirstGrant
-            && let Ok(v) = serde_json::to_value(&tools)
-        {
-            let _ = self.durable.put(
-                crate::state::Kind::Cred,
-                &format!("{CATALOGUE}{server}"),
-                v,
-                None,
-            );
+        if s.tools_from == ToolsFrom::FirstGrant {
+            self.keep_catalogue(server, &tools);
         }
         let n = tools.len();
         self.note(Note::Catalogue {
@@ -4562,6 +4706,9 @@ impl Delegation {
     /// purged, and a new grant one epoch up is made from what is configured
     /// now. Either way the refresh token replaced is revoked at the IdP
     /// (RFC 7009), once the new one is kept.
+    ///
+    /// With the grant, the templated servers whose empty catalogue this
+    /// sign-in is to list ([`Delegation::mark_unlisted`]).
     pub(crate) fn enrolled(
         &self,
         who: &Who,
@@ -4569,7 +4716,7 @@ impl Delegation {
         claims: &idjag::IdClaims,
         rt: &str,
         id_token: &str,
-    ) -> Result<Grant, DelegationError> {
+    ) -> Result<(Grant, Vec<String>), DelegationError> {
         let bound_by = self.bind(who, idp, claims)?;
         let template = self.template_for(who, &idp.name).ok_or_else(|| {
             refuse(
@@ -4672,19 +4819,7 @@ impl Delegation {
         // its grant is held (`enrol`): a step that names one of their tools
         // meanwhile waits for it, rather than finding none — marked before
         // the grant can admit anyone, and cleared once the loop holds it.
-        for server in grant.ceilings.keys() {
-            if self
-                .servers
-                .get(server)
-                .is_some_and(|s| s.tools_from == ToolsFrom::FirstGrant)
-                && self.catalogue(server).is_none()
-            {
-                self.catalogue_due
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(server.clone(), CatalogueDue::Listing);
-            }
-        }
+        let to_list = self.mark_unlisted(grant.ceilings.keys());
         self.remember(&grant);
         drop(held);
         // The refresh token this sign-in replaced is agentd's no longer, so
@@ -4717,7 +4852,7 @@ impl Delegation {
                 });
             }
         });
-        Ok(grant)
+        Ok((grant, to_list))
     }
 
     /// Revoke a refresh token a sign-in handed agentd that it keeps no
@@ -4986,6 +5121,84 @@ mod tests {
         }
         assert!(!transient_listing(&refuse(Code::ScopeBeyondCeiling, "x")));
         assert!(!transient_listing(&refuse(Code::NotEnrolled, "x")));
+    }
+
+    /// A build without what the endpoint needs (the transport's
+    /// `Unsupported`) is permanent: it is not tried again, though its text
+    /// is the transport's `mcp-http: …` as a dropped connection's is.
+    #[test]
+    fn a_listing_the_build_cannot_make_is_not_tried_again() {
+        let unsupported = ::mcp::http::HttpError::Unsupported(
+            "https:// MCP requires building with --features tls".into(),
+        );
+        let m = format!(
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: {unsupported}"
+        );
+        assert!(m.contains("mcp-http: "), "{m}");
+        assert!(
+            !transient_listing(&refuse(Code::ResourceFault, m.as_str())),
+            "{m}"
+        );
+    }
+
+    thread_local! {
+        /// What runs inside [`Delegation::mark_unlisted`] between its look
+        /// at a catalogue and its mark: a test's interleaving.
+        static AT_MARK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// [`AT_MARK`]'s hook, once.
+    pub(super) fn at_mark() {
+        if let Some(f) = AT_MARK.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    /// Two people enrol at once: alice's sign-in looks and finds no
+    /// catalogue, and before it marks one as being listed, bob's listing
+    /// keeps the catalogue and the loop takes it. Alice's mark must not
+    /// outlive that: every step naming one of its tools would wait its
+    /// whole timeout for a listing no one clears.
+    #[test]
+    fn a_catalogue_kept_between_the_look_and_the_mark_leaves_no_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = template("people", "oidc", &["issues:read"]);
+        let d = supervisor(
+            &people(dir.path(), json!({"templates": [t]})),
+            Arc::new(Book::default()),
+        );
+        let tools: Vec<::mcp::wire::Tool> =
+            serde_json::from_value(json!([{"name": "whoami", "inputSchema": {"type": "object"}}]))
+                .unwrap();
+        let other = Arc::new(Mutex::new(None));
+        let (bob, slot) = (Arc::clone(&d), Arc::clone(&other));
+        AT_MARK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                // Bob's listing lands — kept, then taken by the loop — with
+                // every chance to do so before alice's mark.
+                *slot.lock().unwrap() = Some(std::thread::spawn(move || {
+                    bob.keep_catalogue("linear", &tools);
+                    bob.catalogue_landed("linear");
+                }));
+                std::thread::sleep(Duration::from_millis(300));
+            }))
+        });
+        let linear = "linear".to_string();
+        let marked = d.mark_unlisted([&linear]);
+        other
+            .lock()
+            .unwrap()
+            .take()
+            .expect("bob's listing ran")
+            .join()
+            .unwrap();
+        assert!(d.catalogue("linear").is_some(), "bob's catalogue is kept");
+        assert_eq!(
+            d.catalogue_due("linear"),
+            None,
+            "a mark outlived the listing that landed (marked {marked:?})"
+        );
     }
 
     /// A step-up's fresh ID token is the subject of the call it was signed

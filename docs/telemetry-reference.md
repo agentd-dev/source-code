@@ -411,7 +411,7 @@ its `jti`.
 | `delegation.quota_warn` | info | `day`, `grant_id`, `month`, `per_day`, `per_month`, `resource` | A mint brought a day or a month to 80% of its budget. |
 | `delegation.catalogue` | info | `server`, `tools` | A delegated server's tools joined the registry, listed with a delegated token. |
 | `delegation.catalogue.refused` | warn | `errors`, `server` | The listed tools did not fit the registry. |
-| `delegation.catalogue.retry` | warn | `attempt`, `err`, `server` | The tool list an enrolment fetches from `server` failed transiently — a connection that failed or timed out, a `429` or `5xx`, an IdP that did not answer the mint — with `err`, and is fetched again as `attempt` (2–4) after 250 ms, 1 s, then 4 s, on the enrolment's thread. A step waiting for the list keeps waiting meanwhile; after the last attempt, or a non-transient error, the steps waiting fail `the delegated server's tool catalogue could not be fetched`. |
+| `delegation.catalogue.retry` | warn | `attempt`, `err`, `server`, `wait_ms` | The tool list an enrolment fetches from `server` failed transiently — a connection that failed or timed out, a `429` or `5xx`, an IdP that did not answer the mint — with `err`, and is fetched again as `attempt` (2–4) after `wait_ms`: 250 ms, 1 s, then 4 s, or at least the `Retry-After` a `429` or `503` asked for, on the enrolment's thread. A step waiting for the list keeps waiting meanwhile; after the last attempt, a non-transient error (a `401` or `403` under a closed handshake among them), or a `Retry-After` longer than the retries have left, the steps waiting fail `the delegated server's tool catalogue could not be fetched`. |
 | `delegation.unbound` | warn | `grant_id`, `note`, `server` | An ID-JAG named no resource and `allow_unbound_at` admitted it. |
 | `delegation.probe.failed` | warn | `code`, `err`, `grant_id` | A liveness probe failed; the grant's tokens were dropped. |
 | `delegation.register.unanchored` | warn | `err`, `grant_id`, `msg` | A floor of the tombstone register could not be anchored in the audit chain. The store's register was raised and a revoked record deleted all the same; the anchor is tried again at the next raise and the next start. `grant_id` is null for the anchors tried at start. |
@@ -506,7 +506,7 @@ its `jti`.
 | Event | Level | Fields | Notes |
 |---|---|---|---|
 | `instance.drain` | info | `handle`, `pid` | The parent's drain sent the child `SIGTERM`, so it drains itself. |
-| `instance.exited` | info | `handle`, `pid`, `status`, `cause` | `cause`, for a child that failed, is the `err` its last `proc.exit` logged. `status` is `parked` for a child that drained at its parent's drain; the next start spawns it again. A `sync` child a stopped turn waited on is `cancelled` instead: the turn's replay spawns it again. |
+| `instance.exited` | info | `handle`, `pid`, `status`, `cause` | `cause`, for a child that failed, is the `err` its last `proc.exit` logged, read only from the log file the parent opened for it (none when a symlink, FIFO or other file is in its place). `status` is `parked` for a child that drained at its parent's drain; the next start spawns it again. A `sync` child a stopped turn waited on is `cancelled` instead: the turn's replay spawns it again. |
 | `instance.kill` | warn | `handle`, `note`, `pid` |  |
 | `instance.metered` | info | `delta_tokens`, `handle`, `total_tokens` |  |
 | `instance.mirror` | info | `handle`, `link`, `seq`, `stream` | `link`: the span of the child's report. |
@@ -521,7 +521,7 @@ its `jti`.
 | `instance.respawn_wait` | info | `handle`, `holder`, `note`, `within_ms` | A restart found the child's previous process (`holder`, `pid <n>`) still holding its state; the child is respawned once that process releases it. |
 | `instance.result` | info | `handle`, `link` | `link`: the span of the child's report. |
 | `instance.retire` | info | `handle`, `pid`, `why` |  |
-| `instance.send` | info, warn | `handle`, `err?` |  |
+| `instance.send` | info, warn | `handle`, `message_id`, `err?` | A `subagent.send` to an instance child went (or, at `warn`, did not), as the A2A `message_id` its answer named. |
 | `instance.spawn` | info | `dir`, `handle`, `log`, `pid`, `reports_to`, `retire_at`, `singleton`, `socket`, `template`, `until` | An instance-tier subagent started. `dir` is its directory and `log` the log it writes there, both absolute; `reports_to` its template's reporting line — the operator's `subagents.templates.<name>.reports_to`, else a document agent's (RFC 0056) — or null. |
 | `instance.spawn.refused` | warn | `reason`, `template` | An instance-tier subagent was refused before anything was created. |
 
@@ -946,7 +946,7 @@ an instruction's by `origin: instruction` and `name`.
 | `subagent.template.retired` | info | `handle`, `template`, `why` | A reload removed the template of a live instance child, or made it no longer a singleton instance child: the child is retired and not started again. |
 | `subagent.template.start_refused` | warn | `error`, `reports_to`, `template` | Under `subagents.document_agents.start: on_compose`, a document agent's start was refused, by an instance ceiling say; the others still start. |
 | `subagent.template.started` | info | `handle`, `reports_to`, `template` | Under `subagents.document_agents.start: on_compose`, a document agent's singleton started: at load, when a reload added it, or when a reload turned `on_compose` on and it was not live. |
-| `subagent.turn` | info, warn | `handle`, `status`, `tier?`, `err?` | A warm worker finished a turn, or an instance child answered a `subagent.send` (`tier: instance`; at `warn`, with `status: failed` and `err`, when no answer came). |
+| `subagent.turn` | info, warn | `handle`, `status`, `tier?`, `message_id?`, `kept?`, `why?`, `err?` | A warm worker finished a turn, or an instance child answered a `subagent.send` (`tier: instance`, with the `message_id` of the send it answers; at `warn`, with `status: failed` and `err`, when no answer came). `kept: false` and `why`: the answer is to a send older than the one whose reply is kept, and does not replace it. |
 
 ### timer
 

@@ -86,6 +86,19 @@ pub(crate) struct Operations {
 }
 
 impl Joining {
+    /// The step `run/step`'s wait for a delegated server's catalogue ended
+    /// — it found its tool, finished or was cancelled — so the next wait it
+    /// may begin begins anew rather than at this one's start.
+    pub(crate) fn catalogue_wait_ended(&mut self, run: &str, step: &str) {
+        self.catalogue_waits.remove(&format!("{run}/{step}"));
+    }
+
+    /// The run `run` ended: no step of it waits for anything.
+    pub(crate) fn run_ended(&mut self, run: &str) {
+        let prefix = format!("{run}/");
+        self.catalogue_waits.retain(|k, _| !k.starts_with(&prefix));
+    }
+
     /// The sign-in of `server` ended well: it is dialed again now, its
     /// backoff forgotten.
     pub(crate) fn dial_now(&mut self, server: &str) {
@@ -771,6 +784,26 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
+    /// A catalogue wait's start is forgotten when the wait ends — its step
+    /// found its tool or finished — and when its run ends, so a later wait
+    /// of the same step starts anew and no entry outlives its run; another
+    /// run's, even one whose id this one's begins, stays.
+    #[test]
+    fn a_catalogue_wait_is_forgotten_when_it_ends() {
+        let mut j = super::Joining::default();
+        j.catalogue_waits.insert("r1/s".into(), 5);
+        j.catalogue_waits.insert("r1/t".into(), 6);
+        j.catalogue_waits.insert("r10/s".into(), 7);
+        j.catalogue_wait_ended("r1", "s");
+        assert!(!j.catalogue_waits.contains_key("r1/s"));
+        j.run_ended("r1");
+        assert_eq!(
+            j.catalogue_waits.keys().collect::<Vec<_>>(),
+            vec!["r10/s"],
+            "another run's wait stays"
+        );
+    }
+
     #[test]
     fn the_dial_backs_off_from_a_second_to_a_minute() {
         assert_eq!(super::backoff(1), 1_000);

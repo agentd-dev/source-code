@@ -52,7 +52,7 @@ use super::{Code, Delegation, DelegationError, Who, WhoKind, refuse};
 use crate::auth::browser::{check_iss, pct, pct_decode};
 use crate::auth::idjag::{self, IdpMeta};
 use crate::auth::oauth2::{self, OAuth2Params, PollOutcome, Tokens};
-use crate::config::settings::delegation::{SignInGrant, ToolsFrom};
+use crate::config::settings::delegation::SignInGrant;
 use crate::state::now_ms;
 
 /// How long a sign-in may take, end to end.
@@ -268,7 +268,7 @@ pub(crate) fn keep(
             format!("{name} issued no refresh token: sign_in.scopes needs offline_access, and the app the refresh_token grant"),
         )
     })?;
-    let g = d
+    let (g, to_list) = d
         .enrolled(who, idp, &claims, &rt, &id_token)
         .inspect_err(|e| {
             if matches!(
@@ -312,18 +312,14 @@ pub(crate) fn keep(
         proof: Some(proof.clone()),
         ..who.clone()
     };
+    // What `enrolled` marked as being listed is what this sign-in lists —
+    // never looked at again here: a catalogue another sign-in kept since
+    // would leave the mark for no one to clear.
     let mut listed = Vec::new();
-    for server in g.ceilings.keys() {
-        let empty = d
-            .servers
-            .get(server)
-            .is_some_and(|s| s.tools_from == ToolsFrom::FirstGrant)
-            && d.catalogue(server).is_none();
-        if empty {
-            match d.fill_catalogue(server, &lister) {
-                Ok(n) => listed.push(format!("{server} ({n} tools)")),
-                Err(e) => listed.push(format!("{server} (not listed: {e})")),
-            }
+    for server in &to_list {
+        match d.fill_catalogue(server, &lister) {
+            Ok(n) => listed.push(format!("{server} ({n} tools)")),
+            Err(e) => listed.push(format!("{server} (not listed: {e})")),
         }
     }
     let until = crate::delegation::vault::days(g.expires_ms).0;

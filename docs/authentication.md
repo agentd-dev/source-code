@@ -664,8 +664,19 @@ server's tools while that listing is still on its way waits for it — for
 the step's `timeout`, else 30 s — and is judged against the list once it
 lands. A fetch that fails transiently — the connection failed or timed
 out, the server answered `429` or a `5xx`, the IdP did not answer — is
-tried again after 250 ms, 1 s and 4 s (`delegation.catalogue.retry`); a
-`4xx`, a refused credential or the server's own error answer is not. A
+tried again after 250 ms, 1 s and 4 s (`delegation.catalogue.retry`). A
+`429` or `503` with `Retry-After` is tried again no sooner than the server
+asked, on the same connection; a wait longer than the retries have left
+(about 5 s) is not waited — the listing fails `the server asked for no
+request for Ns`. A `4xx`, a refused credential, the server's own error
+answer or a build without what the endpoint needs (`requires building with
+--features tls`) is not tried again. Nor is a token the server refuses
+while the connection is set up: the MCP SDK reports a failed
+`notifications/initialized` — whatever the server answered — as its
+transport channel closing, so agentd reads the status from its own
+transport, and a `401` or `403` there fails the listing `… refused the
+delegated token (HTTP 401)`, where a closed channel with no such status is
+tried again like any dropped connection. A
 listing that fails, or does not finish in that time, fails the
 step with `the delegated server's tool catalogue could not be fetched: …`
 and the reason. A step for someone who holds no grant at all is refused at

@@ -2333,6 +2333,8 @@ impl Runtime {
                             0,
                         ),
                         (Some(name), Ok(())) => {
+                            // Its tool is found: a catalogue wait is over.
+                            self.joining.catalogue_wait_ended(run_id, step_id);
                             self.step_tool_call(run_id, step_id, &step_caller, &name, args)
                         }
                         // The catalogue an enrolment is listing: the step
@@ -3397,6 +3399,8 @@ impl Runtime {
         // A terminal step may make dependents ready this very iteration — tell
         // the loop to re-run scheduling before it parks (the inline fixpoint).
         self.resched = true;
+        // A wait for a catalogue it was in ends with it.
+        self.joining.catalogue_wait_ended(run_id, step_id);
         // A wait that subscribed lets go as it leaves the wait, so its
         // grant's slot is free for the next one at once (RFC 0045 §5.15).
         #[cfg(feature = "mcp-events")]
@@ -3921,6 +3925,7 @@ impl Runtime {
             self.firing_run_ended(run_id);
         }
         self.end_run_span(run_id);
+        self.joining.run_ended(run_id);
         self.governor.drop_scope(&format!("run:{run_id}"));
         // What the table says the run carries now goes on its record before
         // the sweep below can release the definition it ran under: the

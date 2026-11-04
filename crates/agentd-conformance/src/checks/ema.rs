@@ -131,6 +131,21 @@ pub fn checks() -> Vec<Check> {
             a_listing_whose_connection_fails_is_tried_again,
         ),
         check(
+            "ema/a-listing-asked-to-wait-waits-as-asked",
+            "a post-enrolment tool-list fetch answered 429 with Retry-After is tried again no sooner than the server asked, and the step waiting in the gap completes",
+            a_listing_asked_to_wait_waits_as_asked,
+        ),
+        check(
+            "ema/a-listing-asked-to-wait-too-long-fails-at-once",
+            "a tool-list fetch answered 429 with a Retry-After longer than the retries have left is not asked again, and the waiting step fails saying the server asked for no request for that long",
+            a_listing_asked_to_wait_too_long_fails_at_once,
+        ),
+        check(
+            "ema/a-listing-whose-token-is-refused-at-the-handshake-is-not-tried-again",
+            "a tool-list fetch whose token the server refuses (401) at notifications/initialized — which rmcp says as its channel closing — is not tried again, and the waiting step fails saying the token was refused",
+            a_listing_whose_token_is_refused_at_the_handshake_is_not_tried_again,
+        ),
+        check(
             "ema/a-person-not-enrolled-is-refused-while-a-catalogue-is-listed",
             "while one person's enrolment lists a catalogue, a step for a person who holds no grant is refused at once with the enrol error, and does not wait",
             p2c::a_person_not_enrolled_is_refused_while_a_catalogue_is_listed,
@@ -2113,6 +2128,105 @@ fn a_listing_whose_connection_fails_is_tried_again(h: &Harness) -> Outcome {
                 "the call is made once the list lands",
             )
         })
+}
+
+/// The first `tools/list` is answered `429` with `Retry-After: 2`: the
+/// listing is tried again once, no sooner than two seconds after, and the
+/// step started in the gap completes.
+fn a_listing_asked_to_wait_waits_as_asked(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"slow_tools_list_ms": SLOW_LIST_MS, "tools_list_429_times": 1,
+               "tools_list_retry_after": 2}),
+        &Opts::default(),
+    );
+    let _d = s.daemon(h);
+    let n = tryo!(in_the_enrolments_gap(&s, h, || s.start("who")));
+    let run = tryo!(s.ended("who", n, Duration::from_secs(40)));
+    let retries = s.events("delegation.catalogue.retry");
+    let lists: Vec<u64> = s
+        .xaa
+        .mcp_calls("tools/list")
+        .iter()
+        .filter_map(|r| r["t"].as_u64())
+        .collect();
+    completed(&run)
+        .and(|| {
+            Outcome::require(
+                retries.len() == 1 && retries[0]["wait_ms"].as_u64() >= Some(2000),
+                format!("one retry, after the wait asked for: {retries:?}"),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                // Recorded as asked; the `429` came `SLOW_LIST_MS` later.
+                lists.len() == 2 && lists[1].saturating_sub(lists[0] + SLOW_LIST_MS) >= 2000,
+                format!("the second tools/list waits out the Retry-After: {lists:?}"),
+            )
+        })
+}
+
+/// Every `tools/list` is answered `429` with `Retry-After: 60`, longer than
+/// the retries have left: the listing is not asked again, and the step
+/// waiting in the gap fails saying the server asked for no request for 60s.
+fn a_listing_asked_to_wait_too_long_fails_at_once(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"slow_tools_list_ms": SLOW_LIST_MS, "tools_list_429_times": 10,
+               "tools_list_retry_after": 60}),
+        &Opts::default(),
+    );
+    let _d = s.daemon(h);
+    let n = tryo!(in_the_enrolments_gap(&s, h, || s.start("who")));
+    let run = tryo!(s.ended("who", n, Duration::from_secs(30)));
+    let err = run["err"].as_str().unwrap_or_default();
+    Outcome::require(
+        run["status"] == "failed"
+            && err.contains("the delegated server's tool catalogue could not be fetched")
+            && err.contains("the server asked for no request for 60s"),
+        format!("the step says the server asked for a wait: {run}"),
+    )
+    .and(|| {
+        Outcome::require(
+            s.events("delegation.catalogue.retry").is_empty()
+                && s.xaa.mcp_calls("tools/list").len() == 1,
+            format!(
+                "not asked again: {} lists",
+                s.xaa.mcp_calls("tools/list").len()
+            ),
+        )
+    })
+}
+
+/// The server refuses the token (`401`) at `notifications/initialized`,
+/// which rmcp says as `Transport channel closed`: agentd reads the status
+/// from its own transport and does not try the listing again; the step
+/// waiting in the gap fails saying the token was refused.
+fn a_listing_whose_token_is_refused_at_the_handshake_is_not_tried_again(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"slow_tools_list_ms": SLOW_LIST_MS, "initialized_401_once": true}),
+        &Opts::default(),
+    );
+    let _d = s.daemon(h);
+    let n = tryo!(in_the_enrolments_gap(&s, h, || s.start("who")));
+    let run = tryo!(s.ended("who", n, Duration::from_secs(30)));
+    let err = run["err"].as_str().unwrap_or_default();
+    Outcome::require(
+        run["status"] == "failed"
+            && err.contains("the delegated server's tool catalogue could not be fetched")
+            && err.contains("refused the delegated token (HTTP 401)"),
+        format!("the step says the token was refused: {run}"),
+    )
+    .and(|| {
+        Outcome::require(
+            s.events("delegation.catalogue.retry").is_empty(),
+            format!(
+                "not tried again: {:?}",
+                s.events("delegation.catalogue.retry")
+            ),
+        )
+    })
 }
 
 /// The catalogue alice's enrolment lists cannot be fetched — the server

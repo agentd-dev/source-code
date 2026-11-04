@@ -129,6 +129,7 @@ export const SLASH_OPS: Readonly<Record<string, string>> = Object.freeze({
   revoke: OPS.authSessionsRevoke,
   enrol: OPS.delegationEnrol,
   consent: OPS.delegationList,
+  allowances: OPS.paymentAllowances,
 });
 
 /**

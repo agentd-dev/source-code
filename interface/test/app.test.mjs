@@ -273,6 +273,54 @@ test('slash commands are gated on the card, and an approval asks first', async (
   }
 });
 
+test('/allowances is offered only with its op, and shows each allowance as a block', async () => {
+  const mirror = new Mirror();
+  let reads = 0;
+  const client = {
+    paymentAllowances: async () => {
+      reads += 1;
+      return {
+        allowances: [
+          { id: 'groceries', title: 'Weekly shop', currency: 'GBP', period: 'month', period_start: '2026-11-01T00:00:00Z', period_end: '2026-12-01T00:00:00Z', spent: '385', budget: '400', left: '15', max: '50', approve_above: '30', payments: 3, times: 10 },
+          { id: 'domains', title: null, currency: 'USD', period: 'once', period_start: null, period_end: null, spent: '0', budget: '100', left: '100', max: '20', approve_above: null, payments: 0, times: null },
+        ],
+      };
+    },
+  };
+  const ui = render(React.createElement(App, { configured: 'http://127.0.0.1:1', client, mirror, observe: false }));
+  const type = async (line) => {
+    ui.stdin.write(line);
+    await tick();
+    ui.stdin.write('\r');
+    await tick(60);
+  };
+  try {
+    // Without the op on the card: not sent.
+    mirror.setSession(opsSession([{ op: 'status', reply: 'message' }]));
+    mirror.setConn('ready');
+    await tick();
+    await type('/allowances');
+    assert.match(ui.lastFrame(), /\/allowances is not offered by this agent to you \(its card does not list payment\.allowances\)/);
+    assert.equal(reads, 0);
+    // With it: one read, each allowance a short block.
+    mirror.setSession(opsSession([{ op: 'payment.allowances', reply: 'message' }]));
+    await tick();
+    await type('/allowances');
+    assert.equal(reads, 1);
+    const frame = ui.lastFrame();
+    assert.match(frame, /groceries · Weekly shop {2}GBP/);
+    assert.match(frame, /this period: per month since 2026-11-01T00:00:00Z/);
+    assert.match(frame, /spent 385 \/ 400 · payments 3 \/ 10 · asks above 30/);
+    // No title, no count, no approval threshold: those parts are left out.
+    assert.match(frame, /domains {2}USD/);
+    assert.match(frame, /this period: per once\n/);
+    assert.match(frame, /spent 0 \/ 100\n|spent 0 \/ 100$/m);
+    assert.ok(!/spent 0 \/ 100 ·/.test(frame), frame);
+  } finally {
+    ui.unmount();
+  }
+});
+
 test('chrome from the client layout, status values, and terminal banners', async () => {
   const mirror = new Mirror();
   const ui = render(

@@ -57,6 +57,7 @@ import {
   revocationEndpointOf,
   revokeToken,
   routeSend,
+  allowancesNote,
   runAuthCommand,
   runDelegationCommand,
   join,
@@ -646,6 +647,9 @@ export function App(props: AppProps): React.JSX.Element {
             mirror.note(`plan: ${JSON.stringify(p?.plan ?? null).slice(0, 800)}`);
             break;
           }
+          case 'allowances':
+            mirror.note(allowancesNote(await need().paymentAllowances()));
+            break;
           case 'workflow': {
             if (!arg) {
               mirror.note('usage: /workflow <name>', 'error');

@@ -23,6 +23,7 @@ export {
   APPROVAL_NAME,
   SYSTEM_COMMANDS,
   activityLine,
+  allowancesNote,
   applySuggestion,
   availableCommands,
   commandHelp,

@@ -21,6 +21,7 @@
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import {
+  allowancesNote,
   APPROVAL_NAME,
   AgentdClient,
   CredentialStore,
@@ -1578,6 +1579,9 @@ function Connected({
           mirror.note(`plan: ${JSON.stringify(p?.plan ?? null).slice(0, 800)}`);
           return;
         }
+        case 'allowances':
+          mirror.note(allowancesNote(await need().paymentAllowances()));
+          return;
         case 'workflow': {
           if (!arg) {
             mirror.note('usage: /workflow <name>', 'error');

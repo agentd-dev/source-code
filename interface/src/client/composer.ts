@@ -78,6 +78,7 @@ const COMMANDS: ReadonlyArray<[string, string]> = [
   ['revoke', 'end sessions: /revoke <sid> | name <name> | all'],
   ['enrol', 'sign in at an identity provider so agentd acts for you there: /enrol <idp>'],
   ['consent', 'your consent gates: /consent | /consent approve <gate> | /consent deny <gate>'],
+  ['allowances', 'the spending allowances: this period, spent and budget'],
   ['drain', 'graceful drain'],
   ['layout', "this client's top and bottom edges"],
   ['login', 'sign in'],
@@ -581,6 +582,35 @@ export async function runAuthCommand(
       return { text: `revoked ${shown(field(r, 'revoked'))} session(s)` };
     }
   }
+}
+
+// ---- spending allowances (RFC 0057, operator) ------------------------------
+
+/**
+ * The `/allowances` note: each allowance the `payment.allowances` reply
+ * lists, as a short block — its id and title, currency, this period (per and
+ * since when), spent of budget, payments of times when a count is set, and
+ * the amount above which a payment asks first. Every value is shown inert:
+ * a title is whatever the operator's configuration says.
+ */
+export function allowancesNote(reply: Json): string {
+  const list = rows(field(reply, 'allowances'));
+  if (list.length === 0) return 'no allowances';
+  const blocks = list.map((a) => {
+    const title = text(field(a, 'title'));
+    const start = text(field(a, 'period_start'));
+    const period = shown(field(a, 'period'));
+    const times = field(a, 'times');
+    const above = text(field(a, 'approve_above'));
+    const head = `${shown(field(a, 'id'))}${title !== undefined ? ` · ${inert(title)}` : ''}  ${shown(field(a, 'currency'))}`;
+    const when = `  this period: per ${period}${start !== undefined ? ` since ${inert(start)}` : ''}`;
+    const spend =
+      `  spent ${shown(field(a, 'spent'))} / ${shown(field(a, 'budget'))}` +
+      (typeof times === 'number' ? ` · payments ${shown(field(a, 'payments'))} / ${times}` : '') +
+      (above !== undefined ? ` · asks above ${inert(above)}` : '');
+    return [head, when, spend].join('\n');
+  });
+  return `allowances:\n${blocks.join('\n')}`;
 }
 
 // ---- the person's own delegation (RFC 0044) --------------------------------

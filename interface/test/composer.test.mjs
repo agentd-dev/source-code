@@ -9,6 +9,7 @@ import {
   OPS,
   SLASH_OPS,
   SYSTEM_COMMANDS,
+  allowancesNote,
   applySuggestion,
   availableCommands,
   capabilitiesOf,
@@ -106,6 +107,38 @@ test('commands are gated by the card', () => {
   assert.deepEqual(
     SYSTEM_COMMANDS.filter((c) => c.needs === undefined).map((c) => c.name).sort(),
     ['cancel', 'chat', 'conversations', 'debug', 'help', 'layout', 'login', 'logout', 'new', 'quit', 'subagents', 'tasks'],
+  );
+});
+
+test('/allowances is offered only while the card lists payment.allowances', () => {
+  const without = new Mirror();
+  without.setSession(session(cardWith({ ops: [{ op: 'status', reply: 'message' }] })));
+  assert.ok(!availableCommands(without.getState()).some((c) => c.name === 'allowances'));
+  assert.ok(!suggest('/allow', without.getState()).some((x) => x.label === '/allowances'));
+  const withOp = new Mirror();
+  withOp.setSession(session(cardWith({ ops: [{ op: 'payment.allowances', reply: 'message' }] })));
+  assert.ok(availableCommands(withOp.getState()).some((c) => c.name === 'allowances' && c.needs === 'payment.allowances'));
+  assert.deepEqual(suggest('/allow', withOp.getState()).map((x) => x.label), ['/allowances']);
+});
+
+test('the /allowances note: one block per allowance, values inert', () => {
+  assert.equal(allowancesNote({ allowances: [] }), 'no allowances');
+  assert.equal(
+    allowancesNote({
+      allowances: [
+        { id: 'groceries', title: 'Weekly\u001b[2J shop', currency: 'GBP', period: 'month', period_start: '2026-11-01T00:00:00Z', spent: '385', budget: '400', left: '15', max: '50', approve_above: '30', payments: 3, times: 10 },
+        { id: 'domains', title: null, currency: 'USD', period: 'once', period_start: null, spent: '0', budget: '100', left: '100', max: '20', approve_above: null, payments: 0, times: null },
+      ],
+    }),
+    [
+      'allowances:',
+      'groceries · Weekly\\u001b[2J shop  GBP',
+      '  this period: per month since 2026-11-01T00:00:00Z',
+      '  spent 385 / 400 · payments 3 / 10 · asks above 30',
+      'domains  USD',
+      '  this period: per once',
+      '  spent 0 / 100',
+    ].join('\n'),
   );
 });
 

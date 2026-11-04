@@ -866,6 +866,7 @@ in [Host the web UI](hosting-the-ui.md).
 | `/revoke <sid>`, `/revoke name <name>`, `/revoke all` | end sessions | `auth.sessions.revoke` |
 | `/enrol <idp>` | sign in at an identity provider so agentd acts for you there | `delegation.enrol` |
 | `/consent`, `/consent approve <gate>`, `/consent deny <gate>` | your open consent gates; answer one | `delegation.list` |
+| `/allowances` | the spending allowances: this period, spent of budget, payments of times, the amount above which a payment asks (served where an allowance is declared) | `payment.allowances` |
 | `/drain` | graceful drain | `admin.drain` |
 | `/layout [top\|bottom <items>\|reset]` | the status line | |
 | `/login [user\|operator]`, `/logout` | sign in, sign out | |

@@ -20,6 +20,11 @@
  *
  * Pasting is handled too — a chunk arriving with embedded newlines is
  * inserted verbatim rather than submitting on the first one.
+ *
+ * Completion: while the composer offers a suggestion and the cursor is at the
+ * end, the rest of it is drawn after the cursor, dim — the "ghost" — and →
+ * accepts it, as Tab does. The ghost is drawing only: it is never part of the
+ * value, and it never takes a row of its own ({@link ghostFits}).
  */
 import React from 'react';
 import { Text, useInput } from 'ink';
@@ -134,6 +139,25 @@ export function applyKey(s: EditState, input: string, key: EditKey): EditResult 
   return { state: insert(st, input) };
 }
 
+/**
+ * How much of `ghost` can be drawn after the cursor at the end of `value` in a
+ * field `width` columns wide without the field wrapping to another row: all
+ * of it when it fits, else what fits on the cursor's row, cut there. When the
+ * last line already fills its row (or there is no width to judge by), none.
+ * A last line that already wraps shows none either: the cursor's column
+ * inside a word-wrapped line is the renderer's to know, and a ghost that
+ * guessed it wrong would take a row and push the frame.
+ */
+export function ghostFits(value: string, ghost: string, width: number | undefined): string {
+  if (!ghost || width === undefined || width < 1) return '';
+  const last = [...value.slice(value.lastIndexOf('\n') + 1)].length;
+  // The cursor sits on the ghost's first character, so the row holds the
+  // line and the ghost.
+  const room = width - last;
+  if (room < 1) return '';
+  return [...ghost].slice(0, room).join('');
+}
+
 export interface MultilineInputProps {
   value: string;
   cursor: number;
@@ -148,6 +172,17 @@ export interface MultilineInputProps {
    */
   ignoreVertical?: boolean;
   placeholder?: string;
+  /**
+   * The completion → accepts at the end of the text: the value it becomes,
+   * or `null` when nothing is offered for it. Asked of the value the keys
+   * left — not the last render's — so a → typed before a redraw completes
+   * what was typed.
+   */
+  complete?: (value: string) => string | null;
+  /** The rest of the offered completion, drawn dim after the cursor at the end. */
+  ghost?: string;
+  /** The field's width in columns, which a ghost must fit on its row of. */
+  width?: number;
 }
 
 /**
@@ -164,6 +199,9 @@ export function MultilineInput({
   isActive = true,
   ignoreVertical = false,
   placeholder,
+  complete,
+  ghost,
+  width,
 }: MultilineInputProps): React.JSX.Element {
   // Keys can arrive faster than React re-renders (a fast typist, `tmux
   // send-keys`): each must edit the state the key before it left, not the
@@ -180,6 +218,15 @@ export function MultilineInput({
     (input, key) => {
       if (ignoreVertical && (key.upArrow || key.downArrow)) return;
       const was = live.current;
+      // → at the end accepts the completion; anywhere else it moves.
+      if (key.rightArrow && complete && was.cursor >= was.value.length) {
+        const next = complete(was.value);
+        if (next !== null && next !== was.value) {
+          live.current = { value: next, cursor: next.length };
+          onChange(live.current);
+          return;
+        }
+      }
       const r = applyKey(was, input, key as EditKey);
       if (r.history && onHistory) {
         onHistory(r.history);
@@ -205,6 +252,19 @@ export function MultilineInput({
   const before = value.slice(0, at);
   const under = value.slice(at, at + 1);
   const after = value.slice(at + 1);
+  const shown = at === value.length && value !== '' ? ghostFits(value, ghost ?? '', width) : '';
+  if (shown) {
+    const first = [...shown][0];
+    return (
+      <Text wrap="wrap">
+        {before}
+        <Text inverse color={theme.dim}>
+          {first}
+        </Text>
+        <Text color={theme.dim}>{shown.slice(first.length)}</Text>
+      </Text>
+    );
+  }
   return (
     <Text wrap="wrap">
       {before}

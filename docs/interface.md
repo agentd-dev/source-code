@@ -456,8 +456,13 @@ per change keeps every attached client in sync at a fixed cost, where a token
 stream would multiply the daemon's outbound traffic by the number of
 watchers.
 
-**The composer** reads four prefixes, with suggestions as you type (`Tab`
-accepts one):
+**The composer** reads four prefixes, with suggestions as you type. While
+one is offered and the cursor is at the end, the rest of the selected one is
+drawn after the cursor, dim; `→` or `Tab` accepts it, and `↑`/`↓` pick
+another. The dim text is only drawn: `Enter` sends what you typed. It is cut
+at the end of the row it is on, and not drawn at all when the line already
+wraps, so the composer never grows a row for it. Elsewhere in the line, `→`
+moves the cursor.
 
 - `/` runs a [slash command](#slash-commands), and every workflow is a
   shortcut too: `/deploy` runs the `deploy` workflow (built-in names win). A
@@ -566,13 +571,25 @@ attempt       1
 tokens        4120
 instruction   Review the diff for correctness regressions and report findings.
 requested_by  operator
-m message · k stop · esc/backspace back · tab next screen
+m/enter message · l log · k stop · esc/backspace back · tab next screen
 ● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
 ```
 
-- **`m` messages it.** The composer opens addressed to this subagent
-  (`/send <handle> `), so you do not retype the handle. Only a warm subagent
-  can take a message; the view says so when it cannot.
+- **`m` or `Enter` messages it.** A message field opens in the detail view
+  itself; `Enter` sends, `Esc` leaves the field. What you sent and what the
+  subagent answered stay above it as a short exchange, so you can follow up
+  without leaving the child. A warm flat worker and a live instance child
+  take messages; for any other, the field says why it cannot. A refusal from
+  the daemon (a child that is not running, or not reachable yet) is shown in
+  the field too. `/send <handle> <text>` in the chat still sends one.
+- **`l` shows its log**, while the card lists `subagent.log` for you (the
+  operator). The pane tails the child's log and follows new lines, reading
+  every 1.5 s while it is open. `↑`/`↓` and `PgUp`/`PgDn` scroll it, and
+  `Esc` closes it. Each line is shown as its time, level and event, then the
+  event's own fields; the fields every line carries (`run_id`, `agent_path`,
+  `pid`, trace ids) are left out. An instance child's lines are its own log
+  file; a flat worker's are the daemon's lines about it from its in-memory
+  log ring, kept while introspection is on.
 - **`k` stops it.** The supervisor owns the process group, so this is a real
   kill rather than a request the child can decline. It asks first, because a
   stop cannot be undone:
@@ -590,6 +607,47 @@ tokens        4120
 instruction   Review the diff for correctness regressions and report findings.
 requested_by  operator
 stop sa-review? y to confirm, any other key to cancel
+● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
+```
+
+A message and its reply:
+
+```tui
+# agentd tui — messaging a subagent
+agentd 1.24.0 triage-1 debug
+subagent sa-review
+status        running
+template      reviewer
+reports to    cto
+mode          supervised
+attempt       1
+tokens        4120
+instruction   Review the diff for correctness regressions and report findings.
+requested_by  operator
+you › Look at the auth changes first.
+sa-review › Starting with auth/: two regressions in session refresh, one in token scope. Details
+in my result.
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ › message sa-review                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+enter send · esc leave the field
+● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
+```
+
+The log pane:
+
+```tui
+# agentd tui — a subagent's log
+agentd 1.24.0 triage-1 debug
+log sa-review · following · 7 lines
+09:00:02 info  proc.start version=1.24.0 instance=sa-review
+09:00:02 info  a2a.listen addr=unix:///run/agentd/sa-review/a2a.sock
+09:00:02 info  proc.ready
+09:00:03 info  turn.start conversation=parent
+09:00:05 info  tool.call tool=git.diff ms=212
+09:00:09 warn  intel.retry status=429 after_ms=800
+09:00:12 info  turn.done status=completed tokens=4120
+↑/↓ pgup/pgdn scroll · esc close
 ● live http://127.0.0.1:8420 [subagents] tab:screens esc:cancel /:cmd ^c:quit
 ```
 
@@ -882,6 +940,7 @@ caller may run is the daemon's decision.
 | Key | Where | Does |
 |---|---|---|
 | `Tab` | anywhere | next screen; accepts a suggestion while one is shown |
+| `→` | the composer, at the end of the text, a suggestion shown | accept the suggestion; elsewhere, move the cursor |
 | `Esc` | chat | cancel the newest working task |
 | `Esc`, `Backspace` | subagent detail | back to the list |
 | `PgUp`, `PgDn` | chat, fullscreen | scroll the conversation |
@@ -889,7 +948,9 @@ caller may run is the daemon's decision.
 | `Enter` | lists | open the selection |
 | `1`–`9` | chat, empty composer, a question with choices | pick a choice |
 | `c` | tasks | cancel the selected task |
-| `m`, `k` | subagent detail | message, stop |
+| `m` or `Enter`, `l`, `k` | subagent detail | message it, its log, stop it |
+| `Enter`, `Esc` | a subagent's message field | send; leave the field |
+| `↑`, `↓`, `PgUp`, `PgDn`, `Esc` | a subagent's log | scroll; close |
 | `y` | a confirmation | confirm; any other key cancels |
 | `Ctrl-C` | anywhere | quit |
 

@@ -19,6 +19,8 @@ const TITLES = {
   'agentd tui — subagents': 'subagents',
   'agentd tui — subagent detail': 'subagent-detail',
   'agentd tui — confirming a stop': 'subagent-stop',
+  'agentd tui — messaging a subagent': 'subagent-message',
+  'agentd tui — a subagent\'s log': 'subagent-log',
   'agentd tui — debug': 'debug',
 };
 

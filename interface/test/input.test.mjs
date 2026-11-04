@@ -118,3 +118,80 @@ test('keys that arrive before a re-render all land, and Enter sends them all', a
   r.unmount();
   assert.deepEqual(sent, ['#01 ok']);
 });
+
+test('the ghost fits the cursor row: whole, cut there, or not at all', async () => {
+  const { ghostFits } = await import('../dist/tui/parts/input.js');
+  assert.equal(ghostFits('/he', 'lp ', 20), 'lp ', 'room for all of it');
+  assert.equal(ghostFits('/s', 'ubagents ', 6), 'ubag', 'cut at the row');
+  assert.equal(ghostFits('abcdef', 'x', 6), '', 'the line fills its row');
+  assert.equal(ghostFits('a long line that wraps', 'xy', 6), '', 'a wrapped line shows none');
+  // Only the last line counts: earlier ones are rows of their own.
+  assert.equal(ghostFits('a long first line\n/he', 'lp', 6), 'lp');
+  assert.equal(ghostFits('/he', 'lp', undefined), '', 'no width to judge by');
+  assert.equal(ghostFits('/he', '', 20), '');
+});
+
+test('→ at the end accepts the completion, keys faster than a redraw included', async () => {
+  const React = (await import('react')).default;
+  const { render } = await import('ink-testing-library');
+  const { MultilineInput } = await import('../dist/tui/parts/input.js');
+  const sent = [];
+  const asked = [];
+  function Host() {
+    const [s, set] = React.useState({ value: '', cursor: 0 });
+    return React.createElement(MultilineInput, {
+      value: s.value,
+      cursor: s.cursor,
+      onChange: set,
+      onSubmit: (v) => sent.push(v),
+      complete: (v) => {
+        asked.push(v);
+        return v === '/he' ? '/help ' : null;
+      },
+    });
+  }
+  const r = render(React.createElement(Host));
+  await new Promise((ok) => setTimeout(ok, 20));
+  // No render between them: → completes what the keys left, not the last frame.
+  for (const ch of '/he') r.stdin.write(ch);
+  r.stdin.write('\u001b[C');
+  r.stdin.write('x');
+  r.stdin.write('\r');
+  await new Promise((ok) => setTimeout(ok, 50));
+  r.unmount();
+  assert.deepEqual(asked, ['/he']);
+  assert.deepEqual(sent, ['/help x']);
+});
+
+test('→ before the end moves the cursor and completes nothing', async () => {
+  const React = (await import('react')).default;
+  const { render } = await import('ink-testing-library');
+  const { MultilineInput } = await import('../dist/tui/parts/input.js');
+  const sent = [];
+  let asked = 0;
+  function Host() {
+    const [s, set] = React.useState({ value: '', cursor: 0 });
+    return React.createElement(MultilineInput, {
+      value: s.value,
+      cursor: s.cursor,
+      onChange: set,
+      onSubmit: (v) => sent.push(v),
+      complete: () => {
+        asked += 1;
+        return '/help ';
+      },
+    });
+  }
+  const r = render(React.createElement(Host));
+  await new Promise((ok) => setTimeout(ok, 20));
+  for (const ch of 'abc') r.stdin.write(ch);
+  r.stdin.write('\u001b[D');
+  r.stdin.write('\u001b[D');
+  r.stdin.write('\u001b[C');
+  r.stdin.write('X');
+  r.stdin.write('\r');
+  await new Promise((ok) => setTimeout(ok, 50));
+  r.unmount();
+  assert.equal(asked, 0, 'mid-line, → is a move');
+  assert.deepEqual(sent, ['abXc']);
+});

@@ -70,6 +70,20 @@ function session() {
   return { cardUrl: `${ENDPOINT}/.well-known/agent-card.json`, card: c, extended: c, ep: { url: `${ENDPOINT}/` }, caps, warnings: [] };
 }
 
+/** What the stand-in subagent has answered so far. */
+let replied = null;
+
+/** An instance child's own log, as `subagent.log` returns it. */
+const LOG = [
+  { ts: '2026-09-01T09:00:02.114Z', level: 'info', event: 'proc.start', version: '1.24.0', instance: 'sa-review' },
+  { ts: '2026-09-01T09:00:02.161Z', level: 'info', event: 'a2a.listen', addr: 'unix:///run/agentd/sa-review/a2a.sock' },
+  { ts: '2026-09-01T09:00:02.170Z', level: 'info', event: 'proc.ready' },
+  { ts: '2026-09-01T09:00:03.402Z', level: 'info', event: 'turn.start', conversation: 'parent' },
+  { ts: '2026-09-01T09:00:05.977Z', level: 'info', event: 'tool.call', tool: 'git.diff', ms: 212 },
+  { ts: '2026-09-01T09:00:09.530Z', level: 'warn', event: 'intel.retry', status: 429, after_ms: 800 },
+  { ts: '2026-09-01T09:00:12.018Z', level: 'info', event: 'turn.done', status: 'completed', tokens: 4120 },
+].map((l) => JSON.stringify({ run_id: 'r1', agent_id: 'sa-review', agent_path: '0', comp: 'supervisor', pid: 4242, ...l }));
+
 /** A stand-in daemon: the App calls these on user actions. */
 const client = {
   subagentGet: async (handle) => ({
@@ -84,7 +98,17 @@ const client = {
     requested_by: 'operator',
   }),
   subagentKill: async () => ({ ok: true }),
-  subagentSend: async () => ({ ok: true }),
+  subagentSend: async () => {
+    replied = 'Starting with auth/: two regressions in session refresh, one in token scope. Details in my result.';
+    return { ok: true };
+  },
+  subagentStatus: async (handle) => ({ handle, status: 'running', mode: 'detached', result: null, ...(replied ? { reply: replied } : {}) }),
+  subagentLog: async (handle, lines, after) => ({
+    handle,
+    source: 'file',
+    cursor: 2048,
+    lines: after === undefined ? LOG : [],
+  }),
   // A prompt typed into the composer opens a task in conversation c1.
   send: async (text) => ({
     task: {
@@ -195,6 +219,31 @@ await capture('subagent-stop', async (m, ui) => {
   ui.stdin.write('\t'); await tick();
   ui.stdin.write('\r'); await tick(120);
   ui.stdin.write('k'); await tick(200);
+});
+
+// A message to the subagent from its detail view, and its reply beside it.
+await capture('subagent-message', async (m, ui) => {
+  replied = null;
+  populate(m);
+  await settle(m);
+  await tick();
+  ui.stdin.write('\t'); await tick();
+  ui.stdin.write('\t'); await tick();
+  ui.stdin.write('\r'); await tick(120);   // enter -> detail
+  ui.stdin.write('\r'); await tick();      // enter -> the message field
+  ui.stdin.write('Look at the auth changes first.'); await tick();
+  ui.stdin.write('\r'); await tick(1800);  // sent; the reply is read back
+});
+
+// The child's log, tailed in the detail view.
+await capture('subagent-log', async (m, ui) => {
+  populate(m);
+  await settle(m);
+  await tick();
+  ui.stdin.write('\t'); await tick();
+  ui.stdin.write('\t'); await tick();
+  ui.stdin.write('\r'); await tick(120);
+  ui.stdin.write('l'); await tick(150);
 });
 
 await capture('debug', async (m, ui) => {

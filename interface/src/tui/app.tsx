@@ -65,6 +65,8 @@ import {
   suggest,
   workflowNames,
   DAEMON_KEYS,
+  OPS,
+  offers,
 } from '../client/index.js';
 import type { Credential, Failure, Layout, LoginOption, MirrorState, TaskView } from '../client/index.js';
 import { GatePrompt, gateOptions, gateRows } from './parts/gate.js';
@@ -74,7 +76,7 @@ import { TaskList } from './parts/tasks.js';
 import { DebugScreen, settable } from './parts/debug.js';
 import { Edge } from './parts/chrome.js';
 import { StatusBar } from './parts/statusbar.js';
-import { SubagentDetail, SubagentList } from './parts/subagents.js';
+import { SubagentDetail, SubagentList, SubagentLog, cannotMessage, replyText, type ExchangeItem } from './parts/subagents.js';
 import { TUI_CLIENT_ID, chooseSignIn, launchTokenUrl, shownCode, unrevokedNote } from './args.js';
 
 /** How the credential the TUI holds was obtained; it decides what an ended session says. */
@@ -152,6 +154,40 @@ function authWait(s: MirrorState, ctx: string | undefined): TaskView | undefined
 
 type Screen = 'chat' | 'tasks' | 'subagents' | 'debug';
 
+/** How often an open subagent log pane, or a message awaiting its reply, is read again. */
+export const SUBAGENT_POLL_MS = 1500;
+/** How long a message to a subagent waits for its reply before the exchange says none came. */
+const REPLY_WAIT_MS = 10 * 60 * 1000;
+/** The most log lines the pane holds. */
+const LOG_KEEP = 1000;
+/** The statuses a subagent does not leave: a message waits for no reply from one. */
+const TERMINAL_SUBAGENT: ReadonlySet<string> = new Set(['completed', 'failed', 'crashed', 'killed', 'cancelled']);
+
+/** What the detail view of one subagent is doing: showing it, taking a message for it, or showing its log. */
+type SubMode = 'view' | 'compose' | 'log';
+
+/** A message to a subagent waiting for its reply: what its result was when the message went. */
+interface Awaiting {
+  handle: string;
+  base: string;
+  baseUpdated: number;
+  since: number;
+}
+
+/** A log pane's contents: the lines read so far, and the cursor to read on from. */
+interface SubLog {
+  handle: string;
+  lines: string[];
+  cursor?: number;
+  note?: string;
+}
+
+/** A failure as the exchange says it: the agent's words, never a stack. */
+function plainFailure(e: unknown): string {
+  if (e instanceof RpcError) return e.message;
+  return e instanceof Error ? e.message : String(e);
+}
+
 export function App(props: AppProps): React.JSX.Element {
   const { exit } = useApp();
   // Without an interactive terminal (piped/CI) the TUI degrades to a live
@@ -203,6 +239,14 @@ export function App(props: AppProps): React.JSX.Element {
   // Stopping a subagent is not undoable, so it asks first — one keystroke to
   // confirm, any other key to back out.
   const [killAsk, setKillAsk] = useState<string | null>(null);
+  // The detail view's own modes: its message field, and its log pane.
+  const [subMode, setSubMode] = useState<SubMode>('view');
+  const [subInput, setSubInput] = useState<EditState>({ value: '', cursor: 0 });
+  const [exchanges, setExchanges] = useState<Record<string, ExchangeItem[]>>({});
+  const [awaiting, setAwaiting] = useState<Awaiting | null>(null);
+  const [subLog, setSubLog] = useState<SubLog | null>(null);
+  /** Log lines hidden below the pane (0 = following the newest). */
+  const [logScroll, setLogScroll] = useState(0);
   const [spin, setSpin] = useState(0);
   const [logLines, setLogLines] = useState<Json[]>([]);
   const logCursor = useRef(0);
@@ -245,6 +289,27 @@ export function App(props: AppProps): React.JSX.Element {
 
   useEffect(() => setSugIndex(0), [input]);
 
+  // The selected suggestion, as → accepts it at the end of the text — asked
+  // of the text the keys left, which is this render's only until the next
+  // key lands, so its selection holds for this render's text alone.
+  const complete = useCallback(
+    (v: string): string | null => {
+      if (screen !== 'chat') return null;
+      const sugs = suggest(v, mirror.getState());
+      if (sugs.length === 0) return null;
+      const pick = v === input ? Math.min(sugIndex, sugs.length - 1) : 0;
+      return applySuggestion(v, sugs[pick]);
+    },
+    [screen, mirror, input, sugIndex],
+  );
+  // What → would add, drawn after the cursor: only an extension of the text
+  // (a completion that rewrites what was typed has no rest to show).
+  const ghost = useMemo(() => {
+    if (suggestions.length === 0 || cursor < input.length) return '';
+    const next = applySuggestion(input, suggestions[Math.min(sugIndex, suggestions.length - 1)]);
+    return next.startsWith(input) ? next.slice(input.length) : '';
+  }, [suggestions, input, cursor, sugIndex]);
+
   // Scrolled up? New entries must not yank the view — hold position by
   // counting them into the offset. At the bottom (offset 0) we follow.
   const lastLen = useRef(s.transcript.length);
@@ -278,6 +343,92 @@ export function App(props: AppProps): React.JSX.Element {
       clearInterval(t);
     };
   }, [screen, debugOn, client]);
+
+  // Leaving a subagent's detail (or moving to another) leaves its field and
+  // its pane; what was said to it stays, for when it is opened again.
+  useEffect(() => {
+    setSubMode('view');
+    setSubLog(null);
+    setLogScroll(0);
+    setSubInput({ value: '', cursor: 0 });
+  }, [subDetail?.handle]);
+
+  const note = useCallback((handle: string, item: ExchangeItem) => {
+    setExchanges((cur) => ({ ...cur, [handle]: [...(cur[handle] ?? []), item].slice(-20) }));
+  }, []);
+
+  // A message awaiting its reply: the subagent's answer is read until it is
+  // no longer the one it was when the message went — a warm worker's turn
+  // is its `result`, an instance child's answer its `reply`.
+  useEffect(() => {
+    if (!awaiting || !client) return;
+    let alive = true;
+    const tick = async () => {
+      const summary = mirror.getState().subagents.get(awaiting.handle) as { [k: string]: Json } | undefined;
+      if (Date.now() - awaiting.since > REPLY_WAIT_MS) {
+        note(awaiting.handle, { who: 'note', text: 'no reply came' });
+        setAwaiting(null);
+        return;
+      }
+      try {
+        const r = (await client.subagentStatus(awaiting.handle)) as { [k: string]: Json } | null;
+        if (!alive) return;
+        // An instance child's answer is its `reply`; a warm worker's, its `result`.
+        const answer = r?.reply ?? r?.result ?? null;
+        const now = JSON.stringify(answer);
+        const moved = Number(summary?.updated ?? 0) > awaiting.baseUpdated;
+        if (answer !== null && (now !== awaiting.base || moved)) {
+          note(awaiting.handle, { who: 'child', text: replyText(answer) });
+          setAwaiting(null);
+        } else if (r && typeof r.status === 'string' && TERMINAL_SUBAGENT.has(r.status)) {
+          note(awaiting.handle, { who: 'note', text: `${awaiting.handle} is ${r.status}${r.error ? `: ${String(r.error)}` : ''}` });
+          setAwaiting(null);
+        }
+      } catch {
+        /* the next read may answer */
+      }
+    };
+    const t = setInterval(() => void tick(), SUBAGENT_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [awaiting, client, mirror, note]);
+
+  const logCursorOf = useRef<number | undefined>(undefined);
+  // The log pane: its tail when it opens, then what is written since, read
+  // with the cursor every SUBAGENT_POLL_MS while it is open.
+  const logOpen = screen === 'subagents' && subMode === 'log' ? subLog?.handle : undefined;
+  useEffect(() => {
+    if (!logOpen || !client) return;
+    let alive = true;
+    const read = async () => {
+      try {
+        const cur = logCursorOf.current;
+        const r = (await client.subagentLog(logOpen, 200, cur)) as { [k: string]: Json } | null;
+        if (!alive || !r) return;
+        const lines = Array.isArray(r.lines) ? r.lines.filter((l): l is string => typeof l === 'string') : [];
+        const cursor = typeof r.cursor === 'number' ? r.cursor : cur;
+        logCursorOf.current = cursor;
+        const noteText = typeof r.note === 'string' ? r.note : undefined;
+        setSubLog((was) =>
+          was?.handle === logOpen
+            ? { handle: logOpen, lines: [...was.lines, ...lines].slice(-LOG_KEEP), cursor, note: noteText }
+            : was,
+        );
+        // Scrolled up? New lines must not move what is being read.
+        if (lines.length > 0) setLogScroll((o) => (o > 0 ? o + lines.length : 0));
+      } catch (e) {
+        if (alive) setSubLog((was) => (was?.handle === logOpen ? { ...was, note: plainFailure(e) } : was));
+      }
+    };
+    void read();
+    const t = setInterval(() => void read(), SUBAGENT_POLL_MS);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [logOpen, client]);
 
   // The gate a plain reply answers: this conversation's newest INPUT_REQUIRED
   // task, never another conversation's (routeSend reads the same rule). A
@@ -709,6 +860,52 @@ export function App(props: AppProps): React.JSX.Element {
     [client],
   );
 
+  /**
+   * Send what the detail view's field holds to the subagent it shows. What
+   * cannot be sent — a child not running, not warm, or a refusal — is said
+   * in the exchange, plainly.
+   */
+  const sendToSubagent = useCallback(
+    async (handle: string, raw: string) => {
+      const text = raw.trim();
+      setSubInput({ value: '', cursor: 0 });
+      if (text.length === 0) return;
+      const summary = s.subagents.get(handle) as { [k: string]: Json } | undefined;
+      const why = cannotMessage(summary);
+      if (why) {
+        note(handle, { who: 'note', text: why });
+        return;
+      }
+      if (!client) {
+        note(handle, { who: 'note', text: 'not connected yet' });
+        return;
+      }
+      // What its result is now, so the reply is told from it.
+      let base = 'null';
+      try {
+        const st = (await client.subagentStatus(handle)) as { [k: string]: Json } | null;
+        base = JSON.stringify(st?.reply ?? st?.result ?? null);
+      } catch {
+        /* the send says what is wrong, if anything is */
+      }
+      note(handle, { who: 'you', text });
+      try {
+        await client.subagentSend(handle, text);
+        setAwaiting({ handle, base, baseUpdated: Number(summary?.updated ?? 0), since: Date.now() });
+      } catch (e) {
+        note(handle, { who: 'note', text: `not sent: ${plainFailure(e)}` });
+      }
+    },
+    [client, s, note],
+  );
+
+  const openLog = useCallback((handle: string) => {
+    logCursorOf.current = undefined;
+    setLogScroll(0);
+    setSubLog({ handle, lines: [] });
+    setSubMode('log');
+  }, []);
+
   useInput(
     (ch, key) => {
       // A pending yes/no takes the next keystroke, whatever it is: `y` is
@@ -716,6 +913,26 @@ export function App(props: AppProps): React.JSX.Element {
       if (ask) {
         setAsk(null);
         ask.resolve(ch === 'y' || ch === 'Y');
+        return;
+      }
+      // A subagent's message field has the keys while it is open: Esc leaves
+      // it, and everything else is the field's.
+      if (screen === 'subagents' && subDetail && subMode === 'compose') {
+        if (key.escape) setSubMode('view');
+        return;
+      }
+      // Its log pane scrolls; Esc closes it.
+      if (screen === 'subagents' && subDetail && subMode === 'log') {
+        const total = subLog?.lines.length ?? 0;
+        const page = Math.max(1, bodyRows - 3);
+        const most = Math.max(0, total - 1);
+        if (key.escape || key.backspace || key.delete) {
+          setSubMode('view');
+          setSubLog(null);
+        } else if (key.upArrow) setLogScroll((o) => Math.min(most, o + 1));
+        else if (key.downArrow) setLogScroll((o) => Math.max(0, o - 1));
+        else if (key.pageUp) setLogScroll((o) => Math.min(most, o + page));
+        else if (key.pageDown) setLogScroll((o) => Math.max(0, o - page));
         return;
       }
       // A form-shaped gate takes the number keys, so picking an option is one
@@ -836,20 +1053,12 @@ export function App(props: AppProps): React.JSX.Element {
           if (handle) openSubagent(handle);
         }
       } else if (screen === 'subagents' && subDetail) {
-        // Control lives on the thing being controlled. `m` opens the composer
-        // pre-addressed to this subagent so a message is one keystroke away
-        // rather than a `/send <handle> …` you have to retype the handle into;
-        // `k` stops it — a subagent is a process the supervisor owns, so stop
-        // means stop rather than a request the child can decline.
-        if (key.backspace || key.delete || key.escape) setSubDetail(null);
-        else if (ch === 'm') {
-          const pre = `/send ${subDetail.handle} `;
-          setScreen('chat');
-          setInput(pre);
-          setCursor(pre.length);
-          setSubDetail(null);
-        } else if (ch === 'k') setKillAsk(subDetail.handle);
-        else if (killAsk && (ch === 'y' || ch === 'Y') && client) {
+        // Control lives on the thing being controlled. `m` (or Enter) opens
+        // a message field in this view, so a subagent is talked to where it
+        // is shown and its reply lands beside what was said; `l` opens its
+        // log; `k` stops it — a subagent is a process the supervisor owns,
+        // so stop means stop rather than a request the child can decline.
+        if (killAsk && (ch === 'y' || ch === 'Y') && client) {
           const h = killAsk;
           setKillAsk(null);
           void client
@@ -857,6 +1066,10 @@ export function App(props: AppProps): React.JSX.Element {
             .then(() => mirror.note(`stopped ${h}`))
             .catch((e: unknown) => mirror.note(`stop failed: ${String(e)}`));
         } else if (killAsk) setKillAsk(null);
+        else if (key.backspace || key.delete || key.escape) setSubDetail(null);
+        else if (ch === 'm' || key.return) setSubMode('compose');
+        else if (ch === 'l' && offers(s, OPS.subagentLog)) openLog(subDetail.handle);
+        else if (ch === 'k') setKillAsk(subDetail.handle);
       }
     },
     { isActive: isRawModeSupported },
@@ -865,6 +1078,8 @@ export function App(props: AppProps): React.JSX.Element {
   // ---- render ------------------------------------------------------------
 
   const { top, bottom } = layout;
+  // The composer's text width: the terminal less the box (fullscreen) and the prompt.
+  const composerWidth = Math.max(1, columns - (fullscreen ? 4 : 0) - 2);
   const chrome = { s, endpoint: props.configured, screen, active: active.length };
   // The live working line (RFC 0032 §17): what the daemon is doing, ticking
   // its own clock off the activity record's `started_ms` (the spinner interval
@@ -914,7 +1129,16 @@ export function App(props: AppProps): React.JSX.Element {
       ) : screen === 'tasks' ? (
         <TaskList tasks={mirror.allTasks()} selected={selected} />
       ) : screen === 'subagents' ? (
-        subDetail ? (
+        subDetail && subMode === 'log' && subLog ? (
+          <SubagentLog
+            handle={subLog.handle}
+            lines={subLog.lines}
+            note={subLog.note}
+            scroll={logScroll}
+            rows={bodyRows}
+            width={Math.max(1, columns)}
+          />
+        ) : subDetail ? (
           <SubagentDetail
             handle={subDetail.handle}
             killAsk={killAsk === subDetail.handle}
@@ -922,6 +1146,18 @@ export function App(props: AppProps): React.JSX.Element {
             detail={subDetail.detail as { [k: string]: Json } | null}
             debug={debugOn}
             canSet={settable(s, DAEMON_KEYS.introspection)}
+            canLog={offers(s, OPS.subagentLog)}
+            compose={{
+              open: subMode === 'compose' && isRawModeSupported,
+              value: subInput.value,
+              cursor: subInput.cursor,
+              onChange: setSubInput,
+              onSubmit: (v: string) => void sendToSubagent(subDetail.handle, v),
+              exchange: exchanges[subDetail.handle] ?? [],
+              waiting: awaiting?.handle === subDetail.handle,
+              // Inside the field's box: its border and padding, and the prompt.
+              width: Math.max(1, columns - 6),
+            }}
           />
         ) : (
           <SubagentList s={s} selected={selected} />
@@ -960,7 +1196,7 @@ export function App(props: AppProps): React.JSX.Element {
               {/* An explicit width: measured beside the prompt, the text's
                   wrap would be judged at a wider width than it is drawn at,
                   and a long line would wrap to more rows than its box holds. */}
-              <Box width={Math.max(1, columns - (fullscreen ? 4 : 0) - 2)} flexShrink={0}>
+              <Box width={composerWidth} flexShrink={0}>
                 <MultilineInput
                   value={input}
                   cursor={cursor}
@@ -971,6 +1207,9 @@ export function App(props: AppProps): React.JSX.Element {
                   onSubmit={(v: string) => void submit(v)}
                   ignoreVertical={suggestions.length > 0}
                   isActive={ask === null}
+                  complete={complete}
+                  ghost={ghost}
+                  width={composerWidth}
                 />
               </Box>
             </Box>

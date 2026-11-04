@@ -328,6 +328,19 @@ pub struct SubagentRecord {
     /// the first one wins, and a `sync` spawn waits on it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<Value>,
+    /// Which send `reply` answers, by the id that send's answer named to its
+    /// caller — the A2A task of a `subagent.send` command, else the tool's
+    /// `message_id` — so a client matches its own send.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    /// The latest sends an A2A caller made, as (`message_id`, the A2A task
+    /// id its answer named): what `reply_to` is said as. A few, newest last.
+    #[serde(skip)]
+    pub send_ids: std::collections::VecDeque<(String, String)>,
+    /// The order of the send `reply` answers, among this process's sends: a
+    /// late answer to an older send never takes the place of a newer one's.
+    #[serde(skip)]
+    pub reply_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -391,6 +404,12 @@ pub struct SubagentRecord {
     pub config_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub socket: Option<String>,
+    /// Instance tier: the device and inode of the log file this parent
+    /// opened for the child at its last spawn (`<dir>/log`). The child owns
+    /// its directory, so a read of its log (`subagent.log`, the exit cause)
+    /// takes the file at that path only while it is still this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_id: Option<super::subagent_log::LogId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retire_at: Option<u64>,
     /// Instance tier: set when retirement began (SIGTERM sent); the tick
@@ -725,6 +744,10 @@ pub struct Runtime {
     /// build without a listener hands its children no channel.
     #[cfg_attr(not(feature = "a2a"), allow(dead_code))]
     pub(crate) instance_doors: std::sync::Arc<super::instances::DoorSlot>,
+    /// The followers of `subagent.send` to instance children: one per child
+    /// at most, [`super::instances::FOLLOWERS_MAX`] across the process.
+    #[cfg(feature = "a2a")]
+    pub(crate) instance_followers: super::instances::Followers,
     /// When this runtime last read its durable instance children's spend
     /// (epoch ms; `runtime::instances`).
     pub(crate) instances_metered_at: u64,

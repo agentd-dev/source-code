@@ -329,6 +329,9 @@ impl Runtime {
             attempt: 1,
             result: None,
             reply: None,
+            reply_to: None,
+            reply_seq: 0,
+            send_ids: Default::default(),
             error: None,
             requested_by: Some(
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": 0}),
@@ -354,6 +357,7 @@ impl Runtime {
             pid: None,
             config_path: Some(config_path.display().to_string()),
             socket: Some(socket.clone()),
+            log_id: None,
             retire_at,
             retiring_since: None,
             durable,
@@ -363,8 +367,9 @@ impl Runtime {
         };
         record.principal = self.spawn_principal(&record);
         match self.spawn_instance_process(&handle, &config_path, &dir, &t.spec.limits, &prose) {
-            Ok(pid) => {
+            Ok((pid, log_id)) => {
                 record.pid = Some(pid);
+                record.log_id = Some(log_id);
                 record.status = "running".into();
                 self.log.in_trace(Some(&trace)).info(
                     "instance.spawn",
@@ -799,17 +804,35 @@ impl Runtime {
         dir: &std::path::Path,
         limits: &Option<Value>,
         delivered: &str,
-    ) -> Result<i32, String> {
+    ) -> Result<(i32, super::subagent_log::LogId), String> {
         let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let run_as = self.settings.spawn.instance();
         if let Some(ids) = run_as {
             make_own(dir, ids)?;
         }
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("log"))
-            .map_err(|e| format!("open log: {e}"))?;
+        // A previous life of the child owned this directory: what is at
+        // `log` is opened only as a regular file, never through a symlink
+        // nor waited on as a FIFO. Its identity is what a read of the log
+        // takes it by from here (`subagent_log::open_child_log`).
+        let log_file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(dir.join("log"))
+                .map_err(|e| format!("open log: {e}"))?
+        };
+        if !log_file
+            .metadata()
+            .map_err(|e| format!("open log: {e}"))?
+            .file_type()
+            .is_file()
+        {
+            return Err("open log: it is not a regular file".into());
+        }
+        let log_id =
+            super::subagent_log::log_id_of(&log_file).map_err(|e| format!("open log: {e}"))?;
         // The channel: only where this parent serves A2A, whose router the
         // child's connections are served by.
         #[cfg(all(unix, feature = "a2a"))]
@@ -851,7 +874,7 @@ impl Runtime {
         }
         #[cfg(not(all(unix, feature = "a2a")))]
         let _ = (handle, channel);
-        Ok(pid)
+        Ok((pid, log_id))
     }
 
     /// The per-tick maintenance pass: `ttl` retirement and the SIGTERM→SIGKILL
@@ -969,7 +992,7 @@ impl Runtime {
         let cause = self
             .instance_dir_of(&handle)
             .filter(|_| failed)
-            .and_then(|d| exit_cause(&d.join("log")));
+            .and_then(|d| exit_cause(&d.join("log"), self.subagents[&handle].log_id));
         self.release_reaped_instance(&handle, failed);
         if let Some(s) = self.subagents.get_mut(&handle) {
             s.status = status.into();
@@ -1418,9 +1441,10 @@ impl Runtime {
             return;
         }
         match self.spawn_instance_process(handle, &path, &dir, &None, &delivered) {
-            Ok(pid) => {
+            Ok((pid, log_id)) => {
                 if let Some(s) = self.subagents.get_mut(handle) {
                     s.pid = Some(pid);
+                    s.log_id = Some(log_id);
                     s.status = "running".into();
                     s.attempt += 1;
                     s.retiring_since = None;
@@ -1570,69 +1594,50 @@ impl Runtime {
                 .or_else(|| s.trace.clone())
                 .map(|t| t.child());
             let log = self.log.in_trace(hop.as_ref());
-            let auth = crate::mcp::a2a_client::PeerAuth {
-                trace: hop.clone(),
-                tree: true,
-                ..Default::default()
+            let message_id = crate::mcp::a2a_client::mint_message_id();
+            let out = Outgoing {
+                seq: SEND_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                message_id: message_id.clone(),
+                parts,
+                endpoint,
+                hop,
+                log,
             };
-            let h = handle.to_string();
-            let tx = self.events_tx.clone();
-            std::thread::Builder::new()
-                .name(format!("inst.send:{handle}"))
-                .spawn(move || {
-                    let start = crate::obs::otel::now_unix_nanos();
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                    let sent =
-                        crate::mcp::a2a_client::send(&endpoint, auth, &parts, None, None, deadline);
-                    // The child's answer, once it has one, is the record's
-                    // `reply`. Read on this thread, so the loop never waits
-                    // on the child.
-                    let follow = |reply: &Value| {
-                        let auth = crate::mcp::a2a_client::PeerAuth {
-                            trace: hop.clone(),
-                            tree: true,
-                            ..Default::default()
-                        };
-                        let until = std::time::Instant::now() + INSTANCE_REPLY_WAIT;
-                        let result = match crate::mcp::a2a_client::follow_sent(
-                            &endpoint, auth, reply, until,
-                        ) {
-                            crate::mcp::a2a_client::DelegateOutcome::Distillate(text) => {
-                                json!({"text": text})
-                            }
-                            crate::mcp::a2a_client::DelegateOutcome::Error(e) => {
-                                json!({"error": e})
-                            }
-                        };
-                        let _ = tx.send(super::events::Event::Background {
-                            id: format!("{INSTANCE_REPLY}{h}"),
-                            result,
-                        });
-                    };
-                    // The send is the CLIENT span the child's task continues.
-                    crate::obs::otel::span(
-                        hop.as_ref(),
-                        &format!("instance.send {h}"),
-                        crate::obs::otel::Kind::Client,
-                        start,
-                    )
-                    .attr("rpc.system", "jsonrpc")
-                    .attr("rpc.method", "SendMessage")
-                    .attr("agentd.instance.handle", h.as_str())
-                    .end(sent.is_ok());
-                    match sent {
-                        Ok(reply) => {
-                            log.info("instance.send", json!({"handle": h}));
-                            follow(&reply);
-                        }
-                        Err(e) => log.warn("instance.send", json!({"handle": h, "err": e})),
+            // One follower per child carries its sends and reads the answer
+            // to the newest; past the cap a send still goes, unfollowed.
+            let mut answer = json!({"ok": true, "handle": handle, "delivery": "async", "message_id": message_id});
+            match self.instance_followers.admit(handle, out) {
+                Admit::Joined => {}
+                Admit::Started => {
+                    let followers = self.instance_followers.clone();
+                    let (h, tx) = (handle.to_string(), self.events_tx.clone());
+                    let spawned = std::thread::Builder::new()
+                        .name(format!("inst.follow:{handle}"))
+                        .spawn(move || follow_child(&followers, &h, &tx));
+                    if spawned.is_err() {
+                        // No thread: the slot it would have drained goes too.
+                        self.instance_followers.abandon(handle);
+                        return err(format!(
+                            "instance {handle:?}: no thread to send the message on"
+                        ));
                     }
-                })
-                .ok();
-            ToolOutcome::Ready(
-                json!({"ok": true, "handle": handle, "delivery": "async"}),
-                false,
-            )
+                }
+                Admit::Full(out) => {
+                    let h = handle.to_string();
+                    std::thread::Builder::new()
+                        .name(format!("inst.send:{handle}"))
+                        .spawn(move || {
+                            let _ = send_one(&h, &out);
+                        })
+                        .ok();
+                    answer["followed"] = json!(false);
+                    answer["note"] = json!(format!(
+                        "sent, but its answer is not read back: {} children's answers are being read already, the most at once",
+                        self.instance_followers.max
+                    ));
+                }
+            }
+            ToolOutcome::Ready(answer, false)
         }
         #[cfg(not(feature = "a2a"))]
         {
@@ -1643,12 +1648,40 @@ impl Runtime {
         }
     }
 
+    /// The `subagent.send` to `handle` that went as `message_id` was
+    /// answered to its A2A caller as the task `task_id`: its reply is said
+    /// as answering `task_id` (`reply_to`), the id that caller holds.
+    #[cfg(feature = "a2a")]
+    pub(crate) fn name_instance_send(&mut self, handle: &str, message_id: &str, task_id: &str) {
+        /// How many sends' names a child keeps: the follower reads the
+        /// answer to the newest alone.
+        const KEPT: usize = 16;
+        let Some(s) = self.subagents.get_mut(handle) else {
+            return;
+        };
+        s.send_ids
+            .push_back((message_id.to_string(), task_id.to_string()));
+        while s.send_ids.len() > KEPT {
+            s.send_ids.pop_front();
+        }
+        // A reply that landed before the answer was named is renamed.
+        if s.reply_to.as_deref() == Some(message_id) {
+            s.reply_to = Some(task_id.to_string());
+            s.dirty = true;
+        }
+    }
+
     /// An instance child answered a `subagent.send` ([`INSTANCE_REPLY`]):
     /// its answer is the record's `reply`, which `subagent.status` reads and
     /// whose arrival moves the feed's `updated`. Not its `result`: that is the
     /// child's own report, the first of which a `sync` spawn waits on, and an
     /// answer landing there first would take its place. A child that did not
     /// answer leaves the reply as it was, and the log says why.
+    ///
+    /// Replies are kept in send order: `reply_to` names the send (its
+    /// `message_id`) the kept reply answers, and an answer to a send older
+    /// than that one's — a slow turn overtaken by a later send's — is not
+    /// kept in its place.
     pub(crate) fn on_instance_reply(&mut self, handle: &str, reply: &Value) {
         let Some(s) = self.subagents.get(handle) else {
             return;
@@ -1656,17 +1689,35 @@ impl Runtime {
         if s.killed || is_terminal_status(&s.status) {
             return;
         }
+        let seq = reply["seq"].as_u64().unwrap_or(0);
+        let message_id = reply["message_id"].as_str().map(str::to_string);
+        let kept_seq = s.reply_seq;
         let log = self.subagent_log(handle);
         match reply["text"].as_str() {
+            Some(_) if seq <= kept_seq => log.info(
+                "subagent.turn",
+                json!({"handle": handle, "status": "completed", "tier": "instance",
+                       "message_id": message_id, "kept": false,
+                       "why": "a later send's reply is kept already"}),
+            ),
             Some(text) => {
                 if let Some(s) = self.subagents.get_mut(handle) {
                     s.reply = Some(super::subagents::distill(&Value::String(text.to_string())));
+                    // Said as the id the send's caller was answered with.
+                    s.reply_to = message_id.as_ref().map(|m| {
+                        s.send_ids
+                            .iter()
+                            .find(|(sent, _)| sent == m)
+                            .map_or_else(|| m.clone(), |(_, task)| task.clone())
+                    });
+                    s.reply_seq = seq;
                     s.updated = now_ms();
                     s.dirty = true;
                 }
                 log.info(
                     "subagent.turn",
-                    json!({"handle": handle, "status": "completed", "tier": "instance"}),
+                    json!({"handle": handle, "status": "completed", "tier": "instance",
+                           "message_id": message_id}),
                 );
             }
             None => log.warn(
@@ -2312,19 +2363,300 @@ pub(crate) const INSTANCE_REPLY: &str = "instance.reply:";
 #[cfg(feature = "a2a")]
 const INSTANCE_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The most instance children whose `subagent.send` answers are read back
+/// at once, one follower thread each, across this process.
+#[cfg(feature = "a2a")]
+pub(crate) const FOLLOWERS_MAX: usize = 32;
+
+/// How long a follower waits before its first look at a sent task, and the
+/// longest it waits between looks: the wait doubles from the first to that.
+#[cfg(feature = "a2a")]
+const FOLLOW_FIRST: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(feature = "a2a")]
+const FOLLOW_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The order of this process's sends to instance children: what a reply
+/// is kept by ([`Runtime::on_instance_reply`]).
+#[cfg(feature = "a2a")]
+static SEND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One `subagent.send` to an instance child, on its way.
+#[cfg(feature = "a2a")]
+pub(crate) struct Outgoing {
+    /// Its place in [`SEND_SEQ`].
+    pub seq: u64,
+    /// The A2A `messageId` it goes with, which the send's answer names.
+    pub message_id: String,
+    pub parts: Value,
+    pub endpoint: crate::config::A2aEndpoint,
+    /// The span the send is, which the child's turn continues.
+    pub hop: Option<crate::obs::trace::TraceContext>,
+    pub log: crate::obs::log::Logger,
+}
+
+/// How a send was taken by [`Followers::admit`].
+#[cfg(feature = "a2a")]
+pub(crate) enum Admit {
+    /// The child had no follower: one is to be started for it, with this
+    /// send first.
+    Started,
+    /// The child's follower takes it, next.
+    Joined,
+    /// No follower for it: [`FOLLOWERS_MAX`] children have one already.
+    /// The send is handed back, to go unfollowed.
+    Full(Box<Outgoing>),
+}
+
+/// What a follower does next ([`Followers::next`]).
+#[cfg(feature = "a2a")]
+enum Next {
+    Send(Box<Outgoing>),
+    /// Look at the task it follows again.
+    Look,
+    /// Nothing to send, nothing followed: it has gone.
+    Done,
+}
+
+/// What waits to be sent to each child that has a follower.
+#[cfg(feature = "a2a")]
+type Slots = std::collections::HashMap<String, std::collections::VecDeque<Box<Outgoing>>>;
+
+/// The followers of `subagent.send` to instance children: at most one per
+/// child, at most `max` across the process. A child's follower sends its
+/// messages in order and reads the answer to the newest one; a send to a
+/// child that has a follower is handed to it, never another thread.
+#[cfg(feature = "a2a")]
+#[derive(Clone)]
+pub(crate) struct Followers {
+    inner: std::sync::Arc<(std::sync::Mutex<Slots>, std::sync::Condvar)>,
+    pub max: usize,
+}
+
+#[cfg(feature = "a2a")]
+impl Followers {
+    pub(crate) fn new(max: usize) -> Followers {
+        Followers {
+            inner: Default::default(),
+            max,
+        }
+    }
+
+    fn slots(&self) -> std::sync::MutexGuard<'_, Slots> {
+        self.inner.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Take `out`, a send to `child`.
+    pub(crate) fn admit(&self, child: &str, out: Outgoing) -> Admit {
+        let mut slots = self.slots();
+        if let Some(outbox) = slots.get_mut(child) {
+            outbox.push_back(Box::new(out));
+            self.inner.1.notify_all();
+            return Admit::Joined;
+        }
+        if slots.len() >= self.max {
+            return Admit::Full(Box::new(out));
+        }
+        slots.insert(
+            child.to_string(),
+            std::collections::VecDeque::from([Box::new(out)]),
+        );
+        Admit::Started
+    }
+
+    /// The follower of `child` that was to be started was not: its slot,
+    /// and what waits in it, go.
+    pub(crate) fn abandon(&self, child: &str) {
+        self.slots().remove(child);
+    }
+
+    /// How many children have a follower.
+    #[cfg(test)]
+    pub(crate) fn live(&self) -> usize {
+        self.slots().len()
+    }
+
+    /// What `child`'s follower does next: send what waits, else — while it
+    /// follows a task (`look_in`) — look at it again once that long has
+    /// passed, or sooner should a send come; with nothing to follow, it
+    /// leaves, and its slot goes in the same breath, so a send after that
+    /// starts a follower anew.
+    fn next(&self, child: &str, look_in: Option<std::time::Duration>) -> Next {
+        let mut slots = self.slots();
+        let until = look_in.map(|d| std::time::Instant::now() + d);
+        loop {
+            match slots.get_mut(child).and_then(|o| o.pop_front()) {
+                Some(out) => return Next::Send(out),
+                None => {
+                    let Some(until) = until else {
+                        slots.remove(child);
+                        return Next::Done;
+                    };
+                    let now = std::time::Instant::now();
+                    if now >= until {
+                        return Next::Look;
+                    }
+                    slots = self
+                        .inner
+                        .1
+                        .wait_timeout(slots, until - now)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+            }
+        }
+    }
+}
+
+/// Send `out` to the child `handle`, as its CLIENT span: the child's
+/// answer to the `SendMessage`, or why there is none (logged).
+#[cfg(feature = "a2a")]
+fn send_one(handle: &str, out: &Outgoing) -> Option<Value> {
+    let start = crate::obs::otel::now_unix_nanos();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let auth = crate::mcp::a2a_client::PeerAuth {
+        trace: out.hop.clone(),
+        tree: true,
+        ..Default::default()
+    };
+    let sent = crate::mcp::a2a_client::send(
+        &out.endpoint,
+        auth,
+        &out.parts,
+        None,
+        Some(&out.message_id),
+        deadline,
+    );
+    // The send is the CLIENT span the child's task continues.
+    crate::obs::otel::span(
+        out.hop.as_ref(),
+        &format!("instance.send {handle}"),
+        crate::obs::otel::Kind::Client,
+        start,
+    )
+    .attr("rpc.system", "jsonrpc")
+    .attr("rpc.method", "SendMessage")
+    .attr("agentd.instance.handle", handle)
+    .end(sent.is_ok());
+    match sent {
+        Ok(reply) => {
+            out.log.info(
+                "instance.send",
+                json!({"handle": handle, "message_id": out.message_id}),
+            );
+            Some(reply)
+        }
+        Err(e) => {
+            out.log.warn(
+                "instance.send",
+                json!({"handle": handle, "message_id": out.message_id, "err": e}),
+            );
+            None
+        }
+    }
+}
+
+/// The task a follower reads for the answer to one send.
+#[cfg(feature = "a2a")]
+struct Following {
+    seq: u64,
+    message_id: String,
+    task: Box<crate::mcp::a2a_client::SentTask>,
+    until: std::time::Instant,
+    every: std::time::Duration,
+}
+
+/// The follower of the instance child `handle`: it sends what is handed to
+/// it ([`Followers::admit`]) in order, and reads the answer to the newest
+/// send — a newer send's task takes the place of the one it read — looking
+/// at the task after [`FOLLOW_FIRST`], then at twice the wait each time up
+/// to [`FOLLOW_MAX`], for at most [`INSTANCE_REPLY_WAIT`]. Each answer goes
+/// to the loop as the [`INSTANCE_REPLY`] of the child, with the send it
+/// answers. It ends once nothing is left to send or follow.
+#[cfg(feature = "a2a")]
+fn follow_child(
+    followers: &Followers,
+    handle: &str,
+    tx: &std::sync::mpsc::Sender<super::events::Event>,
+) {
+    use crate::mcp::a2a_client::{DelegateOutcome, Sent};
+    let answer = |seq: u64, message_id: &str, outcome: DelegateOutcome| {
+        let mut result = match outcome {
+            DelegateOutcome::Distillate(text) => json!({"text": text}),
+            DelegateOutcome::Error(e) => json!({"error": e}),
+        };
+        result["seq"] = json!(seq);
+        result["message_id"] = json!(message_id);
+        let _ = tx.send(super::events::Event::Background {
+            id: format!("{INSTANCE_REPLY}{handle}"),
+            result,
+        });
+    };
+    let mut following: Option<Following> = None;
+    loop {
+        let look_in = following.as_ref().map(|f| {
+            f.every
+                .min(f.until.saturating_duration_since(std::time::Instant::now()))
+        });
+        match followers.next(handle, look_in) {
+            Next::Done => return,
+            Next::Send(out) => {
+                let Some(reply) = send_one(handle, &out) else {
+                    continue;
+                };
+                let auth = crate::mcp::a2a_client::PeerAuth {
+                    trace: out.hop.clone(),
+                    tree: true,
+                    ..Default::default()
+                };
+                match crate::mcp::a2a_client::settle_sent(&out.endpoint, auth, &reply) {
+                    Sent::Answered(outcome) => answer(out.seq, &out.message_id, outcome),
+                    Sent::Running(task) => {
+                        following = Some(Following {
+                            seq: out.seq,
+                            message_id: out.message_id,
+                            task,
+                            until: std::time::Instant::now() + INSTANCE_REPLY_WAIT,
+                            every: FOLLOW_FIRST,
+                        });
+                    }
+                }
+            }
+            Next::Look => {
+                let Some(f) = following.as_mut() else {
+                    continue;
+                };
+                let outcome = if std::time::Instant::now() >= f.until {
+                    Some(f.task.still_running())
+                } else {
+                    f.task.look(f.until)
+                };
+                match outcome {
+                    Some(outcome) => {
+                        answer(f.seq, &f.message_id, outcome);
+                        following = None;
+                    }
+                    None => f.every = (f.every * 2).min(FOLLOW_MAX),
+                }
+            }
+        }
+    }
+}
+
 /// How much of a failed child's log [`exit_cause`] reads, from its end.
 const EXIT_CAUSE_TAIL: u64 = 16 * 1024;
 
 /// What a child that failed logged it failed of: the `err` of the last
-/// `proc.exit` in its `log`.
-fn exit_cause(log: &std::path::Path) -> Option<String> {
+/// `proc.exit` in its `log` — while that is the file this parent opened for
+/// it, `expect` ([`super::subagent_log::open_child_log`]): the directory is
+/// the child's, and so is whatever it left at `log`.
+fn exit_cause(log: &std::path::Path, expect: Option<super::subagent_log::LogId>) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(log).ok()?;
+    let mut f = super::subagent_log::open_child_log(log, expect).ok()?;
     let len = f.metadata().ok()?.len();
     f.seek(SeekFrom::Start(len.saturating_sub(EXIT_CAUSE_TAIL)))
         .ok()?;
     let mut tail = Vec::new();
-    f.read_to_end(&mut tail).ok()?;
+    f.take(EXIT_CAUSE_TAIL).read_to_end(&mut tail).ok()?;
     String::from_utf8_lossy(&tail)
         .lines()
         .rev()
@@ -2780,6 +3112,103 @@ mod tests {
         assert_eq!(delivered_prose_of(&dir.path().join("gone.json")), None);
     }
 
+    /// A send to an instance child, the `seq`th, for the followers' tests.
+    #[cfg(feature = "a2a")]
+    fn outgoing(seq: u64) -> Outgoing {
+        use crate::obs::log::{Comp, Level, LogCtx, Logger};
+        Outgoing {
+            seq,
+            message_id: format!("m{seq}"),
+            parts: json!([{"text": "hi"}]),
+            endpoint: crate::config::A2aEndpoint::parse("unix:///nonexistent/a2a.sock").unwrap(),
+            hop: None,
+            log: Logger::new(
+                LogCtx {
+                    run_id: "r".into(),
+                    agent_id: "0".into(),
+                    agent_path: "0".into(),
+                    comp: Comp::Supervisor,
+                    pid: 1,
+                    trace_id: None,
+                    span_id: None,
+                    parent_span_id: None,
+                    trace_flags: None,
+                },
+                Level::Error,
+            ),
+        }
+    }
+
+    /// Any number of sends to one child are carried by one follower, in
+    /// the order they were made; once it has nothing to send or follow it
+    /// leaves, and the child's next send starts one anew.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn sends_to_one_child_share_one_follower() {
+        let f = Followers::new(FOLLOWERS_MAX);
+        assert!(matches!(f.admit("c", outgoing(1)), Admit::Started));
+        for n in 2..=20 {
+            assert!(
+                matches!(f.admit("c", outgoing(n)), Admit::Joined),
+                "send {n}"
+            );
+        }
+        assert_eq!(f.live(), 1);
+        for n in 1..=20 {
+            match f.next("c", None) {
+                Next::Send(o) => assert_eq!(o.seq, n),
+                _ => panic!("send {n} is not next"),
+            }
+        }
+        assert!(matches!(f.next("c", None), Next::Done));
+        assert_eq!(f.live(), 0);
+        assert!(matches!(f.admit("c", outgoing(21)), Admit::Started));
+    }
+
+    /// No more than `max` children have a follower at once: a send to
+    /// another child past that is handed back, to go unfollowed, while a
+    /// child that has one still takes its sends.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn followers_are_capped_across_children() {
+        let f = Followers::new(2);
+        assert!(matches!(f.admit("a", outgoing(1)), Admit::Started));
+        assert!(matches!(f.admit("b", outgoing(2)), Admit::Started));
+        match f.admit("c", outgoing(3)) {
+            Admit::Full(o) => assert_eq!(o.seq, 3, "the send is handed back"),
+            _ => panic!("a third child got a follower past the cap"),
+        }
+        assert!(matches!(f.admit("a", outgoing(4)), Admit::Joined));
+        assert_eq!(f.live(), 2);
+        // One leaves: the next child may have one.
+        while let Next::Send(_) = f.next("a", None) {}
+        assert!(matches!(f.admit("c", outgoing(5)), Admit::Started));
+    }
+
+    /// A follower waiting to look at its task again wakes for a new send
+    /// rather than sleeping its wait out.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn a_new_send_wakes_its_follower() {
+        let f = Followers::new(FOLLOWERS_MAX);
+        assert!(matches!(f.admit("c", outgoing(1)), Admit::Started));
+        assert!(matches!(f.next("c", None), Next::Send(_)));
+        let g = f.clone();
+        let started = std::time::Instant::now();
+        let waiter = std::thread::spawn(
+            move || matches!(g.next("c", Some(std::time::Duration::from_secs(30))), Next::Send(o) if o.seq == 2),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(matches!(f.admit("c", outgoing(2)), Admit::Joined));
+        assert!(waiter.join().unwrap(), "the follower took the new send");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // With nothing sent, it looks again once its wait is out.
+        assert!(matches!(
+            f.next("c", Some(std::time::Duration::from_millis(20))),
+            Next::Look
+        ));
+    }
+
     /// Only the operator speaks for a child, from one pure rule that every
     /// consumer asks: `admit` refuses each report for an agent, a user and a
     /// caller nobody named — as `instance.op.refused` — and admits it for the
@@ -3011,10 +3440,56 @@ mod tests {
         text.push_str(r#"{"event":"proc.exit","code":2,"err":"a2a bind: too long"}"#);
         text.push_str("\nthread 'main' panicked\n");
         std::fs::write(&log, &text).unwrap();
-        assert_eq!(exit_cause(&log).as_deref(), Some("a2a bind: too long"));
+        let id = |p: &std::path::Path| {
+            Some(super::super::subagent_log::log_id_of(&std::fs::File::open(p).unwrap()).unwrap())
+        };
+        assert_eq!(
+            exit_cause(&log, id(&log)).as_deref(),
+            Some("a2a bind: too long")
+        );
         std::fs::write(&log, r#"{"event":"proc.exit","code":0}"#).unwrap();
-        assert_eq!(exit_cause(&log), None);
-        assert_eq!(exit_cause(&dir.path().join("gone")), None);
+        assert_eq!(exit_cause(&log, id(&log)), None);
+        assert_eq!(exit_cause(&dir.path().join("gone"), id(&log)), None);
+    }
+
+    /// The exit cause is read by the rule `subagent.log` reads by: a
+    /// symlink, a FIFO or another file the child put at its log's path is
+    /// not read — the FIFO without blocking the loop on its open.
+    #[test]
+    fn a_failed_childs_cause_is_read_from_its_own_log_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        std::fs::write(&log, "{\"event\":\"proc.exit\",\"err\":\"its own\"}\n").unwrap();
+        let spawned = Some(
+            super::super::subagent_log::log_id_of(&std::fs::File::open(&log).unwrap()).unwrap(),
+        );
+        let other = dir.path().join("parent-only");
+        std::fs::write(
+            &other,
+            "{\"event\":\"proc.exit\",\"err\":\"the parent's\"}\n",
+        )
+        .unwrap();
+        std::fs::rename(&log, dir.path().join("kept")).unwrap();
+        std::os::unix::fs::symlink(&other, &log).unwrap();
+        assert_eq!(exit_cause(&log, spawned), None, "a symlink is followed");
+        std::fs::remove_file(&log).unwrap();
+        std::fs::copy(&other, &log).unwrap();
+        assert_eq!(exit_cause(&log, spawned), None, "another file is read");
+        std::fs::remove_file(&log).unwrap();
+        let c = std::ffi::CString::new(log.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = log.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(exit_cause(&at, spawned));
+        });
+        let read = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("reading a FIFO's exit cause blocked");
+        assert_eq!(read, None);
+        std::fs::remove_file(&log).unwrap();
+        std::fs::rename(dir.path().join("kept"), &log).unwrap();
+        assert_eq!(exit_cause(&log, spawned).as_deref(), Some("its own"));
     }
 
     /// A durable parent's children are kept under the identity its state is

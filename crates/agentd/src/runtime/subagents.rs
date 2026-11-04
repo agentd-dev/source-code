@@ -145,6 +145,9 @@ impl Runtime {
                         if let Some(r) = &s.reply {
                             v["reply"] = r.clone();
                         }
+                        if let Some(id) = &s.reply_to {
+                            v["reply_to"] = json!(id);
+                        }
                         ToolOutcome::Ready(v, false)
                     }
                     None => err(format!("no such subagent {handle:?}")),
@@ -584,6 +587,9 @@ impl Runtime {
             attempt: 1,
             result: None,
             reply: None,
+            reply_to: None,
+            reply_seq: 0,
+            send_ids: Default::default(),
             error: None,
             requested_by: Some(
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": depth}),
@@ -616,6 +622,7 @@ impl Runtime {
             pid: None,
             config_path: None,
             socket: None,
+            log_id: None,
             retire_at: None,
             retiring_since: None,
             durable: args

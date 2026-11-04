@@ -386,64 +386,79 @@ pub fn send(
     conn.call("SendMessage", params, deadline)
 }
 
-/// What came of a message [`send`] delivered: the reply, once the peer has
-/// one. A `{message}` answer is the reply; a task is followed (`GetTask`)
-/// until it ends, or until it stops to ask for input — its status message is
-/// the reply then, as it is a person's to answer. The same distillate a
-/// delegation hands back, for a send whose caller wants to see the answer
-/// too (`subagent.send` to an instance child) without sending it a second
-/// time. `deadline` bounds the wait.
-pub fn follow_sent(
-    endpoint: &A2aEndpoint,
-    auth: PeerAuth,
-    sent: &Value,
-    deadline: Instant,
-) -> DelegateOutcome {
+/// What came of a message [`send`] delivered, as far as its answer goes:
+/// the reply already ([`Sent::Answered`]), or a task still to be read for it
+/// ([`Sent::Running`]).
+pub enum Sent {
+    Answered(DelegateOutcome),
+    Running(Box<SentTask>),
+}
+
+/// A task a [`send`] started on the peer, read (`GetTask`) one look at a
+/// time by whoever follows it to its answer, at the pace they choose.
+pub struct SentTask {
+    conn: HttpConn,
+    params: Value,
+    task_id: String,
+}
+
+/// The answer to a message [`send`] delivered, once the peer has one. A
+/// `{message}` answer is the reply; a task is followed until it ends, or
+/// until it stops to ask for input — its status message is the reply then,
+/// as it is a person's to answer. The same distillate a delegation hands
+/// back, for a send whose caller wants to see the answer too
+/// (`subagent.send` to an instance child) without sending it a second time.
+pub fn settle_sent(endpoint: &A2aEndpoint, auth: PeerAuth, sent: &Value) -> Sent {
     if let Some(a2a::Reply::Message(_)) = a2a::reply_of(sent) {
-        return DelegateOutcome::Distillate(a2a::reply_text_of(sent));
+        return Sent::Answered(DelegateOutcome::Distillate(a2a::reply_text_of(sent)));
     }
     let task = sent.get("task").unwrap_or(sent);
-    let asked = |t: &Value| a2a::task_state_of(t) == TaskState::InputRequired;
-    if asked(task) {
-        return DelegateOutcome::Distillate(a2a::status_text_of(task));
-    }
-    if let Some(outcome) = terminal_outcome(task) {
-        return outcome;
+    if let Some(outcome) = answered(task) {
+        return Sent::Answered(outcome);
     }
     let task_id = a2a::task_id_of(sent);
     if task_id.is_empty() {
-        return DelegateOutcome::Error("a2a: SendMessage reply named no task".into());
+        return Sent::Answered(DelegateOutcome::Error(
+            "a2a: SendMessage reply named no task".into(),
+        ));
     }
     let ep = match HttpEp::of(endpoint) {
         Ok(ep) => ep,
-        Err(e) => return DelegateOutcome::Error(e),
+        Err(e) => return Sent::Answered(DelegateOutcome::Error(e)),
     };
-    let mut conn = HttpConn::new(ep, auth);
-    let params = a2a::get_task_params(&task_id, None);
-    loop {
-        let now = Instant::now();
-        if now >= deadline {
-            return DelegateOutcome::Error(format!(
-                "a2a: no reply yet (task {task_id} still running)"
-            ));
-        }
-        std::thread::sleep(FOLLOW_INTERVAL.min(deadline - now));
-        let t = match conn.call("GetTask", params.clone(), deadline) {
-            Ok(t) => t,
-            Err(e) => return DelegateOutcome::Error(e),
-        };
-        if asked(&t) {
-            return DelegateOutcome::Distillate(a2a::status_text_of(&t));
-        }
-        if let Some(outcome) = terminal_outcome(&t) {
-            return outcome;
-        }
-    }
+    Sent::Running(Box::new(SentTask {
+        conn: HttpConn::new(ep, auth),
+        params: a2a::get_task_params(&task_id, None),
+        task_id,
+    }))
 }
 
-/// How often [`follow_sent`] reads the peer's task: a reply is a model's
-/// turn, seconds rather than milliseconds away.
-const FOLLOW_INTERVAL: Duration = Duration::from_millis(500);
+/// A task's answer, when it has one: ended, or asking for input.
+fn answered(task: &Value) -> Option<DelegateOutcome> {
+    if a2a::task_state_of(task) == TaskState::InputRequired {
+        return Some(DelegateOutcome::Distillate(a2a::status_text_of(task)));
+    }
+    terminal_outcome(task)
+}
+
+impl SentTask {
+    /// One look at the task: its answer, or `None` while it runs. A read
+    /// that failed is the answer: an error.
+    pub fn look(&mut self, deadline: Instant) -> Option<DelegateOutcome> {
+        match self.conn.call("GetTask", self.params.clone(), deadline) {
+            Ok(t) => answered(&t),
+            Err(e) => Some(DelegateOutcome::Error(e)),
+        }
+    }
+
+    /// What a follower that gave up on the task says.
+    pub fn still_running(&self) -> DelegateOutcome {
+        DelegateOutcome::Error(format!(
+            "a2a: no reply yet (task {} still running)",
+            self.task_id
+        ))
+    }
+}
 
 /// One call of `method` to the A2A peer at `endpoint`, with `params`: its
 /// JSON-RPC `result`, or why there is none. What a thin client of a daemon
@@ -1309,7 +1324,7 @@ impl Caller for HttpConn {
 
 /// Mint a per-delegation `messageId` (the A2A `Message.messageId`). agentd has no
 /// ULID dependency; time-plus-counter is unique enough for one client's run.
-fn mint_message_id() -> String {
+pub(crate) fn mint_message_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);

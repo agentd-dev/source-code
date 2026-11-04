@@ -265,14 +265,26 @@ impl Runtime {
             }
             Answer::Done { link, text, result } => {
                 debug_assert_eq!(spec.reply, Reply::Task, "{op} answered a task");
-                self.task_complete_now(
+                // A send to an instance child: its reply is said as
+                // answering the task this caller is answered with.
+                let sent = (op == "subagent.send")
+                    .then(|| result.as_ref()?["message_id"].as_str().map(str::to_string))
+                    .flatten();
+                let reply = self.task_complete_now(
                     &ctx,
                     principal,
                     link.unwrap_or(Link::Turn { ctx: ctx.clone() }),
                     message,
                     text,
                     result,
-                )
+                );
+                if let (Some(mid), Some(task)) =
+                    (sent, reply.pointer("/task/id").and_then(Value::as_str))
+                {
+                    let handle = data["handle"].as_str().unwrap_or("").to_string();
+                    self.name_instance_send(&handle, &mid, task);
+                }
+                reply
             }
             Answer::Reply(v) => {
                 // A task op its handler refused (an unknown workflow, a role,

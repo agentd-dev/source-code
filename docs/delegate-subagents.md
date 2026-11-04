@@ -428,6 +428,17 @@ and the daemon logs `subagent.turn` with `tier: instance`. The child's
 has not answered within 10 minutes leaves its reply as it was, and the log
 line says why (`status: failed`, `err`).
 
+The reply is the newest send's: `reply_to` names the send it answers, by
+the id that send was answered with — the task of a `subagent.send` command
+over A2A, else the `message_id` in the tool's answer — so a client shows a
+reply only against its own send. A later send replaces an earlier one's
+reply, never the other way round: a slow turn that ends after a newer send
+was made does not take its place. One thread per child carries its sends in
+order and reads the answer to the newest, looking at the child's task after
+500 ms, then at twice the wait each time up to 5 s. At most 32 children's
+answers are read at once; a send to another child past that still goes, and
+its answer says `followed: false` with a `note`.
+
 In the TUI, open the child on the subagents screen and press `m` or `Enter`:
 the message field is in the detail view, and what you sent and what the
 child answered stay above it
@@ -1209,9 +1220,9 @@ the principal that spawned it.
 | Tool | Arguments | Returns |
 |---|---|---|
 | `subagent.run` | `instruction` or `template` with `params`; optional `mode`, `servers`, `tools` (not with `template`), `limits` (`steps`, `tokens`, `deadline`, `memory`, `cpu`), `priority` (`low`, `normal`, `high`), `context`, `output_contract`, `output_schema`, `durable` | `{handle, status, result, error}` for `sync`; `{handle, status}` otherwise; instance children add `tier`, `peer`, `socket` |
-| `subagent.status` | `handle` | `{handle, status, mode, result, tokens, error}`, and an instance child's latest answer to `subagent.send` as `reply`; safe to poll |
+| `subagent.status` | `handle` | `{handle, status, mode, result, tokens, error}`, and an instance child's answer to its newest answered `subagent.send` as `reply`, with `reply_to` naming that send; safe to poll |
 | `subagent.await` | `handle` (`timeout` is accepted and not applied) | `{handle, status, result, error}` once the child is finished |
-| `subagent.send` | `handle`, `message` | `{ok, handle}` for a warm child, which queues the message; an instance child receives it over A2A and the reply adds `delivery: "async"`; a warm child's answer is its `result`, an instance child's its `reply` |
+| `subagent.send` | `handle`, `message` | `{ok, handle}` for a warm child, which queues the message; an instance child receives it over A2A and the reply adds `delivery: "async"` and the `message_id` it went as (`followed: false` and a `note` when its answer is not read back); a warm child's answer is its `result`, an instance child's its `reply` |
 | `subagent.log` | `handle`; optional `lines` (default 200, at most 1000), `after` | `{handle, source, lines, cursor}`, and `skipped` or `note`; read-only, the operator's alone ([Read a child's log](#read-a-childs-log)) |
 | `subagent.kill` | `handle`, optional `reason` | `{ok, handle}`; flat children only |
 | `subagent.retire` | `handle` | `{ok, handle, status: "retiring"}`; instance children only |
@@ -1259,7 +1270,14 @@ Where the lines come from is the child's record, never the caller:
 
 - **An instance child**'s are its own log file, `log` in its directory
   (`source: file`). At most its last 256 KiB are read, and a line still being
-  written waits for the next read.
+  written waits for the next read. Only whole lines are returned: a line
+  longer than the whole 256 KiB is passed over, and in its place is one
+  `{"truncated": true, "bytes": N}` line; the next read begins after its
+  end. The child owns its directory, so the parent reads only the file it
+  opened for the child's log at spawn: a symlink, a FIFO or another file put
+  at that path is refused, `the child's log is not the file agentd opened
+  for it`, and nothing of it is read. The cause a failed child's
+  `instance.exited` line names is read by the same rule.
 - **A flat worker** writes into this daemon's log. Its lines here are this
   daemon's lines about it — those naming its `handle`, or written in its
   `agent_path` — from the in-memory log ring (`source: ring`), which the

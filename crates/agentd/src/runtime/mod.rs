@@ -931,6 +931,8 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         once_fired: Default::default(),
         private_instances: None,
         instance_doors: Default::default(),
+        #[cfg(feature = "a2a")]
+        instance_followers: instances::Followers::new(instances::FOLLOWERS_MAX),
         instances_metered_at: 0,
         drain_left: Default::default(),
         idle_since: None,

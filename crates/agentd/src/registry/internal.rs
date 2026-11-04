@@ -180,7 +180,11 @@ pub fn contracts() -> Vec<Contract> {
             &["handle", "message"],
         ),
         open_obj(
-            json!({"ok": {"type": "boolean"}, "handle": {"type": "string"}}),
+            json!({"ok": {"type": "boolean"}, "handle": {"type": "string"},
+                   "delivery": {"type": "string", "description": "async: an instance child takes the message over its socket"},
+                   "message_id": {"type": "string", "description": "An instance child's send: the A2A messageId it went as"},
+                   "followed": {"type": "boolean", "description": "false: the send went, but its answer is not read back (too many children's answers are read already)"},
+                   "note": {"type": "string"}}),
             &["ok"],
         ),
         true,
@@ -208,7 +212,8 @@ pub fn contracts() -> Vec<Contract> {
         obj(json!({"handle": s("The subagent handle")}), &["handle"]),
         open_obj(
             json!({"handle": {"type": "string"}, "status": {"type": "string"}, "mode": {"type": "string"}, "result": any(), "error": {"type": "string"},
-                   "reply": {"description": "An instance child's latest answer to subagent.send"}}),
+                   "reply": {"description": "An instance child's answer to the latest subagent.send whose answer it has; a later send's replaces an earlier one's, never the other way"},
+                   "reply_to": {"type": "string", "description": "Which send `reply` answers: the id that send's answer named to its caller — the A2A task of a subagent.send command, else the tool's message_id"}}),
             &["handle", "status"],
         ),
         true,

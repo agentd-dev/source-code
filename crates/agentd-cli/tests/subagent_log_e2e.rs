@@ -43,10 +43,15 @@ impl Drop for Daemon {
 }
 
 fn config(port: u16) -> String {
+    config_with(port, "mock:final")
+}
+
+/// The deployment, its model the mock at `intel`.
+fn config_with(port: u16, intel: &str) -> String {
     format!(
         "\
          agent: {{ name: sl-parent, instruction: You are the parent., preflight: never }}\n\
-         intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
+         intelligence: {{ endpoints: \"{intel}\", model: mock }}\n\
          store: {{ kind: memory }}\n\
          a2a:\n  listen: http://127.0.0.1:{port}\n\
          \x20 principals:\n\
@@ -245,4 +250,164 @@ fn the_operator_reads_an_instance_childs_log_and_messages_it() {
         !after["lines"].as_array().unwrap().is_empty(),
         "the child logged the turn the message started: {after}"
     );
+}
+
+/// The parent on the model `intel`, and its A2A address.
+fn start(intel: &str) -> (Daemon, String) {
+    common::spawn_bound(|port| {
+        let cfg = common::unique_path("subagent-log", "yaml");
+        std::fs::write(&cfg, config_with(port, intel)).unwrap();
+        let stderr = common::unique_path("subagent-log", "log");
+        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg])
+            .env("AGENTD_SL_OPERATOR", OPERATOR)
+            .env("AGENTD_SL_USER", USER)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let path = stderr.clone();
+        (Daemon { child, stderr }, path)
+    })
+}
+
+/// `f`, given `secs` to answer: a call the daemon never answers fails here
+/// rather than hanging the test.
+fn within<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(Duration::from_secs(secs))
+        .unwrap_or_else(|_| panic!("{what} got no answer in {secs}s: the daemon hangs"))
+}
+
+/// How many of the process `pid`'s threads have a name beginning `prefix`.
+fn threads_named(pid: u32, prefix: &str) -> usize {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|t| {
+                    std::fs::read_to_string(t.path().join("comm"))
+                        .is_ok_and(|c| c.starts_with(prefix))
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// The child owns its directory, so what is at its log's path is its to
+/// choose; the parent reads only the file it opened for it. A symlink to a
+/// file of the parent's, a FIFO (whose open would wait, on the loop) and
+/// another file are refused, said; the log put back reads again. Then the
+/// child is messaged: a burst of sends is carried by one follower thread,
+/// not one each, and the reply kept is the newest send's — named by the
+/// task that send was answered with — though an older send's turn ends
+/// after it.
+#[test]
+fn the_parent_reads_only_the_log_it_opened_and_follows_sends_in_order() {
+    let play = common::unique_path("subagent-log-play", "json");
+    std::fs::write(
+        &play,
+        json!({"match": [
+            {"when_contains": "SLOW-A", "delay_ms": 4000, "content": "answer A"},
+            {"when_contains": "FAST-B", "content": "answer B"}],
+         "turns": [{"content": "ok"}]})
+        .to_string(),
+    )
+    .unwrap();
+    let (daemon, addr) = start(&format!("mock:file:{play}"));
+    let parent = || std::fs::read_to_string(&daemon.stderr).unwrap_or_default();
+    let spawned = wait_for("the instance child", &daemon, || {
+        events(&parent(), "instance.spawn").into_iter().next()
+    });
+    let handle = spawned["handle"].as_str().unwrap().to_string();
+    let log = std::path::PathBuf::from(spawned["log"].as_str().unwrap());
+    let kept = log.with_extension("kept");
+    wait_for("the child's log", &daemon, || {
+        let doc = read(&addr, OPERATOR, "subagent.log", json!({"handle": handle}));
+        (!doc["lines"].as_array()?.is_empty()).then_some(())
+    });
+    let log_op = |addr: &str, handle: &str| {
+        let (addr, handle) = (addr.to_string(), handle.to_string());
+        within(10, "subagent.log", move || {
+            SendMessage::command("subagent.log", json!({"handle": handle}))
+                .bearer(OPERATOR)
+                .post(&addr)
+        })
+    };
+    let refused = |r: &Value, what: &str| {
+        let msg = r["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("the child's log is not the file agentd opened for it"),
+            "{what} is read as the child's log: {r}"
+        );
+        assert!(!r.to_string().contains("only the parent"), "{what}: {r}");
+    };
+
+    // A symlink to a file only the parent may read: not followed.
+    std::fs::rename(&log, &kept).unwrap();
+    let parents = common::unique_path("subagent-log-parents", "json");
+    std::fs::write(&parents, "{\"event\":\"only the parent\"}\n").unwrap();
+    std::os::unix::fs::symlink(&parents, &log).unwrap();
+    refused(&log_op(&addr, &handle), "a symlink");
+    // A FIFO: refused at once, the daemon still answering.
+    std::fs::remove_file(&log).unwrap();
+    let c = std::ffi::CString::new(log.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    refused(&log_op(&addr, &handle), "a FIFO");
+    // Another regular file under the log's name.
+    std::fs::remove_file(&log).unwrap();
+    std::fs::copy(&parents, &log).unwrap();
+    refused(&log_op(&addr, &handle), "another file");
+    // The log it opened, put back, reads.
+    std::fs::remove_file(&log).unwrap();
+    std::fs::rename(&kept, &log).unwrap();
+    let back = log_op(&addr, &handle);
+    assert!(back.get("error").is_none(), "{back}");
+
+    // A burst of sends: one follower carries them all.
+    let send = |text: &str| {
+        let r = SendMessage::command("subagent.send", json!({"handle": handle, "message": text}))
+            .bearer(OPERATOR)
+            .result(&addr);
+        r["task"]["id"].as_str().expect("a task").to_string()
+    };
+    let pid = daemon.child.id();
+    let mut most = 0;
+    for n in 0..10 {
+        send(&format!("burst {n}"));
+        most = most.max(threads_named(pid, "inst."));
+    }
+    for _ in 0..5 {
+        most = most.max(threads_named(pid, "inst."));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(most <= 1, "{most} threads carried one child's sends");
+
+    // A slow turn, then a fast one: the fast one's reply is kept, and stays.
+    wait_for("the burst's answers", &daemon, || {
+        (threads_named(pid, "inst.") == 0).then_some(())
+    });
+    let a = send("SLOW-A");
+    let b = send("FAST-B");
+    assert_ne!(a, b);
+    let status = || {
+        read(
+            &addr,
+            OPERATOR,
+            "subagent.status",
+            json!({"handle": handle}),
+        )
+    };
+    let says_b = |st: &Value| st["reply"].as_str().is_some_and(|r| r.contains("answer B"));
+    wait_for("the fast send's reply", &daemon, || {
+        says_b(&status()).then_some(())
+    });
+    // Past the slow turn's end: its answer did not take the newer one's place.
+    std::thread::sleep(Duration::from_secs(6));
+    let st = status();
+    assert!(says_b(&st), "an older send's reply took its place: {st}");
+    assert_eq!(st["reply_to"], json!(b), "the reply names its send: {st}");
 }

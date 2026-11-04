@@ -3775,7 +3775,22 @@
         "reply": "task",
         "result": {
           "properties": {
+            "delivery": {
+              "description": "async: an instance child takes the message over its socket",
+              "type": "string"
+            },
+            "followed": {
+              "description": "false: the send went, but its answer is not read back (too many children's answers are read already)",
+              "type": "boolean"
+            },
             "handle": {
+              "type": "string"
+            },
+            "message_id": {
+              "description": "An instance child's send: the A2A messageId it went as",
+              "type": "string"
+            },
+            "note": {
               "type": "string"
             },
             "ok": {
@@ -3816,7 +3831,11 @@
               "type": "string"
             },
             "reply": {
-              "description": "An instance child's latest answer to subagent.send"
+              "description": "An instance child's answer to the latest subagent.send whose answer it has; a later send's replaces an earlier one's, never the other way"
+            },
+            "reply_to": {
+              "description": "Which send `reply` answers: the id that send's answer named to its caller — the A2A task of a subagent.send command, else the tool's message_id",
+              "type": "string"
             },
             "result": {},
             "status": {

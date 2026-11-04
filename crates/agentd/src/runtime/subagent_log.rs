@@ -46,40 +46,133 @@ pub(crate) struct FileTail {
     pub skipped: bool,
 }
 
-/// The newest `max` whole lines of the file at `path` after the byte offset
+/// The identity of the log file agentd opened for a child at spawn: its
+/// device and inode. A read takes the file at the child's log path only
+/// while it is still that file.
+pub(crate) type LogId = (u64, u64);
+
+/// What a read of a child's log says when the path no longer names the
+/// file agentd opened for it: a symlink, a FIFO, or another file the child
+/// put there.
+pub(crate) const NOT_ITS_LOG: &str = "the child's log is not the file agentd opened for it";
+
+/// The identity of an open file, for [`LogId`].
+pub(crate) fn log_id_of(f: &std::fs::File) -> std::io::Result<LogId> {
+    use std::os::unix::fs::MetadataExt;
+    let m = f.metadata()?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// Open the child's log at `path` to read it, only while it is the file
+/// `expect` names. The directory is the child's own — under
+/// `spawn.instance_uid` its uid owns it — so what is at `path` now is the
+/// child's to choose: a symlink is not followed (`O_NOFOLLOW`), and nothing
+/// is waited on (`O_NONBLOCK`: a FIFO with no writer would block the open,
+/// and a read runs on the loop). What opened must be a regular file, and
+/// the very one agentd opened for the child at spawn; anything else is
+/// [`NOT_ITS_LOG`]. A path with nothing at it is `NotFound`.
+pub(crate) fn open_child_log(path: &Path, expect: Option<LogId>) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let not_its = || std::io::Error::other(NOT_ITS_LOG);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                not_its()
+            } else {
+                e
+            }
+        })?;
+    let regular = f.metadata()?.file_type().is_file();
+    if !regular || expect.is_none() || Some(log_id_of(&f)?) != expect {
+        return Err(not_its());
+    }
+    Ok(f)
+}
+
+/// Whether `e` is [`open_child_log`]'s refusal.
+pub(crate) fn is_not_its_log(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|i| i.to_string() == NOT_ITS_LOG)
+}
+
+/// The newest `max` whole lines of the child's log at `path` — while it is
+/// the file `expect` names ([`open_child_log`]) — after the byte offset
 /// `after`, reading at most `cap` bytes from its end. An `after` past the
 /// end (the file was replaced) reads as no cursor at all.
+///
+/// Only whole lines are returned. A read that starts inside a line — the
+/// window cut it, or the cursor was left inside one — begins after it. A
+/// line longer than the whole window is passed over rather than waited on
+/// for ever: in its place is one [`truncated_line`], and the cursor lands
+/// past what was passed over, so the next read begins after the line's end
+/// — its rest is never returned as a line, nor marked again.
 pub(crate) fn tail_file(
     path: &Path,
+    expect: Option<LogId>,
     after: Option<u64>,
     max: usize,
     cap: u64,
 ) -> std::io::Result<FileTail> {
-    let mut f = std::fs::File::open(path)?;
+    let mut f = open_child_log(path, expect)?;
     let len = f.metadata()?.len();
     let from = after.filter(|a| *a <= len).unwrap_or(0);
     let start = from.max(len.saturating_sub(cap));
-    f.seek(SeekFrom::Start(start))?;
+    // The byte before the window says whether the window starts a line.
+    let back = u64::from(start > 0);
+    f.seek(SeekFrom::Start(start - back))?;
     let mut buf = Vec::new();
-    f.take(len - start).read_to_end(&mut buf)?;
-    let mut skipped = start > from;
-    // A window that starts inside a line begins after it.
-    let mut first = 0;
-    if start > from {
-        match buf.iter().position(|b| *b == b'\n') {
-            Some(i) => first = i + 1,
-            None => first = buf.len(),
-        }
+    (&mut f).take(len - start + back).read_to_end(&mut buf)?;
+    let at_line_start = back == 0 || buf.first() == Some(&b'\n');
+    if back == 1 && !buf.is_empty() {
+        buf.remove(0);
     }
-    let (body, cursor) = match buf[first..].iter().rposition(|b| *b == b'\n') {
-        Some(i) => (&buf[first..first + i + 1], start + (first + i + 1) as u64),
-        // No whole line: one longer than the whole window is passed over
-        // rather than waited on for ever; anything shorter is still coming.
-        None if buf.len() as u64 >= cap => {
-            skipped = true;
-            (&buf[0..0], len)
+    let window_cut = start > from;
+    let mut skipped = window_cut;
+    // Where the first whole line begins.
+    let first = if at_line_start {
+        0
+    } else {
+        match buf.iter().position(|b| *b == b'\n') {
+            Some(i) => i + 1,
+            // The whole window is inside one line longer than it: passed
+            // over — marked, unless this read began where an earlier one
+            // passed over it (or a caller's offset put it inside the line).
+            None if buf.len() as u64 >= cap => {
+                return Ok(FileTail {
+                    lines: window_cut
+                        .then(|| truncated_line(buf.len()))
+                        .into_iter()
+                        .collect(),
+                    cursor: len,
+                    skipped: true,
+                });
+            }
+            // Its end is still coming: the next read looks from here.
+            None => {
+                return Ok(FileTail {
+                    lines: Vec::new(),
+                    cursor: start,
+                    skipped,
+                });
+            }
         }
-        None => (&buf[0..0], start + first as u64),
+    };
+    let (body, cursor, marked) = match buf[first..].iter().rposition(|b| *b == b'\n') {
+        Some(i) => (
+            &buf[first..first + i + 1],
+            start + (first + i + 1) as u64,
+            None,
+        ),
+        // A line that begins in the window and fills it, unended: passed
+        // over, marked.
+        None if (buf.len() - first) as u64 >= cap => {
+            skipped = true;
+            (&buf[0..0], len, Some(truncated_line(buf.len() - first)))
+        }
+        // A line still being written waits for the next read, from its start.
+        None => (&buf[0..0], start + first as u64, None),
     };
     let text = String::from_utf8_lossy(body);
     let mut lines: Vec<String> = text
@@ -87,6 +180,7 @@ pub(crate) fn tail_file(
         .filter(|l| !l.trim().is_empty())
         .map(cap_line)
         .collect();
+    lines.extend(marked);
     if lines.len() > max {
         lines.drain(..lines.len() - max);
         skipped = true;
@@ -108,6 +202,13 @@ fn cap_line(line: &str) -> String {
         cut -= 1;
     }
     format!("{}…(+{} bytes)", &line[..cut], line.len() - cut)
+}
+
+/// What stands in for a line longer than the whole read window, passed
+/// over: `bytes` of it were, and none of it is returned. A JSON line, as
+/// the others are, so a reader that parses each line parses this one.
+pub(crate) fn truncated_line(bytes: usize) -> String {
+    json!({"truncated": true, "bytes": bytes}).to_string()
 }
 
 /// Is the ring line `v` one about the flat worker `handle`: naming it, or
@@ -177,7 +278,7 @@ impl Runtime {
                     false,
                 );
             };
-            return match tail_file(&dir.join("log"), after, max, FILE_TAIL_CAP) {
+            return match tail_file(&dir.join("log"), s.log_id, after, max, FILE_TAIL_CAP) {
                 Ok(t) => ToolOutcome::Ready(
                     json!({"handle": handle, "source": "file", "lines": t.lines,
                            "cursor": t.cursor, "skipped": t.skipped}),
@@ -188,6 +289,7 @@ impl Runtime {
                            "note": "the child's log is gone: its directory went when it exited"}),
                     false,
                 ),
+                Err(e) if is_not_its_log(&e) => err(format!("subagent.log: {e}")),
                 Err(e) => err(format!("subagent.log: the child's log: {e}")),
             };
         }
@@ -220,28 +322,173 @@ mod tests {
         (dir, p)
     }
 
+    /// The identity of the file at `p`, as the spawn records it.
+    fn id(p: &Path) -> LogId {
+        log_id_of(&std::fs::File::open(p).unwrap()).unwrap()
+    }
+
+    /// [`tail_file`] of the log the spawn opened at `p`.
+    fn tail(p: &Path, after: Option<u64>, max: usize, cap: u64) -> std::io::Result<FileTail> {
+        tail_file(p, Some(id(p)), after, max, cap)
+    }
+
+    /// The child owns its directory, so it can put a symlink where its log
+    /// was — to a file only the parent may read — and the read refuses it,
+    /// returning none of the target.
+    #[test]
+    fn a_symlink_the_child_put_in_its_logs_place_is_refused() {
+        let (d, p) = file(&[r#"{"event":"mine"}"#]);
+        let spawned = id(&p);
+        let secret = d.path().join("parent-only");
+        std::fs::write(&secret, "{\"secret\":\"the parent's\"}\n").unwrap();
+        std::fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(&secret, &p).unwrap();
+        let r = tail_file(&p, Some(spawned), None, 200, FILE_TAIL_CAP);
+        let e = r.expect_err("a symlink is not the child's log");
+        assert!(is_not_its_log(&e), "{e}");
+        assert_eq!(e.to_string(), NOT_ITS_LOG);
+        // Even one naming the very file agentd opened is not followed.
+        let real = d.path().join("real");
+        std::fs::write(&real, "{\"event\":\"x\"}\n").unwrap();
+        std::fs::remove_file(&p).unwrap();
+        std::os::unix::fs::symlink(&real, &p).unwrap();
+        let e = tail_file(&p, Some(id(&real)), None, 200, FILE_TAIL_CAP).unwrap_err();
+        assert!(is_not_its_log(&e), "{e}");
+    }
+
+    /// A FIFO in the log's place would block an open for its writer — on
+    /// the loop. It is refused at once instead.
+    #[test]
+    fn a_fifo_the_child_put_in_its_logs_place_is_refused_without_waiting() {
+        let (_d, p) = file(&[r#"{"event":"mine"}"#]);
+        let spawned = id(&p);
+        std::fs::remove_file(&p).unwrap();
+        let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let at = p.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(tail_file(&at, Some(spawned), None, 200, FILE_TAIL_CAP));
+        });
+        let r = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("the read of a FIFO did not return: it waits for a writer");
+        let e = r.expect_err("a FIFO is not the child's log");
+        assert!(is_not_its_log(&e), "{e}");
+    }
+
+    /// Another regular file under the log's name — not the one the spawn
+    /// opened — is refused; the one it opened, still there, reads.
+    #[test]
+    fn a_file_put_in_the_logs_place_is_refused() {
+        let (d, p) = file(&[r#"{"event":"mine"}"#]);
+        let spawned = id(&p);
+        let kept = d.path().join("kept");
+        std::fs::rename(&p, &kept).unwrap();
+        std::fs::write(&p, "{\"event\":\"planted\"}\n").unwrap();
+        let e = tail_file(&p, Some(spawned), None, 200, FILE_TAIL_CAP).unwrap_err();
+        assert!(is_not_its_log(&e), "{e}");
+        // No identity on record: no file is the child's.
+        let e = tail_file(&p, None, None, 200, FILE_TAIL_CAP).unwrap_err();
+        assert!(is_not_its_log(&e), "{e}");
+        // The file it opened, put back, reads as before.
+        std::fs::rename(&kept, &p).unwrap();
+        let t = tail_file(&p, Some(spawned), None, 200, FILE_TAIL_CAP).unwrap();
+        assert_eq!(t.lines, vec![r#"{"event":"mine"}"#]);
+        // Gone: not found, as a child's directory gone with it is.
+        std::fs::remove_file(&p).unwrap();
+        let e = tail_file(&p, Some(spawned), None, 200, FILE_TAIL_CAP).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// A line longer than the whole window, still being written, is passed
+    /// over and marked once; the read after it begins after the line's end,
+    /// never with the line's rest as if it were a line.
+    #[test]
+    fn the_rest_of_a_line_passed_over_is_never_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        std::fs::write(&p, "x".repeat(200)).unwrap();
+        let t = tail(&p, None, 10, 50).unwrap();
+        assert_eq!(
+            t.lines,
+            vec![truncated_line(50)],
+            "the line passed over is marked: {t:?}"
+        );
+        assert!(t.skipped);
+        assert_eq!(t.cursor, 200);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"yyy\n{\"event\":\"next\"}\n").unwrap();
+        let next = tail(&p, Some(t.cursor), 10, 50).unwrap();
+        assert_eq!(next.lines, vec![r#"{"event":"next"}"#], "{next:?}");
+        // The same from a line that began inside the window.
+        std::fs::write(&p, format!("{{\"event\":\"a\"}}\n{}", "z".repeat(50))).unwrap();
+        let t = tail(&p, Some(14), 10, 50).unwrap();
+        assert_eq!(t.lines, vec![truncated_line(50)], "{t:?}");
+        assert_eq!(t.cursor, 64);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"zz\n{\"event\":\"b\"}\n").unwrap();
+        let next = tail(&p, Some(t.cursor), 10, 50).unwrap();
+        assert_eq!(next.lines, vec![r#"{"event":"b"}"#], "{next:?}");
+        // A read that passes over it again from inside it marks nothing.
+        std::fs::write(&p, "w".repeat(300)).unwrap();
+        let t = tail(&p, None, 10, 50).unwrap();
+        assert_eq!(t.lines.len(), 1);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all("w".repeat(50).as_bytes()).unwrap();
+        let again = tail(&p, Some(t.cursor), 10, 50).unwrap();
+        assert!(again.lines.is_empty(), "{again:?}");
+        assert_eq!(again.cursor, 350);
+        // Less of it than a window since: its end is waited for.
+        f.write_all("w".repeat(10).as_bytes()).unwrap();
+        let wait = tail(&p, Some(again.cursor), 10, 50).unwrap();
+        assert!(wait.lines.is_empty(), "{wait:?}");
+        assert_eq!(wait.cursor, 350);
+    }
+
+    /// A window that holds one line's end and then a line still being
+    /// written leaves the cursor at that line's start, so the next read
+    /// returns it whole — not its tail.
+    #[test]
+    fn a_line_still_being_written_after_a_cut_is_read_whole_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("log");
+        // 100 'a' and a newline, then 45 'b' still being written: the
+        // 50-byte window holds 4 'a', the newline, and the 45 'b'.
+        std::fs::write(&p, format!("{}\n{}", "a".repeat(100), "b".repeat(45))).unwrap();
+        let t = tail(&p, None, 10, 50).unwrap();
+        assert!(t.lines.is_empty(), "{t:?}");
+        assert!(t.skipped);
+        assert_eq!(t.cursor, 101, "the cursor waits at the line's start");
+        let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        f.write_all(b"bb\n").unwrap();
+        let next = tail(&p, Some(t.cursor), 10, 50).unwrap();
+        assert_eq!(next.lines, vec!["b".repeat(47)], "{next:?}");
+        assert!(!next.skipped);
+    }
+
     /// The tail is the newest lines, the cursor the end of the last whole
     /// one, and a read from the cursor sees only what was written since.
     #[test]
     fn an_instance_log_is_tailed_and_followed_by_its_cursor() {
         let (_d, p) = file(&[r#"{"event":"a"}"#, r#"{"event":"b"}"#, r#"{"event":"c"}"#]);
-        let t = tail_file(&p, None, 2, FILE_TAIL_CAP).unwrap();
+        let t = tail(&p, None, 2, FILE_TAIL_CAP).unwrap();
         assert_eq!(t.lines, vec![r#"{"event":"b"}"#, r#"{"event":"c"}"#]);
         assert!(t.skipped, "a line was left out");
         assert_eq!(t.cursor, std::fs::metadata(&p).unwrap().len());
 
-        let again = tail_file(&p, Some(t.cursor), 200, FILE_TAIL_CAP).unwrap();
+        let again = tail(&p, Some(t.cursor), 200, FILE_TAIL_CAP).unwrap();
         assert!(again.lines.is_empty());
         assert_eq!(again.cursor, t.cursor);
 
         // A line half written is left for the next read.
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
         f.write_all(b"{\"event\":\"d\"}\n{\"event\":").unwrap();
-        let next = tail_file(&p, Some(t.cursor), 200, FILE_TAIL_CAP).unwrap();
+        let next = tail(&p, Some(t.cursor), 200, FILE_TAIL_CAP).unwrap();
         assert_eq!(next.lines, vec![r#"{"event":"d"}"#]);
         assert!(!next.skipped);
         writeln!(f, r#""e"}}"#).unwrap();
-        let last = tail_file(&p, Some(next.cursor), 200, FILE_TAIL_CAP).unwrap();
+        let last = tail(&p, Some(next.cursor), 200, FILE_TAIL_CAP).unwrap();
         assert_eq!(last.lines, vec![r#"{"event":"e"}"#]);
     }
 
@@ -253,19 +500,19 @@ mod tests {
         let refs: Vec<&str> = long.iter().map(String::as_str).collect();
         let (_d, p) = file(&refs);
         // Each line is 11 bytes with its newline; 50 bytes hold 4 whole ones.
-        let t = tail_file(&p, None, 1000, 50).unwrap();
+        let t = tail(&p, None, 1000, 50).unwrap();
         assert_eq!(t.lines, long[96..].to_vec(), "{t:?}");
         assert!(t.skipped);
         // A cursor far behind is held to the cap too.
-        let t = tail_file(&p, Some(0), 1000, 50).unwrap();
+        let t = tail(&p, Some(0), 1000, 50).unwrap();
         assert_eq!(t.lines.len(), 4);
         assert!(t.skipped);
         // A cursor past the end (the log was replaced) reads the tail.
-        let t = tail_file(&p, Some(1 << 40), 1000, 50).unwrap();
+        let t = tail(&p, Some(1 << 40), 1000, 50).unwrap();
         assert_eq!(t.lines.len(), 4);
         // One line longer than the whole window is passed over, not waited on.
         let (_d2, big) = file(&[&"x".repeat(200)]);
-        let t = tail_file(&big, None, 10, 50).unwrap();
+        let t = tail(&big, None, 10, 50).unwrap();
         assert!(t.lines.is_empty());
         assert_eq!(t.cursor, 201);
     }

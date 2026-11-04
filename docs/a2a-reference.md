@@ -501,7 +501,8 @@ introspection ops, which answer `INTROSPECTION_DISABLED`.
   ([Draw the org chart](delegate-subagents.md#draw-the-org-chart)).
 - **`subagent.send`** reaches a warm flat worker and a live instance child.
   A warm worker's answer is its `result`; an instance child's, once it has
-  one, is its `reply`. `subagent.status` reads both.
+  one, is its `reply`, the newest send's, and `reply_to` is the id of the
+  task this op answered that send with. `subagent.status` reads both.
 - **`subagent.log`** answers `{handle, source, lines, cursor}`: the newest
   `lines` (default 200, at most 1000) of the child's log, each one of
   agentd's own JSON log lines as written. An instance child's are read from
@@ -510,7 +511,11 @@ introspection ops, which answer `INTROSPECTION_DISABLED`.
   ring (`source: ring`, kept while `a2a.introspection.enabled` is on —
   without a ring the answer has no lines and a `note`). Pass `cursor` back as
   `after` for only the lines written since. The path is the one this
-  instance recorded for the child, never one a caller names.
+  instance recorded for the child, never one a caller names, and the file
+  read there is only the one this instance opened for the child's log: a
+  symlink, a FIFO or another file the child put in its place is refused.
+  A line longer than the window is passed over as one `{"truncated": true,
+  "bytes": N}` line, never returned in pieces.
 - **`admin.drain`** begins a graceful drain, as `SIGTERM` does, and returns
   at once; the process exits `0` when the drain completes, within
   `lifecycle.drain_timeout`.

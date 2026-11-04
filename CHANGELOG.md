@@ -22,6 +22,37 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   currency, this period (per what, since when), spent of budget, payments
   of `times` when set, and the amount above which a payment asks. Offered
   only while the agent's card lists the op for the caller.
+- **Completion in the TUI's prompt.** While the composer offers a
+  suggestion and the cursor is at the end, the rest of the selected one is
+  drawn after the cursor, dim, and `→` accepts it as `Tab` does; elsewhere
+  `→` moves the cursor. The dim text is never part of what is sent, and it
+  is cut at the end of its row (or not drawn when the line already wraps),
+  so the composer never grows a row for it. A `→` typed before a redraw
+  completes what was typed.
+- **Talk to a subagent from its detail view.** `m` or `Enter` on the TUI's
+  subagent detail opens a message field there (`Enter` sends, `Esc` leaves
+  it), with what was sent and what the child answered shown above it. A
+  child that cannot take a message — not running, not warm — or a send the
+  daemon refuses is said in the field. `/send <handle> <text>` in the chat
+  works as before.
+- **An instance child's answer to `subagent.send` is read back.** The
+  message still goes over the child's socket; the parent now follows the
+  child's task to its answer, off the loop, and records it as the child's
+  `reply`: `subagent.status` carries it, the feed's `updated` moves, and a
+  `subagent.turn` line with `tier: instance` says so. The child's `result`
+  stays its own report, the one a `sync` spawn waits for.
+- **`subagent.log {handle, lines?, after?}`**, an operator-only read op and
+  a read-only tool for the root and workflows: the newest lines of one
+  child's log (200 by default, at most 1000) and a cursor to read on from.
+  An instance child's come from its own log file, the path its parent
+  recorded, at most its last 256 KiB; a flat worker's are this daemon's
+  lines about it from the in-memory log ring, while one is kept
+  (`a2a.introspection.enabled`). The lines are agentd's JSON lines as
+  written. In the TUI, `l` on a child's detail view opens a log pane that
+  follows new lines, scrolls with `↑`/`↓` and `PgUp`/`PgDn`, and shows each
+  line as its time, level, event and own fields; it is offered only when the
+  card lists the op. Published in the command extension's vocabulary and
+  schema, and in the client's `OPS` and `AgentdClient.subagentLog()`.
 
 ## v1.24.0 — the org chart
 

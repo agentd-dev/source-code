@@ -551,7 +551,8 @@ export function App(props: AppProps): React.JSX.Element {
     rows -
       (edgeRows.top +
         edgeRows.bottom +
-        composerRows +
+        // The composer is drawn on the chat screen only.
+        (screen === 'chat' ? composerRows : 0) +
         promptRows +
         bannerRows +
         (ask ? 1 : 0) +

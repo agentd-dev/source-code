@@ -609,3 +609,35 @@ test('two sends each get their own reply, and a reply to someone else is not sho
   assert.doesNotMatch(frame, /waiting for/);
   ui.unmount();
 });
+
+test('off the chat screen the log pane takes the rows the chat composer would', async () => {
+  // The composer is drawn on the chat screen only; the rows it measured
+  // there are not taken from another screen's body.
+  const many = Array.from({ length: 60 }, (_, i) => line(`ev${i}`, {}, 'info', i % 60));
+  const client = {
+    subagentGet: async () => ({}),
+    subagentLog: async (handle) => ({ handle, source: 'file', lines: many, cursor: 1 }),
+  };
+  const rows = 24;
+  const { mirror, stdin, app, frame } = await realApp(client, { cols: 60, rows, ops: [OPS.subagentLog] });
+  try {
+    mirror.apply(sub({ handle: 'inst-9', tier: 'instance' }));
+    await tick();
+    stdin.write('\t');
+    await tick();
+    stdin.write('\t');
+    await tick();
+    stdin.write('\r');
+    await tick();
+    stdin.write('l');
+    await tick(120);
+    const out = plain(frame()).replace(/\n$/, '').split('\n');
+    const shown = out.filter((r) => /\bev\d+\b/.test(r)).length;
+    // Fullscreen, the frame fills the terminal: no rows are left blank for a
+    // composer that is not there.
+    assert.equal(out.length, rows, `the frame fills the terminal: ${JSON.stringify(out)}`);
+    assert.ok(shown >= rows - 8, `the log pane uses the body's rows (${shown} lines shown): ${JSON.stringify(out)}`);
+  } finally {
+    app.unmount();
+  }
+});

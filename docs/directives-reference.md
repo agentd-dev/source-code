@@ -2,7 +2,7 @@
 
 agentd reads instruction documents in the instruction.md specification's
 first edition, `instruction/1` (`spec: "1"`), with the official instruction.md
-Rust SDK (`instruction-md`), pinned to specification commit `af8400f`. The
+Rust SDK (`instruction-md`), pinned to specification commit `bf4f9a0`. The
 syntax, the checks and the agent text are the specification's and the SDK's;
 this page is what agentd, as a host, does with a document: which blocks
 become configuration, under which grants, and what it says about the rest.

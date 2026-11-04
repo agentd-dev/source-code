@@ -15,7 +15,7 @@ the crate's own NOTICE gives it:
 
   The instruction.md specification's registry and workflow registry
   (`src/registry.json` and `src/workflow-registry.json`, verbatim;
-  specification commit af8400f)
+  specification commit bf4f9a0)
     Source:  https://github.com/instruction-md/specification
     Licence: Creative Commons Attribution 4.0 International (CC BY 4.0)
              https://creativecommons.org/licenses/by/4.0/

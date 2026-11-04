@@ -6,7 +6,7 @@ instruction.md Rust SDK, `instruction-md`, which vendors the specification's
 registry (`registry.json`) at one commit, `instruction_md::SPEC_COMMIT`.
 
 Upstream: **https://github.com/instruction-md/specification**. The SDK's
-registry is from commit `af8400f69ec82ac120b96def8eb401d385104eb3` (the first
+registry is from commit `bf4f9a0db62c79ee1365edec47fb6ffdcfd623bb` (the first
 edition, `instruction/1`). CI checks out that exact commit
 (`.github/workflows/ci.yml`); moving the pin is a deliberate change, made
 with the SDK revision that vendors it.

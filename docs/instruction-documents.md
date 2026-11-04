@@ -229,7 +229,7 @@ Three more views help:
 - At startup the log says how the document was read and what it mapped:
 
 ```text
-{"event":"instruction.read","reader":"instruction-md","spec":"af8400f","digest":"sha256:…","diagnostics":0,"agent_text_bytes":1534,"mcp_servers":1,"a2a_peers":0,"workflows":1,"skills":1,"people":0,"not_activated":0,…}
+{"event":"instruction.read","reader":"instruction-md","spec":"bf4f9a0","digest":"sha256:…","diagnostics":0,"agent_text_bytes":1534,"mcp_servers":1,"a2a_peers":0,"workflows":1,"skills":1,"people":0,"not_activated":0,…}
 {"event":"skills.discovered","origin":"instruction","skills":[{"name":"refunds"}],…}
 ```
 

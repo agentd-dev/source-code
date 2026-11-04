@@ -48,7 +48,7 @@ jobs:
           # this is a deliberate change, made with the SDK revision that
           # vendors it; following upstream main would turn the drift test red
           # on any upstream commit.
-          ref: af8400f69ec82ac120b96def8eb401d385104eb3
+          ref: bf4f9a0db62c79ee1365edec47fb6ffdcfd623bb
           path: .spec-upstream
       - run: echo "INSTRUCTION_SPEC_REPO=$GITHUB_WORKSPACE/.spec-upstream" >> "$GITHUB_ENV"
       # The Personal Agent Protocol draft, at the commit its vendored copy

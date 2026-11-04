@@ -176,7 +176,7 @@ per period, a count, a window, the payees, and who approves above an
 amount. agentd enforces them as allowances, across the rails it pays on.
 The RFC is accepted in instruction.md, and its document form — the `wallet`
 and `allowance` kinds (proposal S29, with S28's protocol names for a
-wallet's rails) — is read by the official SDK, `instruction-md` 0.2.
+wallet's rails) — is read by the official SDK, `instruction-md` 0.3.
 
 | | Support |
 |---|---|
@@ -357,7 +357,7 @@ series.
 
 | Standard | Where |
 |---|---|
-| [instruction.md](https://github.com/instruction-md/specification), first edition `instruction/1` (commit `af8400f`), read with the official Rust SDK `instruction-md` | instruction documents: reading, the agent text, signatures and the `instruction-resolved/1` manifest |
+| [instruction.md](https://github.com/instruction-md/specification), first edition `instruction/1` (commit `bf4f9a0`), read with the official Rust SDK `instruction-md` | instruction documents: reading, the agent text, signatures and the `instruction-resolved/1` manifest |
 | [AGENTS.md](https://agents.md) (no version; the Agentic AI Foundation's `agentsmd/agents.md` at `d001185d79`) | the [workspace's notes for agents](coding-agent.md#the-repositorys-agentsmd): the `AGENTS.md` files of `agent.workspace`, from its root down to the working directory, nearest last, in the system prompt as text below the instruction |
 | OCI distribution, cosign signatures | `oci://` instruction sources, verified against a cosign key |
 | age v1, JWE Compact (ECDH-ES with X25519, `dir`) | encrypted instruction documents |

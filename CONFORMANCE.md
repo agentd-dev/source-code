@@ -218,6 +218,13 @@ skip.
 | `ema/re-presentation-and-fallback` | a 401 on a token not just minted re-presents the cached ID-JAG with no new exchange; an authorization server that refuses a re-presented one is minted for instead |
 | `ema/freshness-kill-switch` | once the IdP stops answering, no delegated call succeeds after the liveness interval: idp_unavailable, never an old token |
 | `ema/no-mint-at-boot` | enrolment mints once per templated server, to list its tools; a restart mints nothing |
+| `ema/a-step-in-the-enrolments-gap-waits-for-the-catalogue` | a step started once a person's grant is held, before the catalogue their enrolment lists reaches the loop, waits for it and completes once it lands |
+| `ema/a-catalogue-that-cannot-be-fetched-fails-its-waiting-step` | a catalogue the enrolment cannot list fails the step waiting for it, saying the catalogue could not be fetched and why, never that the person must enrol |
+| `ema/a-listing-whose-connection-fails-is-tried-again` | a post-enrolment tool-list fetch whose connection fails is tried again, logged once as delegation.catalogue.retry, and the step waiting in the gap completes |
+| `ema/a-listing-asked-to-wait-waits-as-asked` | a post-enrolment tool-list fetch answered 429 with Retry-After is tried again no sooner than the server asked, and the step waiting in the gap completes |
+| `ema/a-listing-asked-to-wait-too-long-fails-at-once` | a tool-list fetch answered 429 with a Retry-After longer than the retries have left is not asked again, and the waiting step fails saying the server asked for no request for that long |
+| `ema/a-listing-whose-token-is-refused-at-the-handshake-is-not-tried-again` | a tool-list fetch whose token the server refuses (401) at notifications/initialized — which rmcp says as its channel closing — is not tried again, and the waiting step fails saying the token was refused |
+| `ema/a-person-not-enrolled-is-refused-while-a-catalogue-is-listed` | while one person's enrolment lists a catalogue, a step for a person who holds no grant is refused at once with the enrol error, and does not wait |
 | `ema/slow-idp-delays-nothing-else` | while a mint waits on a slow IdP, an unrelated run starts and finishes |
 | `ema/no-token-reaches-a-worker-or-a-prompt` | a turn's delegated call answers its worker — and so the prompt — with every live token value scrubbed, and no frame to a child carries a token or the supervisor's reserved variables |
 | `ema/loopback-caller-gets-no-delegation` | a delegated server on a loopback listener with no verifier is refused at load; with one, the operator a bearer names is not the enrolled person, and its run is no_delegation |

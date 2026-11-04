@@ -1366,7 +1366,7 @@ impl Runtime {
             "ask_human" => self.ask_human_tool(caller, args),
             // ---- subagents ----
             "subagent.run" | "subagent.send" | "subagent.kill" | "subagent.status"
-            | "subagent.await" | "subagent.list" | "subagent.retire" => {
+            | "subagent.await" | "subagent.list" | "subagent.retire" | "subagent.log" => {
                 self.subagent_tool(caller, name, args)
             }
             // ---- conversations ----

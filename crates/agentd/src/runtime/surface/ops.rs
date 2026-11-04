@@ -275,6 +275,18 @@ pub const OPS: &[OpSpec] = &[
         subagent_status_result,
     ),
     op(
+        "subagent.log",
+        Message,
+        Operator,
+        &[],
+        Scope::Instance,
+        Gate::Always,
+        Handler::Subagent,
+        "The last lines of one subagent's log {handle, lines?, after?} and a cursor to tail it with: an instance child's own log file, a flat worker's lines from this instance's log ring. Read-only",
+        subagent_log_args,
+        subagent_log_result,
+    ),
+    op(
         "plan.get",
         Message,
         Granted,
@@ -878,6 +890,12 @@ fn subagent_status_args() -> Value {
 }
 fn subagent_status_result() -> Value {
     tool("subagent.status").output
+}
+fn subagent_log_args() -> Value {
+    tool("subagent.log").input
+}
+fn subagent_log_result() -> Value {
+    tool("subagent.log").output
 }
 
 /// The `status` document every caller is told: the instance's facts, the
@@ -1918,6 +1936,31 @@ mod tests {
         }
     }
 
+    /// A child's log is the instance's: `subagent.log` answers the operator
+    /// alone, whatever a grant says — the other `subagent.*` ops are open to
+    /// a child's owner — and reads, creating no task.
+    #[test]
+    fn a_childs_log_is_the_operators_alone() {
+        let spec = op_spec("subagent.log").expect("a row");
+        assert_eq!(spec.floor, Floor::Operator);
+        assert_eq!(spec.reply, Reply::Message);
+        assert!(command_ops_of(&Settings::default()).contains(&"subagent.log"));
+        let who = |role, grants: &[&str]| Principal {
+            role,
+            grants: grants.iter().map(|g| (*g).to_string()).collect(),
+            ..Principal::anonymous()
+        };
+        assert!(who(Role::Operator, &[]).may_command("subagent.log"));
+        for role in [Role::User, Role::Agent] {
+            for grants in [&["*"][..], &["subagent.log"], &["subagent.*"]] {
+                assert!(
+                    !who(role, grants).may_command("subagent.log"),
+                    "{role:?} {grants:?} must not read a child's log"
+                );
+            }
+        }
+    }
+
     /// The device ops are served with the grant; the session ops on any TCP
     /// listener, and on no unix socket, which issues no session.
     #[test]
@@ -2008,6 +2051,7 @@ mod tests {
             "subagent.send" => json!({"handle": "sub-1", "message": "left"}),
             "subagent.kill" => json!({"handle": "sub-1", "reason": "done"}),
             "subagent.status" | "subagent.get" => json!({"handle": "sub-1"}),
+            "subagent.log" => json!({"handle": "sub-1", "lines": 50, "after": 1024}),
             "plan.get" => json!({"id": "chat"}),
             "conversation.get" => json!({"id": "chat", "limit": 20}),
             "debug.events" => json!({"after": 3, "limit": 10, "level": "warn", "prefix": "a2a."}),

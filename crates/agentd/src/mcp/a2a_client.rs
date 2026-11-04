@@ -386,6 +386,65 @@ pub fn send(
     conn.call("SendMessage", params, deadline)
 }
 
+/// What came of a message [`send`] delivered: the reply, once the peer has
+/// one. A `{message}` answer is the reply; a task is followed (`GetTask`)
+/// until it ends, or until it stops to ask for input — its status message is
+/// the reply then, as it is a person's to answer. The same distillate a
+/// delegation hands back, for a send whose caller wants to see the answer
+/// too (`subagent.send` to an instance child) without sending it a second
+/// time. `deadline` bounds the wait.
+pub fn follow_sent(
+    endpoint: &A2aEndpoint,
+    auth: PeerAuth,
+    sent: &Value,
+    deadline: Instant,
+) -> DelegateOutcome {
+    if let Some(a2a::Reply::Message(_)) = a2a::reply_of(sent) {
+        return DelegateOutcome::Distillate(a2a::reply_text_of(sent));
+    }
+    let task = sent.get("task").unwrap_or(sent);
+    let asked = |t: &Value| a2a::task_state_of(t) == TaskState::InputRequired;
+    if asked(task) {
+        return DelegateOutcome::Distillate(a2a::status_text_of(task));
+    }
+    if let Some(outcome) = terminal_outcome(task) {
+        return outcome;
+    }
+    let task_id = a2a::task_id_of(sent);
+    if task_id.is_empty() {
+        return DelegateOutcome::Error("a2a: SendMessage reply named no task".into());
+    }
+    let ep = match HttpEp::of(endpoint) {
+        Ok(ep) => ep,
+        Err(e) => return DelegateOutcome::Error(e),
+    };
+    let mut conn = HttpConn::new(ep, auth);
+    let params = a2a::get_task_params(&task_id, None);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return DelegateOutcome::Error(format!(
+                "a2a: no reply yet (task {task_id} still running)"
+            ));
+        }
+        std::thread::sleep(FOLLOW_INTERVAL.min(deadline - now));
+        let t = match conn.call("GetTask", params.clone(), deadline) {
+            Ok(t) => t,
+            Err(e) => return DelegateOutcome::Error(e),
+        };
+        if asked(&t) {
+            return DelegateOutcome::Distillate(a2a::status_text_of(&t));
+        }
+        if let Some(outcome) = terminal_outcome(&t) {
+            return outcome;
+        }
+    }
+}
+
+/// How often [`follow_sent`] reads the peer's task: a reply is a model's
+/// turn, seconds rather than milliseconds away.
+const FOLLOW_INTERVAL: Duration = Duration::from_millis(500);
+
 /// One call of `method` to the A2A peer at `endpoint`, with `params`: its
 /// JSON-RPC `result`, or why there is none. What a thin client of a daemon
 /// on this host asks with (`agentd --login company:<name>`), one request per

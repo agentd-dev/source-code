@@ -72,6 +72,7 @@ enum SubagentOp {
     Send,
     Kill,
     Status,
+    Log,
 }
 
 /// Where an op goes: its handler, with the op already resolved to one the
@@ -118,6 +119,7 @@ fn route(op: &str) -> Option<(&'static surface::OpSpec, Route)> {
             "subagent.send" => Some(SubagentOp::Send),
             "subagent.kill" => Some(SubagentOp::Kill),
             "subagent.status" => Some(SubagentOp::Status),
+            "subagent.log" => Some(SubagentOp::Log),
             _ => None,
         }
         .map(Route::Subagent),
@@ -536,9 +538,9 @@ impl Runtime {
         }
     }
 
-    /// `subagent.send {handle, message}`, `subagent.kill {handle}` and
-    /// `subagent.status {handle?}` — the internal tool implementations, run
-    /// verbatim.
+    /// `subagent.send {handle, message}`, `subagent.kill {handle}`,
+    /// `subagent.status {handle?}` and `subagent.log {handle, lines?,
+    /// after?}` — the internal tool implementations, run verbatim.
     fn subagent_op(
         &mut self,
         principal: &Principal,
@@ -559,7 +561,7 @@ impl Runtime {
         };
         match self.subagent_tool(&tool_caller, op, data.clone()) {
             crate::runtime::tools::ToolOutcome::Ready(v, false) => match s {
-                SubagentOp::Status => Answer::Doc(v),
+                SubagentOp::Status | SubagentOp::Log => Answer::Doc(v),
                 SubagentOp::Send | SubagentOp::Kill => Answer::Done {
                     link: None,
                     text: None,

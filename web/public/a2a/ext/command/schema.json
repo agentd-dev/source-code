@@ -141,6 +141,21 @@
           "if": {
             "properties": {
               "op": {
+                "const": "subagent.log"
+              }
+            },
+            "required": [
+              "op"
+            ]
+          },
+          "then": {
+            "$ref": "#/$defs/envelopes/$defs/subagent.log"
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "op": {
                 "const": "plan.get"
               }
             },
@@ -1337,6 +1352,35 @@
             "reason": {
               "description": "Why; kept as the cancelled record's error",
               "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "handle"
+          ],
+          "type": "object"
+        },
+        "subagent.log": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "description": "The cursor a previous read returned: only lines written since",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            },
+            "lines": {
+              "default": 200,
+              "description": "How many of the newest lines (at most 1000)",
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "op": {
+              "const": "subagent.log"
             }
           },
           "required": [
@@ -3640,6 +3684,74 @@
           "type": "object"
         }
       },
+      "subagent.log": {
+        "args": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "description": "The cursor a previous read returned: only lines written since",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            },
+            "lines": {
+              "default": 200,
+              "description": "How many of the newest lines (at most 1000)",
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "handle"
+          ],
+          "type": "object"
+        },
+        "description": "The last lines of one subagent's log {handle, lines?, after?} and a cursor to tail it with: an instance child's own log file, a flat worker's lines from this instance's log ring. Read-only",
+        "reply": "message",
+        "result": {
+          "properties": {
+            "cursor": {
+              "description": "Pass as `after` to read only what comes next",
+              "type": "integer"
+            },
+            "handle": {
+              "type": "string"
+            },
+            "lines": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "note": {
+              "description": "Why there are no lines to read, when there are none",
+              "type": "string"
+            },
+            "skipped": {
+              "description": "Older lines since the cursor were left out (the byte cap or the line count)",
+              "type": "boolean"
+            },
+            "source": {
+              "description": "file: the instance child's own log; ring: this instance's log ring",
+              "enum": [
+                "file",
+                "ring"
+              ]
+            }
+          },
+          "required": [
+            "handle",
+            "source",
+            "lines",
+            "cursor"
+          ],
+          "type": "object"
+        }
+      },
       "subagent.send": {
         "args": {
           "additionalProperties": false,
@@ -3702,6 +3814,9 @@
             },
             "mode": {
               "type": "string"
+            },
+            "reply": {
+              "description": "An instance child's latest answer to subagent.send"
             },
             "result": {},
             "status": {

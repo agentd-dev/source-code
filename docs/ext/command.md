@@ -123,6 +123,7 @@ workflow may declare them as a command.
 | `subagent.send` | task | `user` or a grant | always | Send a message to a warm subagent |
 | `subagent.kill` | task | a grant | always | Stop a subagent |
 | `subagent.status` | message | `user` or a grant | always | The status of one subagent, and its result once it has one |
+| `subagent.log` | message | operator | always | The last lines of one subagent's log {handle, lines?, after?} and a cursor to tail it with: an instance child's own log file, a flat worker's lines from this instance's log ring. Read-only |
 | `plan.get` | message | `user` or a grant | always | One conversation's current plan and its progress |
 | `conversation.get` | message | `user` or a grant | `a2a.introspection.enabled` | One conversation's transcript, message bodies included |
 | `run.get` | message | `user` or a grant | `a2a.introspection.enabled` | One run with per-step status, timings, errors and output |

@@ -207,7 +207,8 @@ pub fn contracts() -> Vec<Contract> {
         "The status (and result, when finished) of a subagent.",
         obj(json!({"handle": s("The subagent handle")}), &["handle"]),
         open_obj(
-            json!({"handle": {"type": "string"}, "status": {"type": "string"}, "mode": {"type": "string"}, "result": any(), "error": {"type": "string"}}),
+            json!({"handle": {"type": "string"}, "status": {"type": "string"}, "mode": {"type": "string"}, "result": any(), "error": {"type": "string"},
+                   "reply": {"description": "An instance child's latest answer to subagent.send"}}),
             &["handle", "status"],
         ),
         true,
@@ -236,6 +237,33 @@ pub fn contracts() -> Vec<Contract> {
         open_obj(
             json!({"subagents": arr(json!({"type": "object"}))}),
             &["subagents"],
+        ),
+        true,
+        ROOT_WF,
+    );
+
+    c(
+        "subagent.log",
+        "subagent",
+        "The last lines of one subagent's log, and a cursor to read on from: an instance child's own log file (at most its last 256 KiB), a flat worker's lines from this instance's in-memory log ring. Each line is agentd's own JSON log line, as written. Read-only, and the operator's alone.",
+        obj(
+            json!({
+                "handle": s("The subagent handle"),
+                "lines": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200, "description": "How many of the newest lines (at most 1000)"},
+                "after": {"type": "integer", "minimum": 0, "description": "The cursor a previous read returned: only lines written since"}
+            }),
+            &["handle"],
+        ),
+        open_obj(
+            json!({
+                "handle": {"type": "string"},
+                "source": {"enum": ["file", "ring"], "description": "file: the instance child's own log; ring: this instance's log ring"},
+                "lines": arr(json!({"type": "string"})),
+                "cursor": {"type": "integer", "description": "Pass as `after` to read only what comes next"},
+                "skipped": {"type": "boolean", "description": "Older lines since the cursor were left out (the byte cap or the line count)"},
+                "note": {"type": "string", "description": "Why there are no lines to read, when there are none"}
+            }),
+            &["handle", "source", "lines", "cursor"],
         ),
         true,
         ROOT_WF,
@@ -1532,7 +1560,11 @@ pub fn read_back(name: &str) -> Option<ReadBack> {
         "status" => Some(ReadBack::Every),
         // `subagent.list` too: it hands back the opening of each child's
         // instruction, which is the spawner's text.
-        "subagent.status" | "subagent.await" | "subagent.list" => Some(ReadBack::Child),
+        // `subagent.log` too: what a child logged can carry what it was
+        // handed and what it made of it (`observability.log_content`).
+        "subagent.status" | "subagent.await" | "subagent.list" | "subagent.log" => {
+            Some(ReadBack::Child)
+        }
         "plan.update" => Some(ReadBack::Bound),
         _ => None,
     }
@@ -1552,7 +1584,8 @@ mod tests {
     /// ([`Onward::Children`]).
     #[test]
     fn every_contract_that_hands_back_a_result_is_a_read_back_edge() {
-        const RESULT: [&str; 4] = ["output", "result", "runs", "subagents"];
+        // `lines`: a child's log lines (`subagent.log`).
+        const RESULT: [&str; 5] = ["output", "result", "runs", "subagents", "lines"];
         let mut classified = Vec::new();
         for c in contracts() {
             let carries = c.output["properties"]
@@ -1671,6 +1704,7 @@ mod tests {
             "subagent.await",
             "subagent.list",
             "subagent.retire",
+            "subagent.log",
             "code.run",
             "memory.get",
             "memory.set",

@@ -328,6 +328,7 @@ impl Runtime {
             status: "spawned".into(),
             attempt: 1,
             result: None,
+            reply: None,
             error: None,
             requested_by: Some(
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": 0}),
@@ -1575,6 +1576,7 @@ impl Runtime {
                 ..Default::default()
             };
             let h = handle.to_string();
+            let tx = self.events_tx.clone();
             std::thread::Builder::new()
                 .name(format!("inst.send:{handle}"))
                 .spawn(move || {
@@ -1582,6 +1584,31 @@ impl Runtime {
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
                     let sent =
                         crate::mcp::a2a_client::send(&endpoint, auth, &parts, None, None, deadline);
+                    // The child's answer, once it has one, is the record's
+                    // `reply`. Read on this thread, so the loop never waits
+                    // on the child.
+                    let follow = |reply: &Value| {
+                        let auth = crate::mcp::a2a_client::PeerAuth {
+                            trace: hop.clone(),
+                            tree: true,
+                            ..Default::default()
+                        };
+                        let until = std::time::Instant::now() + INSTANCE_REPLY_WAIT;
+                        let result = match crate::mcp::a2a_client::follow_sent(
+                            &endpoint, auth, reply, until,
+                        ) {
+                            crate::mcp::a2a_client::DelegateOutcome::Distillate(text) => {
+                                json!({"text": text})
+                            }
+                            crate::mcp::a2a_client::DelegateOutcome::Error(e) => {
+                                json!({"error": e})
+                            }
+                        };
+                        let _ = tx.send(super::events::Event::Background {
+                            id: format!("{INSTANCE_REPLY}{h}"),
+                            result,
+                        });
+                    };
                     // The send is the CLIENT span the child's task continues.
                     crate::obs::otel::span(
                         hop.as_ref(),
@@ -1594,7 +1621,10 @@ impl Runtime {
                     .attr("agentd.instance.handle", h.as_str())
                     .end(sent.is_ok());
                     match sent {
-                        Ok(_) => log.info("instance.send", json!({"handle": h})),
+                        Ok(reply) => {
+                            log.info("instance.send", json!({"handle": h}));
+                            follow(&reply);
+                        }
                         Err(e) => log.warn("instance.send", json!({"handle": h, "err": e})),
                     }
                 })
@@ -1610,6 +1640,40 @@ impl Runtime {
             err(format!(
                 "instance {handle:?}: subagent.send to an instance child needs --features a2a"
             ))
+        }
+    }
+
+    /// An instance child answered a `subagent.send` ([`INSTANCE_REPLY`]):
+    /// its answer is the record's `reply`, which `subagent.status` reads and
+    /// whose arrival moves the feed's `updated`. Not its `result`: that is the
+    /// child's own report, the first of which a `sync` spawn waits on, and an
+    /// answer landing there first would take its place. A child that did not
+    /// answer leaves the reply as it was, and the log says why.
+    pub(crate) fn on_instance_reply(&mut self, handle: &str, reply: &Value) {
+        let Some(s) = self.subagents.get(handle) else {
+            return;
+        };
+        if s.killed || is_terminal_status(&s.status) {
+            return;
+        }
+        let log = self.subagent_log(handle);
+        match reply["text"].as_str() {
+            Some(text) => {
+                if let Some(s) = self.subagents.get_mut(handle) {
+                    s.reply = Some(super::subagents::distill(&Value::String(text.to_string())));
+                    s.updated = now_ms();
+                    s.dirty = true;
+                }
+                log.info(
+                    "subagent.turn",
+                    json!({"handle": handle, "status": "completed", "tier": "instance"}),
+                );
+            }
+            None => log.warn(
+                "subagent.turn",
+                json!({"handle": handle, "status": "failed", "tier": "instance",
+                       "err": reply["error"]}),
+            ),
         }
     }
 
@@ -2238,6 +2302,15 @@ fn read_child_lifetime_tokens(manifest: &std::path::Path) -> Option<u64> {
         .pointer("/state/budget/instance/lifetime_used")
         .and_then(Value::as_u64)
 }
+
+/// The [`super::events::Event::Background`] id prefix an instance child's
+/// reply to `subagent.send` comes back to the loop under, its handle after.
+pub(crate) const INSTANCE_REPLY: &str = "instance.reply:";
+
+/// How long a `subagent.send` to an instance child waits for its reply: a
+/// turn of the child's, which may call tools and models.
+#[cfg(feature = "a2a")]
+const INSTANCE_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How much of a failed child's log [`exit_cause`] reads, from its end.
 const EXIT_CAUSE_TAIL: u64 = 16 * 1024;

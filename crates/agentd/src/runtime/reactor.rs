@@ -323,6 +323,11 @@ pub struct SubagentRecord {
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// An instance child's latest answer to a `subagent.send`. Kept apart
+    /// from `result`, which is the child's own report (`_instance.result`:
+    /// the first one wins, and a `sync` spawn waits on it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1168,6 +1173,12 @@ impl Runtime {
             Event::Background { id, result } if id == "goal.judge" => {
                 self.charge_judge("goal", &result);
                 self.on_goal_judge(&result)
+            }
+            Event::Background { id, result }
+                if id.starts_with(super::instances::INSTANCE_REPLY) =>
+            {
+                let handle = id.trim_start_matches(super::instances::INSTANCE_REPLY);
+                self.on_instance_reply(handle, &result);
             }
             Event::Background { id, result } if id.starts_with("human.judge:") => {
                 self.charge_judge("approve", &result);

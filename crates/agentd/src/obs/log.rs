@@ -588,6 +588,42 @@ pub fn read_event_window(
     })
 }
 
+/// The NEWEST `max` lines with `seq > after` that `keep` accepts, oldest
+/// first, each with its `seq` folded in — and the ring's newest `seq`, the
+/// cursor a follow-up read passes as `after` so it sees only what came since.
+/// [`read_event_window`] reads from the cursor forwards, which is right for a
+/// tail that drains everything; a filtered tail wants the last lines that
+/// match instead. `None` when no ring is installed.
+pub fn read_ring_tail(
+    after: u64,
+    max: usize,
+    keep: impl Fn(&Value) -> bool,
+) -> Option<(Vec<Value>, u64)> {
+    if RING_INSTALLED.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let g = EVENT_RING.lock().unwrap_or_else(|e| e.into_inner());
+    let ring = g.as_ref()?;
+    let newest = ring.buf.back().map(|e| e.seq).unwrap_or(after);
+    let mut lines: Vec<Value> = ring
+        .buf
+        .iter()
+        .rev()
+        .filter(|e| e.seq > after && keep(&e.line))
+        .take(max)
+        .map(|e| {
+            let mut line = match &e.line {
+                Value::Object(m) => m.clone(),
+                _ => Map::new(),
+            };
+            line.insert("seq".into(), Value::Number(e.seq.into()));
+            Value::Object(line)
+        })
+        .collect();
+    lines.reverse();
+    Some((lines, newest.max(after)))
+}
+
 /// Capture one already-assembled line into the ring (a no-op when none is
 /// installed). Pulls `level`/`event` off the object for cheap filterable
 /// metadata, mints a `seq`, and pushes — lossy oldest-evicted, never blocking.

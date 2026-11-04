@@ -417,6 +417,21 @@ assistant that reacts to a stream of events with context it built earlier.
 
 Then steer it with `subagent.send {handle, message}`. Messages sent during a
 turn queue in order. Each turn gets a fresh step, token and deadline budget.
+Each turn's output is the child's `result` until the next one, so
+`subagent.status` reads the answer to the message before it.
+
+A live instance child takes messages too: `subagent.send` delivers the
+message over the child's socket, and the child answers it in a turn of its
+own. When it has answered, `subagent.status` carries the answer as `reply`,
+and the daemon logs `subagent.turn` with `tier: instance`. The child's
+`result` stays its own report, the one a `sync` spawn waits for. A child that
+has not answered within 10 minutes leaves its reply as it was, and the log
+line says why (`status: failed`, `err`).
+
+In the TUI, open the child on the subagents screen and press `m` or `Enter`:
+the message field is in the detail view, and what you sent and what the
+child answered stay above it
+([Use the terminal and web UI](interface.md#watch-tasks-and-subagents)).
 
 Three edges to plan for:
 
@@ -1194,17 +1209,18 @@ the principal that spawned it.
 | Tool | Arguments | Returns |
 |---|---|---|
 | `subagent.run` | `instruction` or `template` with `params`; optional `mode`, `servers`, `tools` (not with `template`), `limits` (`steps`, `tokens`, `deadline`, `memory`, `cpu`), `priority` (`low`, `normal`, `high`), `context`, `output_contract`, `output_schema`, `durable` | `{handle, status, result, error}` for `sync`; `{handle, status}` otherwise; instance children add `tier`, `peer`, `socket` |
-| `subagent.status` | `handle` | `{handle, status, mode, result, tokens, error}`; safe to poll |
+| `subagent.status` | `handle` | `{handle, status, mode, result, tokens, error}`, and an instance child's latest answer to `subagent.send` as `reply`; safe to poll |
 | `subagent.await` | `handle` (`timeout` is accepted and not applied) | `{handle, status, result, error}` once the child is finished |
-| `subagent.send` | `handle`, `message` | `{ok, handle}` for a warm child, which queues the message; an instance child receives it over A2A and the reply adds `delivery: "async"` |
+| `subagent.send` | `handle`, `message` | `{ok, handle}` for a warm child, which queues the message; an instance child receives it over A2A and the reply adds `delivery: "async"`; a warm child's answer is its `result`, an instance child's its `reply` |
+| `subagent.log` | `handle`; optional `lines` (default 200, at most 1000), `after` | `{handle, source, lines, cursor}`, and `skipped` or `note`; read-only, the operator's alone ([Read a child's log](#read-a-childs-log)) |
 | `subagent.kill` | `handle`, optional `reason` | `{ok, handle}`; flat children only |
 | `subagent.retire` | `handle` | `{ok, handle, status: "retiring"}`; instance children only |
 | `subagent.list` | none | `{subagents: [...]}`: handle, mode, status, the first 80 characters of the instruction, created, and for a templated child its template, tier and `reports_to` (the template's reporting line, the operator's or its document's) |
 
 Over A2A, `subagent.send`, `subagent.kill` and `subagent.status` are command
 operations, each held to the caller's grants, and an introspection read
-returns one subagent without a task; see the
-[A2A API reference](a2a-reference.md).
+returns one subagent without a task. `subagent.log` is one too, the
+operator's alone; see the [A2A API reference](a2a-reference.md).
 
 ## Watch children run
 
@@ -1219,7 +1235,7 @@ events to watch:
 | Event | When |
 |---|---|
 | `subagent.spawn` | A flat child started: `handle`, `mode`, `pid`, `depth`, `servers` (a count), `priority`, `memory_bytes`, `cpu_seconds` |
-| `subagent.turn` | A warm child finished a turn |
+| `subagent.turn` | A warm child finished a turn, or an instance child answered a message (`tier: instance`; `status: failed` and `err` when it did not) |
 | `subagent.result` | A flat child finished: `handle`, `status`, `tokens`, `err` |
 | `subagent.kill`, `subagent.respawn` | A kill request; a re-spawn after restart |
 | `subagent.kill.escalated` | A killed child had not stopped at its grace and was signalled: `handle`, `signal` (`SIGTERM`, then `SIGKILL`) |
@@ -1233,6 +1249,65 @@ events to watch:
 | `subagent.template.reports_to_changed` | A reload moved a live child's template to another manager, in the document or in the operator's `reports_to`: `template`, `handle`, `from`, `to`; the child keeps running |
 | `a2a.peer.reports_to_changed` | A reload moved a peer's `reports_to`: `peer`, `from`, `to` |
 | `agent.org` | The org chart, `org`, as the status document has it: at load and after a reload that moved it, when anyone in it (this agent, a template or a peer) has a line or a title |
+
+### Read a child's log
+
+`subagent.log {handle}` answers the newest lines of one child's log and a
+cursor: pass the cursor back as `after` and the next read has only what was
+written since. Each line is one of agentd's own JSON log lines, as written.
+Where the lines come from is the child's record, never the caller:
+
+- **An instance child**'s are its own log file, `log` in its directory
+  (`source: file`). At most its last 256 KiB are read, and a line still being
+  written waits for the next read.
+- **A flat worker** writes into this daemon's log. Its lines here are this
+  daemon's lines about it — those naming its `handle`, or written in its
+  `agent_path` — from the in-memory log ring (`source: ring`), which the
+  daemon keeps while `a2a.introspection.enabled` is on. Without the ring the
+  answer has no lines and a `note` saying so; the lines are in the daemon's
+  stderr all the same.
+
+It is the operator's alone, over A2A and as a tool: a turn or a run acting
+for any other principal is refused. A non-durable instance child's directory
+goes when it exits cleanly, and its log with it; a failed child's stays until
+the parent exits.
+
+In the TUI, `l` on a child's detail view opens the log pane, which follows
+new lines while it is open. A workflow reads it with a tool step — here, the
+last lines of a reviewer that did not finish, kept with the run's output:
+
+```yaml
+# fragment: under workflows:
+- name: review
+  steps:
+    start: {kind: manual}
+    review:
+      kind: subagent
+      depends_on: [start]
+      mode: async
+      instruction: "Review the open pull request for correctness regressions."
+    done:
+      kind: wait
+      depends_on: [review]
+      on: subagent
+      subagent: "{{steps.review.output.handle}}"
+      timeout: 30m
+    tail:
+      kind: tool
+      depends_on: [done]
+      when: "steps.done.output.status != 'completed'"
+      name: subagent.log
+      args: {handle: "{{steps.review.output.handle}}", lines: 50}
+    report:
+      kind: finish
+      depends_on: [done, tail]
+      output: {status: "{{steps.done.output.status}}", last_lines: "{{steps.tail.output.lines | null}}"}
+```
+
+What a child logged can carry what it was handed and what it made of it
+(with `observability.log_content: true`, its tool arguments and results), so
+a read of its log is a read-back of the child, held to the same rules as
+`subagent.status` ([Security model](security.md)).
 
 The `agent_subagents_spawned_total` and `agent_subagents_exited_total`
 metrics count every child process, turn and think workers included. Count

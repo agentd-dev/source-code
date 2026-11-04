@@ -463,6 +463,7 @@ op answers with a Task whose `<taskId>.result` artifact carries the result.
 | `subagent.send` | task | user | always | `handle`, `message` |
 | `subagent.kill` | task | a grant | always | `handle`; `reason` |
 | `subagent.status` | message | user | always | `handle` |
+| `subagent.log` | message | operator | always | `handle`; `lines`, `after` |
 | `plan.get` | message | user | always | `id` |
 | `conversation.get` | message | user | introspection on | `id`; `limit` |
 | `run.get` | message | user | introspection on | `run` |
@@ -498,6 +499,18 @@ introspection ops, which answer `INTROSPECTION_DISABLED`.
   `{name, kind, title, reports_to}`, so a client draws the hierarchy
   without joining lists. The lines are labels
   ([Draw the org chart](delegate-subagents.md#draw-the-org-chart)).
+- **`subagent.send`** reaches a warm flat worker and a live instance child.
+  A warm worker's answer is its `result`; an instance child's, once it has
+  one, is its `reply`. `subagent.status` reads both.
+- **`subagent.log`** answers `{handle, source, lines, cursor}`: the newest
+  `lines` (default 200, at most 1000) of the child's log, each one of
+  agentd's own JSON log lines as written. An instance child's are read from
+  the log file in its directory (`source: file`, at most the last 256 KiB);
+  a flat worker's are this instance's lines about it from the in-memory log
+  ring (`source: ring`, kept while `a2a.introspection.enabled` is on —
+  without a ring the answer has no lines and a `note`). Pass `cursor` back as
+  `after` for only the lines written since. The path is the one this
+  instance recorded for the child, never one a caller names.
 - **`admin.drain`** begins a graceful drain, as `SIGTERM` does, and returns
   at once; the process exits `0` when the drain completes, within
   `lifecycle.drain_timeout`.

@@ -69,6 +69,7 @@ pub mod steps;
 #[cfg(feature = "xaa")]
 pub(crate) mod stepup; // step-up sign-ins as consent gates (RFC 0044 §5.10 L4)
 pub(crate) mod streams;
+pub(crate) mod subagent_log; // `subagent.log`: a child's last log lines, for the operator
 pub mod subagents;
 pub mod surface;
 pub(crate) mod taint; // which work read outside text, and which holds delegated data (RFC 0044 P2)

@@ -142,6 +142,9 @@ impl Runtime {
                         if let Some(e) = &s.error {
                             v["error"] = json!(e);
                         }
+                        if let Some(r) = &s.reply {
+                            v["reply"] = r.clone();
+                        }
                         ToolOutcome::Ready(v, false)
                     }
                     None => err(format!("no such subagent {handle:?}")),
@@ -162,6 +165,7 @@ impl Runtime {
                     Some(_) => ToolOutcome::Deferred(PendingKind::Subagent { handle }),
                 }
             }
+            "subagent.log" => self.subagent_log_tool(caller, &args),
             "subagent.list" => {
                 let acting = self.acting_principal(caller.principal.as_deref());
                 ToolOutcome::Ready(
@@ -579,6 +583,7 @@ impl Runtime {
             status: "spawned".into(),
             attempt: 1,
             result: None,
+            reply: None,
             error: None,
             requested_by: Some(
                 json!({"caller": caller.node.map(|n| n.0), "ctx": caller.ctx, "run": caller.run, "step": caller.step, "subagent": caller.subagent, "depth": depth}),
@@ -1249,7 +1254,7 @@ fn secret_free_payload(p: &SpawnPayload) -> Value {
     v
 }
 
-fn distill(v: &Value) -> Value {
+pub(crate) fn distill(v: &Value) -> Value {
     match v {
         Value::String(s) if s.len() > DISTILL_CAP => Value::String(format!(
             "{}… [truncated]",

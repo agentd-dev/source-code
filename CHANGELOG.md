@@ -5,7 +5,20 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.25.0 — talk to a subagent, read its log
+
+The TUI completes with `→`, and a subagent's view holds a message field,
+the child's replies to it, and its log, followed live. A new
+operator-only `subagent.log` reads the log agentd opened for the child and
+nothing else, as an op and as a read-only tool for workflows; an instance
+child's answer to `subagent.send` is read back and matched to the send it
+answers. `/allowances` shows each spending allowance, and `agent.title`
+names this agent in the org chart. A step started just after a person
+signs in waits for the delegated server's tool list instead of failing,
+and the list is fetched again after a transient failure, as long as the
+server asks for, and not after a refusal. agentd-core and agentd-cli
+1.25.0 and @agentd-dev/cli 1.25.0; agentd-mcp 5.0.0 and agentd-net 3.0.1
+are unchanged.
 
 **Added.**
 

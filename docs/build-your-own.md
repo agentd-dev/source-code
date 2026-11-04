@@ -304,7 +304,7 @@ that carries the binary:
 ```text
 agentd-build: warning: CI does not test this combination (cel,cron,metrics,mock-models,tls); the nearest tested set is ci.yml's row "--features cron": it adds cel,metrics,mock-models
 agentd-build: cargo build --release --locked --offline -p agentd-cli --features cel,cron,metrics,mock-models
-agentd-build: built agentd 1.24.0 (release, x86_64-unknown-linux-musl)
+agentd-build: built agentd 1.25.0 (release, x86_64-unknown-linux-musl)
   features         cel,cron,metrics,mock-models,tls
   revision         unknown (source modified: unknown)
   builder          unknown
@@ -510,7 +510,7 @@ docker run --rm agentd:invoices --build-info
   "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
   "source_modified": null,
   "target": "x86_64-unknown-linux-musl",
-  "version": "1.24.0"
+  "version": "1.25.0"
 }
 ```
 
@@ -557,7 +557,7 @@ cosign verify-attestation --type spdxjson ghcr.io/agentd-dev/agentd-builder:late
 
 The identity is the release workflow at a release tag. To accept one
 release only, name it exactly:
-`--certificate-identity https://github.com/agentd-dev/source-code/.github/workflows/release.yml@refs/tags/v1.24.0`.
+`--certificate-identity https://github.com/agentd-dev/source-code/.github/workflows/release.yml@refs/tags/v1.25.0`.
 
 ## Other ways to get agentd
 
@@ -568,7 +568,7 @@ the configuration. Nothing to build, and the image is signed:
 
 ```bash
 curl -fsSL https://agentd.dev/install.sh | sh
-docker run --rm ghcr.io/agentd-dev/agentd:1.24.0 --version
+docker run --rm ghcr.io/agentd-dev/agentd:1.25.0 --version
 ```
 
 [Install](install.md) covers both, and how to verify them.
@@ -579,7 +579,7 @@ BuildKit builds a Git repository by its URL, with no checkout. The
 repository's `Dockerfile` takes the features as a build argument:
 
 ```bash
-docker buildx build --build-arg FEATURES=cel,cron,metrics,mock-models --build-arg BUILD_INFO_FEATURES=cel,cron,metrics,mock-models,tls -t agentd:invoices --load https://github.com/agentd-dev/source-code.git#v1.24.0
+docker buildx build --build-arg FEATURES=cel,cron,metrics,mock-models --build-arg BUILD_INFO_FEATURES=cel,cron,metrics,mock-models,tls -t agentd:invoices --load https://github.com/agentd-dev/source-code.git#v1.25.0
 ```
 
 Use it for a one-off image when you have Docker and nothing else. It

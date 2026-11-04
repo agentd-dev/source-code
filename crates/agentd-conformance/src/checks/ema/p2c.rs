@@ -1486,3 +1486,90 @@ pub(super) fn a_subagent_inherits_what_it_declares(h: &Harness) -> Outcome {
         })
         .and(|| Outcome::require(!leaked, "no token reaches a child"))
 }
+
+/// While the catalogue alice's enrolment lists is on its way, Bob — signed
+/// in on his own device, enrolled nowhere — starts a run whose step names
+/// the same server's tool: his step is refused at once, saying he has no
+/// grant and how to enrol, and does not wait for her catalogue; hers,
+/// started in the same gap, waits and completes.
+pub(super) fn a_person_not_enrolled_is_refused_while_a_catalogue_is_listed(h: &Harness) -> Outcome {
+    let s = Fed::new(
+        h,
+        &FedOpts {
+            device: true,
+            templates: vec![
+                "{name: devices, principals: {source: device}, idp: okta, servers: {linear: {scopes: [\"issues:read\"]}}}",
+            ],
+            first_binding: true,
+            ..FedOpts::default()
+        },
+    );
+    s.xaa.control(json!({"slow_tools_list_ms": 3000}));
+    let _d = s.daemon(h);
+    let (alice, _) = tryo!(s.device_session("laptop"));
+    let (bob, _) = tryo!(s.device_session("phone"));
+    let gap = std::thread::scope(|scope| {
+        let enrol = scope.spawn(|| s.enrol_signed_in(&alice, ALICE));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while s.events("delegation.enrolled").is_empty() {
+            if Instant::now() > deadline {
+                return Err(format!("alice never enrolled:\n{}", tail(&s.log_text())));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let listed = !s.events("delegation.catalogue").is_empty();
+        // His first, to its end: the one run of `who` there is.
+        let his = s.start_as(&bob, "who").and_then(|n| s.ended("who", n));
+        // Bob's run ended before the catalogue it was not waiting for.
+        let before = s.events("delegation.catalogue").is_empty();
+        let hers = s.start_as(&alice, "who");
+        let enrolled = enrol
+            .join()
+            .unwrap_or_else(|_| Err("the enrolment panicked".into()));
+        if listed {
+            return Err("the catalogue landed before the runs were started".into());
+        }
+        Ok((hers?, his?, before, enrolled?))
+    });
+    let (n, his, before, (state, text)) = tryo!(gap);
+    // Hers: the run of `who` that is not his.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let hers = loop {
+        if let Some(r) = s
+            .runs_done("who")
+            .into_iter()
+            .skip(n)
+            .find(|r| r["run"] != his["run"])
+        {
+            break r;
+        }
+        if Instant::now() > deadline {
+            return Outcome::fail(format!("alice's run did not end:\n{}", tail(&s.log_text())));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let err = his["err"].as_str().unwrap_or_default();
+    Outcome::require(
+        state == "TASK_STATE_COMPLETED",
+        format!("alice's enrolment: {state} {text}"),
+    )
+    .and(|| {
+        Outcome::require(
+            his["status"] == "failed"
+                && err.contains("has no grant at okta")
+                && err.contains("delegation.enrol")
+                && !err.contains("catalogue"),
+            format!("bob is told he has no grant, and how to enrol: {his}"),
+        )
+    })
+    .and(|| {
+        Outcome::require(
+            before,
+            format!(
+                "bob's step is refused at once, not after her catalogue lands:\n{}",
+                tail(&s.log_text())
+            ),
+        )
+    })
+    .and(|| completed(&hers))
+}

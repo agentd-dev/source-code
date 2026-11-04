@@ -325,6 +325,17 @@ pub enum Note {
     Elicit(Box<Elicitation>),
 }
 
+/// Where a delegated server's tool catalogue is, while the loop holds
+/// none: what a step that names one of its tools does meanwhile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatalogueDue {
+    /// An enrolment's grant is held and the catalogue is being listed
+    /// with it, or is listed and on its way to the loop: the step waits.
+    Listing,
+    /// The listing failed, for this reason: the step fails saying so.
+    Failed(String),
+}
+
 /// Where notes go.
 pub type Notify = Arc<dyn Fn(Note) + Send + Sync>;
 
@@ -1127,6 +1138,11 @@ pub struct Delegation {
     handles: Mutex<BTreeMap<String, String>>,
     /// Servers whose catalogue is being listed.
     listing: Mutex<BTreeSet<String>>,
+    /// Servers whose catalogue an enrolment is to list and the loop has
+    /// not been handed yet, or whose listing failed: a step that names one
+    /// of their tools waits on the first, and fails saying so on the
+    /// second ([`CatalogueDue`]).
+    catalogue_due: Mutex<BTreeMap<String, CatalogueDue>>,
     /// Servers whose protected-resource metadata confirmed their pins.
     confirmed: Mutex<BTreeSet<String>>,
     /// Each principal's personal key once opened (RFC 0044 §6.4), by
@@ -1436,6 +1452,7 @@ impl Delegation {
             minted: Mutex::new(BTreeMap::new()),
             handles: Mutex::new(BTreeMap::new()),
             listing: Mutex::new(BTreeSet::new()),
+            catalogue_due: Mutex::new(BTreeMap::new()),
             confirmed: Mutex::new(BTreeSet::new()),
             personal: Mutex::new(BTreeMap::new()),
             personal_open: Mutex::new(()),
@@ -3883,7 +3900,8 @@ impl Delegation {
 
     /// List `server`'s tools with the delegated token of whoever `acting`
     /// is — one mint — and keep them: after an enrolment, for each
-    /// templated server whose catalogue is empty.
+    /// templated server whose catalogue is empty. A listing that fails is
+    /// said so to the steps that wait on it ([`CatalogueDue::Failed`]).
     pub fn fill_catalogue(&self, server: &str, who: &Who) -> Result<usize, DelegationError> {
         if !self
             .listing
@@ -3898,7 +3916,37 @@ impl Delegation {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(server);
+        if let Err(e) = &out {
+            self.catalogue_unfetched(server, &e.message);
+        }
         out
+    }
+
+    /// Where `server`'s catalogue is while the loop holds none: being
+    /// listed for an enrolment, or failed to be; `None` when no
+    /// enrolment is listing it.
+    pub fn catalogue_due(&self, server: &str) -> Option<CatalogueDue> {
+        self.catalogue_due
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(server)
+            .cloned()
+    }
+
+    /// `server`'s catalogue could not be listed, for `why`.
+    pub fn catalogue_unfetched(&self, server: &str, why: &str) {
+        self.catalogue_due
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(server.to_string(), CatalogueDue::Failed(why.to_string()));
+    }
+
+    /// The loop holds `server`'s catalogue now.
+    pub fn catalogue_landed(&self, server: &str) {
+        self.catalogue_due
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(server);
     }
 
     fn list_with_grant(&self, server: &str, who: &Who) -> Result<usize, DelegationError> {
@@ -4559,6 +4607,23 @@ impl Delegation {
                 g
             }
         };
+        // The enrolment lists each templated server's empty catalogue once
+        // its grant is held (`enrol`): a step that names one of their tools
+        // meanwhile waits for it, rather than finding none — marked before
+        // the grant can admit anyone, and cleared once the loop holds it.
+        for server in grant.ceilings.keys() {
+            if self
+                .servers
+                .get(server)
+                .is_some_and(|s| s.tools_from == ToolsFrom::FirstGrant)
+                && self.catalogue(server).is_none()
+            {
+                self.catalogue_due
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(server.clone(), CatalogueDue::Listing);
+            }
+        }
         self.remember(&grant);
         drop(held);
         // The refresh token this sign-in replaced is agentd's no longer, so

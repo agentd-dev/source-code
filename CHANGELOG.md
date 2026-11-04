@@ -54,6 +54,20 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   card lists the op. Published in the command extension's vocabulary and
   schema, and in the client's `OPS` and `AgentdClient.subagentLog()`.
 
+**Fixed.**
+
+- **A step started just after a person enrols waits for the server's tool
+  list.** An enrolment keeps the grant, then lists the delegated server's
+  tools with it; a step that named one of those tools in between — a
+  firing of a schedule, say — failed `is not in the delegated server's
+  tool catalogue: the person enrols`, though the person just had. Such a
+  step now waits for the list, for its `timeout` (else 30 s), suspended
+  like a connect wait and costing no attempt, and is judged against it
+  once it lands. A listing that fails or does not finish in time fails the
+  step `the delegated server's tool catalogue could not be fetched: …`,
+  with the reason. A step for someone with no grant is still refused at
+  once.
+
 ## v1.24.0 — the org chart
 
 Reporting lines in the operator's configuration: `reports_to` and `title`

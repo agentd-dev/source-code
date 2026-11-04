@@ -2335,16 +2335,28 @@ impl Runtime {
                         (Some(name), Ok(())) => {
                             self.step_tool_call(run_id, step_id, &step_caller, &name, args)
                         }
-                        (None, Ok(())) => self.finish_step(
-                            run_id,
-                            step_id,
-                            StepStatus::Failed,
-                            None,
-                            Some(format!(
-                                "{server}.{tool} is not in the delegated server's tool catalogue: the person enrols (`agentd --login idp:<name>`), or the operator pins it (auth.tools_from: file)"
-                            )),
-                            0,
-                        ),
+                        // The catalogue an enrolment is listing: the step
+                        // waits for it, and is judged against it then.
+                        (None, Ok(())) => {
+                            if !self.catalogue_wait(
+                                run_id,
+                                step_id,
+                                &server,
+                                &tool,
+                                step.timeout_ms,
+                            ) {
+                                self.finish_step(
+                                    run_id,
+                                    step_id,
+                                    StepStatus::Failed,
+                                    None,
+                                    Some(format!(
+                                        "{server}.{tool} is not in the delegated server's tool catalogue: the person enrols (`agentd --login idp:<name>`), or the operator pins it (auth.tools_from: file)"
+                                    )),
+                                    0,
+                                );
+                            }
+                        }
                     }
                     return;
                 }
@@ -3330,6 +3342,15 @@ impl Runtime {
                     .as_ref()
                     .filter(|w| w["kind"] == "connect_wait")
                     .and_then(|w| w["since"].as_u64());
+                // So does one for a delegated server's catalogue.
+                if let Some(w) = st.wait.as_ref().filter(|w| w["kind"] == "catalogue_wait")
+                    && let Some(at) = w["since"].as_u64()
+                {
+                    self.joining
+                        .catalogue_waits
+                        .entry(format!("{run_id}/{step_id}"))
+                        .or_insert(at);
+                }
                 st.status = StepStatus::Pending;
                 st.wait = None;
             }

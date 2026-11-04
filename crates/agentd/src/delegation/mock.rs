@@ -167,6 +167,10 @@ fn unattended_knobs() -> Value {
         // a revocation.
         "slow_refresh_ms": 0,
         "slow_revoke_ms": 0,
+        // How long the MCP server takes to answer `tools/list`, and
+        // whether it answers it with an error.
+        "slow_tools_list_ms": 0,
+        "tools_list_error": false,
     })
 }
 
@@ -1531,6 +1535,15 @@ fn rpc(id: &Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
+/// The MCP server's `tools/list` result.
+fn tools_listed() -> Value {
+    json!({"tools": [
+    {"name": "list_issues", "description": "List issues", "inputSchema": {"type": "object"}},
+    {"name": "create_issue", "description": "Create an issue",
+     "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}},
+    {"name": "whoami", "description": "Who the token is for", "inputSchema": {"type": "object"}}]})
+}
+
 fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     let origin = s.mcp.trim_end_matches("/mcp").to_string();
@@ -1627,6 +1640,10 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
     };
     let echo = s.flag("mcp_error_echo");
     let elicit = s.knob("elicit").clone();
+    let (slow_list, list_error) = (
+        s.knob("slow_tools_list_ms").as_u64().unwrap_or(0),
+        s.flag("tools_list_error"),
+    );
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(Value::Null);
     // The client's answer to an elicitation this server sent.
     if body.get("method").is_none() && (body.get("result").is_some() || body.get("error").is_some())
@@ -1654,14 +1671,16 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
         )),
         "server/discover" => reply(json!({"jsonrpc": "2.0", "id": id,
                                           "error": {"code": -32601, "message": "Method not found"}})),
-        "tools/list" => reply(rpc(
-            &id,
-            json!({"tools": [
-            {"name": "list_issues", "description": "List issues", "inputSchema": {"type": "object"}},
-            {"name": "create_issue", "description": "Create an issue",
-             "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}},
-            {"name": "whoami", "description": "Who the token is for", "inputSchema": {"type": "object"}}]}),
-        )),
+        "tools/list" if slow_list > 0 || list_error => {
+            std::thread::sleep(std::time::Duration::from_millis(slow_list));
+            if list_error {
+                reply(json!({"jsonrpc": "2.0", "id": id,
+                             "error": {"code": -32603, "message": "the tool list is unavailable"}}))
+            } else {
+                reply(rpc(&id, tools_listed()))
+            }
+        }
+        "tools/list" => reply(rpc(&id, tools_listed())),
         "tools/call" if echo => reply(json!({"jsonrpc": "2.0", "id": id,
             "error": {"code": -32000, "message": format!("the token Bearer {token} is not good here")}})),
         "tools/call" => {

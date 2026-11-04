@@ -116,6 +116,21 @@ pub fn checks() -> Vec<Check> {
             no_mint_at_boot,
         ),
         check(
+            "ema/a-step-in-the-enrolments-gap-waits-for-the-catalogue",
+            "a step started once a person's grant is held, before the catalogue their enrolment lists reaches the loop, waits for it and completes once it lands",
+            a_step_in_the_enrolments_gap_waits,
+        ),
+        check(
+            "ema/a-catalogue-that-cannot-be-fetched-fails-its-waiting-step",
+            "a catalogue the enrolment cannot list fails the step waiting for it, saying the catalogue could not be fetched and why, never that the person must enrol",
+            a_catalogue_that_cannot_be_fetched_fails_the_step_waiting,
+        ),
+        check(
+            "ema/a-person-not-enrolled-is-refused-while-a-catalogue-is-listed",
+            "while one person's enrolment lists a catalogue, a step for a person who holds no grant is refused at once with the enrol error, and does not wait",
+            p2c::a_person_not_enrolled_is_refused_while_a_catalogue_is_listed,
+        ),
+        check(
             "ema/slow-idp-delays-nothing-else",
             "while a mint waits on a slow IdP, an unrelated run starts and finishes",
             slow_idp,
@@ -1996,6 +2011,95 @@ fn kill_switch(h: &Harness) -> Outcome {
                 "no delegated call may succeed once the IdP is gone past the liveness interval",
             )
         })
+}
+
+/// How long the mock MCP server takes to answer `tools/list` in the
+/// enrolment-gap checks: the window between alice's grant being held and
+/// her server's catalogue reaching the loop.
+const SLOW_LIST_MS: u64 = 3000;
+
+/// Sign alice in on another thread while `during` runs, once her grant is
+/// held — `delegation.enrolled` logged — and the listing of her server's
+/// catalogue the enrolment makes is on its way (the mock answers it
+/// [`SLOW_LIST_MS`] late): what `during` saw, and how the sign-in ended.
+fn in_the_enrolments_gap<T: Send>(
+    s: &Setup,
+    h: &Harness,
+    during: impl FnOnce() -> T + Send,
+) -> Result<T, String> {
+    std::thread::scope(|scope| {
+        let login = scope.spawn(|| s.login(h));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while s.events("delegation.enrolled").is_empty() {
+            if Instant::now() > deadline {
+                return Err(format!("alice never enrolled:\n{}", tail(&s.log_text())));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let gap = s.events("delegation.catalogue").is_empty();
+        let out = during();
+        let signed = login
+            .join()
+            .unwrap_or_else(|_| Err("the sign-in panicked".into()));
+        if !gap {
+            return Err("the catalogue landed before the step was started".into());
+        }
+        signed.map(|_| out)
+    })
+}
+
+/// A run started once alice's grant is held but before the catalogue her
+/// enrolment lists has reached the loop: its step waits for the catalogue
+/// (`step.catalogue_wait`) and, once it lands, is made and completes —
+/// rather than failing as if she had never enrolled.
+fn a_step_in_the_enrolments_gap_waits(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"slow_tools_list_ms": SLOW_LIST_MS}),
+        &Opts::default(),
+    );
+    let _d = s.daemon(h);
+    let n = tryo!(in_the_enrolments_gap(&s, h, || s.start("who")));
+    let run = tryo!(s.ended("who", n, Duration::from_secs(30)));
+    let waited = s
+        .events("step.catalogue_wait")
+        .iter()
+        .any(|e| e["run"] == run["run"] && e["server"] == "linear");
+    completed(&run)
+        .and(|| {
+            Outcome::require(
+                waited,
+                format!(
+                    "the step waited for the catalogue:\n{}",
+                    tail(&s.log_text())
+                ),
+            )
+        })
+        .and(|| Outcome::require(s.made("whoami") == 1, "the call is made once it lands"))
+}
+
+/// The catalogue alice's enrolment lists cannot be fetched — the server
+/// answers `tools/list` with an error — while a step waits for it: the
+/// step fails saying the catalogue could not be fetched, and why; never
+/// that she must enrol, which she has.
+fn a_catalogue_that_cannot_be_fetched_fails_the_step_waiting(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"slow_tools_list_ms": SLOW_LIST_MS, "tools_list_error": true}),
+        &Opts::default(),
+    );
+    let _d = s.daemon(h);
+    let n = tryo!(in_the_enrolments_gap(&s, h, || s.start("who")));
+    let run = tryo!(s.ended("who", n, Duration::from_secs(30)));
+    let err = run["err"].as_str().unwrap_or_default();
+    Outcome::require(
+        run["status"] == "failed"
+            && err.contains("the delegated server's tool catalogue could not be fetched")
+            && err.contains("the tool list is unavailable")
+            && !err.contains("the person enrols"),
+        format!("the step says the catalogue could not be fetched: {run}"),
+    )
+    .and(|| Outcome::require(s.made("whoami") == 0, "no call is made"))
 }
 
 fn no_mint_at_boot(h: &Harness) -> Outcome {

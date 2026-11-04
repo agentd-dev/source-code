@@ -398,7 +398,101 @@ fn reads_of(caller: &ToolCaller) -> Option<super::companies::Reads> {
         .then(|| Reads::Conversation(caller.context_id()))
 }
 
+/// How long a step waits for a delegated server's tool catalogue that an
+/// enrolment is listing, when the step names no `timeout` of its own.
+pub(crate) const CATALOGUE_WAIT_MS: u64 = 30_000;
+/// How often a step waiting for one looks again.
+const CATALOGUE_POLL_MS: u64 = 250;
+
 impl Runtime {
+    /// The tool `server.tool` that the admitted step `run_id/step_id` names
+    /// is in no catalogue the loop holds. While an enrolment's grant is
+    /// held and the server's catalogue is being listed with it
+    /// ([`crate::delegation::CatalogueDue::Listing`]), the step waits for it
+    /// — suspended on a durable timer that puts it back to pending, as a
+    /// connect wait does, its attempt not spent — and is judged against it
+    /// once the loop holds it; for the step's `timeout`, else
+    /// [`CATALOGUE_WAIT_MS`]. A listing that failed, or a wait past that,
+    /// fails the step saying the catalogue could not be fetched. `true`
+    /// when the step is held or has failed here; `false` when no
+    /// enrolment is listing the catalogue, for the caller's own error.
+    pub(crate) fn catalogue_wait(
+        &mut self,
+        run_id: &str,
+        step_id: &str,
+        server: &str,
+        tool: &str,
+        step_timeout: Option<u64>,
+    ) -> bool {
+        use crate::delegation::CatalogueDue;
+        use crate::engine::run::StepStatus;
+        let key = format!("{run_id}/{step_id}");
+        let due = self
+            .delegation
+            .as_ref()
+            .and_then(|d| d.catalogue_due(server));
+        let unfetched = |why: &str| {
+            format!(
+                "{server}.{tool}: the delegated server's tool catalogue could not be fetched: {why}"
+            )
+        };
+        let why = match due {
+            None => {
+                self.joining.catalogue_waits.remove(&key);
+                return false;
+            }
+            Some(CatalogueDue::Failed(why)) => unfetched(&why),
+            Some(CatalogueDue::Listing) => {
+                let now = now_ms();
+                let started = *self
+                    .joining
+                    .catalogue_waits
+                    .entry(key.clone())
+                    .or_insert(now);
+                let limit = step_timeout.unwrap_or(CATALOGUE_WAIT_MS);
+                if now.saturating_sub(started) > limit {
+                    unfetched(&format!(
+                        "the enrolment listing it had not finished {} ms after the step asked for it",
+                        limit
+                    ))
+                } else {
+                    match self.timers.arm(
+                        &self.durable,
+                        now + CATALOGUE_POLL_MS,
+                        json!({"kind": "step_budget", "run": run_id, "step": step_id}),
+                        Value::Null,
+                    ) {
+                        Ok(id) => {
+                            if started == now {
+                                self.run_log(run_id).info(
+                                    "step.catalogue_wait",
+                                    json!({"run": run_id, "step": step_id, "server": server}),
+                                );
+                            }
+                            if let Some(r) = self.runs.get_mut(run_id) {
+                                r.suspend_step(
+                                    step_id,
+                                    json!({"kind": "catalogue_wait", "server": server, "timer": id, "since": started}),
+                                );
+                                // The look that found no catalogue is no
+                                // attempt: the next one is.
+                                if let Some(st) = r.steps.get_mut(step_id) {
+                                    st.attempt = st.attempt.saturating_sub(1);
+                                }
+                            }
+                            self.checkpoint(false);
+                            return true;
+                        }
+                        Err(e) => unfetched(&format!("the wait for it could not be armed: {e}")),
+                    }
+                }
+            }
+        };
+        self.joining.catalogue_waits.remove(&key);
+        self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(why), 0);
+        true
+    }
+
     /// Whether `server` is a delegated server.
     pub(crate) fn is_delegated_server(&self, server: &str) -> bool {
         self.delegation
@@ -1954,6 +2048,16 @@ impl Runtime {
             }),
             Note::Catalogue { server, tools } => {
                 let count = tools.len();
+                // Held by the loop from here: a step waiting for it runs at
+                // its next look (`catalogue_wait`), and finds its tool.
+                let landed = |rt: &Self, why: Option<String>| {
+                    if let Some(d) = &rt.delegation {
+                        match why {
+                            None => d.catalogue_landed(&server),
+                            Some(w) => d.catalogue_unfetched(&server, &w),
+                        }
+                    }
+                };
                 match self.registry_with(&server, tools) {
                     Ok(Some(registry)) => {
                         self.registry = registry;
@@ -1962,12 +2066,19 @@ impl Runtime {
                             json!({"server": server, "tools": count}),
                         );
                         self.log_workflow_tools();
+                        landed(self, None);
                     }
-                    Ok(None) => {}
-                    Err(errors) => self.log.warn(
-                        "delegation.catalogue.refused",
-                        json!({"server": server, "errors": errors}),
-                    ),
+                    Ok(None) => landed(self, None),
+                    Err(errors) => {
+                        self.log.warn(
+                            "delegation.catalogue.refused",
+                            json!({"server": server, "errors": errors}),
+                        );
+                        landed(
+                            self,
+                            Some(format!("its tools were refused: {}", errors.join("; "))),
+                        );
+                    }
                 }
             }
             Note::Elicit(e) => self.delegated_elicit(*e),

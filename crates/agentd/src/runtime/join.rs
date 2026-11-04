@@ -59,6 +59,9 @@ pub(crate) struct Joining {
     wanted: std::collections::BTreeSet<String>,
     /// When each step waiting for an on-use server (`run/step`) began to.
     connect_waits: BTreeMap<String, u64>,
+    /// When each step waiting for a delegated server's tool catalogue an
+    /// enrolment is listing (`run/step`) began to (`catalogue_wait`).
+    pub(crate) catalogue_waits: BTreeMap<String, u64>,
     /// The on-use servers whose sign-in failed: not dialed again until
     /// something needs one anew, so a refused sign-in does not ask again on
     /// every backoff.

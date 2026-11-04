@@ -656,6 +656,17 @@ Open https://acme.okta.com/activate and enter the code WDJB-MJHT (it expires in 
 operator:alice is enrolled at okta as 00u1alice (template eng-tools): agentd acts as them on linear until 2026-11-18; listed linear (12 tools)
 ```
 
+**The tool list.** Unless the operator pins it (`tools_from: file`), a
+delegated server's tools are what its first enrolment lists: once the grant
+is kept, agentd lists the server's tools with it (`listed linear (12
+tools)` above) and keeps the list. A workflow step that names one of the
+server's tools while that listing is still on its way waits for it — for
+the step's `timeout`, else 30 s — and is judged against the list once it
+lands. A listing that fails, or does not finish in that time, fails the
+step with `the delegated server's tool catalogue could not be fetched: …`
+and the reason. A step for someone who holds no grant at all is refused at
+once, telling them how to enrol.
+
 **Who may delegate.** Whoever an `identity.delegation.templates` entry
 admits, by the principal's `source` — nobody else:
 

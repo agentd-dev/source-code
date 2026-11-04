@@ -138,56 +138,32 @@ pub struct Parsed {
     /// The SDK's diagnostics — the reader's, the inline checks', the
     /// workflow bodies' and the 1.1 lines' — none of them an error.
     pub diagnostics: Vec<Diagnostic>,
-    /// Each `allowance`'s attributes as the SDK composed them, by the line
-    /// it opens on: its `${parameter}` amounts resolved (S29 §2). Empty
-    /// when the document has none.
-    pub allowances: BTreeMap<u32, Map<String, Value>>,
-    /// The agent text as the SDK composed it, when an allowance's amount
-    /// is a `${parameter}`: the reader's text leaves it unresolved in the
-    /// allowance's sentence, and S29 §6 delivers amounts as they resolve.
-    composed_text: Option<String>,
-}
-
-/// The diagnostics only composition raises about an allowance (S29 §4):
-/// its values once parameters resolve, and what its `wallet`, `approver`
-/// and `&service` payees name.
-fn allowance_code(code: &str) -> bool {
-    code.starts_with("allowance-") || code == "reference-missing" || code == "reference-kind"
-}
-
-/// What [`compose_allowances`] found.
-#[derive(Default)]
-struct Composed {
-    /// Each allowance's attributes, by the line it opens on.
-    allowances: BTreeMap<u32, Map<String, Value>>,
-    /// The composer's errors about an allowance.
-    errors: Vec<Diagnostic>,
-    /// The composed agent text ([`Parsed::composed_text`]).
-    text: Option<String>,
+    /// Each `allowance`'s attributes as the SDK composed them, by its id:
+    /// its `${parameter}` amounts resolved (S29 §2). Empty when the
+    /// document has none.
+    pub allowances: BTreeMap<String, Map<String, Value>>,
 }
 
 /// The SDK's composition of a document that has allowances, with nothing
 /// to compose it with — agentd loads no base and no include — for what the
 /// reader alone cannot say of them: each allowance's resolved attributes,
-/// by its line, and the composer's errors about it. Nothing for a document
-/// with none.
-fn compose_allowances(text: &str, reading: &Reading) -> Composed {
-    let mut lines = BTreeSet::new();
-    let mut pending = false;
+/// by its id, and the composer's errors about it (each targets `#<id>`).
+/// Nothing for a document with none.
+fn compose_allowances(
+    text: &str,
+    reading: &Reading,
+) -> (BTreeMap<String, Map<String, Value>>, Vec<Diagnostic>) {
+    let mut ids = BTreeSet::new();
     instruction_md::walk(&reading.document.body, &mut |n, _| {
         if n.kind == "allowance"
-            && let Some(r) = n.range
+            && let Some(id) = n.attrs.get("id").and_then(Value::as_str)
         {
-            lines.insert(r.start);
-            pending |= n
-                .attrs
-                .values()
-                .any(|v| v.as_str().is_some_and(|s| s.contains("${")));
+            ids.insert(id.to_string());
         }
         true
     });
-    if lines.is_empty() {
-        return Composed::default();
+    if ids.is_empty() {
+        return (BTreeMap::new(), Vec::new());
     }
     let res = instruction_md::resolve_with(
         text,
@@ -197,42 +173,34 @@ fn compose_allowances(text: &str, reading: &Reading) -> Composed {
     let mut resolved = BTreeMap::new();
     instruction_md::walk(&res.resolved.body, &mut |n, _| {
         if n.kind == "allowance"
-            && let Some(r) = n.range
-            && lines.contains(&r.start)
+            && let Some(id) = n.attrs.get("id").and_then(Value::as_str)
+            && ids.contains(id)
         {
-            resolved.entry(r.start).or_insert_with(|| n.attrs.clone());
+            resolved
+                .entry(id.to_string())
+                .or_insert_with(|| n.attrs.clone());
         }
         true
     });
-    // The composed text only where the reader's would deliver an amount
-    // unresolved, and only for a document that composes nothing agentd
-    // leaves unloaded.
-    let composes = reading.document.metadata.front.get("extends").is_some();
-    let composed_text = (pending && !composes).then(|| res.text.clone());
     let errors = res
         .diagnostics
         .into_iter()
         .filter(|d| {
             d.is_error()
                 && d.uri.is_empty()
-                && allowance_code(d.code)
-                && d.line().is_some_and(|l| lines.contains(&l))
+                && d.target
+                    .strip_prefix('#')
+                    .is_some_and(|id| ids.contains(id))
         })
         .collect();
-    Composed {
-        allowances: resolved,
-        errors,
-        text: composed_text,
-    }
+    (resolved, errors)
 }
 
 impl Parsed {
     /// The agent text (`instruction-text/1`), declared defaults substituted
-    /// — in an allowance's sentence too ([`Parsed::composed_text`]).
+    /// — in an allowance's sentence too.
     pub fn text(&self) -> String {
-        self.composed_text
-            .clone()
-            .unwrap_or_else(|| self.reading.text(None))
+        self.reading.text(None)
     }
 }
 
@@ -248,11 +216,7 @@ impl Parsed {
 pub fn parse(text: &str) -> Result<Parsed, Vec<Refusal>> {
     let reading = instruction_md::read(text, &ReadOptions::default());
     let mut diagnostics = instruction_md::check_reading(&reading);
-    let Composed {
-        allowances,
-        errors: composed,
-        text: composed_text,
-    } = compose_allowances(text, &reading);
+    let (allowances, composed) = compose_allowances(text, &reading);
     for d in composed {
         if !diagnostics
             .iter()
@@ -273,7 +237,6 @@ pub fn parse(text: &str) -> Result<Parsed, Vec<Refusal>> {
             reading,
             diagnostics,
             allowances,
-            composed_text,
         })
     } else {
         Err(errors)
@@ -745,7 +708,7 @@ fn fold_knowing(
                 id: id.to_string(),
                 attrs: parsed
                     .allowances
-                    .get(&start)
+                    .get(id)
                     .cloned()
                     .unwrap_or_else(|| n.attrs.clone()),
                 line: start as usize,

@@ -976,27 +976,24 @@ fn document_wallet<'p>(
     if w.rails.is_empty() {
         return Ok(name);
     }
+    use instruction_md::protocol::{Compat, parse, shared_versions};
     let mut x402 = Vec::new();
     for r in &w.rails {
-        if !instruction_md::allowance::protocol_ok(r) {
+        let Some(p) = parse(r) else {
             return Err((
                 format!("its rail {r:?} is not a protocol name, optionally with versions (S28)"),
                 policy,
             ));
-        }
-        let (proto, versions) = match r.split_once('/') {
-            Some((n, v)) => (n, Some(v)),
-            None => (r.as_str(), None),
         };
-        if proto == "x402" {
-            x402.push(versions);
+        if p.name == "x402" {
+            x402.push(p);
         }
     }
-    // A bare `x402` is every version its binding marks stable — 2 (S28 §1).
-    if x402
-        .iter()
-        .any(|v| v.is_none_or(|v| v.split(',').any(|x| x == "2")))
-    {
+    // agentd pays x402 version 2, the one its binding marks stable: a bare
+    // `x402` is it (S28 §1), and `x402/1` alone shares none.
+    if x402.iter().any(|p| {
+        !shared_versions(p, &X402_VERSIONS, Compat::Exact, Some(&X402_VERSIONS)).is_empty()
+    }) {
         return Ok(name);
     }
     if x402.is_empty() {
@@ -1012,8 +1009,7 @@ fn document_wallet<'p>(
         format!(
             "its rails name x402 {} only, and agentd pays with x402 version 2",
             x402.iter()
-                .flatten()
-                .copied()
+                .flat_map(|p| p.versions.iter().map(String::as_str))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -1056,6 +1052,12 @@ fn document_allowance(
         .find_map(|v| v.as_str().filter(|s| s.contains("${")).map(str::to_string))
     {
         return Err(format!("{v:?} did not resolve to a value"));
+    }
+    // The values agentd maps, held to the allowance's own checks (S29 §4)
+    // as resolved: the document refused one already, so this holds only
+    // what reached here otherwise.
+    if let Some(p) = instruction_md::allowance::problems(&a.attrs).first() {
+        return Err(format!("{} ({})", p.message, p.code));
     }
     let wallets = match listed("wallet") {
         None => None,
@@ -1173,6 +1175,10 @@ pub struct StepPayment {
 /// The prefix of an instruction document's own allowances in the spending
 /// engine (RFC 0057 §8): `doc:<id>`, which no operator id can be.
 pub const DOCUMENT_PREFIX: &str = "doc:";
+
+/// The x402 versions agentd pays with, and the ones its binding marks
+/// stable (S28): version 2 alone.
+const X402_VERSIONS: [&str; 1] = ["2"];
 
 /// Read a step's `payment` against the policy `p`. `document`: the step is
 /// an instruction document's, which pays only under one of the document's

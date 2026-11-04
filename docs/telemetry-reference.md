@@ -411,6 +411,7 @@ its `jti`.
 | `delegation.quota_warn` | info | `day`, `grant_id`, `month`, `per_day`, `per_month`, `resource` | A mint brought a day or a month to 80% of its budget. |
 | `delegation.catalogue` | info | `server`, `tools` | A delegated server's tools joined the registry, listed with a delegated token. |
 | `delegation.catalogue.refused` | warn | `errors`, `server` | The listed tools did not fit the registry. |
+| `delegation.catalogue.retry` | warn | `attempt`, `err`, `server` | The tool list an enrolment fetches from `server` failed transiently — a connection that failed or timed out, a `429` or `5xx`, an IdP that did not answer the mint — with `err`, and is fetched again as `attempt` (2–4) after 250 ms, 1 s, then 4 s, on the enrolment's thread. A step waiting for the list keeps waiting meanwhile; after the last attempt, or a non-transient error, the steps waiting fail `the delegated server's tool catalogue could not be fetched`. |
 | `delegation.unbound` | warn | `grant_id`, `note`, `server` | An ID-JAG named no resource and `allow_unbound_at` admitted it. |
 | `delegation.probe.failed` | warn | `code`, `err`, `grant_id` | A liveness probe failed; the grant's tokens were dropped. |
 | `delegation.register.unanchored` | warn | `err`, `grant_id`, `msg` | A floor of the tombstone register could not be anchored in the audit chain. The store's register was raised and a revoked record deleted all the same; the anchor is tried again at the next raise and the next start. `grant_id` is null for the anchors tried at start. |
@@ -880,6 +881,7 @@ an instruction's by `origin: instruction` and `name`.
 |---|---|---|---|
 | `step.cache.not_kept` | info | `run`, `step`, `why` | A step's output was not memoized under its `cache`: the run holds a person's delegated data, which the cache — every run's, keyed by no principal — never keeps. |
 | `step.cache_hit` | info | `run`, `step` | The step's output came from its `cache`; the run takes on what the run that produced it carried (its taint, its origins). |
+| `step.catalogue_wait` | info | `run`, `server`, `step` | A step names a delegated server's tool while the tool list an enrolment fetches from `server` is still on its way: it waits for it — for its `timeout`, else 30 s — and is judged against the list once it lands. Logged once per wait. |
 | `step.done` | info | `attempt`, `err`, `run`, `status`, `step`, `tokens` | A workflow step ended with `status`. In the span of the attempt, as `step.start` and `step.retry` are. |
 | `step.goto` | info | `from`, `run`, `to` |  |
 | `step.output.artifact` | info | `artifact`, `run`, `size`, `step` |  |

@@ -66,7 +66,11 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   once it lands. A listing that fails or does not finish in time fails the
   step `the delegated server's tool catalogue could not be fetched: …`,
   with the reason. A step for someone with no grant is still refused at
-  once.
+  once. The fetch itself, made once before, is tried again after a
+  transient failure — a connection that failed or timed out, a `429` or
+  `5xx`, an IdP that did not answer — after 250 ms, 1 s and 4 s, each
+  logged as `delegation.catalogue.retry`; a `4xx`, a refused credential
+  or the server's own error answer fails it at once.
 
 ## v1.24.0 — the org chart
 

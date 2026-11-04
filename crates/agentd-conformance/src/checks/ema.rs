@@ -126,6 +126,11 @@ pub fn checks() -> Vec<Check> {
             a_catalogue_that_cannot_be_fetched_fails_the_step_waiting,
         ),
         check(
+            "ema/a-listing-whose-connection-fails-is-tried-again",
+            "a post-enrolment tool-list fetch whose connection fails is tried again, logged once as delegation.catalogue.retry, and the step waiting in the gap completes",
+            a_listing_whose_connection_fails_is_tried_again,
+        ),
+        check(
             "ema/a-person-not-enrolled-is-refused-while-a-catalogue-is-listed",
             "while one person's enrolment lists a catalogue, a step for a person who holds no grant is refused at once with the enrol error, and does not wait",
             p2c::a_person_not_enrolled_is_refused_while_a_catalogue_is_listed,
@@ -2076,6 +2081,38 @@ fn a_step_in_the_enrolments_gap_waits(h: &Harness) -> Outcome {
             )
         })
         .and(|| Outcome::require(s.made("whoami") == 1, "the call is made once it lands"))
+}
+
+/// The first `tools/list` the enrolment sends is closed unanswered, as a
+/// server under load may: the listing is tried again once
+/// (`delegation.catalogue.retry`), while the step started in the gap
+/// keeps waiting, and the step completes once the second answer lands.
+fn a_listing_whose_connection_fails_is_tried_again(h: &Harness) -> Outcome {
+    let s = Setup::new(
+        h,
+        json!({"slow_tools_list_ms": SLOW_LIST_MS, "tools_list_drop_once": true}),
+        &Opts::default(),
+    );
+    let _d = s.daemon(h);
+    let n = tryo!(in_the_enrolments_gap(&s, h, || s.start("who")));
+    let run = tryo!(s.ended("who", n, Duration::from_secs(30)));
+    let retries = s.events("delegation.catalogue.retry");
+    completed(&run)
+        .and(|| {
+            Outcome::require(
+                retries.len() == 1
+                    && retries[0]["server"] == "linear"
+                    && retries[0]["attempt"] == 2
+                    && retries[0]["err"].as_str().is_some_and(|e| !e.is_empty()),
+                format!("one retry, logged once: {retries:?}"),
+            )
+        })
+        .and(|| {
+            Outcome::require(
+                s.made("whoami") == 1,
+                "the call is made once the list lands",
+            )
+        })
 }
 
 /// The catalogue alice's enrolment lists cannot be fetched — the server

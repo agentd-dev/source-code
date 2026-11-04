@@ -171,6 +171,8 @@ fn unattended_knobs() -> Value {
         // whether it answers it with an error.
         "slow_tools_list_ms": 0,
         "tools_list_error": false,
+        // The next `tools/list` gets no answer: its connection is closed.
+        "tools_list_drop_once": false,
     })
 }
 
@@ -1535,6 +1537,16 @@ fn rpc(id: &Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
 }
 
+/// Whether the flag `knob` is set, clearing it: a fault the mock plays once.
+fn take_once(state: &Arc<Mutex<State>>, knob: &str) -> bool {
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let set = s.flag(knob);
+    if set {
+        s.knobs[knob] = json!(false);
+    }
+    set
+}
+
 /// The MCP server's `tools/list` result.
 fn tools_listed() -> Value {
     json!({"tools": [
@@ -1671,6 +1683,8 @@ fn mcp(stream: &TcpStream, req: &Http, state: &Arc<Mutex<State>>) {
         )),
         "server/discover" => reply(json!({"jsonrpc": "2.0", "id": id,
                                           "error": {"code": -32601, "message": "Method not found"}})),
+        // Closed unanswered, once: the client sees its connection fail.
+        "tools/list" if take_once(state, "tools_list_drop_once") => {}
         "tools/list" if slow_list > 0 || list_error => {
             std::thread::sleep(std::time::Duration::from_millis(slow_list));
             if list_error {

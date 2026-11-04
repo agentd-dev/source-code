@@ -325,6 +325,50 @@ pub enum Note {
     Elicit(Box<Elicitation>),
 }
 
+/// The waits before each retry of a post-enrolment tool-list fetch that
+/// failed transiently ([`transient_listing`]): three retries over about
+/// five seconds, then the listing has failed.
+const CATALOGUE_RETRY: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(4),
+];
+
+/// Whether a failed tool-list fetch may succeed if tried again: the IdP
+/// did not answer the mint, or the server's connection failed — refused,
+/// reset or closed, timed out, answered no JSON-RPC response, or answered
+/// `429` or a `5xx`. A `4xx`, a refused credential, or the server's own
+/// JSON-RPC error answer is not: trying again would be answered the same.
+fn transient_listing(e: &DelegationError) -> bool {
+    match e.code {
+        Code::IdpUnavailable => true,
+        Code::ResourceFault => {
+            let m = e.message.as_str();
+            if let Some(at) = m.find("server returned HTTP ") {
+                let status: u16 = m[at + "server returned HTTP ".len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .unwrap_or(0);
+                return status == 429 || (500..600).contains(&status);
+            }
+            if m.contains("not sent, no credential") || m.contains("no GET SSE") {
+                return false;
+            }
+            [
+                "Transport channel closed",
+                "timed out",
+                "no JSON-RPC response",
+                "mcp-http: ",
+            ]
+            .iter()
+            .any(|t| m.contains(t))
+        }
+        _ => false,
+    }
+}
+
 /// Where a delegated server's tool catalogue is, while the loop holds
 /// none: what a step that names one of its tools does meanwhile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3911,7 +3955,22 @@ impl Delegation {
         {
             return Ok(0);
         }
-        let out = self.list_with_grant(server, who);
+        // A transient failure is tried again, on this thread — the
+        // enrolment's, never the loop's — while the server stays
+        // `Listing`, so a step waiting for it keeps waiting.
+        let mut out = self.list_with_grant(server, who);
+        for (n, wait) in CATALOGUE_RETRY.iter().enumerate() {
+            let Err(e) = &out else { break };
+            if !transient_listing(e) {
+                break;
+            }
+            self.log.warn(
+                "delegation.catalogue.retry",
+                json!({"server": server, "attempt": n + 2, "err": e.message}),
+            );
+            std::thread::sleep(*wait);
+            out = self.list_with_grant(server, who);
+        }
         self.listing
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3982,9 +4041,11 @@ impl Delegation {
         };
         self.token(s, &grant, &scopes, &entry, &c, firing.as_ref(), true)?;
         let client = self.client(s, &entry, &grant)?;
-        let tools = client
-            .list_tools()
-            .map_err(|e| refuse(Code::ResourceFault, format!("{server}: tools/list: {e}")))?;
+        let tools = client.list_tools().map_err(|e| {
+            // A connection that failed is not the next attempt's.
+            self.reset_client(&entry);
+            refuse(Code::ResourceFault, format!("{server}: tools/list: {e}"))
+        })?;
         if let Some(h) = entry
             .token
             .lock()
@@ -4894,6 +4955,38 @@ impl Delegation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tool-list fetch is tried again after a connection that failed, a
+    /// `429` or a `5xx`, or an IdP that did not answer; never after a
+    /// `4xx`, a refused credential or the server's own JSON-RPC error.
+    #[test]
+    fn a_listing_is_tried_again_only_after_a_transient_failure() {
+        let fault = |m: &str| refuse(Code::ResourceFault, m);
+        for m in [
+            "linear: mcp: transport: mcp server 'linear': server/discover: Method not found (-32601); initialize: Send message error Transport [rmcp] error: Transport channel closed, when send initialized notification",
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: mcp-http: connect: Connection refused (os error 111)",
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: mcp-http: failed to fill whole buffer",
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: mcp-http: server returned HTTP 503",
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: mcp-http: server returned HTTP 429 and asked for no request for 2s",
+            "linear: mcp: transport: mcp server 'linear': handshake timed out after 5000 ms",
+        ] {
+            assert!(transient_listing(&fault(m)), "{m}");
+        }
+        assert!(transient_listing(&refuse(
+            Code::IdpUnavailable,
+            "okta did not answer"
+        )));
+        for m in [
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: mcp-http: server returned HTTP 404",
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: mcp-http: server returned HTTP 401: invalid_token",
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: mcp-http: not sent, no credential: none",
+            "linear: tools/list: mcp: transport: mcp server 'linear': tools/list: the tool list is unavailable (-32603)",
+        ] {
+            assert!(!transient_listing(&fault(m)), "{m}");
+        }
+        assert!(!transient_listing(&refuse(Code::ScopeBeyondCeiling, "x")));
+        assert!(!transient_listing(&refuse(Code::NotEnrolled, "x")));
+    }
 
     /// A step-up's fresh ID token is the subject of the call it was signed
     /// in for alone: another server's, another unit of work's or another

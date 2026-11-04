@@ -662,7 +662,11 @@ is kept, agentd lists the server's tools with it (`listed linear (12
 tools)` above) and keeps the list. A workflow step that names one of the
 server's tools while that listing is still on its way waits for it — for
 the step's `timeout`, else 30 s — and is judged against the list once it
-lands. A listing that fails, or does not finish in that time, fails the
+lands. A fetch that fails transiently — the connection failed or timed
+out, the server answered `429` or a `5xx`, the IdP did not answer — is
+tried again after 250 ms, 1 s and 4 s (`delegation.catalogue.retry`); a
+`4xx`, a refused credential or the server's own error answer is not. A
+listing that fails, or does not finish in that time, fails the
 step with `the delegated server's tool catalogue could not be fetched: …`
 and the reason. A step for someone who holds no grant at all is refused at
 once, telling them how to enrol.

@@ -25,7 +25,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   operator allowance. A document's `approver=#person` is answered by the
   principal the operator binds in the new `security.payments.approvers`;
   unbound, the allowance pays only up to `approve-above`
-  (`approver-unbound`). Without the grant the allowances are delivered as
+  (`approver-unbound`); that approver answers only the allowance's own `approve-above`, every other trigger asks the operator's approver, and when several ask every one of them must say yes. A document allowance with `payees` pays only on an `http` step (`rail-cannot-enforce: payees` on a tool or a peer). Without the grant the allowances are delivered as
   text and nothing is paid under them, said once. A re-release that changes
   an allowance applies at once, counting what was spent. `payments.allowances`
   and `payment.allowances` mark each allowance `source: operator` or

@@ -237,7 +237,11 @@ and S28 (protocol names for a wallet's `rails`) in the official SDK,
   resolve; `max` absent is the budget; a date-only window is whole days in
   UTC (the SDK's `instant`); its `payees` are origin hosts (a domain as
   written, an `&service`'s `src` host), matched against the paid
-  resource's host beside the operator's payee list, never instead of it;
+  resource's host beside the operator's payee list, never instead of it —
+  and only where agentd requested the resource itself (an `http` step,
+  held to the payment request by `same_resource`); on an MCP tool or an
+  A2A peer's task the server names the resource, so an allowance with
+  `payees` is refused there, `rail-cannot-enforce: payees`;
   `categories` is refused on x402, `rail-cannot-enforce`. It never adds a
   payee or a wallet the operator didn't allow: one that draws on no
   operator wallet is held.
@@ -258,7 +262,23 @@ and S28 (protocol names for a wallet's `rails`) in the official SDK,
   one. An allowance whose approver isn't bound pays only up to
   `approve-above`, refuses above it `approver-unbound`, and the load warns
   once. `approve-above` with no approver asks `security.payments.approver`.
-  The agent is never the approver.
+  The agent is never the approver. The document's approver answers only
+  the document allowance's own tier:
+
+  | Tier | What asks | Who is asked |
+  |---|---|---|
+  | document | above the document allowance's `approve-above` | its bound approver, else `security.payments.approver` |
+  | ceiling | above the `document_ceiling` allowance's `approve_above` | that allowance's `approver`, else `security.payments.approver` |
+  | operator | an asset's `approve_above`, `approve: true`, outside text, a model's request | `security.payments.approver` |
+
+  Every approver a tier names must say yes, each on a gate of their own,
+  in the order of the table (one approver of two tiers is asked once); a no
+  declines; the record names each approval and who gave it. When the last
+  yes lands every tier is judged again against the settings then, and a
+  tier that now asks, or names another approver, is asked before anything
+  is paid; an answer is held to the approver of the tiers its gate was
+  opened for, as in force when it lands. Under an operator allowance the
+  allowance's approver answers every trigger, as before.
 - **Paying from a document.** A document's workflow with a paying step is
   refused (RFC 0049 D2) unless the document has an allowance in force; its
   step must then name one of them (`payment: {allowance: <id>}`, read as

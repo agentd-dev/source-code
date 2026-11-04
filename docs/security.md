@@ -1953,7 +1953,7 @@ before anything is signed:
   `security.payments.document_ceiling` holds all document spending to one
   operator allowance) and no approver (its `#person` is answered only by
   the principal the operator binds in `security.payments.approvers`, never
-  an agent; unbound, nothing above `approve-above` is paid). A document
+  an agent, and only for its own `approve-above`: every other trigger asks the operator's approver, and every approver whose rule asks must say yes; unbound, nothing above `approve-above` is paid). A document
   without the grant is text, and its paying step refuses the load.
 - **The approver's gate.** Above `approve_above`, for a step that says
   `approve: true`, and — with `ask_when_tainted`, the default — for work

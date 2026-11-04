@@ -443,7 +443,12 @@ What it becomes:
 - **Payees** are origin hosts: a domain matches the paid resource's host
   exactly, an `&service` the host of its `src`. A document's payee is only
   ever matched among your payees: a payment must pass your payee list (by
-  address) and the document's (by host).
+  address) and the document's (by host). Only a URL agentd requested
+  itself has a host it can hold: an `http` step's. On an `mcp.tool`,
+  `a2a.send` or `a2a.delegate` step the server names the resource, so a
+  document allowance with `payees` is refused there,
+  `rail-cannot-enforce: payees`; one without `payees` pays within your
+  payee list.
 - **It only narrows.** Every asset cap (`per_payment`, `per_run`,
   `per_day`, `per_payee`), your payee list and the step's `max` still hold.
   `security.payments.document_ceiling` names one of your allowances that
@@ -454,7 +459,25 @@ What it becomes:
   in `security.payments.approvers` — a person, never an agent. Unbound, the
   allowance pays only up to `approve-above` and refuses above it,
   `approver-unbound`; the load warns once. `approve-above` with no approver
-  asks `security.payments.approver`.
+  asks `security.payments.approver`. The document's approver answers only
+  its own allowance's `approve-above`. Who is asked, under a document
+  allowance:
+
+  | What asks | Who is asked |
+  |---|---|
+  | above the document allowance's `approve-above` | the principal bound to its `approver` in `security.payments.approvers`; with no `approver`, `security.payments.approver` |
+  | above the `document_ceiling` allowance's `approve_above` | that allowance's `approver`, else `security.payments.approver` |
+  | above the asset's `approve_above`; the step's `approve: true`; a run that read outside text or that a model asked for (`ask_when_tainted`) | `security.payments.approver` |
+
+  When several ask, every approver they name must say yes, each on a gate
+  of their own, in that order (one approver named twice is asked once); a
+  no from any of them declines the payment, and the payment's record names
+  every approval and who gave it. When the last yes lands, each rule is
+  checked again against the configuration then: one a reload made ask, or
+  gave another approver, is asked before anything is paid, and an answer
+  from an approver a reload replaced approves nothing. Under your own
+  allowances nothing changes: the allowance's `approver` answers every
+  trigger, as you chose.
 - **Paying from the document.** The document's own workflow may pay only
   under one of its own allowances: `payment: {allowance: data}` (or
   `doc:data`). A step naming one of your allowances, or giving its own

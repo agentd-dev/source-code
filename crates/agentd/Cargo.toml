@@ -248,7 +248,7 @@ serde_json = "1"
 # checks, the agent text, digests and signature verification. `config::idoc`
 # maps its document model onto agentd's configuration. Its dependencies are
 # serde, serde_json and ring, all already in the tree.
-instruction-md = { version = "0.1", features = ["verify"] }
+instruction-md = { version = "0.2", features = ["verify"] }
 
 # --- feature: cron --- hand-rolled in triggers/timer.rs; no dependency.
 

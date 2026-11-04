@@ -347,7 +347,7 @@ const TWICE: &str = "  - name: nightly\n    act_for: {principal: {source: operat
 impl Setup {
     /// The binding message of the first CIBA request, once one is sent.
     fn first_binding(&self) -> Result<String, String> {
-        self.until("a CIBA request", Duration::from_secs(30), &|| {
+        self.until("a CIBA request", Duration::from_secs(60), &|| {
             !self.ciba_requests().is_empty()
         })?;
         Ok(self.ciba_requests()[0]["body"]["binding_message"]
@@ -372,25 +372,6 @@ impl Setup {
             .collect()
     }
 
-    /// Whether the store holds a run whose step `w` is suspended — the
-    /// [`TWICE`] run waiting on `go`, durably.
-    fn held_on_go(&self) -> bool {
-        fn suspended_w(v: &Value) -> bool {
-            if v.pointer("/steps/w/status").and_then(Value::as_str) == Some("suspended") {
-                return true;
-            }
-            match v {
-                Value::Object(m) => m.values().any(suspended_w),
-                Value::Array(a) => a.iter().any(suspended_w),
-                _ => false,
-            }
-        }
-        self.store_bytes()
-            .iter()
-            .filter_map(|(_, b)| serde_json::from_slice::<Value>(b).ok())
-            .any(|v| suspended_w(&v))
-    }
-
     /// Kill the daemon as a crash would: nothing it holds in memory is
     /// revoked or written.
     fn crash(&self) {
@@ -408,11 +389,13 @@ impl Setup {
         std::thread::sleep(Duration::from_millis(300));
     }
 
-    /// The store's files that keep an approval's refresh token.
-    fn approvals_kept(&self) -> Vec<(PathBuf, Vec<u8>)> {
-        self.store_bytes()
+    /// The store's records that keep an approval's refresh token: committed
+    /// files alone, so a write mid-rename is not one record twice.
+    fn approvals_kept(&self) -> Vec<PathBuf> {
+        self.store_records()
             .into_iter()
-            .filter(|(p, _)| p.components().any(|c| c.as_os_str() == "approval"))
+            .map(|(p, _)| p)
+            .filter(|p| p.components().any(|c| c.as_os_str() == "approval"))
             .collect()
     }
 
@@ -432,18 +415,37 @@ impl Setup {
             .collect()
     }
 
-    /// How the runs' records the store keeps say their firings asked, per
-    /// grant: `once`, `again` or `refused`.
-    fn asked_recorded(&self) -> Vec<String> {
-        self.store_bytes()
-            .into_iter()
-            .filter_map(|(_, b)| serde_json::from_slice::<Value>(&b).ok())
-            .filter_map(|v| v["state"]["unattended"]["asked"].as_object().cloned())
-            .flat_map(|m| {
-                m.into_values()
-                    .filter_map(|v| v.as_str().map(str::to_string))
+    /// The id of the run of `nightly` the CIBA binding message `binding`
+    /// names, once the store holds its record.
+    fn run_named(&self, binding: &str) -> Result<String, String> {
+        let find = || {
+            self.store_records().into_iter().find_map(|(_, v)| {
+                let r = v["state"]["id"].as_str()?;
+                (v["state"]["workflow"] == "nightly" && run_of(binding, &json!({"run": r})))
+                    .then(|| r.to_string())
             })
-            .collect()
+        };
+        self.until(
+            &format!("a record of the run {binding:?} names"),
+            Duration::from_secs(20),
+            &|| find().is_some(),
+        )?;
+        find().ok_or_else(|| format!("no record of the run {binding:?} names"))
+    }
+
+    /// How run `id`'s record says its firing asked, per grant: `once`,
+    /// `again` or `refused` — that one run's record, never another run's
+    /// nor a write's temp file beside it.
+    fn asked_recorded(&self, id: &str) -> Result<Vec<String>, String> {
+        let r = self.run_record(id)?;
+        Ok(r["state"]["unattended"]["asked"]
+            .as_object()
+            .map(|m| {
+                m.values()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -516,17 +518,12 @@ pub(super) fn a_ciba_firing_asks_once_more_after_a_restart(h: &Harness) -> Outco
     tryo!(s.until(
         "the first call made, and the run held on `go` in the store",
         Duration::from_secs(40),
-        &|| s.made("whoami") >= 1 && s.held_on_go()
+        &|| s.made("whoami") >= 1 && s.holds_suspended("w")
     ));
     let binding = tryo!(s.first_binding());
-    std::thread::sleep(Duration::from_millis(500));
     drop(d);
     let _d = s.daemon(h);
-    std::thread::sleep(Duration::from_millis(500));
-    let fired = s.op("workflow.signal", json!({"name": "go"}));
-    if fired.get("error").is_some() {
-        return Outcome::fail(format!("signal: {fired}"));
-    }
+    tryo!(s.signal_until_delivered("go", Duration::from_secs(30)));
     let run = tryo!(s.ended("nightly", 0, Duration::from_secs(40)));
     let asked = s.asked_for(&binding);
     let again = s
@@ -613,7 +610,7 @@ pub(super) fn a_ciba_refresh_token_is_revoked_after_a_crash(h: &Harness) -> Outc
     tryo!(s.until(
         "the first call made, and the run held on `go` in the store",
         Duration::from_secs(40),
-        &|| s.made("whoami") >= 1 && s.held_on_go()
+        &|| s.made("whoami") >= 1 && s.holds_suspended("w")
     ));
     let kept = s.approvals_kept();
     let clear = s
@@ -628,10 +625,7 @@ pub(super) fn a_ciba_refresh_token_is_revoked_after_a_crash(h: &Harness) -> Outc
     s.xaa
         .control(json!({"slow_revoke_ms": 3000, "ciba": "pending"}));
     let _d = s.daemon(h);
-    let fired = s.op("workflow.signal", json!({"name": "go"}));
-    if fired.get("error").is_some() {
-        return Outcome::fail(format!("signal: {fired}"));
-    }
+    tryo!(s.signal_until_delivered("go", Duration::from_secs(30)));
     let sent = s.until(
         "the request the restart makes the firing send",
         Duration::from_secs(30),
@@ -744,7 +738,7 @@ pub(super) fn a_ciba_refresh_token_is_revoked_once_the_signer_is_back(h: &Harnes
     tryo!(s.until(
         "the first call made, and the run held on `go` in the store",
         Duration::from_secs(40),
-        &|| s.made("whoami") >= 1 && s.held_on_go()
+        &|| s.made("whoami") >= 1 && s.holds_suspended("w")
     ));
     let kept = s.approvals_kept().len();
     s.crash();
@@ -823,20 +817,25 @@ pub(super) fn a_ciba_refusal_holds_across_a_restart(h: &Harness) -> Outcome {
                 return Err(format!("--delegation-deny: {} {}", r.stdout, r.stderr));
             }
         }
+        // The record of the one run the request was for: `max_runs: 1`
+        // holds every other firing off while it waits on `go`.
+        let id = s.run_named(&binding)?;
         s.until(
-            "the run's record saying the firing was refused",
-            Duration::from_secs(20),
-            &|| s.asked_recorded().iter().any(|a| a == "refused"),
+            "the run's record saying the firing was refused, and the run gone on to wait on `go`",
+            Duration::from_secs(30),
+            &|| {
+                s.asked_recorded(&id)
+                    .is_ok_and(|a| a.iter().any(|a| a == "refused"))
+                    && s.run_record(&id).is_ok_and(|r| {
+                        r.pointer("/state/steps/w/status").and_then(Value::as_str)
+                            == Some("suspended")
+                    })
+            },
         )?;
-        let recorded = s.asked_recorded();
-        std::thread::sleep(Duration::from_millis(500));
+        let recorded = s.asked_recorded(&id)?;
         drop(d);
         let _d = s.daemon(h);
-        std::thread::sleep(Duration::from_millis(500));
-        let fired = s.op("workflow.signal", json!({"name": "go"}));
-        if fired.get("error").is_some() {
-            return Err(format!("signal: {fired}"));
-        }
+        s.signal_until_delivered("go", Duration::from_secs(30))?;
         let run = s.ended("nightly", 0, Duration::from_secs(30))?;
         if !run_of(&binding, &run) {
             return Err(format!("another run ended first: {run} ({binding})"));
@@ -1515,6 +1514,138 @@ fn ended_by_signal(via: &str) -> String {
     )
 }
 
+/// How long the mock IdP holds every refresh in
+/// [`a_firing_ended_mid_call_mints_nothing`].
+const SLOW_REFRESH_MS: u64 = 6000;
+
+/// Milliseconds since the epoch of the RFC 3339 UTC time the daemon logs
+/// (`2026-11-04T01:48:19.515Z`).
+fn ts_ms(ts: &str) -> Option<u64> {
+    let n = |r: std::ops::Range<usize>| ts.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
+    let (hh, mm, ss) = (n(11..13)?, n(14..16)?, n(17..19)?);
+    let ms = n(20..23).unwrap_or(0);
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from((((days * 24 + hh) * 60 + mm) * 60 + ss) * 1000 + ms).ok()
+}
+
+/// Milliseconds since the epoch now, on the clock the mock IdP stamps its
+/// record with.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+impl Setup {
+    /// The run of `nightly` whose `call` is on its way and held at the IdP
+    /// by a liveness refresh: its step started and not done — no
+    /// `delegation.used`, no `step.done` — and a `refresh_token` grant at
+    /// the IdP that arrived after the step started — and, `approved`, after
+    /// the poll alice's approval answered, the CIBA wait the call made
+    /// first since it started — still unanswered a
+    /// second on, with half a second of the IdP's hold left at least. Any
+    /// refresh then is the call's to wait on: its own probe, or one the
+    /// daemon's pass started that the probe waits behind under the
+    /// grant's lock; a call that needed no probe is done long before that
+    /// second is up. Not run 0 by assumption: a firing before it can end
+    /// otherwise, and is no run this asks about.
+    fn call_held_by_a_refresh(&self, approved: bool, within: Duration) -> Result<String, String> {
+        let deadline = Instant::now() + within;
+        loop {
+            let events = self.log_events();
+            let record = self.xaa.record();
+            // The poll alice's approval answered, when the call waits on one.
+            let approval = record
+                .iter()
+                .filter(|r| r.get("issued_id_token").is_some())
+                .filter_map(|r| r["t"].as_u64())
+                .max();
+            let refreshes: Vec<u64> = record
+                .iter()
+                .filter(|r| r["at"] == "idp" && r["body"]["grant_type"] == "refresh_token")
+                .filter_map(|r| r["t"].as_u64())
+                .collect();
+            let now = now_ms();
+            let held = events
+                .iter()
+                .filter(|e| e["event"] == "step.start" && e["step"] == "call")
+                .filter_map(|e| Some((e["run"].as_str()?, ts_ms(e["ts"].as_str()?)?)))
+                .filter(|(run, _)| run.starts_with("nightly-"))
+                .find(|(run, started)| {
+                    let done = events.iter().any(|e| {
+                        e["run"] == *run
+                            && e["step"] == "call"
+                            && (e["event"] == "step.done" || e["event"] == "delegation.used")
+                    });
+                    !done
+                        && refreshes.iter().any(|t| {
+                            *t >= *started
+                                && (!approved || approval.is_some_and(|a| a >= *started && *t >= a))
+                                && now >= t + 1000
+                                && now + 500 < t + SLOW_REFRESH_MS
+                        })
+                });
+            if let Some((run, _)) = held {
+                return Ok(run.to_string());
+            }
+            // A firing whose call needed no probe — made within a second of
+            // the grant's last proof, as one right after the enrolment can
+            // be — had no call held mid-way: its run, its call done and
+            // waiting on `go`, is let end so that the next firing comes.
+            let finished = |run: &Value| {
+                events
+                    .iter()
+                    .any(|e| e["event"] == "run.done" && e["run"] == *run)
+            };
+            if events.iter().any(|e| {
+                e["event"] == "step.done"
+                    && e["step"] == "call"
+                    && e["run"].as_str().is_some_and(|r| r.starts_with("nightly-"))
+                    && !finished(&e["run"])
+            }) {
+                self.signal_until_delivered("go", Duration::from_secs(10))?;
+                continue;
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "no call held by a liveness refresh:\n{}",
+                    tail(&self.log_text())
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// The `run.done` line of run `run`, once it has ended.
+    fn run_done(&self, run: &str, within: Duration) -> Result<Value, String> {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(e) = self
+                .events("run.done")
+                .into_iter()
+                .find(|e| e["run"] == run)
+            {
+                return Ok(e);
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "run {run} did not end:\n{}",
+                    tail(&self.log_text())
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 /// A firing whose run ends while its call is on its way — here, while the
 /// call proves the grant alive at the IdP — acts for nobody from then on.
 /// `via: ciba`, it mints nothing: the call keeps the firing it was
@@ -1523,10 +1654,10 @@ fn ended_by_signal(via: &str) -> String {
 /// token it got is presented nowhere: the call is not made (`revoked`).
 pub(super) fn a_firing_ended_mid_call_mints_nothing(h: &Harness) -> Outcome {
     let wf = ended_by_signal("ciba");
-    // Every refresh takes 4 s; the grant is proved alive at every call.
+    // Every refresh takes 6 s; the grant is proved alive at every call.
     let s = Setup::new(
         h,
-        json!({"slow_refresh_ms": 4000}),
+        json!({"slow_refresh_ms": SLOW_REFRESH_MS}),
         &Opts {
             liveness: Some("1s"),
             extra: wf,
@@ -1535,56 +1666,35 @@ pub(super) fn a_firing_ended_mid_call_mints_nothing(h: &Harness) -> Outcome {
     );
     let d = s.daemon(h);
     tryo!(s.login(h));
-    // What the enrolment minted, listing the server's tools.
-    let enrolled = (
-        s.xaa.grants("idp", EXCHANGE).len(),
-        s.events("delegation.minted").len(),
-    );
-    // The approval, then the approved call's liveness refresh: the run ends
-    // while the IdP holds it.
-    let probing = || {
-        let record = s.xaa.record();
-        let polls: Vec<usize> = record
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r["body"]["grant_type"] == CIBA)
-            .map(|(i, _)| i)
-            .collect();
-        polls.len() >= 2
-            && record[polls[1]..]
-                .iter()
-                .any(|r| r["at"] == "idp" && r["body"]["grant_type"] == "refresh_token")
-    };
-    tryo!(s.until(
-        "the approved call proving the grant alive",
-        Duration::from_secs(60),
-        &probing
-    ));
-    let fired = s.op("workflow.signal", json!({"name": "go"}));
-    if fired.get("error").is_some() {
-        return Outcome::fail(format!("signal: {fired}"));
-    }
-    let ended = tryo!(s.ended("nightly", 0, Duration::from_secs(10)));
+    // The approved call held at the IdP proving the grant alive: its run
+    // ends while the IdP holds it.
+    let run = tryo!(s.call_held_by_a_refresh(true, Duration::from_secs(90)));
+    // What the enrolment, and any firing before, exchanged.
+    let before = s.xaa.grants("idp", EXCHANGE).len();
+    tryo!(s.signal_until_delivered("go", Duration::from_secs(10)));
+    let ended = tryo!(s.run_done(&run, Duration::from_secs(30)));
     let refused = s.until(
         "the call refused once its probe returned",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
         &|| {
             s.events("delegation.denied")
                 .iter()
-                .any(|e| e["code"] == "subject_expired")
+                .any(|e| e["code"] == "subject_expired" && e["run"] == run.as_str())
         },
     );
     std::thread::sleep(Duration::from_secs(1));
+    // Every refresh takes 6 s, so no later firing gets as far as an
+    // exchange by now: any is the ended firing's.
     let exchanged: Vec<Value> = s
         .xaa
         .grants("idp", EXCHANGE)
         .into_iter()
-        .skip(enrolled.0)
+        .skip(before)
         .collect();
     let minted: Vec<Value> = s
         .events("delegation.minted")
         .into_iter()
-        .skip(enrolled.1)
+        .filter(|e| e["run"] == run.as_str())
         .collect();
     let o = completed(&ended)
         .and(|| Outcome::require(refused.is_ok(), refused.err().unwrap_or_default()))
@@ -1602,7 +1712,7 @@ pub(super) fn a_firing_ended_mid_call_mints_nothing(h: &Harness) -> Outcome {
     drop(d);
     let s = Setup::new(
         h,
-        json!({"slow_refresh_ms": 4000}),
+        json!({"slow_refresh_ms": SLOW_REFRESH_MS}),
         &Opts {
             liveness: Some("1s"),
             ..standing_opts("whoami", "{}")
@@ -1616,40 +1726,35 @@ pub(super) fn a_firing_ended_mid_call_mints_nothing(h: &Harness) -> Outcome {
     });
     let _d = s.daemon(h);
     tryo!(s.login(h));
-    let refreshes = || {
-        s.xaa
-            .record()
-            .iter()
-            .filter(|r| r["at"] == "idp" && r["body"]["grant_type"] == "refresh_token")
-            .count()
-    };
-    let before = refreshes();
-    tryo!(s.until(
-        "the call proving the grant alive",
-        Duration::from_secs(30),
-        &|| refreshes() > before
-    ));
-    let fired = s.op("workflow.signal", json!({"name": "go"}));
-    if fired.get("error").is_some() {
-        return Outcome::fail(format!("signal: {fired}"));
-    }
-    let ended = tryo!(s.ended("nightly", 0, Duration::from_secs(10)));
+    let run = tryo!(s.call_held_by_a_refresh(false, Duration::from_secs(90)));
+    // Made by a run before the held one, if any.
+    let made_before = s.made("whoami");
+    tryo!(s.signal_until_delivered("go", Duration::from_secs(10)));
+    let ended = tryo!(s.run_done(&run, Duration::from_secs(30)));
     let refused = s.until(
         "the call refused once its token was got",
-        Duration::from_secs(15),
+        Duration::from_secs(30),
         &|| {
             s.events("delegation.denied")
                 .iter()
-                .any(|e| e["code"] == "revoked")
+                .any(|e| e["code"] == "revoked" && e["run"] == run.as_str())
         },
     );
     std::thread::sleep(Duration::from_secs(1));
+    let used = s
+        .events("delegation.used")
+        .into_iter()
+        .filter(|e| e["run"] == run.as_str())
+        .count();
+    let made = s.made("whoami") - made_before;
     completed(&ended)
         .and(|| Outcome::require(refused.is_ok(), refused.err().unwrap_or_default()))
         .and(|| {
             Outcome::require(
-                s.made("whoami") == 0,
-                "the ended standing firing's call is not made",
+                used == 0 && made == 0,
+                format!(
+                    "the ended standing firing's call is not made: {used} used by it, {made} made since it was held"
+                ),
             )
         })
 }
@@ -1739,10 +1844,7 @@ pub(super) fn a_ciba_firing_waits_on_one_request_at_a_time(h: &Harness) -> Outco
     tryo!(s.until("a CIBA request", Duration::from_secs(30), &|| {
         !s.ciba_requests().is_empty()
     }));
-    let fired = s.op("workflow.signal", json!({"name": "go"}));
-    if fired.get("error").is_some() {
-        return Outcome::fail(format!("signal: {fired}"));
-    }
+    tryo!(s.signal_until_delivered("go", Duration::from_secs(30)));
     let waits = s.until(
         "the second call waiting on the same request",
         Duration::from_secs(20),

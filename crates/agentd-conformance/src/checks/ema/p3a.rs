@@ -1512,12 +1512,11 @@ fn held_and_approved(s: &Setup, h: &Harness) -> Result<usize, String> {
     if ok.code != Some(0) {
         return Err(format!("approve: {} {}", ok.stdout, ok.stderr));
     }
+    // Parked durably: the store's committed record holds `w` suspended, so
+    // the restart that follows restores the run waiting on `go`.
     until("the run never parked", &|| s.log_text(), &|| {
-        s.events("step.start")
-            .iter()
-            .any(|e| e["step"] == "w" && e["kind"] == "wait")
+        s.holds_suspended("w")
     })?;
-    std::thread::sleep(Duration::from_millis(500));
     Ok(n)
 }
 
@@ -1535,11 +1534,7 @@ fn held_across_a_restart(
     drop(d);
     s.reconfigure(&held_opts(then));
     let _d = s.daemon(h);
-    std::thread::sleep(Duration::from_millis(500));
-    let fired = s.op("workflow.signal", json!({"name": "go"}));
-    if fired.get("error").is_some() {
-        return Err(format!("signal: {fired}"));
-    }
+    s.signal_until_delivered("go", Duration::from_secs(30))?;
     let run = s.ended("held", n, Duration::from_secs(30))?;
     let asked = s
         .events("delegation.consent")

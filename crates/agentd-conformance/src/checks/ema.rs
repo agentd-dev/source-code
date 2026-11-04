@@ -1114,6 +1114,83 @@ impl Setup {
         out
     }
 
+    /// The records the store holds, each key's committed file alone: never
+    /// the temp file (`.<name>.json.tmp.<pid>`) a write is fsyncing beside
+    /// it before the rename. [`Setup::store_bytes`] reads that too — right
+    /// for a scan that no byte of a secret is ever in the clear, wrong for
+    /// what a record says, where it counts one write twice, or tells of a
+    /// write a crash would lose.
+    fn store_records(&self) -> Vec<(PathBuf, Value)> {
+        self.store_bytes()
+            .into_iter()
+            .filter(|(p, _)| {
+                p.extension().is_some_and(|e| e == "json")
+                    && !p
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with('.'))
+            })
+            .filter_map(|(p, b)| Some((p, serde_json::from_slice::<Value>(&b).ok()?)))
+            .collect()
+    }
+
+    /// The run record the store holds for run `id`'s state: its committed
+    /// file's, one record per run.
+    fn run_record(&self, id: &str) -> Result<Value, String> {
+        let mut of: Vec<Value> = self
+            .store_records()
+            .into_iter()
+            .map(|(_, v)| v)
+            .filter(|v| v["state"]["id"] == id && v["state"]["workflow"].is_string())
+            .collect();
+        match of.len() {
+            1 => Ok(of.remove(0)),
+            n => Err(format!("{n} records of run {id} in the store: {of:?}")),
+        }
+    }
+
+    /// Whether the store holds a run whose step `step` is suspended — a run
+    /// waiting there, durably: its committed record, never a temp file a
+    /// crash could leave unrenamed.
+    fn holds_suspended(&self, step: &str) -> bool {
+        let at = format!("/state/steps/{step}/status");
+        self.store_records()
+            .iter()
+            .any(|(_, v)| v.pointer(&at).and_then(Value::as_str) == Some("suspended"))
+    }
+
+    /// Send the signal `name` until it wakes a waiting step: the operator's
+    /// `workflow.signal` answers how many it was delivered to, and a signal
+    /// no suspended step waits on is dropped — so one sent before the wait
+    /// is armed (after a restart, say) is sent again rather than lost.
+    fn signal_until_delivered(&self, name: &str, within: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + within;
+        loop {
+            let fired = self.op("workflow.signal", json!({"name": name}));
+            if fired.get("error").is_some() {
+                return Err(format!("signal {name}: {fired}"));
+            }
+            let delivered = fired["result"]["task"]["artifacts"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|a| a["parts"].as_array().cloned().unwrap_or_default())
+                .find_map(|p| p["data"]["delivered"].as_f64());
+            match delivered {
+                Some(n) if n > 0.0 => return Ok(()),
+                Some(_) => {}
+                None => return Err(format!("signal {name}: no delivery count: {fired}")),
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "signal {name} woke no step:
+{}",
+                    tail(&self.log_text())
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
     fn cfg(&self) -> &str {
         self.cfg.to_str().expect("utf8")
     }

@@ -24,6 +24,13 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
+      # The runner's preinstalled toolchains agentd never uses (.NET, Android,
+      # GHC, CodeQL), about 25G: with them, building every agentd-cli test
+      # binary of a feature row outgrew the disk (the linker died with SIGBUS).
+      - name: room on the runner's disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -237,6 +244,13 @@ jobs:
           - "--features a2a,metrics,cron,otel,hot-reload,config-watch,aauth,oauth,cel,sign,oci,decrypt,mcp-events,mock-models,companies,xaa,x402" # the release-artifact set, exactly (pinned by release_matrix.rs)
           - "--all-features"
     steps:
+      # The runner's preinstalled toolchains agentd never uses (.NET, Android,
+      # GHC, CodeQL), about 25G: with them, building every agentd-cli test
+      # binary of a feature row outgrew the disk (the linker died with SIGBUS).
+      - name: room on the runner's disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:

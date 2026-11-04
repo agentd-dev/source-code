@@ -12,10 +12,11 @@
  * log pane (`subagent.log`) that tails what the child logged.
  */
 import React from 'react';
-import { Box, Text } from 'ink';
+import { Box, Text, measureElement, type DOMElement } from 'ink';
 import { DAEMON_KEYS, inert } from '../../client/index.js';
 import type { Json, MirrorState } from '../../client/index.js';
 import { ago, theme } from '../theme.js';
+import { breakRows, columnsOf, cutToColumns } from './cells.js';
 import { MultilineInput, type EditState } from './input.js';
 
 /** One turn of the exchange the detail view shows: what was sent, what came back, or why nothing did. */
@@ -30,6 +31,42 @@ export function inertLines(text: string): string {
     .split('\n')
     .map((l) => inert(l))
     .join('\n');
+}
+
+/** The most rows one item of the exchange takes: a reply can run to thousands of characters. */
+export const EXCHANGE_ITEM_ROWS = 3;
+
+/** One drawn row of the exchange: the speaker's mark on an item's first row, then its text. */
+export interface ExchangeRow {
+  who: ExchangeItem['who'];
+  mark: string;
+  text: string;
+}
+
+/**
+ * The exchange as the rows it is drawn in, `width` columns wide: each item
+ * broken at the column (its newlines kept) and cut to
+ * {@link EXCHANGE_ITEM_ROWS} rows, the last of a cut one ending "…". Each row
+ * is drawn as one row, so what is counted here is what the view takes.
+ */
+export function exchangeRows(items: readonly ExchangeItem[], handle: string, width: number): ExchangeRow[] {
+  const out: ExchangeRow[] = [];
+  for (const x of items) {
+    const mark = x.who === 'you' ? 'you › ' : x.who === 'child' ? `${handle} › ` : '  ';
+    const markCols = columnsOf(mark);
+    const rows: string[] = [];
+    inertLines(x.text)
+      .split('\n')
+      .forEach((line, i) => rows.push(...breakRows(line, i === 0 ? width - markCols : width, width)));
+    const kept = rows.slice(0, EXCHANGE_ITEM_ROWS);
+    if (rows.length > EXCHANGE_ITEM_ROWS) {
+      const i = kept.length - 1;
+      const room = (i === 0 ? width - markCols : width) - 1;
+      kept[i] = `${cutToColumns(kept[i], Math.max(0, room))}…`;
+    }
+    kept.forEach((text, i) => out.push({ who: x.who, mark: i === 0 ? mark : '', text }));
+  }
+  return out;
 }
 
 /** A reply's text: a string as it is, anything else as its JSON. */
@@ -247,6 +284,7 @@ export function SubagentDetail({
   killAsk = false,
   compose,
   canLog = false,
+  rows,
 }: {
   handle: string;
   summary: { [k: string]: Json } | undefined;
@@ -261,8 +299,28 @@ export function SubagentDetail({
   compose?: DetailCompose;
   /** The card lists `subagent.log` for this caller. */
   canLog?: boolean;
+  /** The rows the view may take: the exchange gets what the rest leaves. */
+  rows?: number;
 }): React.JSX.Element {
   const d = detail ?? summary ?? {};
+  // What the rest of the view takes is measured from the last render (its
+  // lines wrap, and the field grows with its text), and the exchange keeps
+  // to the rows left: an exchange that did not would push the frame.
+  const headRef = React.useRef<DOMElement>(null);
+  const tailRef = React.useRef<DOMElement>(null);
+  const [used, setUsed] = React.useState({ head: 0, tail: 0 });
+  React.useEffect(() => {
+    const head = headRef.current ? measureElement(headRef.current).height : 0;
+    const tail = tailRef.current ? measureElement(tailRef.current).height : 0;
+    if (head !== used.head || tail !== used.tail) setUsed({ head, tail });
+  });
+  const exWidth = compose ? Math.max(1, compose.width + 4) : 1;
+  const allRows = compose ? exchangeRows(compose.exchange, handle, exWidth) : [];
+  // One row of margin above the exchange, and one for "waiting…".
+  const room =
+    rows === undefined ? Infinity : Math.max(0, rows - used.head - used.tail - 1 - (compose?.waiting ? 1 : 0));
+  const shownRows = room === Infinity ? allRows : allRows.slice(Math.max(0, allRows.length - room));
+  const showWaiting = compose?.waiting === true && (rows === undefined || rows - used.head - used.tail - 1 >= 1);
   const line = (label: string, v: Json | undefined, color?: string) =>
     v === undefined || v === null ? null : (
       <Box key={label} flexDirection="row">
@@ -274,75 +332,83 @@ export function SubagentDetail({
     );
   return (
     <Box flexDirection="column">
-      <Text color={theme.accent} bold>
-        subagent {handle}
-      </Text>
-      {line('status', d.status, statusColor(String(d.status ?? '')))}
-      {String(d.status ?? '') !== 'running' ? (
-        <Text color={theme.dim}>{'(not running — messaging and stopping apply to a live subagent)'}</Text>
-      ) : null}
-      {line('template', d.template ?? summary?.template)}
-      {line('reports to', d.reports_to ?? summary?.reports_to)}
-      {line('mode', d.mode)}
-      {line('attempt', d.attempt)}
-      {line('tokens', d.tokens)}
-      {line('instruction', d.instruction)}
-      {line('result', d.result)}
-      {line('error', d.error, theme.error)}
-      {line('requested_by', d.requested_by)}
-      {!debug ? (
-        <Text color={theme.dim}>
-          {`(summary only — instruction and result need ${DAEMON_KEYS.introspection}` +
-            (canSet ? `: /set ${DAEMON_KEYS.introspection} true)` : ' in the daemon config)')}
+      <Box ref={headRef} flexDirection="column" flexShrink={0}>
+        <Text color={theme.accent} bold>
+          subagent {handle}
         </Text>
-      ) : null}
-      {compose && compose.exchange.length > 0 ? (
-        <Box flexDirection="column" marginTop={1} width={compose.width + 4}>
-          {compose.exchange.slice(-6).map((x, i) => (
-            <Text key={i} wrap="wrap" color={x.who === 'note' ? theme.dim : undefined}>
-              <Text color={x.who === 'you' ? theme.accent : x.who === 'child' ? theme.agent : theme.dim} bold={x.who !== 'note'}>
-                {x.who === 'you' ? 'you › ' : x.who === 'child' ? `${handle} › ` : '  '}
-              </Text>
-              {inertLines(x.text)}
+        {line('status', d.status, statusColor(String(d.status ?? '')))}
+        {String(d.status ?? '') !== 'running' ? (
+          <Text color={theme.dim}>{'(not running — messaging and stopping apply to a live subagent)'}</Text>
+        ) : null}
+        {line('template', d.template ?? summary?.template)}
+        {line('reports to', d.reports_to ?? summary?.reports_to)}
+        {line('mode', d.mode)}
+        {line('attempt', d.attempt)}
+        {line('tokens', d.tokens)}
+        {line('instruction', d.instruction)}
+        {line('result', d.result)}
+        {line('error', d.error, theme.error)}
+        {line('requested_by', d.requested_by)}
+        {!debug ? (
+          <Text color={theme.dim}>
+            {`(summary only — instruction and result need ${DAEMON_KEYS.introspection}` +
+              (canSet ? `: /set ${DAEMON_KEYS.introspection} true)` : ' in the daemon config)')}
+          </Text>
+        ) : null}
+      </Box>
+      {compose && compose.exchange.length > 0 && (shownRows.length > 0 || showWaiting) ? (
+        <Box flexDirection="column" marginTop={1} width={exWidth} flexShrink={0}>
+          {shownRows.map((x, i) => (
+            <Text key={allRows.length - shownRows.length + i} wrap="truncate-end" color={x.who === 'note' ? theme.dim : undefined}>
+              {x.mark ? (
+                <Text color={x.who === 'you' ? theme.accent : x.who === 'child' ? theme.agent : theme.dim} bold={x.who !== 'note'}>
+                  {x.mark}
+                </Text>
+              ) : null}
+              {x.text}
             </Text>
           ))}
-          {compose.waiting ? <Text color={theme.dim}>{`  waiting for ${handle}'s reply…`}</Text> : null}
+          {showWaiting ? (
+            <Text color={theme.dim} wrap="truncate-end">{`  waiting for ${handle}'s reply…`}</Text>
+          ) : null}
         </Box>
       ) : null}
-      {compose?.open ? (
-        <Box flexDirection="column">
-          {cannotMessage(summary) ? (
-            <Text color={theme.warn} wrap="wrap">{`  ${cannotMessage(summary)}`}</Text>
-          ) : null}
-          <Box flexDirection="row" flexShrink={0} borderStyle="round" borderColor={theme.border} paddingX={1}>
-            <Text color={theme.accent} bold>
-              {'› '}
-            </Text>
-            {/* An explicit width, as the chat composer has: judged beside the
-                prompt, a long message would wrap to more rows than its box. */}
-            <Box width={Math.max(1, compose.width)} flexShrink={0}>
-              <MultilineInput
-                value={compose.value}
-                cursor={compose.cursor}
-                onChange={compose.onChange}
-                onSubmit={compose.onSubmit}
-                placeholder={`message ${handle}`}
-              />
+      <Box ref={tailRef} flexDirection="column" flexShrink={0}>
+        {compose?.open ? (
+          <Box flexDirection="column">
+            {cannotMessage(summary) ? (
+              <Text color={theme.warn} wrap="wrap">{`  ${cannotMessage(summary)}`}</Text>
+            ) : null}
+            <Box flexDirection="row" flexShrink={0} borderStyle="round" borderColor={theme.border} paddingX={1}>
+              <Text color={theme.accent} bold>
+                {'› '}
+              </Text>
+              {/* An explicit width, as the chat composer has: judged beside the
+                  prompt, a long message would wrap to more rows than its box. */}
+              <Box width={Math.max(1, compose.width)} flexShrink={0}>
+                <MultilineInput
+                  value={compose.value}
+                  cursor={compose.cursor}
+                  onChange={compose.onChange}
+                  onSubmit={compose.onSubmit}
+                  placeholder={`message ${handle}`}
+                />
+              </Box>
             </Box>
+            <Text color={theme.dim}>{'enter send · esc leave the field'}</Text>
           </Box>
-          <Text color={theme.dim}>{'enter send · esc leave the field'}</Text>
-        </Box>
-      ) : killAsk ? (
-        <Text color={theme.error} bold>
-          {'\nstop '}
-          {handle}
-          {'? y to confirm, any other key to cancel'}
-        </Text>
-      ) : (
-        <Text color={theme.dim} wrap="wrap">
-          {`\n${compose ? 'm/enter message · ' : ''}${canLog ? 'l log · ' : ''}k stop · esc/backspace back · tab next screen`}
-        </Text>
-      )}
+        ) : killAsk ? (
+          <Text color={theme.error} bold>
+            {'\nstop '}
+            {handle}
+            {'? y to confirm, any other key to cancel'}
+          </Text>
+        ) : (
+          <Text color={theme.dim} wrap="wrap">
+            {`\n${compose ? 'm/enter message · ' : ''}${canLog ? 'l log · ' : ''}k stop · esc/backspace back · tab next screen`}
+          </Text>
+        )}
+      </Box>
     </Box>
   );
 }

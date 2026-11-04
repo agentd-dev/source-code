@@ -100,9 +100,10 @@ const client = {
   subagentKill: async () => ({ ok: true }),
   subagentSend: async () => {
     replied = 'Starting with auth/: two regressions in session refresh, one in token scope. Details in my result.';
-    return { ok: true };
+    return { task: 'send-1', data: { ok: true, delivery: 'async' } };
   },
-  subagentStatus: async (handle) => ({ handle, status: 'running', mode: 'detached', result: null, ...(replied ? { reply: replied } : {}) }),
+  // The reply names the send it answers: the task that send ran as.
+  subagentStatus: async (handle) => ({ handle, status: 'running', mode: 'detached', result: null, ...(replied ? { reply: replied, reply_to: 'send-1' } : {}) }),
   subagentLog: async (handle, lines, after) => ({
     handle,
     source: 'file',

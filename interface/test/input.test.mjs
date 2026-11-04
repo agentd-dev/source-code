@@ -129,6 +129,10 @@ test('the ghost fits the cursor row: whole, cut there, or not at all', async () 
   assert.equal(ghostFits('a long first line\n/he', 'lp', 6), 'lp');
   assert.equal(ghostFits('/he', 'lp', undefined), '', 'no width to judge by');
   assert.equal(ghostFits('/he', '', 20), '');
+  // Columns, not code points: a wide character takes two.
+  assert.equal(ghostFits('@', '日本語日本語', 6), '日本', 'wide characters cut by their columns');
+  assert.equal(ghostFits('日本語', 'x', 6), '', 'a line of wide characters fills its row');
+  assert.equal(ghostFits('@', '🚀🚀🚀', 6), '🚀🚀', 'an emoji takes two columns');
 });
 
 test('→ at the end accepts the completion, keys faster than a redraw included', async () => {

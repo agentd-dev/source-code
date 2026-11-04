@@ -183,10 +183,11 @@ test("an instance child's answer is its reply, not its own result", async () => 
   const client = {
     subagentGet: async () => ({}),
     // Its `result` is the child's own report, and does not move.
-    subagentStatus: async (handle) => ({ handle, status: 'running', mode: 'detached', result: { status: 'completed', output: 'booted' }, ...(reply ? { reply } : {}) }),
+    // Its `reply` names the send it answers: the task the send ran as.
+    subagentStatus: async (handle) => ({ handle, status: 'running', mode: 'detached', result: { status: 'completed', output: 'booted' }, ...(reply ? { reply, reply_to: 't-9' } : {}) }),
     subagentSend: async () => {
       setTimeout(() => (reply = 'the room is listening'), 100);
-      return { ok: true, delivery: 'async' };
+      return { task: 't-9', data: { ok: true, delivery: 'async' } };
     },
   };
   const { mirror, ui } = boot(client);
@@ -351,4 +352,260 @@ test('the log pane keeps to its width and its rows in a narrow pane', async () =
   } finally {
     app.unmount();
   }
+});
+
+// ---- review fixes: polls, inert ghost, exchange height, reply matching ---------
+
+/** The App on Ink's real renderer, `cols` × `rows`, fullscreen; `frame()` is the last frame written. */
+async function realApp(client, { cols, rows, ops = [] }) {
+  const { render: inkRender } = await import('ink');
+  const { PassThrough } = await import('node:stream');
+  const stdout = new PassThrough();
+  Object.assign(stdout, { isTTY: true, columns: cols, rows });
+  let last = '';
+  let all = '';
+  stdout.on('data', (d) => {
+    last = d.toString();
+    all += last;
+  });
+  const stdin = new PassThrough();
+  Object.assign(stdin, { isTTY: true, setRawMode() {}, ref() {}, unref() {} });
+  const mirror = new Mirror();
+  const app = inkRender(React.createElement(App, { configured: 'http://127.0.0.1:1', client, mirror, observe: false }), {
+    stdout,
+    stdin,
+    debug: true,
+    exitOnCtrlC: false,
+    patchConsole: false,
+  });
+  mirror.setSession(session(ops));
+  mirror.setConn('ready');
+  await tick();
+  return { mirror, stdin, app, frame: () => last, all: () => all };
+}
+
+const count = (s, re) => (s.match(re) ?? []).length;
+
+test('an exchange item is broken at its words and cut to three rows', async () => {
+  const { exchangeRows } = await import('../dist/tui/parts/subagents.js');
+  const rows = exchangeRows([{ who: 'child', text: 'one two three four five six seven eight nine ten\nmore\nand more' }], 'kid', 14);
+  assert.equal(rows.length, 3);
+  assert.deepEqual(
+    rows.map((r) => r.mark + r.text),
+    ['kid › one two', 'three four', 'five six seve…'],
+  );
+  for (const r of rows) assert.ok([...(r.mark + r.text)].length <= 14, JSON.stringify(r));
+  const short = exchangeRows([{ who: 'you', text: 'hi\u001b[2J' }], 'kid', 40);
+  assert.deepEqual(short, [{ who: 'you', mark: 'you › ', text: 'hi\\u001b[2J' }], 'one row, inert');
+});
+
+test('a log read slower than the poll is not overlapped, and appends its lines once', async () => {
+  const calls = [];
+  const client = {
+    subagentGet: async () => ({}),
+    subagentLog: async (handle, lines, after) => {
+      calls.push(after);
+      // Every read answers after the next poll would have started.
+      await tick(2000);
+      if (after === undefined) return { handle, lines: [line('proc.start'), line('a2a.listen')], cursor: 100 };
+      return { handle, lines: [], cursor: after };
+    },
+  };
+  const { mirror, ui } = boot(client, [OPS.subagentLog]);
+  mirror.apply(sub({ handle: 'inst-s', tier: 'instance' }));
+  await openDetail(ui);
+  ui.stdin.write('l');
+  await tick(4400);
+  const frame = ui.lastFrame();
+  assert.equal(count(frame, /proc\.start/g), 1, frame);
+  assert.equal(count(frame, /a2a\.listen/g), 1, frame);
+  assert.equal(calls.filter((c) => c === undefined).length, 1, `one read without a cursor: ${JSON.stringify(calls)}`);
+  assert.ok(calls.length <= 2, `one read at a time: ${JSON.stringify(calls)}`);
+  ui.unmount();
+});
+
+test('a status read slower than the poll is not overlapped, and shows the reply once', async () => {
+  let result = null;
+  let sent = false;
+  let inFlight = 0;
+  let most = 0;
+  const client = {
+    subagentGet: async () => ({}),
+    subagentStatus: async (handle) => {
+      inFlight += 1;
+      most = Math.max(most, inFlight);
+      if (sent) await tick(2000);
+      inFlight -= 1;
+      return { handle, status: 'running', mode: 'warm', result };
+    },
+    subagentSend: async () => {
+      sent = true;
+      result = 'pong once';
+      return { task: 't-1', data: { ok: true } };
+    },
+  };
+  const { mirror, ui } = boot(client);
+  mirror.apply(sub({ handle: 'sub-o' }));
+  await openDetail(ui);
+  ui.stdin.write('m');
+  await tick();
+  for (const ch of 'ping') ui.stdin.write(ch);
+  ui.stdin.write('\r');
+  await tick(5600);
+  assert.equal(count(ui.lastFrame(), /pong once/g), 1, ui.lastFrame());
+  assert.equal(most, 1, 'one status read at a time');
+  ui.unmount();
+});
+
+test('a suggestion with an escape sequence reaches the terminal inert, in the ghost and its row', async () => {
+  const { mirror, stdin, app, all } = await realApp({}, { cols: 60, rows: 20 });
+  try {
+    // Ink strips cursor movement but passes SGR through: a name could blink,
+    // hide or recolour everything drawn after it.
+    mirror.bootstrap({ skill_prefix: '@', skills: ['x\u001b[5m\u001b[8mevil'] });
+    await tick();
+    stdin.write('@');
+    await tick(80);
+    const out = all();
+    assert.doesNotMatch(out, /\u001b\[5m|\u001b\[8m/, 'no SGR from a skill name');
+    const rows = plain(out).split('\n');
+    assert.ok(rows.some((r) => r.includes('› @x\\u001b[5m')), 'the ghost spells the escape out');
+    assert.ok(rows.some((r) => /^ {2}@x\\u001b\[5m\\u001b\[8mevil skill/.test(r)), 'so does its suggestion row');
+  } finally {
+    app.unmount();
+  }
+});
+
+test('a ghost of wide characters is measured in columns, and the composer stays one row', async () => {
+  const { mirror, stdin, app, frame } = await realApp({}, { cols: 12, rows: 20 });
+  try {
+    mirror.bootstrap({ skill_prefix: '@', skills: ['日本語日本語日本語'] });
+    await tick();
+    stdin.write('@');
+    await tick(80);
+    const last = plain(frame()).split('\n');
+    const top = last.findLastIndex((l) => l.includes('╭'));
+    const bottom = last.findIndex((l, i) => i > top && l.includes('╰'));
+    const inside = last.slice(top + 1, bottom);
+    assert.equal(inside.length, 1, `the composer is one row: ${JSON.stringify(inside)}`);
+    assert.match(inside[0], /@日本/, JSON.stringify(inside[0]));
+  } finally {
+    app.unmount();
+  }
+});
+
+test('long replies in the exchange keep to the detail view in a narrow, short pane', async () => {
+  let result = null;
+  let n = 0;
+  const client = {
+    subagentGet: async () => ({}),
+    subagentStatus: async (handle) => ({ handle, status: 'running', mode: 'warm', result }),
+    subagentSend: async () => {
+      n += 1;
+      const k = n;
+      setTimeout(() => (result = `reply ${k} ` + 'a long line that wraps '.repeat(20) + '\nsecond\nthird\nfourth\nfifth'), 50);
+      return { task: `t-${k}`, data: { ok: true } };
+    },
+  };
+  // The rest of the view takes all but a few of these rows at 30 columns.
+  const rows = 24;
+  const { mirror, stdin, app, frame } = await realApp(client, { cols: 30, rows });
+  try {
+    mirror.apply(sub({ handle: 'sub-x' }));
+    await tick();
+    stdin.write('\t');
+    await tick();
+    stdin.write('\t');
+    await tick();
+    stdin.write('\r');
+    await tick();
+    for (let i = 0; i < 3; i++) {
+      stdin.write('m');
+      await tick();
+      stdin.write('go');
+      await tick();
+      stdin.write('\r');
+      await tick(1700);
+      stdin.write(ESC);
+      await tick();
+    }
+    const out = plain(frame()).replace(/\n$/, '').split('\n');
+    assert.ok(out.length <= rows, `the frame is no taller than the terminal: ${JSON.stringify(out)}`);
+    // Squeezed, Ink draws rows over each other: the header is lost and one
+    // item's row is written across another's.
+    assert.ok(out.includes('subagent sub-x'), `the header keeps its row: ${JSON.stringify(out)}`);
+    assert.ok(!out.some((r) => /you › go\S/.test(r)), `no row is drawn over another: ${JSON.stringify(out)}`);
+    assert.ok(out.some((r) => r.startsWith('m/enter message')), `the hint keeps its row: ${JSON.stringify(out)}`);
+    for (const r of out) assert.ok([...r].length <= 30, `${JSON.stringify(r)} is wider than the pane`);
+    assert.match(out.join('\n'), /sub-x › reply 3/, 'the newest reply is shown');
+    assert.match(out.join('\n'), /…/, 'a cut reply says so');
+  } finally {
+    app.unmount();
+  }
+});
+
+test("an instance child's own result is never shown as its answer", async () => {
+  let st = { result: null };
+  const client = {
+    subagentGet: async () => ({}),
+    subagentStatus: async (handle) => ({ handle, status: 'running', mode: 'detached', ...st }),
+    subagentSend: async () => {
+      // The child reports its own first result; it has not answered yet.
+      setTimeout(() => (st = { result: { status: 'completed', output: 'booted' } }), 50);
+      setTimeout(() => (st = { result: { status: 'completed', output: 'booted' }, reply: 'here I am', reply_to: 't-7' }), 2000);
+      return { task: 't-7', data: { ok: true, delivery: 'async' } };
+    },
+  };
+  const { mirror, ui } = boot(client);
+  mirror.apply(sub({ handle: 'inst-r', mode: 'detached', tier: 'instance' }));
+  await openDetail(ui);
+  ui.stdin.write('m');
+  await tick();
+  for (const ch of 'hello') ui.stdin.write(ch);
+  ui.stdin.write('\r');
+  await tick(1700);
+  assert.doesNotMatch(ui.lastFrame(), /booted/);
+  assert.match(ui.lastFrame(), /waiting for inst-r's reply/);
+  await tick(1600);
+  assert.match(ui.lastFrame(), /inst-r › here I am/);
+  assert.doesNotMatch(ui.lastFrame(), /booted/);
+  ui.unmount();
+});
+
+test('two sends each get their own reply, and a reply to someone else is not shown', async () => {
+  let st = {};
+  let n = 0;
+  const client = {
+    subagentGet: async () => ({}),
+    subagentStatus: async (handle) => ({ handle, status: 'running', mode: 'detached', result: null, ...st }),
+    subagentSend: async () => {
+      n += 1;
+      return { task: `t-${n}`, data: { ok: true, delivery: 'async' } };
+    },
+  };
+  const { mirror, ui } = boot(client);
+  mirror.apply(sub({ handle: 'inst-t', mode: 'detached', tier: 'instance' }));
+  await openDetail(ui);
+  ui.stdin.write('m');
+  await tick();
+  for (const ch of 'first') ui.stdin.write(ch);
+  ui.stdin.write('\r');
+  await tick(60);
+  for (const ch of 'second') ui.stdin.write(ch);
+  ui.stdin.write('\r');
+  await tick(60);
+  st = { reply: 'for another caller', reply_to: 't-other' };
+  await tick(1700);
+  assert.doesNotMatch(ui.lastFrame(), /for another caller/);
+  st = { reply: 'answer one', reply_to: 't-1' };
+  await tick(1600);
+  assert.match(ui.lastFrame(), /inst-t › answer one/);
+  assert.match(ui.lastFrame(), /waiting for inst-t's reply/, 'the second send still waits');
+  st = { reply: 'answer two', reply_to: 't-2' };
+  await tick(1600);
+  const frame = ui.lastFrame();
+  assert.match(frame, /inst-t › answer one/);
+  assert.match(frame, /inst-t › answer two/);
+  assert.doesNotMatch(frame, /waiting for/);
+  ui.unmount();
 });

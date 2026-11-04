@@ -26,15 +26,24 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   suggestion and the cursor is at the end, the rest of the selected one is
   drawn after the cursor, dim, and `→` accepts it as `Tab` does; elsewhere
   `→` moves the cursor. The dim text is never part of what is sent, and it
-  is cut at the end of its row (or not drawn when the line already wraps),
-  so the composer never grows a row for it. A `→` typed before a redraw
-  completes what was typed.
+  is cut at the end of its row, measured in terminal columns (a wide
+  character or an emoji takes two), or not drawn when the line already
+  wraps, so the composer never grows a row for it. A `→` typed before a
+  redraw completes what was typed. The names it offers are the daemon's
+  (workflows, skills, conversations another user named), so the dim text,
+  the suggestion row and the composer spell out any control character in
+  them rather than pass it to the terminal.
 - **Talk to a subagent from its detail view.** `m` or `Enter` on the TUI's
   subagent detail opens a message field there (`Enter` sends, `Esc` leaves
-  it), with what was sent and what the child answered shown above it. A
-  child that cannot take a message — not running, not warm — or a send the
-  daemon refuses is said in the field. `/send <handle> <text>` in the chat
-  works as before.
+  it), with what was sent and what the child answered shown above it, each
+  item cut to three rows and the whole exchange kept to the rows the view
+  has left, so a long reply never pushes the frame. Each message waits for
+  its own reply, matched by the `reply_to` that `subagent.status` names (the
+  task the send ran as): a second message does not lose the first one's
+  answer, and an instance child's own result is never shown as its answer.
+  `AgentdClient.subagentSend()` returns `{task, data}`. A child that cannot
+  take a message — not running, not warm — or a send the daemon refuses is
+  said in the field. `/send <handle> <text>` in the chat works as before.
 - **An instance child's answer to `subagent.send` is read back.** The
   message still goes over the child's socket; the parent now follows the
   child's task to its answer, off the loop, and records it as the child's
@@ -61,7 +70,8 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   lines about it from the in-memory log ring, while one is kept
   (`a2a.introspection.enabled`). The lines are agentd's JSON lines as
   written. In the TUI, `l` on a child's detail view opens a log pane that
-  follows new lines, scrolls with `↑`/`↓` and `PgUp`/`PgDn`, and shows each
+  follows new lines (one read at a time, each from the last one's cursor,
+  so a slow read never appends its lines twice), scrolls with `↑`/`↓` and `PgUp`/`PgDn`, and shows each
   line as its time, level, event and own fields; it is offered only when the
   card lists the op. Published in the command extension's vocabulary and
   schema, and in the client's `OPS` and `AgentdClient.subagentLog()`.

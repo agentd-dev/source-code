@@ -67,6 +67,7 @@ import {
   DAEMON_KEYS,
   OPS,
   offers,
+  inert,
 } from '../client/index.js';
 import type { Credential, Failure, Layout, LoginOption, MirrorState, TaskView } from '../client/index.js';
 import { GatePrompt, gateOptions, gateRows } from './parts/gate.js';
@@ -166,9 +167,23 @@ const TERMINAL_SUBAGENT: ReadonlySet<string> = new Set(['completed', 'failed', '
 /** What the detail view of one subagent is doing: showing it, taking a message for it, or showing its log. */
 type SubMode = 'view' | 'compose' | 'log';
 
-/** A message to a subagent waiting for its reply: what its result was when the message went. */
+/**
+ * One message to a subagent waiting for its reply — one per send, so a
+ * second message does not take the first one's place.
+ */
 interface Awaiting {
+  /** This entry's own key in the list. */
+  key: number;
   handle: string;
+  /** The task the send returned: a status whose `reply_to` names it carries this message's answer. */
+  sent?: string;
+  /** Where the answer is read: an instance child's `reply`, a warm worker's `result`. */
+  from: 'reply' | 'result';
+  /**
+   * A warm worker's `result` when the message went, and its summary's
+   * `updated`: with no `reply_to` in its status, the turn this message
+   * started is told by its result moving from these.
+   */
   base: string;
   baseUpdated: number;
   since: number;
@@ -243,7 +258,12 @@ export function App(props: AppProps): React.JSX.Element {
   const [subMode, setSubMode] = useState<SubMode>('view');
   const [subInput, setSubInput] = useState<EditState>({ value: '', cursor: 0 });
   const [exchanges, setExchanges] = useState<Record<string, ExchangeItem[]>>({});
-  const [awaiting, setAwaiting] = useState<Awaiting | null>(null);
+  const [awaiting, setAwaiting] = useState<Awaiting[]>([]);
+  // The poll reads the list as it is when it runs, not as it was when it
+  // started: a message sent meanwhile is read on the next round.
+  const awaitingRef = useRef<Awaiting[]>(awaiting);
+  awaitingRef.current = awaiting;
+  const awaitKey = useRef(0);
   const [subLog, setSubLog] = useState<SubLog | null>(null);
   /** Log lines hidden below the pane (0 = following the newest). */
   const [logScroll, setLogScroll] = useState(0);
@@ -357,76 +377,121 @@ export function App(props: AppProps): React.JSX.Element {
     setExchanges((cur) => ({ ...cur, [handle]: [...(cur[handle] ?? []), item].slice(-20) }));
   }, []);
 
-  // A message awaiting its reply: the subagent's answer is read until it is
-  // no longer the one it was when the message went — a warm worker's turn
-  // is its `result`, an instance child's answer its `reply`.
+  // Messages awaiting their replies: each subagent with one is read every
+  // SUBAGENT_POLL_MS, one round at a time — the next is scheduled when the
+  // last has finished, so a slow read is never overlapped. A reply is shown
+  // only when it answers one of these sends: the status names the send its
+  // `reply` (or a warm worker's `result`) answers in `reply_to`, the task id
+  // the send returned. A warm worker whose status names none is matched the
+  // one way it can be: its result moving from what it was when the oldest
+  // message still waiting went.
+  const awaitingAny = awaiting.length > 0;
   useEffect(() => {
-    if (!awaiting || !client) return;
+    if (!awaitingAny || !client) return;
     let alive = true;
-    const tick = async () => {
-      const summary = mirror.getState().subagents.get(awaiting.handle) as { [k: string]: Json } | undefined;
-      if (Date.now() - awaiting.since > REPLY_WAIT_MS) {
-        note(awaiting.handle, { who: 'note', text: 'no reply came' });
-        setAwaiting(null);
-        return;
-      }
-      try {
-        const r = (await client.subagentStatus(awaiting.handle)) as { [k: string]: Json } | null;
-        if (!alive) return;
-        // An instance child's answer is its `reply`; a warm worker's, its `result`.
-        const answer = r?.reply ?? r?.result ?? null;
-        const now = JSON.stringify(answer);
-        const moved = Number(summary?.updated ?? 0) > awaiting.baseUpdated;
-        if (answer !== null && (now !== awaiting.base || moved)) {
-          note(awaiting.handle, { who: 'child', text: replyText(answer) });
-          setAwaiting(null);
-        } else if (r && typeof r.status === 'string' && TERMINAL_SUBAGENT.has(r.status)) {
-          note(awaiting.handle, { who: 'note', text: `${awaiting.handle} is ${r.status}${r.error ? `: ${String(r.error)}` : ''}` });
-          setAwaiting(null);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const round = async () => {
+      const list = awaitingRef.current;
+      const done = new Set<number>();
+      const rebase = new Map<number, { base: string; baseUpdated: number }>();
+      for (const handle of [...new Set(list.map((a) => a.handle))]) {
+        const mine = list.filter((a) => a.handle === handle);
+        for (const a of mine) {
+          if (Date.now() - a.since > REPLY_WAIT_MS) {
+            note(handle, { who: 'note', text: 'no reply came' });
+            done.add(a.key);
+          }
         }
-      } catch {
-        /* the next read may answer */
+        const open = mine.filter((a) => !done.has(a.key));
+        if (open.length === 0) continue;
+        let r: { [k: string]: Json } | null;
+        try {
+          r = (await client.subagentStatus(handle)) as { [k: string]: Json } | null;
+        } catch {
+          continue; // the next round may answer
+        }
+        if (!alive) return;
+        const replyTo = typeof r?.reply_to === 'string' ? r.reply_to : undefined;
+        if (replyTo !== undefined) {
+          const a = open.find((x) => x.sent === replyTo);
+          const answer = a ? (r?.[a.from] ?? null) : null;
+          if (a && answer !== null) {
+            note(handle, { who: 'child', text: replyText(answer) });
+            done.add(a.key);
+          }
+        } else {
+          const warm = open.filter((x) => x.from === 'result');
+          const a = warm[0];
+          const answer = r?.result ?? null;
+          const summary = mirror.getState().subagents.get(handle) as { [k: string]: Json } | undefined;
+          const updated = Number(summary?.updated ?? 0);
+          const now = JSON.stringify(answer);
+          if (a && answer !== null && (now !== a.base || updated > a.baseUpdated)) {
+            note(handle, { who: 'child', text: replyText(answer) });
+            done.add(a.key);
+            // The next message's answer is the turn after this one.
+            for (const b of warm.slice(1)) rebase.set(b.key, { base: now, baseUpdated: updated });
+          }
+        }
+        const left = open.filter((a) => !done.has(a.key));
+        if (left.length > 0 && r && typeof r.status === 'string' && TERMINAL_SUBAGENT.has(r.status)) {
+          note(handle, { who: 'note', text: `${handle} is ${r.status}${r.error ? `: ${String(r.error)}` : ''}` });
+          for (const a of left) done.add(a.key);
+        }
       }
+      if (!alive) return;
+      if (done.size > 0 || rebase.size > 0) {
+        setAwaiting((cur) =>
+          cur.filter((a) => !done.has(a.key)).map((a) => (rebase.has(a.key) ? { ...a, ...rebase.get(a.key) } : a)),
+        );
+      }
+      timer = setTimeout(() => void round(), SUBAGENT_POLL_MS);
     };
-    const t = setInterval(() => void tick(), SUBAGENT_POLL_MS);
+    timer = setTimeout(() => void round(), SUBAGENT_POLL_MS);
     return () => {
       alive = false;
-      clearInterval(t);
+      clearTimeout(timer);
     };
-  }, [awaiting, client, mirror, note]);
+  }, [awaitingAny, client, mirror, note]);
 
   const logCursorOf = useRef<number | undefined>(undefined);
   // The log pane: its tail when it opens, then what is written since, read
-  // with the cursor every SUBAGENT_POLL_MS while it is open.
+  // with the cursor while it is open. One read at a time: the next is
+  // scheduled SUBAGENT_POLL_MS after the last one finished, so a read slower
+  // than that is never overlapped by one with the same cursor (both would
+  // append the same lines). A reply to a cursor the pane has moved past is
+  // stale, and dropped.
   const logOpen = screen === 'subagents' && subMode === 'log' ? subLog?.handle : undefined;
   useEffect(() => {
     if (!logOpen || !client) return;
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const read = async () => {
+      const cur = logCursorOf.current;
       try {
-        const cur = logCursorOf.current;
         const r = (await client.subagentLog(logOpen, 200, cur)) as { [k: string]: Json } | null;
-        if (!alive || !r) return;
-        const lines = Array.isArray(r.lines) ? r.lines.filter((l): l is string => typeof l === 'string') : [];
-        const cursor = typeof r.cursor === 'number' ? r.cursor : cur;
-        logCursorOf.current = cursor;
-        const noteText = typeof r.note === 'string' ? r.note : undefined;
-        setSubLog((was) =>
-          was?.handle === logOpen
-            ? { handle: logOpen, lines: [...was.lines, ...lines].slice(-LOG_KEEP), cursor, note: noteText }
-            : was,
-        );
-        // Scrolled up? New lines must not move what is being read.
-        if (lines.length > 0) setLogScroll((o) => (o > 0 ? o + lines.length : 0));
+        if (alive && r && logCursorOf.current === cur) {
+          const lines = Array.isArray(r.lines) ? r.lines.filter((l): l is string => typeof l === 'string') : [];
+          const cursor = typeof r.cursor === 'number' ? r.cursor : cur;
+          logCursorOf.current = cursor;
+          const noteText = typeof r.note === 'string' ? r.note : undefined;
+          setSubLog((was) =>
+            was?.handle === logOpen
+              ? { handle: logOpen, lines: [...was.lines, ...lines].slice(-LOG_KEEP), cursor, note: noteText }
+              : was,
+          );
+          // Scrolled up? New lines must not move what is being read.
+          if (lines.length > 0) setLogScroll((o) => (o > 0 ? o + lines.length : 0));
+        }
       } catch (e) {
         if (alive) setSubLog((was) => (was?.handle === logOpen ? { ...was, note: plainFailure(e) } : was));
       }
+      if (alive) timer = setTimeout(() => void read(), SUBAGENT_POLL_MS);
     };
     void read();
-    const t = setInterval(() => void read(), SUBAGENT_POLL_MS);
     return () => {
       alive = false;
-      clearInterval(t);
+      clearTimeout(timer);
     };
   }, [logOpen, client]);
 
@@ -880,18 +945,33 @@ export function App(props: AppProps): React.JSX.Element {
         note(handle, { who: 'note', text: 'not connected yet' });
         return;
       }
-      // What its result is now, so the reply is told from it.
+      // An instance child's answer is its `reply`, never its own `result`
+      // (the report of the work it was started with). A warm worker's is the
+      // `result` of the turn the message starts: what it is now, so a status
+      // that names no send can still tell that turn from the last.
+      const from = summary?.tier === 'instance' ? 'reply' : 'result';
       let base = 'null';
-      try {
-        const st = (await client.subagentStatus(handle)) as { [k: string]: Json } | null;
-        base = JSON.stringify(st?.reply ?? st?.result ?? null);
-      } catch {
-        /* the send says what is wrong, if anything is */
+      if (from === 'result') {
+        try {
+          const st = (await client.subagentStatus(handle)) as { [k: string]: Json } | null;
+          base = JSON.stringify(st?.result ?? null);
+        } catch {
+          /* the send says what is wrong, if anything is */
+        }
       }
       note(handle, { who: 'you', text });
       try {
-        await client.subagentSend(handle, text);
-        setAwaiting({ handle, base, baseUpdated: Number(summary?.updated ?? 0), since: Date.now() });
+        const sent = await client.subagentSend(handle, text);
+        const entry: Awaiting = {
+          key: ++awaitKey.current,
+          handle,
+          sent: sent?.task ?? undefined,
+          from,
+          base,
+          baseUpdated: Number(summary?.updated ?? 0),
+          since: Date.now(),
+        };
+        setAwaiting((cur) => [...cur, entry]);
       } catch (e) {
         note(handle, { who: 'note', text: `not sent: ${plainFailure(e)}` });
       }
@@ -1154,10 +1234,11 @@ export function App(props: AppProps): React.JSX.Element {
               onChange: setSubInput,
               onSubmit: (v: string) => void sendToSubagent(subDetail.handle, v),
               exchange: exchanges[subDetail.handle] ?? [],
-              waiting: awaiting?.handle === subDetail.handle,
+              waiting: awaiting.some((a) => a.handle === subDetail.handle),
               // Inside the field's box: its border and padding, and the prompt.
               width: Math.max(1, columns - 6),
             }}
+            rows={bodyRows}
           />
         ) : (
           <SubagentList s={s} selected={selected} />
@@ -1221,8 +1302,10 @@ export function App(props: AppProps): React.JSX.Element {
                     color={i === sugIndex ? theme.accent : theme.dim}
                     bold={i === sugIndex}
                   >
-                    {sug.label}
-                    <Text color={theme.dim}> {sug.hint}</Text>
+                    {/* Daemon-supplied names (a skill, a workflow, a
+                        conversation another user named) and values: inert. */}
+                    {inert(sug.label)}
+                    <Text color={theme.dim}> {inert(sug.hint)}</Text>
                   </Text>
                 ))}
               </Box>

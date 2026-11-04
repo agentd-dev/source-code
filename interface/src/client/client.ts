@@ -438,9 +438,15 @@ export class AgentdClient {
     return this.data(OPS.workflowSignal, args);
   }
 
-  /** Inject a message into a WARM subagent. */
-  async subagentSend(handle: string, message: string): Promise<Json> {
-    return this.data(OPS.subagentSend, { handle, message });
+  /**
+   * Send a message to a warm subagent or an instance child. `task` is the id
+   * of the task the send ran as: the child's answer, once recorded, names it
+   * as `reply_to` in `subagent.status`, which is how a reply is told to be
+   * this message's and not another's.
+   */
+  async subagentSend(handle: string, message: string): Promise<{ task: string | null; data: Json }> {
+    const r = await this.command(OPS.subagentSend, { handle, message });
+    return { task: r.kind === 'task' ? r.task.id : null, data: r.data ?? null };
   }
 
   /**

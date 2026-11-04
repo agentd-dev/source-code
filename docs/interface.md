@@ -460,9 +460,13 @@ watchers.
 one is offered and the cursor is at the end, the rest of the selected one is
 drawn after the cursor, dim; `→` or `Tab` accepts it, and `↑`/`↓` pick
 another. The dim text is only drawn: `Enter` sends what you typed. It is cut
-at the end of the row it is on, and not drawn at all when the line already
+at the end of the row it is on, measured in terminal columns (a wide
+character or an emoji takes two), and not drawn at all when the line already
 wraps, so the composer never grows a row for it. Elsewhere in the line, `→`
-moves the cursor.
+moves the cursor. The names offered come from the daemon (workflows, skills,
+conversations another user named), so the dim text, the suggestion row and
+the composer show any control character in them spelled out (`\u001b`),
+never acted on.
 
 - `/` runs a [slash command](#slash-commands), and every workflow is a
   shortcut too: `/deploy` runs the `deploy` workflow (built-in names win). A
@@ -578,13 +582,22 @@ m/enter message · l log · k stop · esc/backspace back · tab next screen
 - **`m` or `Enter` messages it.** A message field opens in the detail view
   itself; `Enter` sends, `Esc` leaves the field. What you sent and what the
   subagent answered stay above it as a short exchange, so you can follow up
-  without leaving the child. A warm flat worker and a live instance child
-  take messages; for any other, the field says why it cannot. A refusal from
-  the daemon (a child that is not running, or not reachable yet) is shown in
-  the field too. `/send <handle> <text>` in the chat still sends one.
+  without leaving the child. Each item takes at most three rows (a longer one
+  ends `…`), and the exchange keeps to the rows the view has left, showing
+  the newest. Each message waits for its own reply: a reply is shown only
+  when `subagent.status` names the send it answers (`reply_to`, the task the
+  send ran as), so a second message does not lose the first one's answer,
+  and an instance child's own result, or its answer to someone else, is not
+  shown as an answer to you. A warm worker whose status names no send is
+  matched by its result moving, oldest message first. A warm flat worker and
+  a live instance child take messages; for any other, the field says why it
+  cannot. A refusal from the daemon (a child that is not running, or not
+  reachable yet) is shown in the field too. `/send <handle> <text>` in the
+  chat still sends one.
 - **`l` shows its log**, while the card lists `subagent.log` for you (the
   operator). The pane tails the child's log and follows new lines, reading
-  every 1.5 s while it is open. `↑`/`↓` and `PgUp`/`PgDn` scroll it, and
+  again 1.5 s after each read finishes, one read at a time, while it is
+  open. `↑`/`↓` and `PgUp`/`PgDn` scroll it, and
   `Esc` closes it. Each line is shown as its time, level and event, then the
   event's own fields; the fields every line carries (`run_id`, `agent_path`,
   `pid`, trace ids) are left out. An instance child's lines are its own log

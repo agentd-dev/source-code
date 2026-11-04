@@ -28,7 +28,9 @@
  */
 import React from 'react';
 import { Text, useInput } from 'ink';
+import { inert } from '../../client/index.js';
 import { theme } from '../theme.js';
+import { columnsOf, cutToColumns } from './cells.js';
 
 /** The editor's state: the buffer, and the cursor's index into it. */
 export interface EditState {
@@ -150,12 +152,22 @@ export function applyKey(s: EditState, input: string, key: EditKey): EditResult 
  */
 export function ghostFits(value: string, ghost: string, width: number | undefined): string {
   if (!ghost || width === undefined || width < 1) return '';
-  const last = [...value.slice(value.lastIndexOf('\n') + 1)].length;
+  // Columns, not code points: a wide character takes two, and a ghost
+  // counted by code points would wrap the row it was cut to fit.
+  const last = columnsOf(value.slice(value.lastIndexOf('\n') + 1));
   // The cursor sits on the ghost's first character, so the row holds the
   // line and the ghost.
   const room = width - last;
   if (room < 1) return '';
-  return [...ghost].slice(0, room).join('');
+  return cutToColumns(ghost, room);
+}
+
+/** Text as the field draws it: its newlines kept, every other control character spelled out ({@link inert}). */
+function drawn(s: string): string {
+  return s
+    .split('\n')
+    .map((l) => inert(l))
+    .join('\n');
 }
 
 export interface MultilineInputProps {
@@ -249,10 +261,14 @@ export function MultilineInput({
   }
 
   const at = clamp(cursor, 0, value.length);
-  const before = value.slice(0, at);
-  const under = value.slice(at, at + 1);
-  const after = value.slice(at + 1);
-  const shown = at === value.length && value !== '' ? ghostFits(value, ghost ?? '', width) : '';
+  // Drawn inert: a completion accepted from a daemon-supplied name (a skill,
+  // a workflow, a conversation another user named) lands in the buffer, and
+  // the terminal must not act on what it carries.
+  const before = drawn(value.slice(0, at));
+  const under = drawn(value.slice(at, at + 1));
+  const after = drawn(value.slice(at + 1));
+  // The ghost is such a name too, measured as it is drawn.
+  const shown = at === value.length && value !== '' ? ghostFits(drawn(value), inert(ghost ?? ''), width) : '';
   if (shown) {
     const first = [...shown][0];
     return (

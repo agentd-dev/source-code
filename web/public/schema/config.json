@@ -3869,6 +3869,10 @@
             }
           ]
         },
+        "title": {
+          "description": "this agent's own title in the org chart (e.g. `Chief executive`), a label: the `self` entry's title in the status document's `org` and in the `agent.org` log. Grants nothing; not on the Agent Card. Operator-only",
+          "type": "string"
+        },
         "tools": {
           "additionalProperties": false,
           "properties": {

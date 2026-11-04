@@ -494,7 +494,7 @@ introspection ops, which answer `INTROSPECTION_DISABLED`.
   facts and the caller's own work. The operator's read adds the internals —
   subagents, children, timers, budget, counters, the store, the instruction
   — and `org`, the org chart in one list: this agent (`kind: self`, named
-  by `agent.name`), every template and every peer, each
+  by `agent.name`, titled by `agent.title`), every template and every peer, each
   `{name, kind, title, reports_to}`, so a client draws the hierarchy
   without joining lists. The lines are labels
   ([Draw the org chart](delegate-subagents.md#draw-the-org-chart)).

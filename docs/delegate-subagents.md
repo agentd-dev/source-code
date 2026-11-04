@@ -1004,7 +1004,8 @@ own definition changed.
 
 Who reports to whom is a label the operator writes on each template and
 each A2A peer: `reports_to` names the manager, and `title` says what the
-role is. A reporting line grants nothing. A manager gets no tool for its
+role is. This agent's own title is `agent.title`; it sits at the top, so it
+has no `reports_to`. A reporting line grants nothing. A manager gets no tool for its
 reports, no peer route to them and no authority over them, and a report
 gets nothing from its manager; what each can do is what it could do
 without the line. agentd checks the lines, carries them, and shows them.
@@ -1016,6 +1017,7 @@ reports to the CEO. Save it as `company.yaml`.
 ```yaml
 agent:
   name: ceo
+  title: Chief executive
   instruction: |
     You run a small company. Hand engineering questions to the cto
     template and marketing to the cmo template.
@@ -1093,7 +1095,7 @@ company above:
 ```json
 {
   "org": [
-    {"name": "ceo", "kind": "self", "title": null, "reports_to": null},
+    {"name": "ceo", "kind": "self", "title": "Chief executive", "reports_to": null},
     {"name": "cmo", "kind": "template", "title": "Chief marketing officer", "reports_to": "ceo"},
     {"name": "cto", "kind": "template", "title": "Chief technology officer", "reports_to": "ceo"},
     {"name": "writer", "kind": "template", "title": "Staff writer", "reports_to": "cmo"},
@@ -1111,8 +1113,8 @@ The line also travels with each child. A template's `reports_to` is on its
 `instance.spawn`, on the child's record, in `subagent.list` and
 `subagent.get`, in the A2A feed's `subagent` items, and in the TUI's
 subagents screen, which shows a `reports to` column. At load agentd logs
-the chart once as `agent.org` when any template or peer has a line or a
-title.
+the chart once as `agent.org` when anyone in it has a line or a title:
+this agent with an `agent.title`, a template or a peer.
 
 A workflow reads the chart with a `status` tool step. No new node is
 needed. A run started by the operator, or by a `once` or `schedule` start,
@@ -1142,7 +1144,14 @@ feed's `subagent` item carries it, and the parent logs
 `to`). A reload that moves a peer's line logs `a2a.peer.reports_to_changed`
 (`peer`, `from`, `to`) and lists `a2a.peers` among what changed. Either way
 the status document's `org` is the new chart at once, and `agent.org` is
-logged again.
+logged again. `agent.title` reloads the same way: a reload that changes it
+lists `agent.title` among what changed, and `org`'s `self` entry carries
+the new title.
+
+A served document's `:::config` cannot set `agent.title`, as it cannot set
+a peer's `reports_to` or `title`: where this agent stands in its
+organisation is the operator's to say, and the load refuses the document,
+naming the field.
 
 ## Avoid these traps
 
@@ -1223,7 +1232,7 @@ events to watch:
 | `subagent.template.retired`, `subagent.template.recomposed`, `subagent.template.respawned`, `subagent.template.respawn_failed` | A reload removed or changed a live child's template: `template`, `handle`, `why`; a respawn names the child it replaces (`was`) |
 | `subagent.template.reports_to_changed` | A reload moved a live child's template to another manager, in the document or in the operator's `reports_to`: `template`, `handle`, `from`, `to`; the child keeps running |
 | `a2a.peer.reports_to_changed` | A reload moved a peer's `reports_to`: `peer`, `from`, `to` |
-| `agent.org` | The org chart, `org`, as the status document has it: at load and after a reload that moved it, when any template or peer has a line or a title |
+| `agent.org` | The org chart, `org`, as the status document has it: at load and after a reload that moved it, when anyone in it (this agent, a template or a peer) has a line or a title |
 
 The `agent_subagents_spawned_total` and `agent_subagents_exited_total`
 metrics count every child process, turn and think workers included. Count

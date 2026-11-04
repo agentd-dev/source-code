@@ -285,6 +285,12 @@ pub struct Agent {
     /// authenticated, so a served document must not be able to rewrite what
     /// it claims to be.
     pub description: Option<String>,
+    /// This agent's own title in the org chart — a short human label, e.g.
+    /// "Chief executive". It is the `self` entry's title in the status
+    /// document's `org` and in the `agent.org` log, and grants nothing.
+    /// Operator-only, like the peers' titles: where this agent stands in
+    /// its organisation is the operator's view of it, not a document's.
+    pub title: Option<String>,
     /// Static text, or a single-token URI a configured MCP server serves
     /// (read + subscribed) — one field, with the shape deciding which.
     pub instruction: Option<String>,
@@ -1240,6 +1246,9 @@ pub const OPERATOR_ONLY: &[&str] = &[
     // served document rewriting it would be the document describing itself
     // to strangers in the operator's name.
     "agent.description",
+    // This agent's own title in the org chart: a label, and the operator's
+    // view of its organisation, as the peers' titles are.
+    "agent.title",
     // The tool grant. A fragment naming tools MERGES with the operator's list
     // (arrays concatenate), so a document could only ever widen it.
     "agent.tools",
@@ -9514,7 +9523,7 @@ impl Settings {
     /// its title and reporting line. Labels only — the chart grants nothing.
     pub fn org_chart(&self) -> Value {
         let mut out = vec![json!({"name": self.agent.name, "kind": "self",
-                                   "title": Value::Null, "reports_to": Value::Null})];
+                                   "title": self.agent.title, "reports_to": Value::Null})];
         out.extend(self.subagents.templates.iter().map(|(n, t)| {
             json!({"name": n, "kind": "template",
                    "title": t.title_label(), "reports_to": t.reporting_line()})
@@ -12512,6 +12521,9 @@ pub const RELOADABLE_PATHS: &[&str] = &[
     "agent.on_workflow_finished",
     "agent.preflight",
     "agent.prompt",
+    // A label in the org chart, read from the live settings by the status
+    // document; a reload that moves it logs `agent.org` again.
+    "agent.title",
     "agent.tools",
     "agent.wake_on",
     // Read again by every reload's load, and rendered from the live
@@ -20161,6 +20173,52 @@ mod reporting_line_tests {
         });
         let e = Settings::from_document(doc, MERGED_DOCUMENT).unwrap_err();
         assert!(e.contains("a2a.peers[0].reports_to"), "{e}");
+    }
+
+    /// `agent.title` is this agent's own title: the chart's `self` entry
+    /// carries it, and it is a label nothing else reads.
+    #[test]
+    fn agent_title_is_the_self_entrys_title() {
+        let mut doc = company();
+        doc["agent"]["title"] = json!("Chief executive");
+        let s = Settings::from_document(doc, MERGED_DOCUMENT).unwrap();
+        assert_eq!(s.agent.title.as_deref(), Some("Chief executive"));
+        assert_eq!(
+            s.org_chart()[0],
+            json!({"name": "ceo", "kind": "self", "title": "Chief executive", "reports_to": null})
+        );
+        assert_eq!(reporting_line_errors(&s), Vec::<String>::new());
+        // Not a string: refused at load, like any mistyped field.
+        let mut doc = company();
+        doc["agent"]["title"] = json!(7);
+        assert!(Settings::from_document(doc, MERGED_DOCUMENT).is_err());
+        // A label: it reloads, and a reload is not a restart.
+        assert!(path_covered("agent.title", RELOADABLE_PATHS));
+        assert!(!path_covered("agent.title", RESTART_ONLY_PATHS));
+    }
+
+    /// A `:::config` names no title for the agent it is delivered to: where
+    /// this agent stands is the operator's view, as a peer's title is.
+    #[test]
+    fn a_documents_config_sets_no_agent_title() {
+        let frag = json!({"agent": {"title": "Supreme leader"}});
+        assert_eq!(
+            document_wrote_operator_config(frag.as_object().unwrap()),
+            ["agent.title"]
+        );
+        let instruction = "---\nspec: \"1\"\n---\n# Co\n\n\
+            :::config{id=c dialect=\"agentd/config\"}\nagent:\n  title: Supreme leader\n:::\n";
+        let doc = json!({
+            "agent": {"name": "ceo", "instruction": instruction},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "store": {"kind": "memory"},
+        });
+        let e = Settings::from_document(doc, MERGED_DOCUMENT).unwrap_err();
+        assert!(e.contains("agent.title"), "{e}");
+        assert!(
+            e.contains("operator configuration is not a document's to set"),
+            "{e}"
+        );
     }
 
     /// A template's composition is not its place in the chart: a reload

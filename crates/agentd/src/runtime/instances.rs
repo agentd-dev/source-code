@@ -1034,14 +1034,15 @@ impl Runtime {
     }
 
     /// The org chart (`Settings::org_chart`) as one `agent.org` line, when
-    /// any template or peer in it has a reporting line or a title: at load,
-    /// and after a reload that moved it.
+    /// anyone in it — this agent, a template or a peer — has a reporting
+    /// line or a title: at load, and after a reload that moved it.
     pub(crate) fn log_org_chart(&self) {
         let org = self.settings.org_chart();
-        let drawn =
-            org.as_array().into_iter().flatten().any(|e| {
-                e["kind"] != "self" && (!e["reports_to"].is_null() || !e["title"].is_null())
-            });
+        let drawn = org
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| !e["reports_to"].is_null() || !e["title"].is_null());
         if drawn {
             self.log.info("agent.org", json!({"org": org}));
         }

@@ -74,11 +74,17 @@ impl Daemon {
 
     /// [`Daemon::boot`] with `extra` appended to the operator's configuration.
     fn boot_with(doc: &str, run_until: &str, extra: &str) -> Daemon {
+        Self::boot_with_agent(doc, run_until, "", extra)
+    }
+
+    /// [`Daemon::boot_with`], with `agent` fields beside the name (`agent`
+    /// is written as `, key: value` pairs).
+    fn boot_with_agent(doc: &str, run_until: &str, agent: &str, extra: &str) -> Daemon {
         let dir = common::unique_path("doc-agents", "d");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(format!("{dir}/team.md"), doc).unwrap();
         let cfg = format!(
-            "agent: {{ name: parent, instruction: {dir}/team.md, document_capabilities: [agents] }}\n\
+            "agent: {{ name: parent{agent}, instruction: {dir}/team.md, document_capabilities: [agents] }}\n\
              store: {{ kind: file, file: {{ path: {dir}/state }} }}\n\
              intelligence: {{ endpoints: \"mock:final\", model: mock }}\n\
              lifecycle: {{ run_until: {run_until}, idle_grace: 1500ms }}\n\
@@ -939,11 +945,12 @@ fn entry<'a>(org: &'a Value, kind: &str, name: &str) -> &'a Value {
 
 /// An operator template's reporting line is on its `instance.spawn`, on the
 /// child's record (`subagent.list`), and in the status document's `org` —
-/// read by a workflow's `status` step — beside the peer's and this agent's.
+/// read by a workflow's `status` step — beside the peer's and this agent's,
+/// whose title is `agent.title`.
 #[test]
 fn an_operators_reporting_lines_reach_the_spawn_the_record_and_the_status_org() {
     let extra = format!("{COMPANY}{KEEPALIVE}");
-    let mut d = Daemon::boot_with(&reader(""), "drained", &extra);
+    let mut d = Daemon::boot_with_agent(&reader(""), "drained", ", title: Chief executive", &extra);
     d.wait_for("both readers to finish", |d| {
         let log = d.log();
         !output_of(&log, "open").is_null() && !output_of(&log, "chart").is_null()
@@ -962,7 +969,7 @@ fn an_operators_reporting_lines_reach_the_spawn_the_record_and_the_status_org() 
     let org = output_of(&log, "chart");
     assert_eq!(
         entry(&org, "self", "parent"),
-        &serde_json::json!({"name": "parent", "kind": "self", "title": null, "reports_to": null})
+        &serde_json::json!({"name": "parent", "kind": "self", "title": "Chief executive", "reports_to": null})
     );
     assert_eq!(
         entry(&org, "template", "cto"),

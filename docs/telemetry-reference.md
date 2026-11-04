@@ -181,7 +181,7 @@ case.
 
 | Event | Level | Fields | Notes |
 |---|---|---|---|
-| `agent.org` | info | `org` | The org chart, as the operator's `status` lists it: this agent, every template and every peer, each `{name, kind, title, reports_to}` (`kind` is `self`, `template` or `peer`). Logged at load, and after a reload that moved it, when any template or peer has a `reports_to` or a `title`. A label only. |
+| `agent.org` | info | `org` | The org chart, as the operator's `status` lists it: this agent, every template and every peer, each `{name, kind, title, reports_to}` (`kind` is `self`, `template` or `peer`). Logged at load, and after a reload that moved it, when anyone in it has a `reports_to` or a `title` (this agent's is `agent.title`). A label only. |
 | `agent.paused` | info | `reason` | An instance-wide `admin.pause` began. |
 | `agent.resumed` | info | — | The instance-wide pause ended. |
 

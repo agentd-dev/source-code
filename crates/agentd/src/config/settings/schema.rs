@@ -89,6 +89,7 @@ fn top_level_properties(
                 "properties": {
                     "name": { "type": "string", "description": "instance identity (falls back to the downward-API instance, then the hostname)" },
                     "description": { "type": "string", "description": "what this agent does, in a sentence — the public Agent Card's description. Operator-only: a served document cannot rewrite what the unauthenticated card claims" },
+                    "title": { "type": "string", "description": "this agent's own title in the org chart (e.g. `Chief executive`), a label: the `self` entry's title in the status document's `org` and in the `agent.org` log. Grants nothing; not on the Agent Card. Operator-only" },
                     "instruction": { "oneOf": [
                     { "type": "string", "description": "short form: the instruction itself, a FILE path (no whitespace, path-shaped or a document extension), a DIRECTORY (path-shaped, trailing `/` or an existing folder), or a URI (`oci://`, `mcp://`, `instruction://`, `https://`). Every other setting takes its default." },
                     { "type": "object", "additionalProperties": false, "description": "long form: name the source explicitly and set everything about it here", "properties": {

@@ -5,6 +5,24 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+**Added.**
+
+- **`agent.title`: this agent's own title in the org chart.** A short
+  label, such as `Chief executive`, that fills the `self` entry's `title`
+  in the operator's `status` (`org`) and in the `agent.org` log, which is
+  now logged when this agent's title alone is set. A label only: it grants
+  nothing, and the Agent Card does not carry it. It reloads (a reload that
+  changes it lists `agent.title` among what changed), and it is the
+  operator's: a served document's `:::config` setting it is refused,
+  naming the field, as a peer's `title` is.
+- **`/allowances` in the TUI and the web UI.** Reads `payment.allowances`
+  and shows each spending allowance as a short block: its id and title,
+  currency, this period (per what, since when), spent of budget, payments
+  of `times` when set, and the amount above which a payment asks. Offered
+  only while the agent's card lists the op for the caller.
+
 ## v1.24.0 — the org chart
 
 Reporting lines in the operator's configuration: `reports_to` and `title`

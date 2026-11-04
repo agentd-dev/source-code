@@ -1231,6 +1231,11 @@ impl Runtime {
             self.follow_peer_lines(old, &new);
             changed.push("a2a.peers");
         }
+        // This agent's own title is a label the status document reads from
+        // the settings: nothing to rebuild, and the chart below says it.
+        if old.agent.title != new.agent.title {
+            changed.push("agent.title");
+        }
         if old.org_chart() != new.org_chart() {
             self.log_org_chart();
         }

@@ -78,6 +78,7 @@ export const OPS = Object.freeze({
   subagentSend: 'subagent.send',
   subagentKill: 'subagent.kill',
   subagentStatus: 'subagent.status',
+  subagentLog: 'subagent.log',
   planGet: 'plan.get',
   conversationGet: 'conversation.get',
   runGet: 'run.get',

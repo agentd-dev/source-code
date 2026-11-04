@@ -98,6 +98,11 @@ function offeredOps(s: MirrorState): ReadonlySet<string> {
   return s.session?.caps.command?.ops ?? new Set();
 }
 
+/** Whether the card offers this caller the op `op` — what a control for it is shown by. */
+export function offers(s: MirrorState, op: string): boolean {
+  return offeredOps(s).has(op);
+}
+
 /**
  * The system commands this caller can use: the client's own, and each op
  * command whose op the card lists. A command the agent would refuse is not

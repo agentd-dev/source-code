@@ -394,6 +394,18 @@ export class AgentdClient {
     return this.data(OPS.subagentGet, { handle });
   }
 
+  /**
+   * The last `lines` lines of one subagent's log, and the cursor to read on
+   * from: pass it back as `after` for only what was written since. The
+   * operator's alone, and served whatever introspection says.
+   */
+  async subagentLog(handle: string, lines?: number, after?: number): Promise<Json> {
+    const args: Obj = { handle };
+    if (lines !== undefined) args.lines = lines;
+    if (after !== undefined) args.after = after;
+    return this.data(OPS.subagentLog, args);
+  }
+
   /** The live log ring, cursored. */
   async debugEvents(after = 0, limit = 200, level?: string): Promise<Json> {
     const args: Obj = { after, limit };

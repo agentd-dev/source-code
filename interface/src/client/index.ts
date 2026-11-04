@@ -33,6 +33,7 @@ export {
   conversationsNote,
   currentGate,
   elapsed,
+  offers,
   parseAuthCommand,
   parseDelegationCommand,
   prepare,

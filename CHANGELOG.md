@@ -5,7 +5,17 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.27.0 — an instruction's events by its id, and its report off the loop
+
+When agentd follows an instruction from an `instruction://` URI, it asks
+for that instruction's own event types by its id: `instructionId` is
+added to the subscription on `events/stream` and `events/poll` wherever
+the server's listing declares the argument and the operator set none, so
+a registry attributes the stream to that instruction and sends only its
+occurrences. The registry's bindings report is made on a worker of its
+own, in apply order, so a slow registry no longer stalls the daemon.
+agentd-core and agentd-cli 1.27.0 and @agentd-dev/cli 1.27.0; agentd-mcp
+5.1.0 and agentd-net 3.0.1 are unchanged.
 
 - **Added.** An instruction read from `instruction://<id>[@ref]` follows its
   own event types (`agent.instruction.mcp.events`) with `instructionId: <id>`

@@ -432,7 +432,7 @@ so they show what the client draws.
 
 ```tui
 # agentd tui — chat
-agentd 1.26.0 triage-1 debug
+agentd 1.27.0 triage-1 debug
 ▌  Triage the newest issue
 ⠋ working
 ╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
@@ -545,7 +545,7 @@ screen lists them live:
 
 ```tui
 # agentd tui — subagents
-agentd 1.26.0 triage-1 debug
+agentd 1.27.0 triage-1 debug
   handle          template    reports to  mode      status    tokens   updated
 ▸ sa-review       reviewer    cto         detached  running   4120     0s
   sa-lint         linter                  detached  failed    260      0s
@@ -565,7 +565,7 @@ are:
 
 ```tui
 # agentd tui — subagent detail
-agentd 1.26.0 triage-1 debug
+agentd 1.27.0 triage-1 debug
 subagent sa-review
 status        running
 template      reviewer
@@ -609,7 +609,7 @@ m/enter message · l log · k stop · esc/backspace back · tab next screen
 
 ```tui
 # agentd tui — confirming a stop
-agentd 1.26.0 triage-1 debug
+agentd 1.27.0 triage-1 debug
 subagent sa-review
 status        running
 template      reviewer
@@ -627,7 +627,7 @@ A message and its reply:
 
 ```tui
 # agentd tui — messaging a subagent
-agentd 1.26.0 triage-1 debug
+agentd 1.27.0 triage-1 debug
 subagent sa-review
 status        running
 template      reviewer
@@ -651,9 +651,9 @@ The log pane:
 
 ```tui
 # agentd tui — a subagent's log
-agentd 1.26.0 triage-1 debug
+agentd 1.27.0 triage-1 debug
 log sa-review · following · 7 lines
-09:00:02 info  proc.start version=1.26.0 instance=sa-review
+09:00:02 info  proc.start version=1.27.0 instance=sa-review
 09:00:02 info  a2a.listen addr=unix:///run/agentd/sa-review/a2a.sock
 09:00:02 info  proc.ready
 09:00:03 info  turn.start conversation=parent
@@ -729,7 +729,7 @@ and only then show the debug screen and the `debug` badge. It serves:
 
 ```tui
 # agentd tui — debug
-agentd 1.26.0 triage-1 debug
+agentd 1.27.0 triage-1 debug
 feed
     1 run           {"id":"pipeline-01M0C0","workflow":"pipeline","status":"running","steps":"3/7"}
     2 step          {"run":"pipeline-01M0C0","step":"fetch","kind":"mcp.tool","phase":"start"}

@@ -311,6 +311,8 @@ fn without_the_grant_an_allowance_is_text_and_a_paying_step_is_refused() {
 /// `doc:data`; and the workflow reads what is left with the
 /// `payment.allowances` tool — the document's allowance marked
 /// `source: document`, with the document's URI.
+// Its `when` branch is CEL, which a build without the `cel` feature refuses.
+#[cfg(feature = "cel")]
 #[test]
 fn a_document_workflow_pays_under_its_allowance_and_not_past_it() {
     let dir = scratch();

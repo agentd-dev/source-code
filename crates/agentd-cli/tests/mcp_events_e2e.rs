@@ -1075,7 +1075,8 @@ fn the_instruction_is_read_again_when_its_server_says_it_changed() {
             "",
         ),
     );
-    ready(&daemon, &mock, "mock.tick");
+    // The mock offers push for the type: the instruction's binding streams.
+    daemon.wait_for("the stream opened", |l| opened(l) == 1);
     let first = events(&daemon.log(), "instruction.loaded")[0].clone();
     assert_eq!(first["server"], "mock");
     let before = instruction_reads(&mock);
@@ -1106,13 +1107,84 @@ fn the_instruction_is_read_again_when_its_server_says_it_changed() {
     assert_eq!(instruction_reads(&mock), before + 1, "{}", mock.log());
     assert!(ticks(&log).is_empty(), "nothing lands in a stream:\n{log}");
     let armed = events(&log, "mcp.events.armed");
-    assert!(armed.iter().all(|e| e["server"] == "mock"), "{log}");
-    let polled = polls(&mock);
     assert!(
-        polled
+        armed
             .iter()
-            .all(|p| p["arguments"] == json!({"topic": "instruction"})),
-        "{polled:?}"
+            .all(|e| e["server"] == "mock" && e["mode"] == "push"),
+        "{log}"
+    );
+    assert!(
+        polls(&mock).is_empty(),
+        "streamed, not polled: {}",
+        mock.log()
+    );
+    let streamed = streams(&mock);
+    assert!(
+        !streamed.is_empty()
+            && streamed
+                .iter()
+                .all(|p| p["arguments"] == json!({"topic": "instruction"})),
+        "{streamed:?}"
+    );
+}
+
+/// Where the server does not offer push, the instruction's types are polled
+/// as before — said once.
+#[test]
+fn the_instruction_is_polled_where_its_server_offers_no_push() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    mock.control("mock.events_flags", json!({"no_push": true}));
+    let daemon = Daemon::start(
+        "events-instruction-poll",
+        &follows_config(
+            &mock.uri(),
+            "[{name: mock.tick, arguments: {topic: instruction}}]",
+            "",
+        ),
+    );
+    ready(&daemon, &mock, "mock.tick");
+    mock.control("mock.publish", json!({}));
+    mock.control("mock.event", json!({"topic": "instruction"}));
+    daemon.wait_for("the instruction read again", |l| {
+        !events(l, "instruction.updated").is_empty()
+    });
+    let log = daemon.log();
+    assert!(
+        events(&log, "mcp.events.armed")
+            .iter()
+            .all(|e| e["mode"] == "poll"),
+        "{log}"
+    );
+    let said = events(&log, "mcp.events.delivery");
+    assert_eq!(said.len(), 1, "{log}");
+    assert_eq!(said[0]["reason"], "not_offered");
+    assert!(streams(&mock).is_empty());
+}
+
+/// MCPG 0.1.0 numbers the extension's errors as the design sketch does
+/// (`-32011`…`-32015`): a poll answered `-32012` (Forbidden) is refused, not
+/// backed off and asked again.
+#[test]
+fn a_poll_refused_in_mcpgs_numbering_is_read_as_the_code_it_means() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-mcpg-codes",
+        &config(&mock.uri(), MEMORY, &tick_binding("")),
+    );
+    ready(&daemon, &mock, "mock.tick");
+    mock.control(
+        "mock.events_fail",
+        json!({"code": -32012, "message": "forbidden", "times": 5}),
+    );
+    daemon.wait_for("refused as forbidden", |l| {
+        events(l, "mcp.events.refused")
+            .iter()
+            .any(|e| e["reason"] == "forbidden")
+    });
+    let log = daemon.log();
+    assert!(
+        events(&log, "mcp.events.poll.fail").is_empty(),
+        "refused, not retried:\n{log}"
     );
 }
 

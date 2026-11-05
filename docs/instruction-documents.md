@@ -378,8 +378,10 @@ mcp:
       auth: { kind: static, token: "{{secret:REGISTRY_TOKEN}}" }
 ```
 
-Each event type is polled for on the server that served the instruction, and
-an occurrence reads the instruction again, at most once a second. A server
+Each event type is followed on the server that served the instruction:
+streamed (`events/stream`) where the server offers push for it, polled
+otherwise, with no configuration. An occurrence reads the instruction
+again, at most once a second. A server
 that does not offer a type refuses it once, in `mcp.events.refused`, and the
 instruction is followed the other ways.
 

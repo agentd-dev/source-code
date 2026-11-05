@@ -303,7 +303,12 @@ fn call(
 ) -> Result<Value, Failure> {
     match client.call_raw(method, params, wire::client_extensions(), bound) {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(Failure::Rpc(e)),
+        // Read in either numbering, so a server on MCPG's default
+        // (`-32011`…`-32015`) is answered as one on SEP-3415's.
+        Ok(Err(mut e)) => {
+            e.code = wire::code::normalize(e.code);
+            Err(Failure::Rpc(e))
+        }
         Err(e) => Err(Failure::Transport(e.to_string())),
     }
 }

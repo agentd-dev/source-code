@@ -46,6 +46,9 @@ struct Policy {
     fail_unsubscribe: u32,
     /// Answer every subscribe `Unsupported` (webhook not offered after all).
     refuse: bool,
+    /// The next subscribe is answered with this code, as is (MCPG's
+    /// numbering, say), once.
+    fail_subscribe: Option<i64>,
 }
 
 impl Default for Policy {
@@ -56,6 +59,7 @@ impl Default for Policy {
             ttl_cap_ms: 3_600_000,
             fail_unsubscribe: 0,
             refuse: false,
+            fail_subscribe: None,
         }
     }
 }
@@ -177,6 +181,17 @@ impl Hooks {
                 "Unsupported",
                 Some(json!({"feature": "deliveryMode", "value": "webhook"})),
             ));
+        }
+        let failing = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .policy
+            .fail_subscribe
+            .take();
+        if let Some(code) = failing {
+            eprintln!("MOCK_HOOK_FAILED {code}");
+            return Err(refusal(code, "injected", None));
         }
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
         let topic = args["topic"].as_str().unwrap_or("default").to_string();
@@ -478,6 +493,9 @@ impl Hooks {
                 }
                 if let Some(b) = args["refuse"].as_bool() {
                     g.policy.refuse = b;
+                }
+                if let Some(c) = args["fail_subscribe"].as_i64() {
+                    g.policy.fail_subscribe = Some(c);
                 }
                 Some(json!({"ok": true}))
             }

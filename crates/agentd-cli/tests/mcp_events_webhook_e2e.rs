@@ -452,3 +452,47 @@ fn a_mode_the_server_will_not_deliver_in_stays_passed_over_at_the_next_listing()
     assert_eq!(events(&log, "mcp.events.mode_changed").len(), 1, "{log}");
     assert_eq!(mock.log().matches("MOCK_HOOK_REFUSED").count(), refused);
 }
+
+/// MCPG 0.1.0 numbers the extension's errors as the design sketch does
+/// (`-32011`…`-32015`). Read in either numbering: a subscribe answered
+/// `-32012` (Forbidden) refuses the binding rather than backing off, and so
+/// does a `terminated` envelope carrying it.
+#[test]
+fn mcpgs_numbering_is_read_on_a_subscribe_and_on_a_terminated_envelope() {
+    let mock = mock();
+    mock.control("mock.hook_policy", json!({"fail_subscribe": -32012}));
+    let dir = tempfile::tempdir().unwrap();
+    let port = common::free_port();
+    let cfg = write(&config(&mock, port, dir.path(), ""));
+    let daemon = Daemon::start("hooks-mcpg-subscribe", &cfg);
+    daemon.wait_for("refused as forbidden", |l| {
+        events(l, "mcp.events.refused")
+            .iter()
+            .any(|e| e["reason"] == "forbidden")
+    });
+    let log = daemon.log();
+    assert!(
+        events(&log, "mcp.events.arm.fail").is_empty(),
+        "refused, not retried:\n{log}"
+    );
+    drop(daemon);
+
+    let mock = crate::mock();
+    let dir = tempfile::tempdir().unwrap();
+    let port = common::free_port();
+    let cfg = write(&config(&mock, port, dir.path(), ""));
+    let daemon = Daemon::start("hooks-mcpg-terminated", &cfg);
+    daemon.wait_for("armed", |_| daemon.armed() == 1);
+    let end = mock.control("mock.hook_terminate", json!({"code": -32012}));
+    assert_eq!(end["answers"][0], 200, "{end}");
+    daemon.wait_for("refused as forbidden", |l| {
+        events(l, "mcp.events.refused")
+            .iter()
+            .any(|e| e["reason"] == "forbidden")
+    });
+    assert_eq!(
+        events(&daemon.log(), "mcp.events.terminated")[0]["code"],
+        -32024,
+        "said as the code it means"
+    );
+}

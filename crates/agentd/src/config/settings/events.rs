@@ -136,7 +136,8 @@ fn default_max() -> u32 {
 
 /// An event type the instruction's own server offers whose occurrences say
 /// the instruction may have changed (`agent.instruction.mcp.events`): each
-/// is polled for, and an occurrence re-reads the instruction — beside the
+/// is streamed where the server offers push and polled for otherwise, and an
+/// occurrence re-reads the instruction — beside the
 /// resource subscription and the `refresh` timer, never instead of them.
 /// The type's name alone, or `{name, arguments}`.
 #[derive(Debug, Clone, PartialEq)]
@@ -418,10 +419,10 @@ pub(crate) fn subscribe_refusals(s: &Settings, w: &crate::engine::model::Workflo
     out
 }
 
-/// `agent.instruction.mcp.events`: each a named type, listed once. Polled
-/// only — a webhook needs a credential and a route checked against a server,
-/// and an instruction that names none is served by whichever answers; one
-/// re-read a second is all an occurrence can bring sooner anyway.
+/// `agent.instruction.mcp.events`: each a named type, listed once. Push,
+/// else poll, never webhook — a webhook needs a credential and a route
+/// checked against a server, and an instruction that names none is served by
+/// whichever answers.
 /// How many it holds, toward the instance's cap.
 fn check_instruction(s: &Settings, d: &mut Diagnostics) -> usize {
     let events = s

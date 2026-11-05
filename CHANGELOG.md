@@ -61,9 +61,24 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `mcp.events.stream.opened` and `mcp.events.stream.closed {reason}`.
   Status counters carry the active bindings by mode
   (`mcp_event_bindings_push`, `_poll`, `_webhook`), and
-  `events.subscriptions` carries each subscription's `mode`. The default
-  is unchanged: `delivery` stays required, and the instruction's own event
-  types (`agent.instruction.mcp.events`) are still polled (RFC 0045 P4).
+  `events.subscriptions` carries each subscription's `mode`. `delivery`
+  stays required, with no default (RFC 0045 P4).
+- **The instruction's own event types are pushed where the server offers
+  push.** `agent.instruction.mcp.events` follows each type as `[push,
+  poll]`. On a server that offers push, such as MCPG 0.1.0, an edit is
+  heard within a fraction of a second, and the consumer shows as listening
+  by push. Anywhere else it is polled, as before.
+
+**Fixed.**
+
+- **MCP Events reads the error codes MCPG 0.1.0 sends by default.** MCPG
+  numbers the extension's errors `-32011`…`-32015`, the design sketch's
+  numbering, where SEP-3415 uses `-32023`…`-32027`. Poll and webhook read
+  only SEP-3415's, so against a default MCPG a type that was gone, a
+  forbidden subscription or a mode it would not deliver in looked like a
+  failure that may pass, and the binding backed off and asked again
+  instead of being refused or re-listed. Every `events/*` answer, and a
+  webhook `terminated` envelope, is now read in either numbering.
 
 ## v1.25.0 — talk to a subagent, read its log
 

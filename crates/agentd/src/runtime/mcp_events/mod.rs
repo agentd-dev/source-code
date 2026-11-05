@@ -276,12 +276,13 @@ impl Shape {
         }
     }
 
-    /// What following the instruction asks: polled, kept nowhere, from
-    /// "now" — the instruction is read afresh at every start, so nothing
-    /// before it is worth catching up on.
+    /// What following the instruction asks: streamed where the server offers
+    /// push, polled otherwise; kept nowhere; from "now" — the instruction is
+    /// read afresh at every start, so nothing before it is worth catching up
+    /// on.
     fn of_instruction() -> Shape {
         Shape {
-            delivery: vec![Delivery::Poll],
+            delivery: vec![Delivery::Push, Delivery::Poll],
             into: None,
             replay: Replay::None,
             rate: None,
@@ -788,8 +789,8 @@ impl Runtime {
     }
 
     /// When only the instruction holds `key` — the config's binding and the
-    /// grants' holds gone — it takes the instruction's shape: polled, kept in
-    /// no stream. It keeps its cursor, so an edit since its last poll still
+    /// grants' holds gone — it takes the instruction's shape: push, else
+    /// poll, kept in no stream. It keeps its cursor, so an edit since its last poll still
     /// brings a read; a webhook subscription is let go when it is next held
     /// against its listing (`events_evaluate`). Whether it changed.
     fn events_fall_back_to_instruction(&mut self, key: &str) -> bool {

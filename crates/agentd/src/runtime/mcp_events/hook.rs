@@ -486,7 +486,7 @@ impl Runtime {
     /// `{"type":"terminated","error":…}`: the server ended the subscription.
     fn events_hook_terminated(&mut self, key: &str, error: &Value) {
         let now = now_ms();
-        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+        let code = wire::code::normalize(error.get("code").and_then(Value::as_i64).unwrap_or(0));
         let Some(b) = self.mcp_events.bindings.get_mut(key) else {
             return;
         };

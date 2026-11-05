@@ -45,8 +45,9 @@ pub mod code {
     /// The code a server means, read under either numbering: SEP-3415's
     /// `-32023`…`-32027`, or `-32011`…`-32015`, the design sketch's and
     /// ChatGPT's — which MCPG 0.1.0 sends by default (its `error_codes`
-    /// numbering `draft`, MCPG RFC 0031 §2.6). Read on the push path, whose
-    /// contract is MCPG's; any other code is unchanged.
+    /// numbering `draft`, MCPG RFC 0031 §2.6). Every path reads it: every
+    /// `events/*` answer (`pool::call`), a push stream's frames and end, and a
+    /// webhook `terminated` envelope. Any other code is unchanged.
     pub fn normalize(code: i64) -> i64 {
         if (-32015..=-32011).contains(&code) {
             code - 12

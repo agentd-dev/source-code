@@ -920,6 +920,7 @@ impl Runtime {
                         version: self.instruction.version + 1,
                         version_id: None,
                         delivered_digest: None,
+                        id: None,
                     };
                 }
             }

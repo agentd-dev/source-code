@@ -5,6 +5,30 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+- **Added.** An instruction read from `instruction://<id>[@ref]` follows its
+  own event types (`agent.instruction.mcp.events`) with `instructionId: <id>`
+  on each `events/stream` and `events/poll`, wherever the type's `events/list`
+  descriptor declares that argument. The id is the registry's canonical
+  without its scheme. A registry serving several instructions to one agent,
+  such as instruction.md's `md.instruction.activity`, can then tell their
+  streams apart. An `instructionId` set in the operator's entry is sent as
+  written, a type whose descriptor does not declare the argument is asked for
+  as before, and an `mcp.servers[].events` binding that shares the type keeps
+  every instruction's occurrences. The argument is not part of the binding's
+  identity, so the binding and its cursor stay the same when it is added.
+  `mcp.events.armed` now logs the `arguments` sent.
+- **Fixed.** A slow registry no longer stalls the daemon after an
+  instruction version is applied. The consumer-binding calls
+  (`instructions_bindings_create`, then `instructions_bindings_report`) ran
+  on the reactor loop, so every workflow step and status read waited for the
+  registry to answer. They now run on a worker of their own, in the order the
+  versions were applied, and the binding id is still written to the durable
+  store from the loop. `instruction.binding.reported` follows
+  `instruction.applied` after one registry round trip, or two when the
+  binding is created first (docs/telemetry-reference.md).
+
 ## v1.26.0 — a document's own spending, and events pushed
 
 A served instruction document can carry its own wallets and allowances

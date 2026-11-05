@@ -810,6 +810,7 @@ impl Runtime {
             self.log.info(
                 "mcp.events.armed",
                 json!({"server": server, "event_type": name, "mode": "webhook",
+                       "arguments": self.mcp_events.bindings[key].arguments,
                        "cursor_present": cursor_present, "truncated": sub.truncated}),
             );
         }

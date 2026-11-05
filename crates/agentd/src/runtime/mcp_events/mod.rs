@@ -29,6 +29,10 @@ use wire::Descriptor;
 
 /// The most occurrences one poll asks for.
 const MAX_EVENTS: u32 = 50;
+/// The argument a registry attributes an instruction's event stream by
+/// (instruction.md's `md.instruction.activity`): sent where the type's
+/// descriptor declares it ([`Binding::sent_arguments`]).
+const INSTRUCTION_ID_ARG: &str = "instructionId";
 /// Polls in a row a binding makes while the server says `hasMore` and each
 /// page held something new; past it, the next poll waits its interval.
 const MAX_DRAIN: u32 = 10;
@@ -170,7 +174,17 @@ pub(crate) struct Binding {
     pub(crate) key: String,
     pub(crate) server: String,
     pub(crate) name: String,
+    /// The arguments it was declared with: its identity, which keys its
+    /// records, and what every holder of it named.
     pub(crate) arguments: Map<String, Value>,
+    /// The running instruction's registry id (`ins_…`), while the
+    /// instruction holds this binding and was read from an
+    /// `instruction://<id>[@ref]` uri.
+    instruction_id: Option<String>,
+    /// The server's `events/list` descriptor for the type declares an
+    /// `instructionId` argument: decided each time the binding is held
+    /// against a listing (`events_evaluate`).
+    takes_instruction_id: bool,
     delivery: Vec<Delivery>,
     /// The stream its occurrences land in; none when only the instruction
     /// follows it.
@@ -305,6 +319,8 @@ impl Binding {
             server: server.to_string(),
             name: name.to_string(),
             arguments,
+            instruction_id: None,
+            takes_instruction_id: false,
             delivery: shape.delivery,
             into: shape.into,
             replay: shape.replay,
@@ -364,6 +380,28 @@ impl Binding {
             self.rate = shape.rate;
             self.tokens = shape.rate.map_or(0.0, |(burst, _)| f64::from(burst));
         }
+    }
+
+    /// The arguments sent on its `events/stream` and `events/poll`: those
+    /// it was declared with, plus `instructionId` — the running
+    /// instruction's id — where only the instruction holds it, the type's
+    /// descriptor declares that argument, and the operator's entry set none
+    /// (theirs always wins). A registry that serves several instructions
+    /// tells them apart by it. Not part of the identity: the binding, its
+    /// key and its cursor are the same before the listing is known and
+    /// after; a change of what is sent re-opens the stream from the cursor
+    /// (`events_push_due`) and the next poll asks with it.
+    pub(crate) fn sent_arguments(&self) -> Map<String, Value> {
+        let mut args = self.arguments.clone();
+        if let Some(id) = &self.instruction_id
+            && self.takes_instruction_id
+            && !args.contains_key(INSTRUCTION_ID_ARG)
+            && !self.owners.is_empty()
+            && self.owners.iter().all(|o| *o == Owner::Instruction)
+        {
+            args.insert(INSTRUCTION_ID_ARG.into(), Value::String(id.clone()));
+        }
+        args
     }
 
     fn cursor_key(&self) -> String {
@@ -751,6 +789,7 @@ impl Runtime {
     fn events_follow_instruction(&mut self, now: u64) {
         let mut wanted = std::collections::BTreeSet::new();
         let source = self.settings.agent.instruction_spec.mcp.clone();
+        let instruction_id = self.instruction.id.clone();
         if let Some(m) = &source
             && self.instruction.source == "resource"
             && self.instruction.uri.as_deref() == Some(m.resource())
@@ -778,8 +817,11 @@ impl Runtime {
         }
         let mut keys = Vec::new();
         for b in self.mcp_events.bindings.values_mut() {
-            if !wanted.contains(&b.key) {
+            if wanted.contains(&b.key) {
+                b.instruction_id = instruction_id.clone();
+            } else {
                 b.owners.remove(&Owner::Instruction);
+                b.instruction_id = None;
             }
             keys.push(b.key.clone());
         }
@@ -1094,7 +1136,7 @@ impl Runtime {
         };
         let params = wire::poll_params(
             &b.name,
-            &b.arguments,
+            &b.sent_arguments(),
             b.cursor.as_deref(),
             max_age,
             max_events,
@@ -1285,9 +1327,16 @@ impl Runtime {
             );
             return self.events_refuse(key, "no_common_mode", &detail);
         };
+        let takes_instruction_id = d.declares_argument(INSTRUCTION_ID_ARG);
+        if let Some(b) = self.mcp_events.bindings.get_mut(key) {
+            b.takes_instruction_id = takes_instruction_id;
+        }
+        let Some(b) = self.mcp_events.bindings.get(key) else {
+            return;
+        };
         if let Some(schema) = &d.input_schema
             && let Err(errs) =
-                crate::jsonschema::validate(schema, &Value::Object(b.arguments.clone()))
+                crate::jsonschema::validate(schema, &Value::Object(b.sent_arguments()))
         {
             let detail = crate::jsonschema::explain(&errs);
             return self.events_refuse(key, "invalid_arguments", &detail);
@@ -1338,6 +1387,7 @@ impl Runtime {
                 self.log.info(
                     "mcp.events.armed",
                     json!({"server": b.server, "event_type": b.name, "mode": mode.as_str(),
+                           "arguments": b.sent_arguments(),
                            "cursor_present": b.cursor.is_some()}),
                 );
             }

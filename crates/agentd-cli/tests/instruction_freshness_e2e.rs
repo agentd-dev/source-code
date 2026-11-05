@@ -384,6 +384,15 @@ fn an_end_matter_only_edit_moves_the_version_id_not_the_instruction() {
             "{id} was not reported in the binding:\n{log}"
         );
     }
+    // Reported in the order applied: a later version's report never lands
+    // before an earlier one's.
+    let applied_order: Vec<&Value> = applied.iter().map(|e| &e["new_version_id"]).collect();
+    let reported_order: Vec<&Value> = reported.iter().map(|e| &e["version_id"]).collect();
+    assert_eq!(
+        reported_order,
+        applied_order[..reported_order.len()],
+        "{log}"
+    );
 
     #[cfg(feature = "sign")]
     {

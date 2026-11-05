@@ -618,6 +618,15 @@ Each occurrence re-reads the instruction, at most once a second
 (`instruction.event`, then `instruction.updated` when the text changed).
 The events add to the resource subscription and the `refresh` timer and
 replace neither.
+
+When the instruction comes from an `instruction://<id>[@ref]` resource and the
+type's `events/list` descriptor declares an `instructionId` argument, each
+`events/stream` and `events/poll` for it carries `instructionId: <id>`. That is
+how a registry serving several instructions tells their streams apart. The
+argument is added only where the operator's entry sets no `instructionId` of
+its own and no `mcp.servers[].events` binding shares the type. It is not part
+of the binding's identity, so the binding and its cursor stay the same either
+way. `mcp.events.armed` shows the `arguments` sent.
 [Write and ship instruction documents](instruction-documents.md) covers
 instruction sources, refresh and what happens when a source stops
 answering.

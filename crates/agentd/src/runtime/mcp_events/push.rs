@@ -110,6 +110,9 @@ pub(crate) struct Open {
     client: Arc<McpClient>,
     /// Its `active` came: the server took the subscription.
     pub(super) acked: bool,
+    /// The arguments it was opened with: once the binding would send others
+    /// ([`super::Binding::sent_arguments`]) it is opened again with them.
+    arguments: serde_json::Map<String, Value>,
 }
 
 impl Drop for Open {
@@ -127,6 +130,11 @@ fn open(
     params: serde_json::Map<String, Value>,
     events: Sender<Event>,
 ) -> Open {
+    let arguments = params
+        .get("arguments")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
     let handle = Arc::new(StreamHandle::new(IDLE_DEFAULT));
     let credit = Arc::new(Credit::default());
     let (h, c, conn) = (
@@ -143,6 +151,7 @@ fn open(
         generation,
         client,
         acked: false,
+        arguments,
     }
 }
 
@@ -258,6 +267,10 @@ impl Runtime {
                     Some("mode_changed")
                 } else if !connected {
                     Some("redialed")
+                } else if b.state == State::Active && o.arguments != b.sent_arguments() {
+                    // Another holder came or went, or the instruction moved:
+                    // opened again at once, from the cursor it reached.
+                    Some("arguments_changed")
                 } else {
                     match b.state {
                         State::Discovering => Some("rediscovering"),
@@ -347,7 +360,8 @@ impl Runtime {
             Replay::Within(d) => Some(d.as_millis() as u64),
             Replay::None => None,
         };
-        let params = wire::stream_params(&b.name, &b.arguments, b.cursor.as_deref(), max_age);
+        let params =
+            wire::stream_params(&b.name, &b.sent_arguments(), b.cursor.as_deref(), max_age);
         b.push = Some(open(key.to_string(), generation, client, params, events));
     }
 

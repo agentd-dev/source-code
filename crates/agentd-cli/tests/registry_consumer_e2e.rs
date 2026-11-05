@@ -83,6 +83,12 @@ fn boot_until(instruction: &str, sources: Value, done: impl Fn(&str) -> bool) ->
     Run { log }
 }
 
+/// The binding's report is in the log, or a binding call failed: it follows
+/// `instruction.applied` by a registry round trip, off the loop.
+fn reported_or_failed(log: &str) -> bool {
+    log.contains("\"instruction.binding.reported\"") || log.contains("\"instruction.binding.fail\"")
+}
+
 fn event(log: &str, name: &str) -> Option<Value> {
     log.lines()
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
@@ -94,8 +100,9 @@ fn a_registry_read_captures_its_version_and_reports_the_binding() {
     // To the machinery's apply: with `agent.instruction.machinery: live` (the
     // default) the served document's workflow joins the running config through
     // the staged reload, after startup.
+    // And to the binding's report, which follows the apply off the loop.
     let r = boot_until("instruction://ins_mock@stable", json!([]), |log| {
-        log.contains("instruction.machinery.applied")
+        log.contains("instruction.machinery.applied") && reported_or_failed(log)
     });
     let loaded = event(&r.log, "instruction.loaded")
         .unwrap_or_else(|| panic!("no instruction.loaded:\n{}", r.log));
@@ -162,7 +169,9 @@ fn a_binding_follows_a_ref_by_name_or_pins_the_version_applied() {
         ("instruction://ins_mock@latest", "latest", "follow"),
         ("instruction://ins_mock@v1", "ver_mock_1", "pin"),
     ] {
-        let r = boot(uri, json!([]));
+        let r = boot_until(uri, json!([]), |log| {
+            log.contains("proc.ready") && reported_or_failed(log)
+        });
         let created = event(&r.log, "instruction.binding.created")
             .unwrap_or_else(|| panic!("{uri}: no binding created:\n{}", r.log));
         assert_eq!(created["target"], target, "{uri}: {created}");
@@ -544,4 +553,109 @@ fn a_pinned_resolved_read_without_a_reader_is_refused_by_name() {
         r.log
     );
     let _ = std::fs::remove_file(&key);
+}
+
+/// A registry slow to take the report holds nothing up: while it sits on
+/// `instructions_bindings_report`, the daemon is ready and answers a status
+/// read at once; then the binding's lines come, created before reported, and
+/// the report follows the apply by the registry's round trip.
+#[cfg(feature = "a2a")]
+#[test]
+fn a_slow_registry_report_holds_up_no_read() {
+    const DELAY_MS: u64 = 3_000;
+    let mock = common::spawn_mock_mcp("mock://watched", false);
+    mock.control("mock.bindings_delay", json!({"ms": DELAY_MS}));
+    let boot = |port: u16| {
+        let cfg = json!({
+            "agent": {"name": "reg-slow", "preflight": "never",
+                      "instruction": {"mcp": "instruction://ins_mock@stable"},
+                      "document_capabilities": ["compute"]},
+            "mcp": {"servers": [{"name": "registry", "endpoint": format!("{}/mcp", mock.uri())}]},
+            "intelligence": {"endpoints": ["http://127.0.0.1:1/v1"], "model": "mock"},
+            "a2a": {"listen": format!("http://127.0.0.1:{port}")},
+            "store": {"kind": "memory"},
+            "observability": {"log_level": "info"},
+        });
+        let cfg_path = common::unique_path("reg-slow", "json");
+        std::fs::write(&cfg_path, serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let err_path = common::unique_path("reg-slow", "log");
+        let errf = std::fs::File::create(&err_path).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["-c", &cfg_path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(errf)
+            .spawn()
+            .unwrap();
+        (Child(child, cfg_path, err_path.clone()), err_path)
+    };
+    let (daemon, addr) = common::spawn_bound(boot);
+    let log = || std::fs::read_to_string(&daemon.2).unwrap_or_default();
+    // The registry has the report, and has not answered it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !mock
+        .log()
+        .contains("MOCK_BINDINGS instructions_bindings_report")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "no report sent:\n{}\n{}",
+            log(),
+            mock.log()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let asked = Instant::now();
+    let status = common::SendMessage::command("status", json!({})).result(&addr);
+    let took = asked.elapsed();
+    assert!(
+        !mock.log().contains("MOCK_BINDINGS_ANSWERED"),
+        "the status read waited for the report ({took:?}):\n{}",
+        log()
+    );
+    assert!(
+        took < Duration::from_millis(DELAY_MS / 2),
+        "{took:?}: {status}"
+    );
+    while !reported_or_failed(&log()) {
+        assert!(Instant::now() < deadline, "no report:\n{}", log());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let log = log();
+    assert!(event(&log, "instruction.binding.fail").is_none(), "{log}");
+    let at = |name: &str| {
+        log.lines()
+            .position(|l| l.contains(&format!("\"{name}\"")))
+            .unwrap_or_else(|| panic!("no {name}:\n{log}"))
+    };
+    assert!(
+        at("instruction.applied") < at("instruction.binding.created"),
+        "{log}"
+    );
+    assert!(
+        at("instruction.binding.created") < at("instruction.binding.reported"),
+        "{log}"
+    );
+    assert!(
+        at("proc.ready") < at("instruction.binding.reported"),
+        "{log}"
+    );
+    assert_eq!(
+        event(&log, "instruction.binding.reported").unwrap()["version_id"],
+        "ver_mock_1"
+    );
+}
+
+/// A daemon stopped when the test is done with it.
+#[cfg(feature = "a2a")]
+struct Child(std::process::Child, String, String);
+
+#[cfg(feature = "a2a")]
+impl Drop for Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+        let _ = std::fs::remove_file(&self.1);
+        let _ = std::fs::remove_file(&self.2);
+    }
 }

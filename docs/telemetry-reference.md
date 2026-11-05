@@ -530,9 +530,9 @@ its `jti`.
 | Event | Level | Fields | Notes |
 |---|---|---|---|
 | `instruction.applied` | info | `delivered_digest`, `new_version_id`, `old_version_id`, `uri` |  |
-| `instruction.binding.created` | info | `binding_id`, `instruction_id`, `server` |  |
-| `instruction.binding.fail` | warn | `err`, `op`, `server` |  |
-| `instruction.binding.reported` | info | `binding_id`, `version_id` |  |
+| `instruction.binding.created` | info | `binding_id`, `instruction_id`, `mode`, `server`, `target` | The registry made this agent's consumer binding for the instruction, on the first report. |
+| `instruction.binding.fail` | warn | `err`, `op`, `server` | `op`: `create` or `report`. The agent carries on. |
+| `instruction.binding.reported` | info | `binding_id`, `version_id` | The registry took the report of a version applied. It follows that version's `instruction.applied` after one registry round trip, or two when the binding is created first. The calls run off the loop, in the order applied. |
 | `instruction.event` | info | `event_type`, `server` |  |
 | `instruction.loaded` | info | `bytes`, `dir`, `files`, `glob`, `layer_digest`, `manifest_digest`, `order`, `resolution`, `server`, `uri`, `version`, `version_id` | The instruction was read. |
 | `instruction.machinery.applied` | info | `agents_added`, `agents_removed`, `servers_added`, `servers_removed`, `skills_added`, `skills_removed`, `version` | A reload applied a served document's changed machinery; the lists are names (`agents_*` the agents it defines, RFC 0056), `version` its registry version id. |
@@ -594,7 +594,7 @@ its `jti`.
 | `mcp.connect.fail` | warn | `server`, `err`, `reason?` | A server could not be connected. Not fatal: agentd retries on a backoff. |
 | `mcp.disconnect` | info, warn | `reason`, `server` | A connection closed. `reason`: `reload`, `reload refused`, `session_lost` (re-dialed), or `user_id_reset` (a Company's connection, dropped by `company.user_id.reset`; it joins again on a new one). |
 | `mcp.events.arm.fail` | error, warn | `err`, `event_type`, `retry_ms`, `server` |  |
-| `mcp.events.armed` | info | `server`, `event_type`, `mode`, `cursor_present`, `truncated?` | An MCP Events binding started polling or streaming, or its webhook subscription was made. |
+| `mcp.events.armed` | info | `server`, `event_type`, `mode`, `arguments`, `cursor_present`, `truncated?` | An MCP Events binding started polling or streaming, or its webhook subscription was made. |
 | `mcp.events.callback_failed` | error | `event_type`, `reason`, `server`, `url` | The server could not reach or verify `webhooks.url`. |
 | `mcp.events.delivery` | warn | `server`, `event_type`, `binding`, `mode`, `reason`, `not_offered?` | A binding moved to a later listed delivery mode, said once. `reason`: `not_offered`, `method_not_found`, `unsupported`, `forbidden`, `refused`. |
 | `mcp.events.delivery_suspended` | warn | `active`, `event_type`, `last_error`, `server` |  |

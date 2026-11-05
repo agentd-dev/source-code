@@ -90,10 +90,24 @@ pub struct Descriptor {
     /// not know is kept and never chosen.
     #[serde(default)]
     pub delivery: Vec<String>,
-    #[serde(default)]
+    /// `inputSchema`; `input_schema`, the spelling a registry's
+    /// own listing has been seen in, is read too.
+    #[serde(default, alias = "input_schema")]
     pub input_schema: Option<Value>,
-    #[serde(default)]
+    #[serde(default, alias = "payload_schema")]
     pub payload_schema: Option<Value>,
+}
+
+impl Descriptor {
+    /// Whether the type takes an argument `name`: its `inputSchema` names
+    /// it among its `properties`.
+    pub fn declares_argument(&self, name: &str) -> bool {
+        self.input_schema
+            .as_ref()
+            .and_then(|s| s.get("properties"))
+            .and_then(Value::as_object)
+            .is_some_and(|p| p.contains_key(name))
+    }
 }
 
 /// One page of `events/list`.
@@ -586,5 +600,26 @@ mod tests {
         assert_eq!(p["maxEvents"], 50);
         let p = poll_params("incident.created", &args, Some("c-1"), None, 50);
         assert!(!p.contains_key("maxAgeMs"), "replay: none");
+    }
+
+    #[test]
+    fn an_argument_is_declared_by_the_input_schemas_properties_in_either_spelling() {
+        let activity = json!({"type": "object", "additionalProperties": false,
+                              "properties": {"instructionId": {"type": "string"},
+                                             "orgId": {"type": "string"}}});
+        for spelling in ["inputSchema", "input_schema"] {
+            let d: Descriptor = serde_json::from_value(
+                json!({"name": "md.instruction.activity", "delivery": ["poll"], spelling: activity}),
+            )
+            .unwrap();
+            assert!(d.declares_argument("instructionId"), "{spelling}");
+            assert!(!d.declares_argument("topic"), "{spelling}");
+        }
+        let bare: Descriptor =
+            serde_json::from_value(json!({"name": "x", "inputSchema": {"type": "object"}}))
+                .unwrap();
+        assert!(!bare.declares_argument("instructionId"));
+        let none: Descriptor = serde_json::from_value(json!({"name": "x"})).unwrap();
+        assert!(!none.declares_argument("instructionId"));
     }
 }

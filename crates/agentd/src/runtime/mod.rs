@@ -18,6 +18,7 @@ pub mod activity;
 pub(crate) mod admission; // AUTH_REQUIRED at a workflow's admission (RFC 0044 §5.4 Door 2)
 pub mod artifacts;
 pub mod audit;
+mod binding_report; // the consumer-alignment report, off the loop (RFC-0028 §3.3)
 pub mod breaker;
 pub mod children;
 pub(crate) mod companies; // who reaches a Company's tools, and only through the supervisor (RFC 0047)
@@ -892,6 +893,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         timers: timers::Timers::new(),
         events_rx,
         events_tx,
+        binding_reports: Default::default(),
         reap_rx,
         pending: Vec::new(),
         turn_queue: Default::default(),
@@ -901,6 +903,7 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
         instruction: reactor::Instruction {
             version_id: None,
             delivered_digest: None,
+            id: None,
             text: String::new(),
             source: "static",
             uri: None,
@@ -2094,6 +2097,7 @@ impl Runtime {
                     // artifact pins by digest instead (recorded on the pull).
                     version_id: None,
                     delivered_digest: Some(pulled.layer_digest.clone()),
+                    id: None,
                 };
                 self.log.info(
                     "instruction.loaded",
@@ -2384,120 +2388,6 @@ impl Runtime {
         }
     }
 
-    /// Consumer-alignment reporting (RFC-0028 §3.3): ensure ONE binding on
-    /// the registry serving the instruction, then report each applied version.
-    /// Best-effort by design — a registry that cannot take the report must
-    /// never take the agent down with it; failures are one warn line each.
-    fn report_instruction_binding(
-        &mut self,
-        server: &str,
-        canonical: Option<&str>,
-        version_id: Option<&str>,
-        delivered_digest: Option<&str>,
-        uri: &str,
-    ) {
-        let (Some(canonical), Some(version_id)) = (canonical, version_id) else {
-            return; // not a versioned registry read
-        };
-        let instruction_id = canonical
-            .strip_prefix("instruction://")
-            .unwrap_or(canonical)
-            .to_string();
-        let Some(client) = self.mcp.get(server).cloned() else {
-            return;
-        };
-        const BINDING_KEY: &str = "_instruction/binding";
-        // One binding per (server, instruction), created once and kept in the
-        // durable store so a restart reuses it instead of minting another.
-        let mut binding_id = self
-            .durable
-            .get(Kind::Memory, BINDING_KEY)
-            .ok()
-            .flatten()
-            .map(|e| e.state)
-            .filter(|v| v["instruction_id"] == instruction_id)
-            .and_then(|v| v["binding_id"].as_str().map(str::to_string));
-        if binding_id.is_none() {
-            let (target, mode) = binding_target(uri, version_id);
-            let args = json!({
-                "instructionId": instruction_id,
-                "target": &target,
-                "mode": mode,
-                // The registry's consumer shape is `{name, kind, host,
-                // version}` and nothing more: it refuses any other property.
-                "consumer": {
-                    "name": self.settings.instance_name(),
-                    "kind": "agentd",
-                    "host": self.settings.agent.name.clone().unwrap_or_else(|| "agentd".into()),
-                    "version": crate::VERSION,
-                },
-            });
-            match client.call_tool("instructions_bindings_create", Some(args)) {
-                Ok(r) if !r.is_error() => {
-                    binding_id = worker::tool_result_json(&r).and_then(|v| {
-                        v.get("bindingId")
-                            .or_else(|| v.pointer("/binding/id"))
-                            .or_else(|| v.get("id"))
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    });
-                    if binding_id.is_none() {
-                        // Said: a binding never made is a consumer the
-                        // registry lists as behind, with nothing here.
-                        self.log.warn(
-                            "instruction.binding.fail",
-                            json!({"op": "create", "server": server,
-                                   "err": "the result names no binding id (bindingId, binding.id or id)"}),
-                        );
-                    }
-                    if let Some(id) = &binding_id {
-                        let _ = self.durable.put(
-                            Kind::Memory,
-                            BINDING_KEY,
-                            json!({"binding_id": id, "instruction_id": instruction_id, "server": server}),
-                            None,
-                        );
-                        self.log.info(
-                            "instruction.binding.created",
-                            json!({"server": server, "instruction_id": instruction_id, "binding_id": id,
-                                   "target": target, "mode": mode}),
-                        );
-                    }
-                }
-                Ok(r) => self.log.warn(
-                    "instruction.binding.fail",
-                    json!({"op": "create", "server": server, "err": r.text()}),
-                ),
-                Err(e) => self.log.warn(
-                    "instruction.binding.fail",
-                    json!({"op": "create", "server": server, "err": e.to_string()}),
-                ),
-            }
-        }
-        let Some(binding_id) = binding_id else { return };
-        let args = json!({
-            "instructionId": instruction_id,
-            "bindingId": binding_id,
-            "versionId": version_id,
-            "deliveredDigest": delivered_digest,
-            "client": {"name": "agentd", "version": crate::VERSION},
-        });
-        match client.call_tool("instructions_bindings_report", Some(args)) {
-            Ok(r) if !r.is_error() => self.log.info(
-                "instruction.binding.reported",
-                json!({"binding_id": binding_id, "version_id": version_id}),
-            ),
-            Ok(r) => self.log.warn(
-                "instruction.binding.fail",
-                json!({"op": "report", "server": server, "err": r.text()}),
-            ),
-            Err(e) => self.log.warn(
-                "instruction.binding.fail",
-                json!({"op": "report", "server": server, "err": e.to_string()}),
-            ),
-        }
-    }
-
     /// Read a resource instruction through `mcp` and fold it — every step
     /// that can refuse it — without adopting it. The connection set is a
     /// parameter because a reload reads the instruction through the servers
@@ -2659,6 +2549,10 @@ impl Runtime {
             version: self.instruction.version + u64::from(changed),
             version_id: version_id.clone(),
             delivered_digest: delivered_digest.clone(),
+            // Only a registry document has an id the registry knows it by.
+            id: res
+                .starts_with("instruction://")
+                .then(|| reactor::instruction_id_of(canonical.as_deref().unwrap_or(&res))),
         };
         self.log.info("instruction.loaded", json!({"server": name, "uri": res, "bytes": self.instruction.text.len(), "version": self.instruction.version, "version_id": version_id, "resolution": resolution}));
         // The APPLY boundary (RFC-0016 §6): a registry version

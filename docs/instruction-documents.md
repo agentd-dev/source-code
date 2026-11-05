@@ -385,6 +385,41 @@ again, at most once a second. A server
 that does not offer a type refuses it once, in `mcp.events.refused`, and the
 instruction is followed the other ways.
 
+A registry can serve several instructions to one agent, and it tells their
+event streams apart by the instruction's id. When the instruction is read from
+an `instruction://<id>[@ref]` resource and the server's `events/list`
+descriptor for a type declares an `instructionId` argument in its
+`inputSchema`, agentd sends `instructionId: <id>` with that type's
+`events/stream` and `events/poll`. The id is the registry's
+`md.instruction/canonical` without its scheme (`ins_…`). An entry that sets
+its own `instructionId` (`{name: md.instruction.activity, arguments:
+{instructionId: ins_…}}`) is sent as written. A type whose descriptor does not
+declare the argument is asked for with the arguments you gave, so a closed
+schema never sees an extra one. The arguments sent are on the type's
+`mcp.events.armed` line.
+
+The id is sent only while the instruction alone holds the binding. If an
+`mcp.servers[].events` entry names the same type with the same arguments, the
+two share one subscription with no `instructionId`, so the operator's binding
+still gets every instruction's occurrences. When that entry goes, the stream
+opens again with the id, from the cursor it had reached.
+
+### The registry's consumer binding
+
+After each new registry version is applied (`instruction.applied`), agentd
+reports it to the registry that served it. The first report creates one
+consumer binding (`instructions_bindings_create`,
+`instruction.binding.created`), and the binding's id is kept in the durable
+store so a restart reuses it. Each version is then reported on that binding
+(`instructions_bindings_report`, `instruction.binding.reported`). A failed call
+is one `instruction.binding.fail` line, and the agent carries on.
+
+The calls run on a worker of their own, so a slow registry delays neither a
+workflow step nor a status read. Reports go out in the order the versions were
+applied. `instruction.binding.reported` follows `instruction.applied` after one
+registry round trip, or two when the binding is created first. A test can wait
+on that line for as long as the registry takes to answer.
+
 A re-read updates the delivered text, which the model reads from its next
 turn. It does not change configuration. A new or edited `:::workflow`,
 `:::mcp` or `:::config` applies on a reload (`SIGHUP`, or a watched file

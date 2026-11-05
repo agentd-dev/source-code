@@ -164,11 +164,11 @@ fn a_binding_polls_its_occurrences_into_its_stream_and_each_starts_a_run() {
     let mut got: Vec<String> = ticks(&log).iter().map(|v| v.to_string()).collect();
     got.sort();
     assert_eq!(got, ["1", "2", "3"], "{log}");
-    // Discovery followed the listing's pages, and saw both types.
+    // Discovery followed the listing's pages, and saw all three types.
     assert!(
         events(&log, "mcp.events.listed")
             .iter()
-            .any(|e| e["server"] == "mock" && e["types"] == 2),
+            .any(|e| e["server"] == "mock" && e["types"] == 3),
         "{log}"
     );
     let wire = mock.log();
@@ -1604,4 +1604,198 @@ fn a_gap_under_a_stream_is_said_as_a_polls_is() {
     });
     assert_eq!(sorted_ticks(&daemon.log()), ["1", "3"]);
     assert_eq!(opened(&daemon.log()), 1, "the same stream goes on");
+}
+
+// --- The instruction's id (`instructionId`): a registry that serves several
+// instructions tells their event streams apart by it.
+
+/// A daemon whose instruction is the registry document
+/// `instruction://ins_mock@stable` on `mock`, following the event types in
+/// `events`; `extra` goes under the server.
+fn registry_follows_config(endpoint: &str, events: &str, extra: &str) -> String {
+    follows_config(endpoint, events, extra)
+        .replace(
+            "resource: \"mock://instruction\"",
+            "resource: \"instruction://ins_mock@stable\"",
+        )
+        .replace(
+            "agent:\n  name: follows\n",
+            "agent:\n  name: follows\n  preflight: never\n  document_capabilities: [compute]\n",
+        )
+}
+
+const ACTIVITY: &str = "md.instruction.activity";
+
+/// What reached the mock for the activity type: its streams and its polls.
+fn activity_requests(mock: &common::MockMcp) -> Vec<Value> {
+    streams(mock)
+        .into_iter()
+        .chain(polls(mock))
+        .filter(|p| p["name"] == ACTIVITY)
+        .collect()
+}
+
+fn armed_line(log: &str, event: &str) -> Option<Value> {
+    events(log, "mcp.events.armed")
+        .into_iter()
+        .find(|e| e["event_type"] == event)
+}
+
+/// Streamed where the server offers push, polled where it does not: the
+/// instruction's activity is asked for with its id, read from the registry's
+/// canonical, because the type's descriptor declares `instructionId` — and
+/// what the registry sends for it re-reads the instruction.
+#[test]
+fn the_instructions_activity_is_asked_for_by_its_id_streamed_and_polled() {
+    for push in [true, false] {
+        let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+        if !push {
+            mock.control("mock.events_flags", json!({"no_push": true}));
+        }
+        let daemon = Daemon::start(
+            "events-instruction-id",
+            &registry_follows_config(&mock.uri(), &format!("[{ACTIVITY}]"), ""),
+        );
+        daemon.wait_for("the activity armed", |l| armed(l, ACTIVITY));
+        daemon.wait_for("its first request", |_| {
+            !activity_requests(&mock).is_empty()
+        });
+        let log = daemon.log();
+        let line = armed_line(&log, ACTIVITY).unwrap();
+        assert_eq!(line["mode"], if push { "push" } else { "poll" }, "{log}");
+        assert_eq!(
+            line["arguments"],
+            json!({"instructionId": "ins_mock"}),
+            "{log}"
+        );
+        let reads = mock.reads("instruction://ins_mock@stable");
+        mock.control("mock.activity", json!({"instruction_id": "ins_mock"}));
+        daemon.wait_for("the instruction read again", |l| {
+            !events(l, "instruction.event").is_empty()
+                && mock.reads("instruction://ins_mock@stable") > reads
+        });
+        let sent = activity_requests(&mock);
+        assert!(
+            sent.iter()
+                .all(|p| p["arguments"] == json!({"instructionId": "ins_mock"})),
+            "push {push}: {sent:?}"
+        );
+        assert_eq!(
+            sent.iter().any(|p| p.get("maxEvents").is_some()),
+            !push,
+            "push {push}: {sent:?}"
+        );
+    }
+}
+
+/// A type whose descriptor does not declare `instructionId` is asked for
+/// with the arguments the operator gave — none — as before: the mock,
+/// whose schema is closed, would refuse one more.
+#[test]
+fn a_type_that_takes_no_instruction_id_is_asked_for_without_one() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    mock.control("mock.events_flags", json!({"activity_bare": true}));
+    let daemon = Daemon::start(
+        "events-instruction-bare",
+        &registry_follows_config(&mock.uri(), &format!("[{ACTIVITY}]"), ""),
+    );
+    daemon.wait_for("the activity armed", |l| armed(l, ACTIVITY));
+    daemon.wait_for("its stream", |_| !activity_requests(&mock).is_empty());
+    mock.control("mock.activity", json!({"instruction_id": "ins_other"}));
+    daemon.wait_for("the instruction read again", |l| {
+        !events(l, "instruction.event").is_empty()
+    });
+    let log = daemon.log();
+    assert_eq!(
+        armed_line(&log, ACTIVITY).unwrap()["arguments"],
+        json!({}),
+        "{log}"
+    );
+    let sent = activity_requests(&mock);
+    assert!(sent.iter().all(|p| p["arguments"] == json!({})), "{sent:?}");
+    assert!(events(&log, "mcp.events.refused").is_empty(), "{log}");
+}
+
+/// The operator's own `instructionId` is the one sent.
+#[test]
+fn an_instruction_id_the_operator_set_is_kept() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-instruction-pinned",
+        &registry_follows_config(
+            &mock.uri(),
+            &format!("[{{name: {ACTIVITY}, arguments: {{instructionId: ins_pinned}}}}]"),
+            "",
+        ),
+    );
+    daemon.wait_for("the activity armed", |l| armed(l, ACTIVITY));
+    daemon.wait_for("its stream", |_| !activity_requests(&mock).is_empty());
+    mock.control("mock.activity", json!({"instruction_id": "ins_pinned"}));
+    daemon.wait_for("the instruction read again", |l| {
+        !events(l, "instruction.event").is_empty()
+    });
+    let log = daemon.log();
+    assert_eq!(
+        armed_line(&log, ACTIVITY).unwrap()["arguments"],
+        json!({"instructionId": "ins_pinned"}),
+        "{log}"
+    );
+    let sent = activity_requests(&mock);
+    assert!(
+        sent.iter()
+            .all(|p| p["arguments"] == json!({"instructionId": "ins_pinned"})),
+        "{sent:?}"
+    );
+}
+
+/// The operator's binding shares the type with the instruction, so it is
+/// streamed with no `instructionId` — the operator asked for every
+/// instruction's activity. Once a reload takes that binding away, only the
+/// instruction holds it: the stream is opened again with the id, from the
+/// cursor it reached, on the same binding.
+#[test]
+fn the_cursor_survives_when_the_instruction_id_is_added() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let shared = format!(
+        "      events:\n        - name: {ACTIVITY}\n          delivery: [push, poll]\n          into: {{stream: ticks, subject: tick}}\n"
+    );
+    let daemon = Daemon::start(
+        "events-instruction-cursor",
+        &registry_follows_config(&mock.uri(), &format!("[{ACTIVITY}]"), &shared),
+    );
+    daemon.wait_for("the stream opened", |_| {
+        !activity_requests(&mock).is_empty()
+    });
+    mock.control(
+        "mock.activity",
+        json!({"instruction_id": "ins_other", "count": 2}),
+    );
+    daemon.wait_for("two runs", |l| ticks(l).len() == 2);
+    let first = activity_requests(&mock);
+    assert!(
+        first.iter().all(|p| p["arguments"] == json!({})),
+        "{first:?}"
+    );
+    std::fs::write(
+        &daemon.cfg_path,
+        registry_follows_config(&mock.uri(), &format!("[{ACTIVITY}]"), ""),
+    )
+    .unwrap();
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) };
+    daemon.wait_for("the stream opened with the id", |_| {
+        activity_requests(&mock)
+            .iter()
+            .any(|p| p["arguments"] == json!({"instructionId": "ins_mock"}))
+    });
+    let sent = activity_requests(&mock);
+    let with_id = sent
+        .iter()
+        .find(|p| p["arguments"] == json!({"instructionId": "ins_mock"}))
+        .unwrap();
+    assert_eq!(with_id["cursor"], "c2", "from the cursor reached: {sent:?}");
+    let log = daemon.log();
+    assert!(
+        events(&log, "mcp.events.removed").is_empty(),
+        "the same binding, not another:\n{log}"
+    );
 }

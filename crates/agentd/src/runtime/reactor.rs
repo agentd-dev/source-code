@@ -452,6 +452,21 @@ pub struct Instruction {
     /// The delivered-content digest the registry attested
     /// (`md.instruction/deliveredDigest`).
     pub delivered_digest: Option<String>,
+    /// The registry's id of the document (`ins_…`), when it was read from an
+    /// `instruction://<id>[@ref]` uri: its `md.instruction/canonical` with
+    /// the scheme taken off, as the bindings report names it
+    /// ([`instruction_id_of`]), else the uri's own `<id>`.
+    pub id: Option<String>,
+}
+
+/// The registry id an `instruction://<id>[@ref]` canonical or uri names: the
+/// scheme and any `@ref` taken off. A value without the scheme is taken as it
+/// is, as the bindings report always took a canonical.
+pub(crate) fn instruction_id_of(canonical: &str) -> String {
+    let id = canonical
+        .strip_prefix("instruction://")
+        .unwrap_or(canonical);
+    id.split(['@', '?', '#']).next().unwrap_or(id).to_string()
 }
 
 impl Instruction {
@@ -683,6 +698,8 @@ pub struct Runtime {
     pub(crate) timers: Timers,
     pub(crate) events_rx: Receiver<Event>,
     pub(crate) events_tx: Sender<Event>,
+    /// The bindings report's worker (`binding_report`).
+    pub(crate) binding_reports: super::binding_report::Reports,
     pub(crate) reap_rx: Receiver<Reaped>,
     pub(crate) pending: Vec<PendingTool>,
     pub(crate) turn_queue: VecDeque<TurnJob>,
@@ -1193,6 +1210,9 @@ impl Runtime {
             Event::A2a(req) => self.on_a2a_request(*req),
             #[cfg(feature = "a2a")]
             Event::Webhook(req) => self.on_webhook_request(*req),
+            Event::Background { id, result } if id == super::binding_report::BACKGROUND_ID => {
+                self.on_binding_report(&result)
+            }
             Event::Background { id, result } if id == "goal.judge" => {
                 self.charge_judge("goal", &result);
                 self.on_goal_judge(&result)
@@ -3239,6 +3259,7 @@ mod tests {
             version: 1,
             version_id: None,
             delivered_digest: None,
+            id: None,
         }
     }
 

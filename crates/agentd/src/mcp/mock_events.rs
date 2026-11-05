@@ -5,6 +5,16 @@
 //! per page, and a cursor log per `topic` argument the control tools write
 //! to.
 //!
+//! A third type, `md.instruction.activity`, is listed as instruction.md's
+//! registry lists it: streamed and pollable, its `inputSchema` closed
+//! (`additionalProperties: false`) over three optional properties —
+//! `instructionId`, `orgId`, `types` — and an occurrence delivered where
+//! `!has(arguments.instructionId) || arguments.instructionId ==
+//! data.row.instruction_id`, as the registry matches. `mock.activity
+//! {instruction_id, count?}` appends one; `mock.events_flags {activity_bare?}`
+//! lists it without `instructionId`, so a request that sends one is refused
+//! `InvalidParams`.
+//!
 //! Each request leaves a line on stderr, the server side's record of the
 //! wire: `MOCK_EVENTS_LIST <cursor>`, `MOCK_EVENTS_POLL <params>` and
 //! `MOCK_EVENTS_STREAM <params>`; a stream's end is `MOCK_EVENTS_STREAM_CLOSED
@@ -75,7 +85,13 @@ struct Inner {
     drops: u64,
     /// Errors the next stream opens are answered with.
     refuse_stream: VecDeque<Value>,
+    /// `md.instruction.activity` is listed without `instructionId`.
+    activity_bare: bool,
 }
+
+/// The registry's activity type, and the log its occurrences are kept in.
+const ACTIVITY: &str = "md.instruction.activity";
+const ACTIVITY_LOG: &str = "@activity";
 
 /// The mock's Events state, shared by every connection.
 #[derive(Default)]
@@ -128,7 +144,59 @@ pub fn declare(caps: &mut Value, spelling: Spelling) {
     }
 }
 
-fn descriptors(later: bool, push: bool) -> Vec<Value> {
+/// `md.instruction.activity` as instruction.md lists it; `bare`, without
+/// `instructionId`.
+fn activity_descriptor(push: bool, bare: bool) -> Value {
+    let mut properties = json!({
+        "instructionId": {"type": "string"},
+        "orgId": {"type": "string"},
+        "types": {"type": "array", "items": {"type": "string",
+                  "enum": ["published", "ref_moved", "binding_reported"]}},
+    });
+    if bare {
+        properties
+            .as_object_mut()
+            .expect("an object")
+            .remove("instructionId");
+    }
+    json!({
+        "name": ACTIVITY,
+        "description": "what happened to an instruction on the registry",
+        "delivery": if push { json!(["push", "poll"]) } else { json!(["poll"]) },
+        "inputSchema": {"type": "object", "additionalProperties": false, "properties": properties},
+        "payloadSchema": {"type": "object"}
+    })
+}
+
+/// The instruction an `md.instruction.activity` request filters on, or why
+/// its arguments do not fit the type as listed.
+fn activity_filter(args: &Map<String, Value>, bare: bool) -> Result<Option<String>, Value> {
+    let fits = args.iter().all(|(k, v)| match k.as_str() {
+        "instructionId" => !bare && v.is_string(),
+        "orgId" => v.is_string(),
+        "types" => v.is_array(),
+        _ => false,
+    });
+    if !fits {
+        return Err(refusal(
+            INVALID_PARAMS,
+            "arguments do not match inputSchema",
+            None,
+        ));
+    }
+    Ok(args
+        .get("instructionId")
+        .and_then(Value::as_str)
+        .map(str::to_string))
+}
+
+/// Whether an occurrence passes the request's filter, as the registry
+/// matches it.
+fn passes(filter: Option<&str>, occurrence: &Value) -> bool {
+    filter.is_none_or(|id| occurrence["data"]["row"]["instruction_id"] == id)
+}
+
+fn descriptors(later: bool, push: bool, activity_bare: bool) -> Vec<Value> {
     let tick_modes = if push {
         json!(["push", "poll", "webhook"])
     } else {
@@ -152,6 +220,7 @@ fn descriptors(later: bool, push: bool) -> Vec<Value> {
             "payloadSchema": {"type": "object"}
         }),
     ];
+    all.push(activity_descriptor(push, activity_bare));
     if later {
         all.push(json!({
             "name": "mock.later",
@@ -180,11 +249,11 @@ pub fn handle(events: &Events, method: &str, params: &Value) -> Result<Value, Va
             let cursor = params.get("cursor").and_then(Value::as_str);
             eprintln!("MOCK_EVENTS_LIST {}", cursor.unwrap_or("-"));
             // One type per page: the client must follow `nextCursor`.
-            let (later, push) = {
+            let (later, push, bare) = {
                 let g = events.inner.lock().unwrap_or_else(|e| e.into_inner());
-                (g.later, !g.no_push)
+                (g.later, !g.no_push, g.activity_bare)
             };
-            let all = descriptors(later, push);
+            let all = descriptors(later, push, bare);
             let at: usize = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
             let mut page = json!({"resultType": "complete", "events": all.get(at).into_iter().collect::<Vec<_>>()});
             if at + 1 < all.len() {
@@ -200,6 +269,34 @@ pub fn handle(events: &Events, method: &str, params: &Value) -> Result<Value, Va
     }
 }
 
+/// The log a request reads and the instruction it filters on, from its
+/// arguments, checked against the type's `inputSchema` as listed.
+fn topic_of(
+    name: &str,
+    args: &Map<String, Value>,
+    activity_bare: bool,
+) -> Result<(String, Option<String>), Value> {
+    if name == ACTIVITY {
+        return Ok((
+            ACTIVITY_LOG.to_string(),
+            activity_filter(args, activity_bare)?,
+        ));
+    }
+    if args.keys().any(|k| k != "topic") || args.get("topic").is_some_and(|t| !t.is_string()) {
+        return Err(refusal(
+            INVALID_PARAMS,
+            "arguments do not match inputSchema",
+            None,
+        ));
+    }
+    let topic = args
+        .get("topic")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+    Ok((topic, None))
+}
+
 fn poll(events: &Events, params: &Value) -> Result<Value, Value> {
     let mut g = events.inner.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = g.fail.pop_front() {
@@ -207,7 +304,7 @@ fn poll(events: &Events, params: &Value) -> Result<Value, Value> {
     }
     let name = params["name"].as_str().unwrap_or_default();
     match name {
-        "mock.tick" | "mock.later" => {}
+        "mock.tick" | "mock.later" | ACTIVITY => {}
         "mock.webhook_only" => {
             return Err(refusal(
                 UNSUPPORTED,
@@ -224,18 +321,7 @@ fn poll(events: &Events, params: &Value) -> Result<Value, Value> {
         }
     }
     let args = params["arguments"].as_object().cloned().unwrap_or_default();
-    if args.keys().any(|k| k != "topic") || args.get("topic").is_some_and(|t| !t.is_string()) {
-        return Err(refusal(
-            INVALID_PARAMS,
-            "arguments do not match inputSchema",
-            None,
-        ));
-    }
-    let topic = args
-        .get("topic")
-        .and_then(Value::as_str)
-        .unwrap_or("default")
-        .to_string();
+    let (topic, filter) = topic_of(name, &args, g.activity_bare)?;
     if topic == "forbidden" {
         return Err(refusal(FORBIDDEN, "Forbidden", None));
     }
@@ -271,9 +357,17 @@ fn poll(events: &Events, params: &Value) -> Result<Value, Value> {
     } else {
         params["maxEvents"].as_u64().unwrap_or(50) as usize
     };
-    let after: Vec<&(u64, String, Value)> = log.iter().filter(|(s, _, _)| *s > start).collect();
+    let after: Vec<&(u64, String, Value)> = log
+        .iter()
+        .filter(|(s, _, o)| *s > start && passes(filter.as_deref(), o))
+        .collect();
     let page: Vec<&(u64, String, Value)> = after.iter().take(max).copied().collect();
-    let next = page.last().map_or(start, |(s, _, _)| *s);
+    // Past what the filter passed over too, once the page holds the rest.
+    let next = if after.len() > page.len() {
+        page.last().map_or(start, |(s, _, _)| *s)
+    } else {
+        log.last().map_or(start, |(s, _, _)| *s).max(start)
+    };
     let events: Vec<Value> = page.iter().map(|(_, _, o)| o.clone()).collect();
     let out = json!({
         "resultType": "complete",
@@ -297,6 +391,9 @@ pub struct StreamStart {
     pub truncated: bool,
     /// The `mock.stream_drop` count it opened under.
     pub drops: u64,
+    /// `md.instruction.activity`: the instruction it delivers for, if it
+    /// names one.
+    pub filter: Option<String>,
 }
 
 /// Open one `events/stream`: checked as a poll is, then from the cursor (or
@@ -307,9 +404,10 @@ pub fn stream_open(events: &Events, params: &Value) -> Result<StreamStart, Value
     if let Some(e) = g.refuse_stream.pop_front() {
         return Err(e);
     }
-    match params["name"].as_str().unwrap_or_default() {
-        "mock.tick" if !g.no_push => {}
-        "mock.tick" | "mock.webhook_only" | "mock.later" => {
+    let name = params["name"].as_str().unwrap_or_default();
+    match name {
+        "mock.tick" | ACTIVITY if !g.no_push => {}
+        "mock.tick" | ACTIVITY | "mock.webhook_only" | "mock.later" => {
             return Err(refusal(
                 UNSUPPORTED_DRAFT,
                 "Unsupported",
@@ -325,18 +423,7 @@ pub fn stream_open(events: &Events, params: &Value) -> Result<StreamStart, Value
         }
     }
     let args = params["arguments"].as_object().cloned().unwrap_or_default();
-    if args.keys().any(|k| k != "topic") || args.get("topic").is_some_and(|t| !t.is_string()) {
-        return Err(refusal(
-            INVALID_PARAMS,
-            "arguments do not match inputSchema",
-            None,
-        ));
-    }
-    let topic = args
-        .get("topic")
-        .and_then(Value::as_str)
-        .unwrap_or("default")
-        .to_string();
+    let (topic, filter) = topic_of(name, &args, g.activity_bare)?;
     let head = g.head.get(&topic).copied().unwrap_or(0);
     let floor = g
         .log
@@ -363,6 +450,7 @@ pub fn stream_open(events: &Events, params: &Value) -> Result<StreamStart, Value
         after,
         truncated,
         drops,
+        filter,
     })
 }
 
@@ -396,7 +484,7 @@ pub fn stream_step(events: &Events, start: &StreamStart, after: u64) -> StreamSt
         gap,
         occurrences: log
             .into_iter()
-            .filter(|(s, _, _)| *s > from)
+            .filter(|(s, _, o)| *s > from && passes(start.filter.as_deref(), o))
             .map(|(s, _, o)| (s, o))
             .collect(),
         heartbeat_ms: if g.heartbeat_ms == 0 {
@@ -454,6 +542,26 @@ pub fn control(events: &Events, name: &str, args: &Value) -> Option<Value> {
             }
             Some(json!({"appended": appended}))
         }
+        // The registry's activity for one instruction.
+        "mock.activity" => {
+            let instruction = args["instruction_id"].as_str().unwrap_or("ins_mock");
+            let mut appended = Vec::new();
+            for _ in 0..args["count"].as_u64().unwrap_or(1) {
+                let seq = g.head.get(ACTIVITY_LOG).copied().unwrap_or(0) + 1;
+                g.head.insert(ACTIVITY_LOG.to_string(), seq);
+                let id = format!("act-{seq}");
+                let o = json!({"eventId": id, "name": ACTIVITY,
+                               "timestamp": "2026-10-10T00:00:00Z",
+                               "data": {"n": seq, "row": {"instruction_id": instruction,
+                                                          "type": "published"}}});
+                g.log
+                    .entry(ACTIVITY_LOG.to_string())
+                    .or_default()
+                    .push((seq, id.clone(), o));
+                appended.push(id);
+            }
+            Some(json!({"appended": appended}))
+        }
         // Retention passed the client by: everything appended so far is gone,
         // and one occurrence it never read with it.
         "mock.event_trim" => {
@@ -495,6 +603,9 @@ pub fn control(events: &Events, name: &str, args: &Value) -> Option<Value> {
             }
             if let Some(n) = args["heartbeat_ms"].as_u64() {
                 g.heartbeat_ms = n;
+            }
+            if let Some(b) = args["activity_bare"].as_bool() {
+                g.activity_bare = b;
             }
             Some(json!({"ok": true}))
         }

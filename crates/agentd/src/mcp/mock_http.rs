@@ -210,6 +210,9 @@ struct State {
     flaky_calls: AtomicU64,
     /// Fault injection: remaining `state.*` calls to fail with a tool error.
     fail_next: AtomicU64,
+    /// How long `instructions_bindings_report` takes to answer
+    /// (`mock.bindings_delay {ms}`): a slow registry.
+    report_delay_ms: AtomicU64,
     /// Every `state.*` call performed (tool name) — `mock.ops` reports it.
     ops: Mutex<Vec<String>>,
     /// The name of every tool called so far, which `mock.tools_changed` can
@@ -312,6 +315,7 @@ pub fn run_with(addr_file: &str, opts: &Options) -> i32 {
         store: Mutex::new(std::collections::BTreeMap::new()),
         flaky_calls: AtomicU64::new(0),
         fail_next: AtomicU64::new(0),
+        report_delay_ms: AtomicU64::new(0),
         ops: Mutex::new(Vec::new()),
         called: Mutex::new(std::collections::BTreeSet::new()),
         events: Arc::new(super::mock_events::Events::default()),
@@ -1011,10 +1015,23 @@ fn handle_tool_call(req: Request, http: &Http, state: &State) -> Response {
     {
         return tool_ok(req.id, out);
     }
+    if name == Some("mock.bindings_delay") {
+        let ms = args
+            .get("ms")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        state.report_delay_ms.store(ms, Ordering::SeqCst);
+        return tool_ok(req.id, json!({"report_delay_ms": ms}));
+    }
     if let Some(n) = name
         && n.starts_with("instructions_bindings_")
     {
         eprintln!("MOCK_BINDINGS {n} {args}");
+        let delay = state.report_delay_ms.load(Ordering::SeqCst);
+        if n == "instructions_bindings_report" && delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+            eprintln!("MOCK_BINDINGS_ANSWERED {n} {args}");
+        }
         // As the registry answers its tools: the JSON as text, then a
         // `resource_link` to what it names, and the JSON as
         // `structuredContent`.

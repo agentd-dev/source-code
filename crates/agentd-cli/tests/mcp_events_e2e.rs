@@ -1753,6 +1753,7 @@ fn an_instruction_id_the_operator_set_is_kept() {
 /// instruction's activity. Once a reload takes that binding away, only the
 /// instruction holds it: the stream is opened again with the id, from the
 /// cursor it reached, on the same binding.
+#[cfg(feature = "hot-reload")]
 #[test]
 fn the_cursor_survives_when_the_instruction_id_is_added() {
     let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);

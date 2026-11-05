@@ -176,7 +176,7 @@ per period, a count, a window, the payees, and who approves above an
 amount. agentd enforces them as allowances, across the rails it pays on.
 The RFC is accepted in instruction.md, and its document form — the `wallet`
 and `allowance` kinds (proposal S29, with S28's protocol names for a
-wallet's rails) — is read by the official SDK, `instruction-md` 0.3.
+wallet's rails) — is read by the official SDK, `instruction-md` 0.4.
 
 | | Support |
 |---|---|

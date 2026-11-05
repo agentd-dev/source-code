@@ -1,7 +1,7 @@
 # RFC 0057: Spending controls — allowances
 
 **Status:** Accepted 2026-11-03 by the user (decisions in §9); phases A–C
-implemented (phase C on `instruction-md` 0.3, S28 and S29); a document's
+implemented (phase C on `instruction-md` 0.4, S28 and S29); a document's
 receipts in the consumer report are not done (§8)
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-11-03
@@ -216,7 +216,7 @@ within" an allowance.
 
 Built on instruction.md proposal S29 (the `wallet` and `allowance` kinds)
 and S28 (protocol names for a wallet's `rails`) in the official SDK,
-`instruction-md` 0.3; agentd reads documents only through it
+`instruction-md` 0.4; agentd reads documents only through it
 (`config::idoc`), and maps what it reads in
 `config::settings::payments::document_allowances`.
 

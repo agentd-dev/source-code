@@ -976,7 +976,7 @@ fn document_wallet<'p>(
     if w.rails.is_empty() {
         return Ok(name);
     }
-    use instruction_md::protocol::{Compat, parse, shared_versions};
+    use instruction_md::protocol::{parse, shared_versions};
     let mut x402 = Vec::new();
     for r in &w.rails {
         let Some(p) = parse(r) else {
@@ -989,11 +989,14 @@ fn document_wallet<'p>(
             x402.push(p);
         }
     }
-    // agentd pays x402 version 2, the one its binding marks stable: a bare
-    // `x402` is it (S28 §1), and `x402/1` alone shares none.
-    if x402.iter().any(|p| {
-        !shared_versions(p, &X402_VERSIONS, Compat::Exact, Some(&X402_VERSIONS)).is_empty()
-    }) {
+    // agentd pays the x402 versions it speaks; a bare `x402` means the ones
+    // the x402 binding marks stable (S28 §1), compared by the binding's rule.
+    let binding = instruction_md::bindings::x402();
+    let stable = binding.stable();
+    if x402
+        .iter()
+        .any(|p| !shared_versions(p, &X402_PAYS, binding.compat, Some(&stable)).is_empty())
+    {
         return Ok(name);
     }
     if x402.is_empty() {
@@ -1176,9 +1179,9 @@ pub struct StepPayment {
 /// engine (RFC 0057 §8): `doc:<id>`, which no operator id can be.
 pub const DOCUMENT_PREFIX: &str = "doc:";
 
-/// The x402 versions agentd pays with, and the ones its binding marks
-/// stable (S28): version 2 alone.
-const X402_VERSIONS: [&str; 1] = ["2"];
+/// The x402 versions agentd pays with: version 2 alone (RFC 0049). Which of
+/// them a bare `x402` means is the x402 binding's (`instruction_md::bindings`).
+const X402_PAYS: [&str; 1] = ["2"];
 
 /// Read a step's `payment` against the policy `p`. `document`: the step is
 /// an instruction document's, which pays only under one of the document's

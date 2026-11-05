@@ -32,10 +32,11 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `source: document`, with the document's URI, and the TUI's `/allowances`
   says which document. Not for a Company's operations, and a document's
   receipts are not in the registry's consumer report.
-- **instruction-md 0.3.** The official instruction.md SDK, on specification commit `bf4f9a0`, with the
+- **instruction-md 0.4.** The official instruction.md SDK, on specification commit `bf4f9a0`, with the
   `wallet` and `allowance` kinds (S29) and protocol names on every connected
   kind (S28). Every existing document reads as before; an allowance's
-  reader or composer error refuses the document, as any reader error does.
+  reader or composer error refuses the document, as any reader error does. Which x402
+  versions a bare `x402` rail means is read from the SDK's x402 binding.
 
 - **MCP Events push delivery: `delivery: [push, poll]`.** A binding or a
   grant that lists `push` first, on a server whose `events/list` offers it,

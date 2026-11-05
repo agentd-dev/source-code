@@ -1080,9 +1080,9 @@ dependencies = [
 
 [[package]]
 name = "instruction-md"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0df619bc6a2468149a41ce61a4c76d9dd2f4c3bcaa93190c5f642b62234d948b"
+checksum = "6a436de25840368bc343e313855601e51e3f6be9e235f893bfde2a5b4260e7e2"
 dependencies = [
  "ring",
  "serde",

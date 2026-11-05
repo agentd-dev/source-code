@@ -160,7 +160,7 @@ all):
   "span_id": "9c1f0e7a3b5d2c84",
   "trace_id": "ec8a5ca41008bc6596c89199c65d9b9c",
   "ts": "2026-10-11T18:49:43.088Z",
-  "version": "1.25.0"
+  "version": "1.26.0"
 }
 ```
 

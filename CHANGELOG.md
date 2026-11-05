@@ -5,7 +5,19 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.26.0 — a document's own spending, and events pushed
+
+A served instruction document can carry its own wallets and allowances
+(RFC 0057 phase C, on instruction.md S29): under the operator's
+`agent.document_capabilities: [spending]`, and over the wire only with a
+pinned author's signature attesting it, each becomes a `doc:<id>`
+allowance that only narrows the operator's caps, payees and ceiling, with
+each approval tier answered by its own approver. MCP Events can be pushed
+(RFC 0045 P4): `delivery: [push, poll]` holds one `events/stream` open
+where the server offers it, from the cursor kept, and the instruction's
+own event types use it first. agentd-core and agentd-cli 1.26.0,
+agentd-mcp 5.1.0 (the stream request) and @agentd-dev/cli 1.26.0;
+agentd-net 3.0.1 is unchanged.
 
 **Added.**
 

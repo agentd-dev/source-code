@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-cli"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "agentd-core",
  "instruction-md",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-core"
-version = "1.25.0"
+version = "1.26.0"
 dependencies = [
  "a2a-lf",
  "a2a-pb",
@@ -115,7 +115,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-mcp"
-version = "5.0.0"
+version = "5.1.0"
 dependencies = [
  "agentd-net",
  "futures",

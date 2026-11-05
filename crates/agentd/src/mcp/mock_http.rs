@@ -491,6 +491,10 @@ fn serve_discover(stream: &mut TcpStream, http: &Http, state: &State) {
             };
             write_json(stream, 200, &payload, None);
         }
+        // Push: a long-lived stream, held on this connection.
+        "events/stream" if state.events_spelling != super::mock_events::Spelling::None => {
+            serve_events_stream(stream, &id, &body, state)
+        }
         // MCP Events (SEP-3415): only where it is declared [SEP L94].
         m if m.starts_with("events/")
             && state.events_spelling != super::mock_events::Spelling::None =>
@@ -1642,6 +1646,94 @@ fn serve_listen(stream: &mut TcpStream, id: &Value, body: &Value, state: &State)
     lock(&state.open).retain(|o| o.id != open_id);
     let _ = stream.shutdown(Shutdown::Both);
     eprintln!("MOCK_LISTEN_CLOSED {how}");
+}
+
+/// One `events/stream` (MCP Events push), served as MCPG 0.1.0 serves it:
+/// `active` first, then an `event` per occurrence as it is appended — and
+/// `active {truncated: true}` where the log was trimmed under the stream —
+/// with a `heartbeat` data frame every interval, every frame tagged with the
+/// request's id. Held until the client hangs up, the server restarts or
+/// `mock.stream_drop` cuts it (without a final result, as a dropped
+/// connection ends).
+fn serve_events_stream(stream: &mut TcpStream, id: &Value, body: &Value, state: &State) {
+    use super::mock_events::{StreamStep, stream_open, stream_step};
+    eprintln!("MOCK_EVENTS_STREAM {}", body["params"]);
+    let start = match stream_open(&state.events, &body["params"]) {
+        Ok(s) => s,
+        Err(error) => {
+            return write_json(
+                stream,
+                200,
+                &json!({"jsonrpc": "2.0", "id": id, "error": error}),
+                None,
+            );
+        }
+    };
+    let tag = |method: &str, mut params: Value| {
+        if !params["_meta"].is_object() {
+            params["_meta"] = json!({});
+        }
+        params["_meta"][SUBSCRIPTION_ID] = id.clone();
+        json!({"jsonrpc": "2.0", "method": method, "params": params})
+    };
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    let active = tag(
+        "notifications/events/active",
+        json!({"cursor": format!("c{}", start.after), "truncated": start.truncated}),
+    );
+    if stream.write_all(head.as_bytes()).is_err() || !send_frame(stream, &active) {
+        eprintln!("MOCK_EVENTS_STREAM_CLOSED client");
+        return;
+    }
+    let generation = state.generation.load(Ordering::SeqCst);
+    let mut after = start.after;
+    let mut beat = Instant::now();
+    let mut cut = false;
+    let how = hold(stream, state, generation, |socket| {
+        let (gap, occurrences, every) = match stream_step(&state.events, &start, after) {
+            StreamStep::Cut => {
+                cut = true;
+                return false;
+            }
+            StreamStep::Quiet => return true,
+            StreamStep::Send {
+                gap,
+                occurrences,
+                heartbeat_ms,
+            } => (gap, occurrences, heartbeat_ms),
+        };
+        if let Some(floor) = gap {
+            after = floor;
+            let f = tag(
+                "notifications/events/active",
+                json!({"cursor": format!("c{floor}"), "truncated": true}),
+            );
+            if !send_frame(socket, &f) {
+                return false;
+            }
+        }
+        for (seq, mut o) in occurrences {
+            o["cursor"] = json!(format!("c{seq}"));
+            if !send_frame(socket, &tag("notifications/events/event", o)) {
+                return false;
+            }
+            after = seq;
+        }
+        if beat.elapsed() >= Duration::from_millis(every) {
+            beat = Instant::now();
+            let f = tag(
+                "notifications/events/heartbeat",
+                json!({"cursor": format!("c{after}")}),
+            );
+            return send_frame(socket, &f);
+        }
+        true
+    });
+    let _ = stream.shutdown(Shutdown::Both);
+    eprintln!(
+        "MOCK_EVENTS_STREAM_CLOSED {}",
+        if cut { "dropped" } else { how }
+    );
 }
 
 /// The long-lived `GET` SSE stream (2025-11-25): hold it open and deliver the

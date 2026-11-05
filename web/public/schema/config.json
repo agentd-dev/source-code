@@ -511,6 +511,7 @@
           "description": "the acceptable delivery modes, in preference order",
           "items": {
             "enum": [
+              "push",
               "poll",
               "webhook"
             ]
@@ -572,6 +573,7 @@
           "description": "the acceptable delivery modes, in preference order",
           "items": {
             "enum": [
+              "push",
               "poll",
               "webhook"
             ]

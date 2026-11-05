@@ -1,6 +1,6 @@
 # RFC 0045: MCP Events
 
-**Status:** Draft; P0 implemented (`8b0ec078`…`599dbfa4` on `main`, unreleased; §8), with the two follow-ups decided 2026-10-01 (a stored definition needs the `interface` grant to open a route; a tainted run's read-back result taints its caller) built after it, and the second replaced on 2026-10-02 by withholding: a tainted result read back by a context holding `sensitive` and `egress` is answered with its text withheld, and implicit notes are opt-in (§8 item 13, §5.11.3, §11). P1 (rmcp 3.5.0 and MCP `2026-07-28`), P2 (bindings, poll mode, and the runtime subscriptions of §5.15) and P3 (webhook delivery) are implemented (§8); P4 waits on upstream. It tracks an external **draft**: SEP-3415, "Events Extension" (Draft, Extensions Track, opened 2026-10-05), which is the design sketch written in SEP format and is not yet part of the MCP specification (§2.1, §2.15). Anything marked **[draft may change]** follows text that is still open upstream.
+**Status:** Draft; P0 implemented (`8b0ec078`…`599dbfa4` on `main`, unreleased; §8), with the two follow-ups decided 2026-10-01 (a stored definition needs the `interface` grant to open a route; a tainted run's read-back result taints its caller) built after it, and the second replaced on 2026-10-02 by withholding: a tainted result read back by a context holding `sensitive` and `egress` is answered with its text withheld, and implicit notes are opt-in (§8 item 13, §5.11.3, §11). P1 (rmcp 3.5.0 and MCP `2026-07-28`), P2 (bindings, poll mode, and the runtime subscriptions of §5.15) and P3 (webhook delivery) are implemented (§8). P4's push delivery is implemented (approved 2026-11-05, §5.6.2.1). It is built against MCPG 0.1.0's `events/stream` (MCPG RFC 0031), the production gateway that serves push. The rest of P4 still waits on upstream. It tracks an external **draft**: SEP-3415, "Events Extension" (Draft, Extensions Track, opened 2026-10-05), which is the design sketch written in SEP format and is not yet part of the MCP specification (§2.1, §2.15). Anything marked **[draft may change]** follows text that is still open upstream.
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-09-29. Revised 2026-09-30 after three adversarial reviews (spec fidelity, codebase fidelity, design completeness). Decisions Q1, Q3 and Q8, the order of work, and the two item-13 follow-ups recorded 2026-10-01; the read-back one revised 2026-10-02 (§11). P0 implemented 2026-10-01/02, and §8 P0 corrected to what it proved. P1 implemented 2026-10-03/10. Revised 2026-10-10 for SEP-3415 (§2.15), with the decisions Q2, Q4, Q6 and Q9 recorded and Q6's dynamic subscriptions designed (§5.15, §11).
 **Extends:** RFC 0035 (event streams). MCP events land in declared streams and are consumed by the existing `stream` and `correlate` starts and by `wait {on: event}`. **Supersedes only the consumption half of RFC 0035 Phase D** ("the MCP broker profile"). Phase D was never built. Its publish half, a broker exposed as an MCP server with `publish` tools (`rfcs/0035-event-streams.md:175-179`), needs no profile, and MCP Events has no publish operation. RFC 0035 is annotated with a pointer, not rewritten (§4, row 1).
@@ -59,7 +59,7 @@ The work is feature-gated (`mcp-events`) and phased (§8):
 - **P1** upgrades rmcp to ≥ 3.5.0, so that agentd can speak `2026-07-28`. It affects every MCP server; the user decided for it (§11 Q1).
 - **P2** builds the bridge and **poll**.
 - **P3** adds **webhook**, the subset ChatGPT ships.
-- **Push** waits for the SEP (P4), because it is the mode maintainers questioned most [MTG].
+- **Push** waited for the SEP (P4), because it is the mode maintainers questioned most [MTG]. It was built on 2026-11-05 against the gateway that serves it in production, MCPG 0.1.0 (§5.6.2.1).
 
 ### 1.2 What the Forkast article says (kept separate from the specification)
 
@@ -501,7 +501,7 @@ The `stream` start's `payload` is the stream event (`runtime/streams.rs:356`), s
 |---|---|---|---|
 | `name` | string | required | The event type, exactly as `events/list` names it |
 | `arguments` | object | `{}` | Subscription arguments. They are part of the binding's identity, as they are part of the draft's subscription key [DS L389]. |
-| `delivery` | list of `poll` \| `webhook` (`push` once P4 lands) | **required** | Acceptable modes, in preference order. There is no default, because each mode has a different exposure: webhook opens inbound deliveries, and push holds a connection. |
+| `delivery` | list of `push` \| `poll` \| `webhook` | **required** | Acceptable modes, in preference order. There is no default, because each mode has a different exposure: webhook opens inbound deliveries, and push holds a connection. |
 | `into.stream` | stream name | required | Must be declared under `streams:` (fail-closed, like `into:` today) |
 | `into.subject` | string | required | The same shape as every other `into:`. "One definition for both node kinds" requires both fields, because "a stream without a subject has nowhere to land" (`engine/model.rs:55-80`). |
 | `replay` | duration \| `none` | `1h` | Upper bound on catch-up (`maxAgeMs`). `none` always re-arms from "now" (`cursor: null`). |
@@ -632,6 +632,64 @@ Push is designed here so that the P2 bridge fits it, but it is built only once t
 - **Reconnect.** When the stream ends or goes silent, reconnect with backoff from the persisted cursor.
 - **Pressure.** The reactor shuts the socket down through the new handle, which aborts the POST: "The client cancels by aborting the request stream" [DS L212]. When pressure clears, the binding reopens from the persisted cursor.
 - **Cost, stated.** agentd's client is HTTP/1.1 only (`crates/net/src/http.rs:2`), and each request opens its own connection (`crates/mcp/src/http.rs:222-226`). Each push binding therefore costs one TCP connection and one OS thread.
+
+#### 5.6.2.1 Push as built (P4, 2026-11-05)
+
+The user approved building push on 2026-11-05, ahead of the SEP's confirmation of the mode. The reason is that the production gateway in front of the instruction.md registry, MCPG 0.1.0, serves it. A consumer on push shows there as "listening (push)", and it hears of an occurrence within about 0.25 s instead of up to 5 s.
+
+**The contract it follows.** Push follows MCPG RFC 0031 at tag `mcpg@v0.1.0`, in §2.1-2.3, §2.6-2.7, §4.1 and §5.3, and the working client in instruction.md's `packages/mcp-client` (`streamed()`, `events.stream`):
+
+- `events/stream {name, arguments, cursor, maxAgeMs?}` is one long-lived POST. Its SSE body carries only `notifications/events/*` frames.
+- Each frame carries `_meta["io.modelcontextprotocol/subscriptionId"]` equal to the request's id. A frame naming another id is not this stream's and is dropped.
+- The frames:
+  - `active {cursor, truncated}` comes first. It comes again, with `truncated: true`, where events were skipped mid-stream.
+  - `event` is one occurrence. Its `cursor` is the position after it.
+  - `heartbeat {cursor}` is an SSE **data** frame, sent at least every 30 s (MCPG's default is 20 s).
+  - `error {error}` is transient, and the stream goes on.
+  - `terminated {error}` ends the subscription, and the server then closes the stream.
+- A server-initiated close ends with the request's result, `{"resultType": "complete"}`.
+- A reconnect is a new stream from the last cursor.
+- A stream is exempt from the server's stream cap.
+
+**Where MCPG RFC 0031 differs from agentd's reading of SEP-3415, and what agentd does.**
+
+| Point | SEP-3415, as `wire.rs` reads it | MCPG 0.1.0 | agentd on the push path |
+|---|---|---|---|
+| Error codes | `-32023`…`-32027` | `-32011`…`-32015` by default (its `error_codes` numbering `draft`, the sketch's and ChatGPT's); `sep_3415` is opt-in | Reads either numbering (`wire::code::normalize`). The poll and webhook paths still read SEP-3415's numbers only, so against a default MCPG they misread an error as one that may pass and back off instead of refusing. That is a separate follow-up. |
+| `active` | the first frame | also sent mid-stream with `truncated: true` where events were skipped | Any `active` frame with `truncated: true` is a gap (`mcp.events.gap`, cause `truncated`), as poll's `truncated` is. |
+| Heartbeat interval | "at least every 30 s" | 20 s by default; 1 s to 30 s configurable, never stated on the wire | The idle bound is three intervals as observed between heartbeats, at least 1 s, and 90 s until two heartbeats have shown the interval. §5.6.2 said 2 × 30 s. |
+| Final result | `{"_meta": {}}` [DS L265] | `{"resultType": "complete", "_meta": {subscriptionId}}` | Either is a server close. agentd reconnects after a backoff that resets once the stream's `active` arrived. |
+| Who may push | unauthenticated servers may offer push | Verified principals only by default (`push.require_trust: verified`); otherwise `-32012` | `-32012` refusing a stream that has not opened is a refusal of push, not of the binding. The binding moves to its next listed mode. |
+| Accept | — | refuses a client that cannot take `text/event-stream` | agentd's socket sends `Accept: application/json, text/event-stream` on every POST. |
+
+**As built.**
+
+- **The transport primitive.** It is `McpClient::stream_raw` (crate `mcp`). It carries the same headers and per-request `_meta` as `call_raw`, on the connection's own socket, so request signing, mTLS and endpoint vetting apply. It takes a `ControlFlow` frame callback and a `StreamHandle`, whose `close` shuts the socket down under the blocked read, and whose `set_idle` retimes the read bound. It ends with `Answered`, `Refused`, `Stopped`, `Silent`, `Status` or `Failed`. No new crate was added.
+- **One reader thread per open stream** (`runtime/mcp_events/push.rs`). It never runs on the loop or the poll pool.
+  - The reader hands each frame to the loop, which is the single writer.
+  - At most 256 frames wait in the loop's queue. Past that the reader waits, and TCP holds the server back.
+  - Frames from a stream the loop has closed carry an older generation and are dropped.
+- **Durability, as poll's (§5.1 rule 2).** For each `event`, the loop deduplicates, checks and appends the occurrence, then flushes. Only after the flush does it keep the frame's cursor and the seen set. A heartbeat or `active` cursor is kept the same way. A null cursor is never kept.
+- **What stops intake closes the stream at the stored cursor:** pressure, a degraded store, a dry `rate`, a failed flush, a cursor over 4 KiB. The binding pauses with the cause, and the next stream asks again from that cursor.
+- **Fallback.** These refusals of a stream that has not opened move the binding to the next listed mode the server offers:
+  - `-32601`;
+  - `Unsupported` that is not `schema_changed`;
+  - `Forbidden`;
+  - `400`, `403`, `404` or `405` with no JSON-RPC answer.
+
+  The same move follows when the type's listing does not offer push, or when a `terminated` frame says `Unsupported`. It is said once, `mcp.events.delivery {server, event_type, binding, mode, reason}`, and it holds until a reload or a re-dial. Any other failure retries push after a backoff from 1 s to 5 min with jitter (15 min for `ResourceExhausted`): a drop, silence, a server close, a `5xx`, another JSON-RPC error. The rule: only a refusal of push itself moves on, and nothing transient does.
+- **`terminated`** follows §5.13, with codes read in either numbering:
+  - `Forbidden` refuses the binding;
+  - `NotFound`, or `Unsupported {reason: schema_changed}` (after letting the cursor go), lists the server again;
+  - `Unsupported` moves to the next mode;
+  - anything else backs off and reopens.
+- **Observability.**
+  - New log lines: `mcp.events.stream.opened` (when `active` arrives), `mcp.events.stream.closed {reason}`, `mcp.events.delivery` and `mcp.events.error`.
+  - `mcp.events.armed` names `mode: push`.
+  - Metrics: `agent_mcp_events_requests_total{method="events/stream"}` once per stream; `agent_subscriptions_active{mode="push"}`; `agent_mcp_events_total{mode="push"}`.
+  - Status counters carry the active bindings by mode (`mcp_event_bindings_push`, `_poll`, `_webhook`) inside the open `counters` object, and `events.subscriptions` carries `mode`.
+- **The default does not change.** `delivery` stays required with no default. The instruction's own event types (§5.16) are still polled, because `Shape::of_instruction` lists `[poll]`.
+- **Workflows.** Push is a delivery detail under the same `stream` starts and `wait {on: event}` steps. A grant that lists `push` first serves its waits by push. No new step kind.
 
 #### 5.6.3 Webhook (P3)
 
@@ -1404,6 +1462,7 @@ All of these exist: `crates/agentd-cli/tests/store_kill_e2e.rs`, `streams_e2e.rs
 
 ### P4 — Contingent on upstream (each its own small change)
 
+- **Push: built 2026-11-05 against MCPG 0.1.0 (§5.6.2.1).** What remains with the SEP: if the WG merges push into long-poll instead, implement PR #5's `waitMs` in the poll driver and delete the push driver.
 - **The SEP confirms the modes.** If push survives [MTG, I4], build §5.6.2: the streaming transport primitive (a `ControlFlow` callback and a shutdown handle), the reader threads, the bounded queue, `subscriptionId` routing and heartbeat liveness. If the WG merges push into long-poll instead, implement PR #5's `waitMs` in the poll driver. Align the capability spelling and delete the losing entry from the constant (§5.3). Renumber the error constants if promoted. Adopt the final verification scheme. If a mode agentd built is dropped, delete its driver.
 - **The WG adds a `subscriptions/listen` filter key for `events/list_changed`, or an abandonment signal.** Adopt it, and delete the workaround it replaces.
 - **rmcp ships Events.** Delete the wire types in `runtime/mcp_events/` and use rmcp's (§6.5).

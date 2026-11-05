@@ -280,7 +280,11 @@ A line names a server's skill by `server` and `uri`, a folder's by `path`.
 | `mcp.events.listed` | info | `server`, `types` | A server's event types were listed |
 | `mcp.events.list.fail` | warn | `server`, `err`, `retry_ms` | Listing failed; retried |
 | `mcp.events.list_changed` | info | `server` | The server said its event types changed; listed again |
-| `mcp.events.armed` | info | `server`, `event_type`, `mode`, `cursor_present` | A binding is polling, or its webhook subscription is live |
+| `mcp.events.armed` | info | `server`, `event_type`, `mode`, `cursor_present` | A binding is polling or streaming, or its webhook subscription is live |
+| `mcp.events.stream.opened` | info | `server`, `event_type`, `cursor_present`, `truncated` | A push binding's `events/stream` was taken: its `active` frame arrived |
+| `mcp.events.stream.closed` | info | `server`, `event_type`, `reason`, `acked`, `code?`, `err?`, `status?`, `retry_ms?` | A push stream ended. `reason`: `server_closed`, `dropped`, `silent`, `refused`, `status`, `terminated`, `rate`, `pressure`, `store_degraded`, `paused`, `mode_changed`, `redialed`, `rediscovering`, `fallback`, `removed`, `oversize_cursor`; `retry_ms` when it is opened again after a backoff |
+| `mcp.events.delivery` | warn | `server`, `event_type`, `binding`, `mode`, `reason`, `not_offered?` | A binding is delivered in a later listed mode: the server does not offer the earlier ones (`not_offered`), or refused the stream (`method_not_found`, `unsupported`, `forbidden`, `refused`). Said once, until a reload or a re-dial decides afresh |
+| `mcp.events.error` | warn | `server`, `event_type`, `code`, `err` | A push stream's transient `error` frame; the stream goes on |
 | `mcp.events.arm.fail` | warn, error | `server`, `event_type`, `err`, `retry_ms` | Arming a binding failed; retried |
 | `mcp.events.refused` | error | `server`, `event_type`, `reason`, `detail` | The binding cannot work; see [refusals](#mcp-events-refusals) |
 | `mcp.events.poll.fail` | warn, error | `server`, `event_type`, `code`, `err`, `retry_ms` | A poll failed; retried. Error level for `-32020` |
@@ -292,7 +296,7 @@ A line names a server's skill by `server` and `uri`, a folder's by `path`.
 | `mcp.events.subscribed` | info | `server`, `event_type`, `owner`, `reason`, `subscription` | A runtime subscription was made; also audited |
 | `mcp.events.unsubscribed` | info | `server`, `event_type`, `owner`, `reason`, `subscription` | A runtime subscription was released; also audited |
 | `mcp.events.removed` | info | `server`, `event_type`, `reason` | A binding was removed and its records deleted |
-| `mcp.events.terminated` | error | `server`, `event_type`, `code` | The server ended a webhook subscription: `-32024` refuses the binding, `-32023` or `-32026` lists the server again, anything else re-arms after a backoff |
+| `mcp.events.terminated` | error | `server`, `event_type`, `code`, `mode?` | The server ended a webhook subscription, or a push stream (`mode: push`): `-32024` refuses the binding, `-32023` or `-32026 {reason: schema_changed}` lists the server again, a push stream's `-32026` moves to the next listed mode, anything else re-arms after a backoff. A push stream's code is read in either numbering (`-32011`…`-32015` as `-32023`…`-32027`) |
 | `mcp.events.delivery_suspended` | warn | `server`, `event_type`, `last_error`, `active` | The server reported failed deliveries; re-armed from the stored cursor |
 | `mcp.events.throttled` | info | `server`, `event_type`, `retry_after_ms` | The server is throttling deliveries |
 | `mcp.events.mode_changed` | warn | `server`, `event_type`, `from`, `to`, `cause` | A binding moved to the next delivery mode the operator listed, until a reload or a re-dial decides afresh |

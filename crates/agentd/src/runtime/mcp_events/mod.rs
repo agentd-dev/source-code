@@ -2,16 +2,19 @@
 //! MCP Events (RFC 0045, SEP-3415): the bindings that bring a server's event
 //! occurrences into declared streams.
 //!
-//! Each binding is discovered against its server's `events/list`, then polled
-//! on the events worker pool; every occurrence becomes one stream event
-//! (§5.4), and the binding's cursor never moves past an occurrence that is
-//! not durably appended (§5.1 rule 2). A binding the server cannot honour is
+//! Each binding is discovered against its server's `events/list`, then
+//! delivered in the first mode the operator lists that the server offers:
+//! polled on the events worker pool, streamed on a thread of its own
+//! (`push`), or taken by webhook (`hook`). Every occurrence becomes one
+//! stream event (§5.4), and the binding's cursor never moves past an
+//! occurrence that is not durably appended (§5.1 rule 2). A binding the server cannot honour is
 //! refused, loudly, with its reason; one that fails in a way that may pass
 //! backs off with jitter and keeps its cursor (§5.13).
 
 pub mod bridge;
 pub mod hook;
 pub mod pool;
+pub mod push;
 pub mod wire;
 
 use super::reactor::Runtime;
@@ -223,6 +226,11 @@ pub(crate) struct Binding {
     demoted: Vec<Delivery>,
     /// Its record is in the store.
     recorded: bool,
+    /// Push: the stream open now, if one is.
+    push: Option<push::Open>,
+    /// The mode `mcp.events.delivery` last said this binding moved to, so a
+    /// move is said once.
+    said_mode: Option<Delivery>,
 }
 
 /// What a binding's config or its grant decides of it.
@@ -326,6 +334,8 @@ impl Binding {
             prior: None,
             demoted: Vec::new(),
             recorded: false,
+            push: None,
+            said_mode: None,
         }
     }
 
@@ -337,6 +347,7 @@ impl Binding {
             self.delivery = shape.delivery;
             self.mode = None;
             self.demoted.clear();
+            self.said_mode = None;
             self.state = State::Discovering;
         }
         self.into = shape.into;
@@ -417,6 +428,20 @@ pub(crate) struct Events {
 }
 
 impl Events {
+    /// The active bindings by the mode they are delivered in, for the status
+    /// counters.
+    pub(crate) fn modes(&self) -> BTreeMap<&'static str, u64> {
+        let mut out = BTreeMap::new();
+        for b in self.bindings.values() {
+            if b.state == State::Active
+                && let Some(m) = b.mode
+            {
+                *out.entry(m.as_str()).or_default() += 1;
+            }
+        }
+        out
+    }
+
     /// `(active, paused, refused)` bindings, for the status counters.
     pub(crate) fn counts(&self) -> (u64, u64, u64) {
         let mut c = (0, 0, 0);
@@ -836,6 +861,7 @@ impl Runtime {
         self.events_sweep_owners(now);
         self.events_list_due(now);
         self.events_poll_due(now);
+        self.events_push_due(now);
         self.events_hook_due(now);
         self.events_reread_instruction(now);
         let mut active: BTreeMap<String, u64> = BTreeMap::new();
@@ -1138,6 +1164,11 @@ impl Runtime {
                 }
                 self.events_polled(&key, result)
             }
+            Done::Push {
+                key,
+                generation,
+                what,
+            } => self.events_pushed(&key, generation, what),
             other => self.events_hook_done(other),
         }
     }
@@ -1227,14 +1258,24 @@ impl Runtime {
                 "the server's events/list does not name this event type",
             );
         };
-        // The first mode the operator listed that the server offers (push
-        // waits on the SEP, P4).
+        // The first mode the operator listed that the server offers, past
+        // the ones it would not deliver in.
         let mode = b
             .delivery
             .iter()
             .copied()
             .filter(|m| !b.demoted.contains(m))
             .find(|m| d.delivery.iter().any(|x| x == m.as_str()));
+        // Listed ahead of it and not offered: said once, as the move a refused
+        // stream makes is (`mcp.events.delivery`).
+        let passed: Vec<&'static str> = b
+            .delivery
+            .iter()
+            .copied()
+            .take_while(|m| Some(*m) != mode)
+            .filter(|m| !b.demoted.contains(m))
+            .map(Delivery::as_str)
+            .collect();
         let Some(mode) = mode else {
             let detail = format!(
                 "the operator lists {:?}, the server offers {:?}",
@@ -1264,6 +1305,16 @@ impl Runtime {
         b.payload_schema = d.payload_schema.clone();
         let left_webhook = mode != Delivery::Webhook && (b.subscribed || b.prior.is_some());
         b.mode = Some(mode);
+        if passed.is_empty() {
+            b.said_mode = None;
+        } else if b.said_mode != Some(mode) {
+            b.said_mode = Some(mode);
+            self.log.warn(
+                "mcp.events.delivery",
+                json!({"server": b.server, "event_type": b.name, "binding": b.key,
+                       "mode": mode.as_str(), "reason": "not_offered", "not_offered": passed}),
+            );
+        }
         if left_webhook {
             self.events_hook_stop(key, false);
         }
@@ -1282,7 +1333,7 @@ impl Runtime {
             // A webhook binding is armed when its subscribe answers
             // (`hook::events_armed`).
             b.armed = false;
-            if mode == Delivery::Poll {
+            if mode != Delivery::Webhook {
                 self.log.info(
                     "mcp.events.armed",
                     json!({"server": b.server, "event_type": b.name, "mode": mode.as_str(),
@@ -1897,6 +1948,7 @@ impl Runtime {
 
     /// Stop a binding no owner holds: its records go.
     fn events_remove(&mut self, key: &str, reason: &str) {
+        self.events_push_close(key, "removed", None);
         // A webhook subscription is let go eagerly; later deliveries to its
         // route are answered `410`.
         self.events_hook_stop(key, true);
@@ -2441,6 +2493,7 @@ impl Runtime {
                                 "subject": b.into.as_ref().map(|i| &i.subject),
                                 "expires_at": expires_at,
                                 "state": b.state.name(),
+                                "mode": b.mode.map(Delivery::as_str),
                             })),
                             _ => None,
                         })

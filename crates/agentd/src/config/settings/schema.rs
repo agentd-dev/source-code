@@ -837,7 +837,7 @@ fn defs_properties(
     let event_into = json!({ "type": "object", "additionalProperties": false, "required": ["stream", "subject"], "properties": {
                 "stream": { "type": "string", "description": "a stream declared under streams:" },
                 "subject": { "type": "string" } } });
-    let delivery = json!({ "type": "array", "minItems": 1, "items": { "enum": ["poll", "webhook"] }, "description": "the acceptable delivery modes, in preference order" });
+    let delivery = json!({ "type": "array", "minItems": 1, "items": { "enum": ["push", "poll", "webhook"] }, "description": "the acceptable delivery modes, in preference order" });
     let replay = json!({ "type": ["string", "integer"], "description": "how far back to catch up after downtime (maxAgeMs): a duration, or `none` to always start from now; default 1h" });
     let event_rate = json!({ "type": "string", "description": "intake ceiling `<burst>/<per>`; required on an untagged or untrusted_input server" });
     m.insert("EventBinding".to_string(), json!({ "type": "object", "additionalProperties": false, "required": ["name", "delivery", "into"], "properties": {

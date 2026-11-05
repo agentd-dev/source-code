@@ -1039,6 +1039,23 @@ impl McpClient {
         self.sdk()?.call_raw(method, params, extensions, bound)
     }
 
+    /// One long-lived request the SDK does not model, on this connection; see
+    /// [`crate::rmcp_client::RmcpClient::stream_raw`].
+    pub fn stream_raw(
+        &self,
+        method: &str,
+        params: serde_json::Map<String, Value>,
+        extensions: Value,
+        open_bound: Duration,
+        handle: &crate::http::StreamHandle,
+        on_frame: impl FnMut(Value) -> std::ops::ControlFlow<()>,
+    ) -> crate::rmcp_client::StreamEnd {
+        match self.sdk() {
+            Ok(c) => c.stream_raw(method, params, extensions, open_bound, handle, on_frame),
+            Err(e) => crate::rmcp_client::StreamEnd::Failed(e.to_string()),
+        }
+    }
+
     /// The URIs this connection holds a subscription for.
     pub fn subscribed(&self) -> Vec<String> {
         self.sdk().map(|c| c.subscribed()).unwrap_or_default()

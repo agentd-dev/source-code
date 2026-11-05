@@ -594,9 +594,11 @@ its `jti`.
 | `mcp.connect.fail` | warn | `server`, `err`, `reason?` | A server could not be connected. Not fatal: agentd retries on a backoff. |
 | `mcp.disconnect` | info, warn | `reason`, `server` | A connection closed. `reason`: `reload`, `reload refused`, `session_lost` (re-dialed), or `user_id_reset` (a Company's connection, dropped by `company.user_id.reset`; it joins again on a new one). |
 | `mcp.events.arm.fail` | error, warn | `err`, `event_type`, `retry_ms`, `server` |  |
-| `mcp.events.armed` | info | `server`, `event_type`, `mode`, `cursor_present`, `truncated?` | An MCP Events binding started polling, or its webhook subscription was made. |
+| `mcp.events.armed` | info | `server`, `event_type`, `mode`, `cursor_present`, `truncated?` | An MCP Events binding started polling or streaming, or its webhook subscription was made. |
 | `mcp.events.callback_failed` | error | `event_type`, `reason`, `server`, `url` | The server could not reach or verify `webhooks.url`. |
+| `mcp.events.delivery` | warn | `server`, `event_type`, `binding`, `mode`, `reason`, `not_offered?` | A binding moved to a later listed delivery mode, said once. `reason`: `not_offered`, `method_not_found`, `unsupported`, `forbidden`, `refused`. |
 | `mcp.events.delivery_suspended` | warn | `active`, `event_type`, `last_error`, `server` |  |
+| `mcp.events.error` | warn | `code`, `err`, `event_type`, `server` | A push stream's transient `error` frame. |
 | `mcp.events.gap` | warn | `server`, `event_type`, `cause`, `refused?` | Occurrences may be missing. `cause`: `truncated`, `no_replay`, `schema_changed`. |
 | `mcp.events.hook.denied` | warn | `event_type`, `reason`, `server` | A webhook delivery did not verify and was answered 401. |
 | `mcp.events.hook.unsaved` | warn | `err` |  |
@@ -613,7 +615,9 @@ its `jti`.
 | `mcp.events.resumed` | info | `cause`, `event_type`, `server` |  |
 | `mcp.events.schema_mismatch` | warn | `event_id`, `event_type`, `server` |  |
 | `mcp.events.subscribed` | info | `server`, `event_type`, `owner`, `reason`, `subscription` |  |
-| `mcp.events.terminated` | error | `code`, `event_type`, `server` | The server ended a webhook subscription. |
+| `mcp.events.stream.closed` | info | `server`, `event_type`, `reason`, `acked`, `code?`, `err?`, `status?`, `retry_ms?` | A push binding's `events/stream` ended. `reason`: `server_closed`, `dropped`, `silent`, `refused`, `status`, `terminated`, `rate`, `pressure`, `store_degraded`, `paused`, `mode_changed`, `redialed`, `rediscovering`, `fallback`, `removed`, `oversize_cursor`. |
+| `mcp.events.stream.opened` | info | `server`, `event_type`, `cursor_present`, `truncated` | A push binding's `events/stream` was taken (its `active` frame arrived). |
+| `mcp.events.terminated` | error | `code`, `event_type`, `server`, `mode?` | The server ended a webhook subscription, or a push stream (`mode: push`). |
 | `mcp.events.throttled` | info | `event_type`, `retry_after_ms`, `server` |  |
 | `mcp.events.unsubscribed` | info | `server`, `event_type`, `owner`, `reason`, `subscription` |  |
 | `mcp.join.refused` | warn | `errors`, `server` | A server's tools could not join the registry; it is dialed again on a backoff. |
@@ -1161,7 +1165,7 @@ Use the log events for anything a series below does not cover.
 |---|---|---|---|---|
 | `agent_stream_lag` | gauge | `stream`, `consumer` (`<workflow>/<node>`) | live | Events on a stream its consumer has not consumed. Up to 32 consumers per start kind by name; the rest fold into one `other` series carrying the largest lag. No sample when no consumer is armed. |
 | `agent_mcp_events_total` | counter | `server`, `event`, `mode`, `outcome` | live | Occurrences by outcome: `appended`, `schema_mismatch`, `duplicate`, `rejected`, `refused_pressure`, `followed` (an event type only the instruction follows: taken, kept in no stream, and the instruction read again), and `unauthenticated` for a webhook |
-| `agent_mcp_events_requests_total` | counter | `server`, `method`, `outcome` | live | `events/list`, `events/poll`, `events/subscribe` and `events/unsubscribe` requests: `ok`, `refused`, `failed` |
+| `agent_mcp_events_requests_total` | counter | `server`, `method`, `outcome` | live | `events/list`, `events/poll`, `events/stream`, `events/subscribe` and `events/unsubscribe` requests: `ok`, `refused`, `failed` (a stream counts once, when it ends) |
 | `agent_mcp_event_gaps_total` | counter | `server`, `event`, `cause` | live | Gaps: `truncated`, `no_replay`, `schema_changed` |
 | `agent_mcp_events_dedup_evicted_total` | counter | `server`, `event` | live | Dedup entries dropped to stay under the 4096 cap |
 | `agent_mcp_event_lag_ms` | gauge | `server`, `event` | live | Append time minus the occurrence's server-reported timestamp, at least 0 |

@@ -405,6 +405,25 @@ pub struct RmcpClient {
 /// Where [`RmcpClient::call_raw`]'s request ids start.
 const RAW_ID_BASE: i64 = 1 << 40;
 
+/// How a [`RmcpClient::stream_raw`] stream ended.
+#[derive(Debug, Clone)]
+pub enum StreamEnd {
+    /// The server answered the request: its result, sent as it closed the
+    /// stream.
+    Answered(Value),
+    /// The server refused the request in JSON-RPC — before the stream opened
+    /// or as it ended it — with its `code` and `data`.
+    Refused(rpc::RpcError),
+    /// Ended from this side: `on_frame` broke, or the handle was closed.
+    Stopped,
+    /// Open, and silent past its idle bound.
+    Silent,
+    /// Refused with an HTTP status and no JSON-RPC answer.
+    Status(u16),
+    /// The connection failed, or ended without an answer.
+    Failed(String),
+}
+
 /// Builder state, so the host can declare capabilities before connecting (the
 /// handshake carries them, so they cannot be added afterwards).
 pub struct RmcpBuilder {
@@ -950,6 +969,137 @@ impl RmcpClient {
         self.protocol_version.as_ref().map(ProtocolVersion::as_str)
     }
 
+    /// The body of one request the SDK does not model: its id, its bytes, and
+    /// the revision it is sent at. At a revision without `initialize` the
+    /// params carry the per-request `_meta` — the revision, the client's info,
+    /// and its capabilities with `extensions` declared in them (a method's own
+    /// `_meta` keys are kept).
+    fn raw_request(
+        &self,
+        method: &str,
+        mut params: serde_json::Map<String, Value>,
+        extensions: Value,
+    ) -> Result<(i64, Vec<u8>, String), McpError> {
+        let id = self
+            .raw_ids
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let version = self.protocol_version().unwrap_or_default().to_string();
+        if self.listens() {
+            let mut caps = self.own_meta["clientCapabilities"].clone();
+            if let Some(ext) = extensions.as_object().filter(|e| !e.is_empty())
+                && let Some(c) = caps.as_object_mut()
+                && let Value::Object(have) = c.entry("extensions").or_insert_with(|| json!({}))
+            {
+                have.extend(ext.clone());
+            }
+            let meta = params.entry("_meta").or_insert_with(|| json!({}));
+            if !meta.is_object() {
+                // The revision's keys need an object; what the caller put
+                // there is kept beside them rather than dropped.
+                *meta = json!({"value": meta.take()});
+            }
+            meta["io.modelcontextprotocol/protocolVersion"] = json!(version);
+            meta["io.modelcontextprotocol/clientInfo"] = self.own_meta["clientInfo"].clone();
+            meta["io.modelcontextprotocol/clientCapabilities"] = caps;
+        }
+        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let bytes = serde_json::to_vec(&body).map_err(|e| {
+            McpError::Transport(format!("mcp server '{}': {method}: {e}", self.name))
+        })?;
+        Ok((id, bytes, version))
+    }
+
+    /// One long-lived request the SDK does not model — an extension's
+    /// stream, such as MCP Events' `events/stream` — on this connection's own
+    /// socket, signed and stamped exactly as [`Self::call_raw`] is. It blocks
+    /// for as long as the stream lasts, so it is called on a thread of its
+    /// own.
+    ///
+    /// Each frame the server sends on the request's SSE body that names this
+    /// request as its subscription (`_meta["io.modelcontextprotocol/
+    /// subscriptionId"]` equal to the request's id, the 2026-07-28
+    /// convention for a long-lived request) is handed to `on_frame`, in
+    /// order; any other is not this stream's and is dropped.
+    /// `ControlFlow::Break` ends the stream there, as [`StreamHandle::close`]
+    /// does from another thread.
+    ///
+    /// `open_bound` bounds the dial, the request and the wait for the first
+    /// frame; from the first frame on, each read waits at most the handle's
+    /// idle bound, and a stream silent past it ends [`StreamEnd::Silent`].
+    ///
+    /// [`StreamHandle::close`]: crate::http::StreamHandle::close
+    pub fn stream_raw(
+        &self,
+        method: &str,
+        params: serde_json::Map<String, Value>,
+        extensions: Value,
+        open_bound: Duration,
+        handle: &crate::http::StreamHandle,
+        mut on_frame: impl FnMut(Value) -> std::ops::ControlFlow<()>,
+    ) -> StreamEnd {
+        let (id, bytes, version) = match self.raw_request(method, params, extensions) {
+            Ok(r) => r,
+            Err(e) => return StreamEnd::Failed(e.to_string()),
+        };
+        let mut headers: Vec<(&str, &str)> = vec![("MCP-Protocol-Version", &version)];
+        if self.listens() {
+            headers.push(("Mcp-Method", method));
+        }
+        let subscription = json!(id);
+        let mut stopped = false;
+        let answered = self.http.exchange_until_hangup(
+            Some(id),
+            &bytes,
+            open_bound,
+            &headers,
+            |frame| {
+                if stopped
+                    || frame.pointer("/params/_meta/io.modelcontextprotocol~1subscriptionId")
+                        != Some(&subscription)
+                {
+                    return;
+                }
+                if on_frame(frame).is_break() {
+                    stopped = true;
+                    handle.hangup.hang_up();
+                }
+            },
+            &handle.hangup,
+            net::http::MAX_RESPONSE,
+        );
+        if stopped || handle.closed() {
+            return StreamEnd::Stopped;
+        }
+        match answered {
+            Ok(Some(answer)) => match answer.message.get("error") {
+                Some(error) => match serde_json::from_value::<rpc::RpcError>(error.clone()) {
+                    Ok(e) => StreamEnd::Refused(e),
+                    Err(e) => StreamEnd::Failed(format!(
+                        "mcp server '{}': {method}: an error answer that is not JSON-RPC's: {e}",
+                        self.name
+                    )),
+                },
+                None => StreamEnd::Answered(
+                    answer.message.get("result").cloned().unwrap_or(Value::Null),
+                ),
+            },
+            Ok(None) | Err(crate::http::HttpError::NoResponse) => {
+                StreamEnd::Failed(format!("mcp server '{}': {method}: no answer", self.name))
+            }
+            Err(crate::http::HttpError::Http(io))
+                if handle.hangup.streamed()
+                    && matches!(
+                        io.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+            {
+                StreamEnd::Silent
+            }
+            Err(crate::http::HttpError::Status(status)) => StreamEnd::Status(status),
+            Err(e) => StreamEnd::Failed(format!("mcp server '{}': {method}: {e}", self.name)),
+        }
+    }
+
     /// One JSON-RPC request the SDK does not model — an extension's method —
     /// on this connection's own socket, signed like every other request.
     ///
@@ -975,38 +1125,15 @@ impl RmcpClient {
     pub fn call_raw(
         &self,
         method: &str,
-        mut params: serde_json::Map<String, Value>,
+        params: serde_json::Map<String, Value>,
         extensions: Value,
         bound: Duration,
     ) -> Result<Result<Value, rpc::RpcError>, McpError> {
-        let id = self
-            .raw_ids
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let version = self.protocol_version().unwrap_or_default().to_string();
+        let (id, bytes, version) = self.raw_request(method, params, extensions)?;
         let mut headers: Vec<(&str, &str)> = vec![("MCP-Protocol-Version", &version)];
         if self.listens() {
-            let mut caps = self.own_meta["clientCapabilities"].clone();
-            if let Some(ext) = extensions.as_object().filter(|e| !e.is_empty())
-                && let Some(c) = caps.as_object_mut()
-                && let Value::Object(have) = c.entry("extensions").or_insert_with(|| json!({}))
-            {
-                have.extend(ext.clone());
-            }
-            let meta = params.entry("_meta").or_insert_with(|| json!({}));
-            if !meta.is_object() {
-                // The revision's keys need an object; what the caller put
-                // there is kept beside them rather than dropped.
-                *meta = json!({"value": meta.take()});
-            }
-            meta["io.modelcontextprotocol/protocolVersion"] = json!(version);
-            meta["io.modelcontextprotocol/clientInfo"] = self.own_meta["clientInfo"].clone();
-            meta["io.modelcontextprotocol/clientCapabilities"] = caps;
             headers.push(("Mcp-Method", method));
         }
-        let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        let bytes = serde_json::to_vec(&body).map_err(|e| {
-            McpError::Transport(format!("mcp server '{}': {method}: {e}", self.name))
-        })?;
         let queue = Arc::clone(&self.notifications);
         // The socket's timeout bounds each read; the exchange as a whole is
         // bounded here, by hanging it up.

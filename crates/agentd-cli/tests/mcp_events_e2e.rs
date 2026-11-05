@@ -1222,3 +1222,314 @@ fn the_instructions_events_are_let_go_when_the_model_moves_it() {
         "the model moved the instruction:\n{log}"
     );
 }
+
+// --- Push (RFC 0045 P4): one `events/stream` per binding, as MCPG 0.1.0
+// serves it — the built-in mock serves it the same way.
+
+/// A push-first binding on `mock.tick`, falling back to poll.
+fn push_binding(extra: &str) -> String {
+    tick_binding(extra).replace("delivery: [poll]", "delivery: [push, poll]")
+}
+
+/// Every `events/stream` that reached the mock, as the params it was sent.
+fn streams(mock: &common::MockMcp) -> Vec<Value> {
+    mock.log()
+        .lines()
+        .filter_map(|l| l.strip_prefix("MOCK_EVENTS_STREAM "))
+        .filter_map(|p| serde_json::from_str(p).ok())
+        .collect()
+}
+
+/// How many of `mcp.events.stream.opened` the daemon said.
+fn opened(log: &str) -> usize {
+    events(log, "mcp.events.stream.opened").len()
+}
+
+/// The finished runs' `n`, sorted.
+fn sorted_ticks(log: &str) -> Vec<String> {
+    let mut got: Vec<String> = ticks(log).iter().map(|v| v.to_string()).collect();
+    got.sort_by_key(|n| n.parse::<u64>().unwrap_or(u64::MAX));
+    got
+}
+
+#[test]
+fn a_push_binding_streams_each_occurrence_well_inside_the_poll_interval() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-push",
+        &config(&mock.uri(), MEMORY, &push_binding("")),
+    );
+    daemon.wait_for("the stream opened", |l| opened(l) == 1);
+    let log = daemon.log();
+    assert!(
+        events(&log, "mcp.events.armed")
+            .iter()
+            .any(|e| e["event_type"] == "mock.tick" && e["mode"] == "push"),
+        "{log}"
+    );
+    let sent = streams(&mock);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0]["cursor"], Value::Null, "from now: {sent:?}");
+    assert_eq!(sent[0]["arguments"], json!({"topic": "t1"}));
+    assert!(sent[0].get("maxEvents").is_none(), "{sent:?}");
+    // The poll floor is a second: pushed, an occurrence is in well before.
+    for n in 1..=3 {
+        let at = Instant::now();
+        mock.control("mock.event", json!({"topic": "t1"}));
+        daemon.wait_for("the pushed run", |l| ticks(l).len() == n);
+        assert!(
+            at.elapsed() < Duration::from_millis(900),
+            "occurrence {n} took {:?}",
+            at.elapsed()
+        );
+    }
+    assert!(polls(&mock).is_empty(), "nothing polled: {}", mock.log());
+    assert_eq!(mock.refused(), 0, "{}", mock.log());
+    assert_eq!(sorted_ticks(&daemon.log()), ["1", "2", "3"]);
+}
+
+#[test]
+fn a_dropped_stream_reopens_from_its_cursor_with_no_gap_and_no_duplicate() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-push-drop",
+        &config(&mock.uri(), MEMORY, &push_binding("")),
+    );
+    daemon.wait_for("the stream opened", |l| opened(l) == 1);
+    mock.control("mock.event", json!({"topic": "t1", "count": 2}));
+    daemon.wait_for("two runs", |l| ticks(l).len() == 2);
+    // Cut without a word, and three more while it is down.
+    mock.control("mock.stream_drop", json!({}));
+    mock.control("mock.event", json!({"topic": "t1", "count": 3}));
+    daemon.wait_for("the stream again", |l| opened(l) == 2);
+    daemon.wait_for("five runs", |l| ticks(l).len() >= 5);
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = daemon.log();
+    assert_eq!(
+        sorted_ticks(&log),
+        ["1", "2", "3", "4", "5"],
+        "no gap, nothing twice:\n{log}"
+    );
+    let sent = streams(&mock);
+    assert_eq!(
+        sent[1]["cursor"], "c2",
+        "reopened from the cursor: {sent:?}"
+    );
+    assert_eq!(sent[1]["maxAgeMs"], 3_600_000, "{sent:?}");
+    assert!(
+        events(&log, "mcp.events.stream.closed")
+            .iter()
+            .any(|e| e["reason"] == "dropped" && e["retry_ms"].as_u64().is_some()),
+        "{log}"
+    );
+    assert!(
+        events(&log, "mcp.events.delivery").is_empty(),
+        "a drop retries push:\n{log}"
+    );
+    assert!(polls(&mock).is_empty(), "{}", mock.log());
+}
+
+#[test]
+fn a_stream_gone_quiet_past_its_heartbeats_is_dropped_and_opened_again() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    mock.control("mock.events_flags", json!({"heartbeat_ms": 200}));
+    let daemon = Daemon::start(
+        "events-push-silent",
+        &config(&mock.uri(), MEMORY, &push_binding("")),
+    );
+    daemon.wait_for("the stream opened", |l| opened(l) == 1);
+    // A few heartbeats show the server's pace.
+    std::thread::sleep(Duration::from_millis(800));
+    mock.control("mock.events_flags", json!({"silent": true}));
+    let quiet = Instant::now();
+    daemon.wait_for("the silent stream closed", |l| {
+        events(l, "mcp.events.stream.closed")
+            .iter()
+            .any(|e| e["reason"] == "silent")
+    });
+    assert!(
+        quiet.elapsed() < Duration::from_secs(5),
+        "three heartbeats (floored at 1 s), not the 90 s default: {:?}",
+        quiet.elapsed()
+    );
+    mock.control("mock.events_flags", json!({"silent": false}));
+    daemon.wait_for("the stream again", |l| opened(l) >= 2);
+    mock.control("mock.event", json!({"topic": "t1"}));
+    daemon.wait_for("the run", |l| ticks(l).len() == 1);
+}
+
+#[test]
+fn a_server_that_does_not_offer_push_is_polled_and_says_so_once() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    mock.control("mock.events_flags", json!({"no_push": true}));
+    let daemon = Daemon::start(
+        "events-push-none",
+        &config(&mock.uri(), MEMORY, &push_binding("")),
+    );
+    ready(&daemon, &mock, "mock.tick");
+    mock.control("mock.event", json!({"topic": "t1"}));
+    daemon.wait_for("the polled run", |l| ticks(l).len() == 1);
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = daemon.log();
+    let said = events(&log, "mcp.events.delivery");
+    assert_eq!(said.len(), 1, "said once:\n{log}");
+    assert_eq!(said[0]["mode"], "poll", "{said:?}");
+    assert_eq!(said[0]["reason"], "not_offered", "{said:?}");
+    assert_eq!(said[0]["not_offered"], json!(["push"]), "{said:?}");
+    assert!(said[0]["binding"].is_string(), "{said:?}");
+    assert!(streams(&mock).is_empty(), "no stream asked for");
+}
+
+#[test]
+fn a_refused_stream_moves_to_poll_once_and_a_failure_that_may_pass_retries_push() {
+    // Refused for what may pass: push again, with backoff, nothing said.
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    mock.control(
+        "mock.stream_refuse",
+        json!({"code": -32603, "message": "busy", "times": 2}),
+    );
+    let daemon = Daemon::start(
+        "events-push-retry",
+        &config(&mock.uri(), MEMORY, &push_binding("")),
+    );
+    daemon.wait_for("the stream opened at the third ask", |l| opened(l) == 1);
+    let log = daemon.log();
+    let closed: Vec<Value> = events(&log, "mcp.events.stream.closed");
+    assert_eq!(closed.len(), 2, "{log}");
+    assert!(
+        closed
+            .iter()
+            .all(|e| e["reason"] == "refused" && e["code"] == -32603),
+        "{closed:?}"
+    );
+    assert!(events(&log, "mcp.events.delivery").is_empty(), "{log}");
+    assert_eq!(streams(&mock).len(), 3);
+    drop(daemon);
+
+    // The type does not offer push after all (MCPG's numbering, -32014):
+    // on to poll, said once, and never asked again.
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    mock.control(
+        "mock.stream_refuse",
+        json!({"code": -32014, "message": "Unsupported",
+               "data": {"feature": "deliveryMode", "value": "push"}}),
+    );
+    let daemon = Daemon::start(
+        "events-push-refused",
+        &config(&mock.uri(), MEMORY, &push_binding("")),
+    );
+    daemon.wait_for("the move to poll", |l| {
+        !events(l, "mcp.events.delivery").is_empty()
+    });
+    ready(&daemon, &mock, "mock.tick");
+    mock.control("mock.event", json!({"topic": "t1"}));
+    daemon.wait_for("the polled run", |l| ticks(l).len() == 1);
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = daemon.log();
+    let said = events(&log, "mcp.events.delivery");
+    assert_eq!(said.len(), 1, "{log}");
+    assert_eq!(said[0]["mode"], "poll");
+    assert_eq!(said[0]["reason"], "unsupported");
+    assert_eq!(streams(&mock).len(), 1, "push is not asked again");
+    assert!(events(&log, "mcp.events.refused").is_empty(), "{log}");
+}
+
+/// The cursor never moves past an occurrence that is not durably appended:
+/// the stream carries six at once, the binding's `rate` takes two, and the
+/// stream is closed at the second — the next one asks from there, and so on
+/// until all six are in, each once.
+#[test]
+fn a_streamed_occurrence_the_rate_holds_back_is_asked_for_again_from_the_cursor_kept() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-push-rate",
+        &config(&mock.uri(), MEMORY, &push_binding("          rate: 2/2s\n")),
+    );
+    daemon.wait_for("the stream opened", |l| opened(l) == 1);
+    mock.control("mock.event", json!({"topic": "t1", "count": 6}));
+    daemon.wait_for("all six runs", |l| ticks(l).len() >= 6);
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = daemon.log();
+    assert_eq!(
+        sorted_ticks(&log),
+        ["1", "2", "3", "4", "5", "6"],
+        "each once:\n{log}"
+    );
+    assert!(
+        events(&log, "mcp.events.paused")
+            .iter()
+            .any(|e| e["cause"] == "rate"),
+        "{log}"
+    );
+    // The stream that carried all six was closed at the second; the next
+    // asked from `c2`, not past what it held back — and every later one from
+    // where the one before stopped.
+    let cursors: Vec<u64> = streams(&mock)
+        .iter()
+        .skip(1)
+        .map(|p| {
+            p["cursor"]
+                .as_str()
+                .and_then(|c| c.strip_prefix('c'))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(u64::MAX)
+        })
+        .collect();
+    assert_eq!(cursors.first(), Some(&2), "{cursors:?}");
+    assert!(
+        cursors.windows(2).all(|w| w[0] < w[1]) && cursors.iter().all(|c| *c < 6),
+        "{cursors:?}"
+    );
+}
+
+#[test]
+fn a_restart_reopens_the_stream_from_the_stored_cursor_and_fires_nothing_twice() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let dir = tempfile::tempdir().unwrap();
+    let store = format!("  kind: file\n  file: {{path: {}}}\n", dir.path().display());
+    let cfg_path = common::unique_path("events-push-restart", "yaml");
+    std::fs::write(&cfg_path, config(&mock.uri(), &store, &push_binding(""))).unwrap();
+    let mut first = Daemon::start_at("events-push-restart-1", &cfg_path);
+    first.wait_for("the stream opened", |l| opened(l) == 1);
+    mock.control("mock.event", json!({"topic": "t1"}));
+    first.wait_for("the first run", |l| ticks(l).len() == 1);
+    first.stop();
+    mock.control("mock.event", json!({"topic": "t1", "count": 2}));
+    let second = Daemon::start_at("events-push-restart-2", &cfg_path);
+    second.wait_for("the two missed runs", |l| ticks(l).len() >= 2);
+    std::thread::sleep(Duration::from_millis(1500));
+    let log = second.log();
+    assert_eq!(sorted_ticks(&log), ["2", "3"], "{log}");
+    assert!(
+        events(&log, "mcp.events.stream.opened")
+            .iter()
+            .any(|e| e["cursor_present"] == true),
+        "{log}"
+    );
+    assert_eq!(streams(&mock).last().unwrap()["cursor"], "c1");
+}
+
+/// The log trimmed under an open stream: the server says `truncated` in an
+/// `active`, and it is the gap a poll's `truncated` is — said, counted, and
+/// delivery goes on from where the server now stands.
+#[test]
+fn a_gap_under_a_stream_is_said_as_a_polls_is() {
+    let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
+    let daemon = Daemon::start(
+        "events-push-gap",
+        &config(&mock.uri(), MEMORY, &push_binding("")),
+    );
+    daemon.wait_for("the stream opened", |l| opened(l) == 1);
+    mock.control("mock.event", json!({"topic": "t1"}));
+    daemon.wait_for("the first run", |l| ticks(l).len() == 1);
+    mock.control("mock.event_trim", json!({"topic": "t1"}));
+    mock.control("mock.event", json!({"topic": "t1"}));
+    daemon.wait_for("the gap and the run after it", |l| {
+        events(l, "mcp.events.gap")
+            .iter()
+            .any(|e| e["cause"] == "truncated")
+            && ticks(l).len() == 2
+    });
+    assert_eq!(sorted_ticks(&daemon.log()), ["1", "3"]);
+    assert_eq!(opened(&daemon.log()), 1, "the same stream goes on");
+}

@@ -18529,11 +18529,15 @@ mod tests {
     #[test]
     fn an_events_binding_that_names_what_it_needs_loads_and_says_it_tracks_a_draft() {
         let l = load_doc(&events_doc(
-            "      tags: {\"*\": [sensitive]}\n      events:\n        - name: incident.created\n          arguments: {severity: P1}\n          delivery: [poll]\n          into: {stream: incidents, subject: incident.created}\n          replay: none\n      event_grants:\n        - name: incident.updated\n          fixed: {service: web}\n          delivery: [poll]\n          into: {stream: incidents, subject: incident.updated}\n          max: 4\n          lifetime: 7d\n          tools: true\n",
+            "      tags: {\"*\": [sensitive]}\n      events:\n        - name: incident.created\n          arguments: {severity: P1}\n          delivery: [push, poll]\n          into: {stream: incidents, subject: incident.created}\n          replay: none\n      event_grants:\n        - name: incident.updated\n          fixed: {service: web}\n          delivery: [push, poll]\n          into: {stream: incidents, subject: incident.updated}\n          max: 4\n          lifetime: 7d\n          tools: true\n",
         ))
         .unwrap();
         let srv = &l.settings.mcp.servers[0];
         assert_eq!(srv.events[0].replay, events::Replay::None);
+        assert_eq!(
+            srv.events[0].delivery,
+            [events::Delivery::Push, events::Delivery::Poll]
+        );
         assert_eq!(srv.event_grants[0].max, 4);
         // Not part of the dial spec: editing a binding never re-dials.
         let spec = serde_json::to_string(&format!("{:?}", srv.to_spec().unwrap())).unwrap();
@@ -18641,9 +18645,9 @@ mod tests {
             ),
             (
                 binding(&format!(
-                    "          delivery: [push]\n{into}          rate: 1/1s\n"
+                    "          delivery: [push, poll, push]\n{into}          rate: 1/1s\n"
                 )),
-                "unknown variant `push`",
+                "`push` is listed twice",
             ),
             (
                 binding(&format!(

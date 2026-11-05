@@ -1,11 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The built-in mock's MCP Events surface (SEP-3415), on its 2026-07-28
-//! edge: two event types — `mock.tick`, pollable, with an `inputSchema` and a
-//! `payloadSchema`, and `mock.webhook_only` — listed one per page, and a
-//! cursor log per `topic` argument the control tools write to.
+//! edge: two event types — `mock.tick`, pollable and streamed, with an
+//! `inputSchema` and a `payloadSchema`, and `mock.webhook_only` — listed one
+//! per page, and a cursor log per `topic` argument the control tools write
+//! to.
 //!
 //! Each request leaves a line on stderr, the server side's record of the
-//! wire: `MOCK_EVENTS_LIST <cursor>` and `MOCK_EVENTS_POLL <params>`.
+//! wire: `MOCK_EVENTS_LIST <cursor>`, `MOCK_EVENTS_POLL <params>` and
+//! `MOCK_EVENTS_STREAM <params>`; a stream's end is `MOCK_EVENTS_STREAM_CLOSED
+//! <client|dropped|restart>`.
+//!
+//! `events/stream` is served as MCPG 0.1.0 serves it (MCPG RFC 0031 §2.1,
+//! §5.3): one SSE body of `notifications/events/*` frames tagged with the
+//! request's id — `active {cursor, truncated}`, an `event` per occurrence
+//! with the position after it, `heartbeat {cursor}` data frames (every
+//! 250 ms here, `heartbeat_ms` to change it), and `active {truncated: true}`
+//! again where the log was trimmed under it. Its refusals carry MCPG's
+//! default numbering (`-32014` for a mode the type does not offer), not
+//! SEP-3415's, which the poll path answers with.
 //!
 //! Control tools (`tools/call`, unlisted): `mock.event {topic, count, id?,
 //! bad_schema?, oversize?, malformed?, traceparent?, tracestate?}` appends
@@ -16,7 +28,12 @@
 //! times?}` answers the next polls with that error; `mock.events_flags
 //! {always_more?, repeat?, ignore_max?}` makes every answer say `hasMore`, the
 //! next answer repeat the last page that held occurrences, or every answer
-//! carry all that is pending whatever `maxEvents` asks.
+//! carry all that is pending whatever `maxEvents` asks. Push's: `mock.events_flags
+//! {no_push?, silent?, heartbeat_ms?}` lists `mock.tick` without `push`, holds
+//! every open stream quiet (no frame, no heartbeat) while set, or paces its
+//! heartbeats; `mock.stream_drop {}` cuts every open stream without a word;
+//! `mock.stream_refuse {code, data?, times?}` answers the next stream opens
+//! with that error.
 
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -48,6 +65,16 @@ struct Inner {
     last: Option<Value>,
     /// `mock.later` is listed (`mock.events_changed`).
     later: bool,
+    /// `mock.tick` is listed without `push`.
+    no_push: bool,
+    /// Open streams send nothing at all.
+    silent: bool,
+    /// Between two heartbeats on a stream; 0 is the default.
+    heartbeat_ms: u64,
+    /// Bumped by `mock.stream_drop`: a stream opened before it is cut.
+    drops: u64,
+    /// Errors the next stream opens are answered with.
+    refuse_stream: VecDeque<Value>,
 }
 
 /// The mock's Events state, shared by every connection.
@@ -60,6 +87,10 @@ const NOT_FOUND: i64 = -32023;
 const FORBIDDEN: i64 = -32024;
 const UNSUPPORTED: i64 = -32026;
 const INVALID_PARAMS: i64 = -32602;
+/// MCPG 0.1.0's default numbering of `Unsupported`, the push path's.
+const UNSUPPORTED_DRAFT: i64 = -32014;
+/// The heartbeat interval when `heartbeat_ms` names none.
+const HEARTBEAT_MS: u64 = 250;
 
 impl Events {
     /// `(head, floor)` of `topic`: its newest sequence, and the position
@@ -97,12 +128,17 @@ pub fn declare(caps: &mut Value, spelling: Spelling) {
     }
 }
 
-fn descriptors(later: bool) -> Vec<Value> {
+fn descriptors(later: bool, push: bool) -> Vec<Value> {
+    let tick_modes = if push {
+        json!(["push", "poll", "webhook"])
+    } else {
+        json!(["poll", "webhook"])
+    };
     let mut all = vec![
         json!({
             "name": "mock.tick",
             "description": "an occurrence the mock.event control tool appends",
-            "delivery": ["poll", "webhook"],
+            "delivery": tick_modes,
             "inputSchema": {"type": "object", "additionalProperties": false,
                             "properties": {"topic": {"type": "string"}}},
             "payloadSchema": {"type": "object", "required": ["n"],
@@ -144,8 +180,11 @@ pub fn handle(events: &Events, method: &str, params: &Value) -> Result<Value, Va
             let cursor = params.get("cursor").and_then(Value::as_str);
             eprintln!("MOCK_EVENTS_LIST {}", cursor.unwrap_or("-"));
             // One type per page: the client must follow `nextCursor`.
-            let later = events.inner.lock().unwrap_or_else(|e| e.into_inner()).later;
-            let all = descriptors(later);
+            let (later, push) = {
+                let g = events.inner.lock().unwrap_or_else(|e| e.into_inner());
+                (g.later, !g.no_push)
+            };
+            let all = descriptors(later, push);
             let at: usize = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
             let mut page = json!({"resultType": "complete", "events": all.get(at).into_iter().collect::<Vec<_>>()});
             if at + 1 < all.len() {
@@ -250,6 +289,124 @@ fn poll(events: &Events, params: &Value) -> Result<Value, Value> {
     Ok(out)
 }
 
+/// Where an `events/stream` starts.
+pub struct StreamStart {
+    pub topic: String,
+    /// The position it reads after.
+    pub after: u64,
+    pub truncated: bool,
+    /// The `mock.stream_drop` count it opened under.
+    pub drops: u64,
+}
+
+/// Open one `events/stream`: checked as a poll is, then from the cursor (or
+/// from now), moved up to the floor — `truncated` — when the log was trimmed
+/// past it. `Err(error object)` refuses it.
+pub fn stream_open(events: &Events, params: &Value) -> Result<StreamStart, Value> {
+    let mut g = events.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.refuse_stream.pop_front() {
+        return Err(e);
+    }
+    match params["name"].as_str().unwrap_or_default() {
+        "mock.tick" if !g.no_push => {}
+        "mock.tick" | "mock.webhook_only" | "mock.later" => {
+            return Err(refusal(
+                UNSUPPORTED_DRAFT,
+                "Unsupported",
+                Some(json!({"feature": "deliveryMode", "value": "push"})),
+            ));
+        }
+        _ => {
+            return Err(refusal(
+                NOT_FOUND,
+                "Not found",
+                Some(json!({"kind": "event"})),
+            ));
+        }
+    }
+    let args = params["arguments"].as_object().cloned().unwrap_or_default();
+    if args.keys().any(|k| k != "topic") || args.get("topic").is_some_and(|t| !t.is_string()) {
+        return Err(refusal(
+            INVALID_PARAMS,
+            "arguments do not match inputSchema",
+            None,
+        ));
+    }
+    let topic = args
+        .get("topic")
+        .and_then(Value::as_str)
+        .unwrap_or("default")
+        .to_string();
+    let head = g.head.get(&topic).copied().unwrap_or(0);
+    let floor = g
+        .log
+        .get(&topic)
+        .and_then(|l| l.first())
+        .map_or(head, |(s, _, _)| s - 1);
+    let (after, truncated) = match params.get("cursor").and_then(Value::as_str) {
+        None => (head, false),
+        Some(c) => {
+            let from: u64 = c
+                .strip_prefix('c')
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0);
+            if from < floor {
+                (floor, true)
+            } else {
+                (from, false)
+            }
+        }
+    };
+    let drops = g.drops;
+    Ok(StreamStart {
+        topic,
+        after,
+        truncated,
+        drops,
+    })
+}
+
+/// What an open stream sends next, after position `after`: `Gap(floor)` when
+/// the log was trimmed past it, then each occurrence kept. `Cut` once
+/// `mock.stream_drop` was called since it opened; nothing while `silent`.
+pub enum StreamStep {
+    Cut,
+    Quiet,
+    Send {
+        gap: Option<u64>,
+        occurrences: Vec<(u64, Value)>,
+        heartbeat_ms: u64,
+    },
+}
+
+pub fn stream_step(events: &Events, start: &StreamStart, after: u64) -> StreamStep {
+    let g = events.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if g.drops != start.drops {
+        return StreamStep::Cut;
+    }
+    if g.silent {
+        return StreamStep::Quiet;
+    }
+    let head = g.head.get(&start.topic).copied().unwrap_or(0);
+    let log = g.log.get(&start.topic).cloned().unwrap_or_default();
+    let floor = log.first().map_or(head, |(s, _, _)| s - 1);
+    let gap = (after < floor).then_some(floor);
+    let from = gap.unwrap_or(after);
+    StreamStep::Send {
+        gap,
+        occurrences: log
+            .into_iter()
+            .filter(|(s, _, _)| *s > from)
+            .map(|(s, _, o)| (s, o))
+            .collect(),
+        heartbeat_ms: if g.heartbeat_ms == 0 {
+            HEARTBEAT_MS
+        } else {
+            g.heartbeat_ms
+        },
+    }
+}
+
 /// One control tool, by name; `None` when `name` is not one of them.
 pub fn control(events: &Events, name: &str, args: &Value) -> Option<Value> {
     let mut g = events.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -330,7 +487,32 @@ pub fn control(events: &Events, name: &str, args: &Value) -> Option<Value> {
             if let Some(b) = args["ignore_max"].as_bool() {
                 g.ignore_max = b;
             }
+            if let Some(b) = args["no_push"].as_bool() {
+                g.no_push = b;
+            }
+            if let Some(b) = args["silent"].as_bool() {
+                g.silent = b;
+            }
+            if let Some(n) = args["heartbeat_ms"].as_u64() {
+                g.heartbeat_ms = n;
+            }
             Some(json!({"ok": true}))
+        }
+        "mock.stream_drop" => {
+            g.drops += 1;
+            Some(json!({"dropped": g.drops}))
+        }
+        "mock.stream_refuse" => {
+            let times = args["times"].as_u64().unwrap_or(1);
+            let code = args["code"].as_i64().unwrap_or(-32603);
+            for _ in 0..times {
+                g.refuse_stream.push_back(refusal(
+                    code,
+                    args["message"].as_str().unwrap_or("injected"),
+                    args.get("data").cloned(),
+                ));
+            }
+            Some(json!({"armed": times}))
         }
         _ => None,
     }

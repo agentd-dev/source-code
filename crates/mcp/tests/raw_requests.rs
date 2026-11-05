@@ -249,3 +249,225 @@ fn an_answer_that_keeps_streaming_is_hung_up_at_the_bound() {
         "the stream's notifications reach the host"
     );
 }
+
+/// A 2026-07-28 server whose `x/stream` answers with an SSE body: each of
+/// `frames` (`"{SUB}"` in one replaced by the request's id), a pause of
+/// `hold_ms`, then `last` when one is given.
+fn streaming(frames: Vec<Value>, hold_ms: u64, last: Option<Value>) -> (String, Seen) {
+    spawn(move |req, w| {
+        let id = req.id();
+        let supported = [MODERN.to_string()];
+        if let Some((status, body)) = stateless_refusal(req, &supported) {
+            return respond(w, status, &[], &body);
+        }
+        match req.method() {
+            "server/discover" => respond(
+                w,
+                200,
+                &[],
+                &discover_answer(
+                    &id,
+                    &StatelessOpts {
+                        caps: json!({}),
+                        ..StatelessOpts::default()
+                    },
+                ),
+            ),
+            "x/stream" => {
+                let _ = w.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                );
+                let ours = |v: &Value| -> Value {
+                    serde_json::from_str(&v.to_string().replace("\"{SUB}\"", &id.to_string()))
+                        .unwrap()
+                };
+                for f in &frames {
+                    // A comment between frames, as SSE allows: not a frame.
+                    let _ = w.write_all(format!(": keep\n\ndata: {}\n\n", ours(f)).as_bytes());
+                    let _ = w.flush();
+                }
+                std::thread::sleep(Duration::from_millis(hold_ms));
+                if let Some(l) = &last {
+                    let mut l = ours(l);
+                    l["id"] = id.clone();
+                    let _ = w.write_all(format!("data: {l}\n\n").as_bytes());
+                    let _ = w.flush();
+                }
+            }
+            _ => respond(w, 404, &[], &error(&id, -32601, "Method not found")),
+        }
+    })
+}
+
+fn note(method: &str, sub: Value, params: Value) -> Value {
+    let mut p = params;
+    p["_meta"] = json!({"io.modelcontextprotocol/subscriptionId": sub});
+    json!({"jsonrpc": "2.0", "method": method, "params": p})
+}
+
+#[test]
+fn a_stream_hands_on_its_own_frames_in_order_and_ends_with_the_answer() {
+    let frames = vec![
+        note("n/active", json!("{SUB}"), json!({"cursor": "c0"})),
+        // Another request's subscription: not this stream's.
+        note("n/event", json!(7), json!({"cursor": "x"})),
+        note("n/event", json!("{SUB}"), json!({"cursor": "c1"})),
+        note("n/heartbeat", json!("{SUB}"), json!({"cursor": "c1"})),
+    ];
+    let last = json!({"jsonrpc": "2.0", "result": {"resultType": "complete"}});
+    let (ep, seen) = streaming(frames, 0, Some(last));
+    let c = connect(&ep, FirstRequest::Discover);
+    let handle = mcp::http::StreamHandle::new(Duration::from_secs(5));
+    let mut got = Vec::new();
+    let end = c.stream_raw(
+        "x/stream",
+        params(),
+        json!({"io.example/ext": {}}),
+        Duration::from_secs(5),
+        &handle,
+        |f| {
+            got.push((
+                f["method"].as_str().unwrap_or("").to_string(),
+                f["params"]["cursor"].clone(),
+            ));
+            std::ops::ControlFlow::Continue(())
+        },
+    );
+    assert!(
+        matches!(&end, mcp::rmcp_client::StreamEnd::Answered(r) if r["resultType"] == "complete"),
+        "{end:?}"
+    );
+    assert_eq!(
+        got,
+        [
+            ("n/active".to_string(), json!("c0")),
+            ("n/event".to_string(), json!("c1")),
+            ("n/heartbeat".to_string(), json!("c1")),
+        ]
+    );
+    // Stamped as any raw request is.
+    let req = &requests(&seen, "x/stream")[0];
+    assert_eq!(req.header("mcp-method"), Some("x/stream"));
+    assert_eq!(req.header("mcp-protocol-version"), Some(MODERN));
+    assert_eq!(
+        req.meta("clientCapabilities").unwrap()["extensions"],
+        json!({"io.example/ext": {}})
+    );
+}
+
+#[test]
+fn a_stream_silent_past_its_idle_bound_ends_silent() {
+    let frames = vec![note("n/active", json!("{SUB}"), json!({}))];
+    let (ep, _) = streaming(frames, 10_000, None);
+    let c = connect(&ep, FirstRequest::Discover);
+    let handle = mcp::http::StreamHandle::new(Duration::from_secs(30));
+    let started = Instant::now();
+    let end = c.stream_raw(
+        "x/stream",
+        Map::new(),
+        Value::Null,
+        Duration::from_secs(5),
+        &handle,
+        |_| {
+            // The server's own pace says how quiet it may go.
+            handle.set_idle(Duration::from_millis(300));
+            std::ops::ControlFlow::Continue(())
+        },
+    );
+    assert!(
+        matches!(end, mcp::rmcp_client::StreamEnd::Silent),
+        "{end:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_stream_ends_when_its_reader_breaks_or_its_handle_is_closed() {
+    let frames = vec![
+        note("n/active", json!("{SUB}"), json!({})),
+        note("n/terminated", json!("{SUB}"), json!({})),
+        note("n/event", json!("{SUB}"), json!({})),
+    ];
+    let (ep, _) = streaming(frames.clone(), 10_000, None);
+    let c = connect(&ep, FirstRequest::Discover);
+    let handle = mcp::http::StreamHandle::new(Duration::from_secs(30));
+    let mut seen = 0;
+    let end = c.stream_raw(
+        "x/stream",
+        Map::new(),
+        Value::Null,
+        Duration::from_secs(5),
+        &handle,
+        |f| {
+            seen += 1;
+            if f["method"] == "n/terminated" {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        },
+    );
+    assert!(
+        matches!(end, mcp::rmcp_client::StreamEnd::Stopped),
+        "{end:?}"
+    );
+    assert_eq!(seen, 2, "nothing after the break");
+
+    // Closed from another thread, mid-stream.
+    let (ep, _) = streaming(frames[..1].to_vec(), 10_000, None);
+    let c = connect(&ep, FirstRequest::Discover);
+    let handle = std::sync::Arc::new(mcp::http::StreamHandle::new(Duration::from_secs(30)));
+    let h = std::sync::Arc::clone(&handle);
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        h.close();
+    });
+    let started = Instant::now();
+    let end = c.stream_raw(
+        "x/stream",
+        Map::new(),
+        Value::Null,
+        Duration::from_secs(5),
+        &handle,
+        |_| std::ops::ControlFlow::Continue(()),
+    );
+    assert!(
+        matches!(end, mcp::rmcp_client::StreamEnd::Stopped),
+        "{end:?}"
+    );
+    assert!(handle.closed());
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_stream_refused_at_open_comes_back_with_its_code() {
+    let refusal = json!({"jsonrpc": "2.0", "id": 0, "error": {
+        "code": -32014, "message": "Unsupported",
+        "data": {"feature": "deliveryMode", "value": "push"}}});
+    let (ep, _) = server(Some((200, refusal)));
+    let c = connect(&ep, FirstRequest::Discover);
+    let handle = mcp::http::StreamHandle::new(Duration::from_secs(30));
+    let end = c.stream_raw(
+        METHOD,
+        Map::new(),
+        Value::Null,
+        Duration::from_secs(5),
+        &handle,
+        |_| std::ops::ControlFlow::Continue(()),
+    );
+    match end {
+        mcp::rmcp_client::StreamEnd::Refused(e) => {
+            assert_eq!(e.code, -32014);
+            assert_eq!(e.data.unwrap()["value"], "push");
+        }
+        other => panic!("{other:?}"),
+    }
+}

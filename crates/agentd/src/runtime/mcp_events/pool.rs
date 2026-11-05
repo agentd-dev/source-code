@@ -116,6 +116,13 @@ pub enum Done {
         server: String,
         result: Result<(), Failure>,
     },
+    /// A push stream's frame, or its end, from its reader thread
+    /// ([`super::push`]): `generation` names the stream.
+    Push {
+        key: String,
+        generation: u64,
+        what: super::push::Pushed,
+    },
 }
 
 impl std::fmt::Debug for Done {
@@ -162,6 +169,16 @@ impl std::fmt::Debug for Done {
                 .field("generation", generation)
                 .field("server", server)
                 .field("ok", &result.is_ok())
+                .finish(),
+            Done::Push {
+                key,
+                generation,
+                what,
+            } => f
+                .debug_struct("Push")
+                .field("key", key)
+                .field("generation", generation)
+                .field("what", what)
                 .finish(),
         }
     }

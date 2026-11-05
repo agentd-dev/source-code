@@ -2616,6 +2616,11 @@ impl Runtime {
             c["mcp_event_bindings_active"] = json!(active);
             c["mcp_event_bindings_paused"] = json!(paused);
             c["mcp_event_bindings_refused"] = json!(refused);
+            // And the active ones by how they are delivered: `push`,
+            // `poll`, `webhook`.
+            for (mode, n) in self.mcp_events.modes() {
+                c[format!("mcp_event_bindings_{mode}")] = json!(n);
+            }
         }
         c
     }

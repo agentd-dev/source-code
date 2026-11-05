@@ -13,11 +13,13 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::time::Duration;
 
-/// A delivery mode an operator may list. Push arrives with the SEP's
-/// confirmation of the mode (RFC 0045 P4).
+/// A delivery mode an operator may list: `push` holds one `events/stream`
+/// open per subscription (RFC 0045 P4), `poll` asks `events/poll` on an
+/// interval, `webhook` takes signed deliveries on the webhook listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Delivery {
+    Push,
     Poll,
     Webhook,
 }
@@ -25,6 +27,7 @@ pub enum Delivery {
 impl Delivery {
     pub fn as_str(self) -> &'static str {
         match self {
+            Delivery::Push => "push",
             Delivery::Poll => "poll",
             Delivery::Webhook => "webhook",
         }
@@ -222,7 +225,7 @@ fn check_common(
 ) {
     if delivery.is_empty() {
         d.errors.push(format!(
-            "{at}.delivery: list the acceptable modes, in preference order (poll, webhook)"
+            "{at}.delivery: list the acceptable modes, in preference order (push, poll, webhook)"
         ));
     }
     for (i, m) in delivery.iter().enumerate() {

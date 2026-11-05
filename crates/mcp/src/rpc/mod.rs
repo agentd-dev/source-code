@@ -71,7 +71,7 @@ pub struct Response {
 /// the model as an observation, the former is a protocol/transport failure.
 /// That distinction is load-bearing in the loop: an `isError` result keeps the
 /// conversation going, an `RpcError` aborts the call.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,

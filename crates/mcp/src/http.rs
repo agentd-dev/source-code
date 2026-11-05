@@ -390,6 +390,63 @@ impl Hangup {
     fn disarm(&self) {
         self.socket.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
+
+    /// Was the exchange hung up?
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Give the open stream a new idle bound, from its next read on. Nothing
+    /// before the stream is open: the connection's timeout bounds that.
+    fn retime(&self, idle: std::time::Duration) {
+        if !self.streamed() {
+            return;
+        }
+        if let Some(s) = self
+            .socket
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = s.set_read_timeout(Some(idle));
+        }
+    }
+}
+
+/// The handle of one long-lived request — an extension's stream, read on a
+/// thread of its own — held by whoever may end it from outside that thread.
+/// [`Self::close`] shuts the connection down under the blocked read, which
+/// at MCP 2026-07-28 is the request's cancellation; once the stream's first
+/// event has arrived, a read that waits past the idle bound ends it as gone
+/// quiet.
+#[derive(Debug)]
+pub struct StreamHandle {
+    pub(crate) hangup: Hangup,
+}
+
+impl StreamHandle {
+    /// A handle whose stream may stay silent for `idle` once open.
+    pub fn new(idle: Duration) -> StreamHandle {
+        StreamHandle {
+            hangup: Hangup::with_stream_idle(idle),
+        }
+    }
+
+    /// End the stream now; a stream not yet dialled is never sent.
+    pub fn close(&self) {
+        self.hangup.hang_up();
+    }
+
+    /// Was it closed?
+    pub fn closed(&self) -> bool {
+        self.hangup.is_closed()
+    }
+
+    /// The stream's idle bound from now on — as the server's own heartbeat
+    /// says how quiet it may go.
+    pub fn set_idle(&self, idle: Duration) {
+        self.hangup.retime(idle);
+    }
 }
 
 /// A request's answer: the server's JSON-RPC message, and the HTTP status

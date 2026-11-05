@@ -193,7 +193,7 @@ mcp:
       events:
         - name: incident.created
           arguments: {severity: P1}
-          delivery: [poll]
+          delivery: [push, poll]
           into: {stream: incidents, subject: incident.created}
           replay: 1h
           rate: 120/1m
@@ -223,8 +223,9 @@ What the binding says:
 - `name` is the event type as the server's `events/list` names it, and
   `arguments` are fixed subscription arguments, checked against the type's
   input schema.
-- `delivery` lists the modes you accept, in order of preference: `poll`,
-  `webhook`. agentd uses the first one the server offers for the type.
+- `delivery` lists the modes you accept, in order of preference: `push`,
+  `poll`, `webhook`. agentd uses the first one the server offers for the
+  type. [Delivery modes](#delivery-modes) compares them.
 - `into` names the stream and subject every occurrence is appended to. The
   stream must be declared under `streams:`.
 - `replay` is how far back agentd asks the server to catch up after
@@ -247,6 +248,47 @@ binding, that it tracks a draft:
 ```text
 {"event":"config.warning","msg":"MCP Events tracks SEP-3415, a draft: its methods, codes and capability may change between releases"}
 ```
+
+### Delivery modes
+
+| Mode | How occurrences arrive | Latency | What it costs |
+|---|---|---|---|
+| `push` | agentd holds one `events/stream` request open per binding, and the server sends each occurrence as it happens | well under a second | one connection and one thread per binding |
+| `poll` | agentd asks `events/poll` on the server's interval, at least a second apart | up to the interval, usually seconds | one request per interval |
+| `webhook` | the server POSTs each occurrence to agentd's webhook listener | the server's | a public URL, a listener and a credential on the server ([below](#deliver-by-webhook-instead-of-polling)) |
+
+**Push** needs nothing beyond the server's offer. agentd asks for no
+credential for it, though a server may stream only to authenticated
+callers. The stream is read on its own thread, through the same connection
+settings as every other request to the server, so its credential, client
+certificate and endpoint checks apply.
+The server sends a heartbeat at least every 30 seconds. A stream that stays
+silent for three of the server's heartbeat intervals, or 90 seconds before
+two heartbeats have shown the interval, counts as dropped. A dropped,
+closed or failed stream reopens from the stored cursor, after a backoff
+from 1 second to 5 minutes with jitter, and push stays the mode.
+
+agentd moves to the next mode you list, and says so once in
+`mcp.events.delivery` with the mode and a `reason`, in two cases:
+
+- the server's `events/list` does not offer `push` for the type
+  (`not_offered`);
+- the server refuses the stream itself: the method is unknown
+  (`method_not_found`), push is unsupported for the type (`unsupported`),
+  the caller may not stream it (`forbidden`), or the request is refused
+  with `400`, `403`, `404` or `405` and no JSON-RPC answer (`refused`).
+
+It keeps that mode until a reload or a re-dial, when push is tried again.
+Any other failure, such as a dropped connection, a `5xx` or a server at
+its stream limit, retries push.
+
+`push` holds the same rules as `poll`. Each occurrence becomes one stream
+event. The binding's cursor never moves past an occurrence that is not
+durably appended. Pressure, a degraded store or a dry `rate` closes the
+stream at the stored cursor, and the next stream asks again from there. A
+`truncated` signal from the server, whether at the start of a stream or
+in the middle of one, is the same gap a poll reports (`mcp.events.gap`,
+cause `truncated`).
 
 ### What a run receives
 
@@ -284,7 +326,8 @@ keep a cursor. The cursor never moves past an occurrence that is not
 durably appended, and a duplicate carries the same id and is dropped.
 
 Two things are not guaranteed. An occurrence reaches the stream up to one
-poll interval after it happened, later after an outage. Order holds within
+poll interval after it happened when polled (well under a second when
+pushed), later after an outage. Order holds within
 one binding, not across bindings. A loss agentd can see, such as a truncated
 answer or a type with no replay re-armed after downtime, is logged as
 `mcp.events.gap`.
@@ -372,7 +415,7 @@ mcp:
       event_grants:
         - name: pull_request.closed
           fixed: {repo: acme/webapp}
-          delivery: [poll]
+          delivery: [push, poll]
           into: {stream: reviews, subject: pr.closed}
           rate: 60/1m
           max: 16
@@ -426,6 +469,9 @@ How the wait behaves:
   step fails and says why. A wait never waits for nothing.
 - Equal subscriptions share one upstream subscription, a static binding's
   included, so two runs watching the same pull request cost one.
+- The grant's `delivery` decides how the occurrences arrive. Push is a
+  delivery detail under the same `wait` and `stream` steps: no step changes
+  with it.
 
 A grant change reaches what is already live. On a reload or a restart, a
 subscription the changed grant does not allow is released, a lowered
@@ -587,7 +633,9 @@ Read the arming lines after startup and after each reload:
 | `start.subscribe.no_server` | warn | The start's server is not connected; it is armed when the server joins |
 | `wait.resubscribed` | info | A parked resource wait was subscribed again |
 | `mcp.events.listed` | info | A server's event types were listed |
-| `mcp.events.armed` | info | A binding is polling, or its webhook subscription is live |
+| `mcp.events.armed` | info | A binding is polling or streaming, or its webhook subscription is live |
+| `mcp.events.stream.opened` | info | A push binding's stream was taken by the server |
+| `mcp.events.delivery` | warn | A binding moved to its next listed mode, and why |
 | `mcp.events.refused` | error | A binding cannot work; `reason` says why |
 | `webhooks.listen` | info | The webhook listener is bound, with its routes |
 | `start.fired` | info | A trigger started a run |

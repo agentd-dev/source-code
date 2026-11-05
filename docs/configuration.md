@@ -700,7 +700,7 @@ document or a subagent template that declares either is refused.
 |---|---|---|---|
 | `name` | string | required | The event type, as the server's `events/list` names it. |
 | `arguments` | object | `{}` | Subscription arguments, checked against the type's input schema. |
-| `delivery` | list of `poll \| webhook` | required | Acceptable modes in preference order; the first the server offers is used. |
+| `delivery` | list of `push \| poll \| webhook` | required | Acceptable modes in preference order; the first the server offers is used. A stream the server refuses moves on to the next listed mode, said once as `mcp.events.delivery`. |
 | `into` | `{stream, subject}` | required | A stream declared under `streams:`, and the subject each occurrence lands under. |
 | `replay` | duration, or `none` | `1h` | How far back to catch up after downtime. |
 | `rate` | rate | — | An intake ceiling. Required on an untagged or `untrusted_input` server. |
@@ -716,8 +716,10 @@ as above, plus:
 | `lifetime` | duration, up to 30d | `1d` | How long a tool-made subscription lives. |
 | `tools` | bool | `false` | Offer the `events.*` tools for this type. |
 
-`webhook` delivery also needs `webhooks.listen`, an `https://` `webhooks.url`,
-no `webhooks.tls.client_ca`, and a credential on the server. The how-to is
+`push` holds one `events/stream` request per binding open on its own thread,
+and needs nothing else. `webhook` delivery also needs `webhooks.listen`, an
+`https://` `webhooks.url`, no `webhooks.tls.client_ca`, and a credential on
+the server. The how-to is
 [React to changes and events](react-to-events.md).
 
 ```yaml
@@ -728,7 +730,7 @@ no `webhooks.tls.client_ca`, and a credential on the server. The how-to is
   events:
     - name: issue.opened
       arguments: {project: web}
-      delivery: [poll]
+      delivery: [push, poll]
       into: {stream: issues, subject: issue.opened}
       rate: "30/1m"
 ```

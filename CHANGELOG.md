@@ -37,6 +37,34 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   kind (S28). Every existing document reads as before; an allowance's
   reader or composer error refuses the document, as any reader error does.
 
+- **MCP Events push delivery: `delivery: [push, poll]`.** A binding or a
+  grant that lists `push` first, on a server whose `events/list` offers it,
+  holds one `events/stream` open per subscription instead of polling, and
+  an occurrence reaches its stream well under a second after the server
+  sends it, where polling waits a second or more. The stream follows MCPG
+  0.1.0's `events/stream` (MCPG RFC 0031): the `active`, `event`,
+  `heartbeat`, `error` and `terminated` frames, each tagged with the
+  request's id, and the extension's error codes read in either numbering.
+  Push keeps poll's rules. The cursor never moves past an occurrence that
+  is not durably appended. Pressure, a degraded store or a dry `rate`
+  closes the stream, and the next stream asks again from the stored
+  cursor. A dropped or silent stream reopens from the cursor with backoff
+  and jitter. A stream counts as silent after three of the server's
+  heartbeat intervals, or 90 s before two heartbeats show the interval. A
+  `truncated` signal is the same `mcp.events.gap` a poll reports. A server
+  that does not offer push, or that refuses the stream (method not found,
+  unsupported, forbidden), moves the binding to the next listed mode. The
+  move is said once as `mcp.events.delivery {binding, mode, reason}` and
+  holds until a reload or a re-dial. Any other failure retries push. The
+  stream runs on its own thread over the server's own connection, so
+  signing, mTLS and endpoint vetting apply. New log lines are
+  `mcp.events.stream.opened` and `mcp.events.stream.closed {reason}`.
+  Status counters carry the active bindings by mode
+  (`mcp_event_bindings_push`, `_poll`, `_webhook`), and
+  `events.subscriptions` carries each subscription's `mode`. The default
+  is unchanged: `delivery` stays required, and the instruction's own event
+  types (`agent.instruction.mcp.events`) are still polled (RFC 0045 P4).
+
 ## v1.25.0 — talk to a subagent, read its log
 
 The TUI completes with `→`, and a subagent's view holds a message field,

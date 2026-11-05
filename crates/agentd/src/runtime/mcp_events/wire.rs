@@ -17,6 +17,14 @@ pub const REVISION: &str = "2026-07-28";
 pub mod method {
     pub const LIST: &str = "events/list";
     pub const POLL: &str = "events/poll";
+    /// Push: one long-lived request whose SSE body carries the stream's
+    /// frames [MCPG RFC 0031 §2.1].
+    pub const STREAM: &str = "events/stream";
+    pub const ACTIVE: &str = "notifications/events/active";
+    pub const EVENT: &str = "notifications/events/event";
+    pub const HEARTBEAT: &str = "notifications/events/heartbeat";
+    pub const ERROR: &str = "notifications/events/error";
+    pub const TERMINATED: &str = "notifications/events/terminated";
     pub const SUBSCRIBE: &str = "events/subscribe";
     pub const UNSUBSCRIBE: &str = "events/unsubscribe";
     pub const LIST_CHANGED: &str = "notifications/events/list_changed";
@@ -33,6 +41,19 @@ pub mod code {
     pub const INVALID_PARAMS: i64 = -32602;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const HEADER_MISMATCH: i64 = -32020;
+
+    /// The code a server means, read under either numbering: SEP-3415's
+    /// `-32023`…`-32027`, or `-32011`…`-32015`, the design sketch's and
+    /// ChatGPT's — which MCPG 0.1.0 sends by default (its `error_codes`
+    /// numbering `draft`, MCPG RFC 0031 §2.6). Read on the push path, whose
+    /// contract is MCPG's; any other code is unchanged.
+    pub fn normalize(code: i64) -> i64 {
+        if (-32015..=-32011).contains(&code) {
+            code - 12
+        } else {
+            code
+        }
+    }
 }
 
 /// The server's settings object for the extension, read from its raw
@@ -130,6 +151,88 @@ pub fn poll_params(
     }
     p.insert("maxEvents".into(), json!(max_events));
     p
+}
+
+/// The params of one `events/stream` [MCPG RFC 0031 §2.1]: `poll`'s,
+/// without `maxEvents` — the server sends what it holds as it holds it.
+/// A `null` cursor is "from now", and `maxAgeMs` goes with a cursor only.
+pub fn stream_params(
+    name: &str,
+    arguments: &Map<String, Value>,
+    cursor: Option<&str>,
+    max_age_ms: Option<u64>,
+) -> Map<String, Value> {
+    let mut p = Map::new();
+    p.insert("name".into(), json!(name));
+    p.insert("arguments".into(), Value::Object(arguments.clone()));
+    p.insert("cursor".into(), cursor.map_or(Value::Null, |c| json!(c)));
+    if let (Some(ms), Some(_)) = (max_age_ms, cursor) {
+        p.insert("maxAgeMs".into(), json!(ms));
+    }
+    p
+}
+
+/// The `_meta` key every frame of a long-lived request carries: the
+/// request's id (2026-07-28 `basic/patterns/subscriptions`).
+pub const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
+
+/// One frame of an `events/stream` body [MCPG RFC 0031 §2.1, §5.3]:
+/// `active {cursor, truncated}` first, and again with `truncated: true`
+/// where events were skipped mid-stream; an `event` per occurrence, whose
+/// `cursor` is the position after it; a `heartbeat {cursor}` as an SSE data
+/// frame at least every 30 s; an `error {error}` that is transient; and
+/// `terminated {error}`, after which the stream closes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Frame {
+    Active {
+        cursor: Option<String>,
+        truncated: bool,
+    },
+    /// The occurrence, raw: checked on its own like a poll page's.
+    Event(Value),
+    Heartbeat {
+        cursor: Option<String>,
+    },
+    Error(::mcp::rpc::RpcError),
+    Terminated(::mcp::rpc::RpcError),
+}
+
+/// The frame a stream notification carries; `None` for any other message,
+/// or one whose params are not the frame's shape. A cursor that is not a
+/// non-empty string is none: a null cursor is never kept [MCPG RFC 0031
+/// §2.3].
+pub fn frame(n: &Value) -> Option<Frame> {
+    let p = n.get("params").filter(|p| p.is_object())?;
+    let cursor = || {
+        p.get("cursor")
+            .and_then(Value::as_str)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+    };
+    let error = || serde_json::from_value::<::mcp::rpc::RpcError>(p.get("error")?.clone()).ok();
+    Some(match n.get("method")?.as_str()? {
+        method::ACTIVE => Frame::Active {
+            cursor: cursor(),
+            truncated: p.get("truncated").and_then(Value::as_bool) == Some(true),
+        },
+        method::EVENT => {
+            let mut o = p.clone();
+            // The stream's tag, not the occurrence's own `_meta`.
+            if let Some(m) = o.get_mut("_meta").and_then(Value::as_object_mut) {
+                m.remove(SUBSCRIPTION_ID);
+                if m.is_empty()
+                    && let Some(obj) = o.as_object_mut()
+                {
+                    obj.remove("_meta");
+                }
+            }
+            Frame::Event(o)
+        }
+        method::HEARTBEAT => Frame::Heartbeat { cursor: cursor() },
+        method::ERROR => Frame::Error(error()?),
+        method::TERMINATED => Frame::Terminated(error()?),
+        _ => return None,
+    })
 }
 
 /// The params of one webhook `events/subscribe` — a first subscribe or a
@@ -358,6 +461,112 @@ mod tests {
         assert_eq!(p["ttlMs"], 3_600_000);
         let u = unsubscribe_params("incident.created", &args, "https://h/x");
         assert_eq!(u["delivery"], json!({"url": "https://h/x"}));
+    }
+
+    /// MCPG 0.1.0's own frames (`libs/mcp-wire/…/events/wire.rs`,
+    /// `stream_frames_match_the_sketch`), read through [`frame`].
+    #[test]
+    fn mcpgs_stream_frames_read_through_the_frame_type() {
+        let sub = json!({SUBSCRIPTION_ID: 1});
+        let active = json!({"jsonrpc": "2.0", "method": "notifications/events/active",
+            "params": {"cursor": "c1", "truncated": false, "_meta": sub}});
+        assert_eq!(
+            frame(&active),
+            Some(Frame::Active {
+                cursor: Some("c1".into()),
+                truncated: false
+            })
+        );
+        let gap = json!({"jsonrpc": "2.0", "method": "notifications/events/active",
+            "params": {"cursor": "c9", "truncated": true, "_meta": sub}});
+        assert!(matches!(
+            frame(&gap),
+            Some(Frame::Active {
+                truncated: true,
+                ..
+            })
+        ));
+        // A null cursor is none: never kept.
+        let beat = json!({"jsonrpc": "2.0", "method": "notifications/events/heartbeat",
+            "params": {"cursor": null, "_meta": {SUBSCRIPTION_ID: "s-1"}}});
+        assert_eq!(frame(&beat), Some(Frame::Heartbeat { cursor: None }));
+        let event = json!({"jsonrpc": "2.0", "method": "notifications/events/event",
+            "params": {"eventId": "evt_001", "name": "email.received",
+                       "timestamp": "2026-02-19T15:30:00Z", "data": {"subject": "hi"},
+                       "cursor": "c2", "_meta": {SUBSCRIPTION_ID: 1, "traceparent": "00-x"}}});
+        let Some(Frame::Event(o)) = frame(&event) else {
+            panic!("an event")
+        };
+        assert_eq!(o["eventId"], "evt_001");
+        assert_eq!(o["cursor"], "c2");
+        assert_eq!(
+            o["_meta"],
+            json!({"traceparent": "00-x"}),
+            "the stream's tag is gone"
+        );
+        let bare = json!({"method": "notifications/events/event",
+            "params": {"eventId": "e", "_meta": {SUBSCRIPTION_ID: 1}}});
+        let Some(Frame::Event(o)) = frame(&bare) else {
+            panic!("an event")
+        };
+        assert!(o.get("_meta").is_none(), "{o}");
+        let ended = json!({"jsonrpc": "2.0", "method": "notifications/events/terminated",
+            "params": {"error": {"code": -32012, "message": "forbidden",
+                                 "data": {"reason": "revoked"}}, "_meta": sub}});
+        let Some(Frame::Terminated(e)) = frame(&ended) else {
+            panic!("terminated")
+        };
+        assert_eq!(e.code, -32012);
+        assert_eq!(code::normalize(e.code), code::FORBIDDEN);
+        let transient = json!({"method": "notifications/events/error",
+            "params": {"error": {"code": -32603, "message": "store"}}});
+        assert!(matches!(frame(&transient), Some(Frame::Error(e)) if e.code == -32603));
+        // Not a frame: another notification, a frame without its params'
+        // shape, the stream's final result.
+        assert_eq!(
+            frame(&json!({"method": "notifications/message", "params": {}})),
+            None
+        );
+        assert_eq!(
+            frame(&json!({"method": "notifications/events/terminated", "params": {}})),
+            None
+        );
+        assert_eq!(
+            frame(&json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete"}})),
+            None
+        );
+    }
+
+    #[test]
+    fn either_numbering_reads_as_the_same_code() {
+        for (draft, sep) in [
+            (-32011, code::NOT_FOUND),
+            (-32012, code::FORBIDDEN),
+            (-32013, code::RESOURCE_EXHAUSTED),
+            (-32014, code::UNSUPPORTED),
+            (-32015, code::CALLBACK_ENDPOINT_ERROR),
+        ] {
+            assert_eq!(code::normalize(draft), sep);
+            assert_eq!(code::normalize(sep), sep);
+        }
+        assert_eq!(
+            code::normalize(code::METHOD_NOT_FOUND),
+            code::METHOD_NOT_FOUND
+        );
+        assert_eq!(code::normalize(-32010), -32010);
+        assert_eq!(code::normalize(-32016), -32016);
+    }
+
+    #[test]
+    fn a_stream_from_now_carries_no_max_age_and_asks_no_page() {
+        let args = json!({"topic": "t"}).as_object().unwrap().clone();
+        let p = stream_params("mock.tick", &args, None, Some(3_600_000));
+        assert_eq!(p["cursor"], Value::Null);
+        assert!(!p.contains_key("maxAgeMs"));
+        assert!(!p.contains_key("maxEvents"));
+        let p = stream_params("mock.tick", &args, Some("c3"), Some(3_600_000));
+        assert_eq!(p["cursor"], "c3");
+        assert_eq!(p["maxAgeMs"], 3_600_000);
     }
 
     #[test]

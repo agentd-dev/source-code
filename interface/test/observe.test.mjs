@@ -166,8 +166,11 @@ test('an expired session ends observation', async (t) => {
   await until(() => mirror.getState().conn === 'unauthenticated', 3000, 'the expiry');
   assert.equal(terminal.length, 1);
   assert.ok(mirror.getState().transcript.some((e) => /expires in a minute/.test(e.text)), 'warned first');
+  // A request already out when the session ended may still reach the server;
+  // what must not happen is a new one. Let any in flight land, then count.
+  await sleep(100);
   const seen = fake.requests.length;
-  await sleep(150);
+  await sleep(200);
   assert.equal(fake.requests.length, seen, 'polling stopped');
 });
 

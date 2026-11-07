@@ -5,7 +5,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.28.0 — every request says it is agentd's
 
 Every HTTP request agentd makes now says which software is calling:
 `User-Agent: agentd/<version>`. Until now only push notifications and

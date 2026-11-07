@@ -739,8 +739,9 @@ the server. The how-to is
 
 The plain-HTTP endpoints agentd may reach: the `http` workflow step, and,
 under `security.egress: closed`, every other HTTP request agentd makes that is
-not MCP, a model or A2A. Needs no build feature. All `http` paths are
-live · op.
+not MCP, a model or A2A; and the `User-Agent` every request agentd makes
+carries. Needs no build feature. `http.endpoints` is live · op;
+`http.user_agent` is restart · op.
 
 | Path | Type | Default | What it does |
 |---|---|---|---|
@@ -750,6 +751,7 @@ live · op.
 | `http.endpoints.<name>.methods` | list of methods | any | The methods `http` steps may use against it. |
 | `http.endpoints.<name>.rate` | rate | — | Pacing of requests to it, per process. |
 | `http.endpoints.<name>.timeout` | duration | the step's default | The default timeout of a request to it; a step's own `timeout` wins. |
+| `http.user_agent` | template | `agentd/{{version}}` | The `User-Agent` on every request agentd makes whose own headers name none; empty, none. See [User-Agent](#user-agent). |
 
 An `http` step uses the entry its URL matches: the `methods` ceiling, the
 entry's headers under the step's own, its `auth`, its `timeout` default and
@@ -779,6 +781,38 @@ document fetched by `url:`, a skill fetched by `src`, `store.http` and a
 stream forward each need a matching `http.endpoints` entry. How each kind of
 destination is checked is [Security model](security.md#operator-endpoints-and-closed-egress); the
 hardening guide is [Harden a deployment](harden.md).
+
+### User-Agent
+
+Every HTTP request agentd makes says which software is calling: a model
+call, an MCP server, an A2A peer, a token endpoint, a registry, an OCI
+pull, an x402 payment, a push notification, a webhook and an `http` step.
+By default it is `agentd/<version>`, as in `agentd/1.28.0`. Some servers,
+GitHub's API among them, and CDN firewalls refuse a request that carries
+none.
+
+`http.user_agent` replaces it with a template. These placeholders are
+filled in, and any other is refused at load:
+
+| Placeholder | Becomes |
+|---|---|
+| `{{version}}` | agentd's version, `1.28.0` |
+| `{{os}}` | the operating system, `linux` or `macos` |
+| `{{arch}}` | the CPU architecture, `x86_64` or `aarch64` |
+| `{{instance}}` | the instance's name |
+
+```yaml
+http:
+  user_agent: "acme-ops/{{version}} ({{os}}; {{arch}}; {{instance}})"
+```
+
+An empty value sends none. A `User-Agent` header the request already names
+wins: one in an `http` step's `headers`, in `http.endpoints.<name>.headers`,
+in `intelligence.headers` or in an MCP server's `headers`. Workers and
+subagents send the supervisor's value; an instance child renders the
+template under its own name. A Company is always sent `agentd/<version>`,
+whatever the template says ([What a company sees](act-at-companies.md#what-a-company-sees)).
+Changing it takes a restart.
 
 ## companies
 

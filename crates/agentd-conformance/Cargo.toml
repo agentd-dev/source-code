@@ -37,4 +37,4 @@ libc = "0.2"
 # workspace's graph — no new crate — and the protocol itself, every JWT,
 # proof and request, is written here from the draft, not taken from agentd.
 ring = "0.17"
-net = { package = "agentd-net", path = "../net", version = "3.0.1", features = ["tls"] }
+net = { package = "agentd-net", path = "../net", version = "3.1.0", features = ["tls"] }

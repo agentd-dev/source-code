@@ -105,3 +105,57 @@ fn intelligence_headers_and_bearer_reach_the_llm() {
         "{h:?}"
     );
 }
+
+/// A turn runs in a worker process of its own: the operator's
+/// `http.user_agent` reaches the model call it makes, rendered by the
+/// supervisor and handed down.
+#[test]
+fn a_turn_workers_model_call_carries_the_operators_user_agent() {
+    let captured: Arc<Mutex<Option<HashMap<String, String>>>> = Arc::new(Mutex::new(None));
+    let llm = spawn_llm(captured.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("agent.yaml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "agent:\n  name: ua-check\n  instruction: Say ok.\n  prompt: Say ok.\n  preflight: never\n\
+             intelligence:\n  endpoints: http://{llm}\n  model: m\n\
+             store:\n  kind: memory\n\
+             http:\n  user_agent: \"acme-ops/{{{{version}}}} ({{{{os}}}})\"\n\
+             lifecycle:\n  run_until: drained\n"
+        ),
+    )
+    .unwrap();
+    let log = dir.path().join("agentd.log");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", cfg.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .expect("agentd runs");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while captured.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let h = captured.lock().unwrap().take().unwrap_or_else(|| {
+        panic!(
+            "the model was called:\n{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        )
+    });
+    assert_eq!(
+        h.get("user-agent").map(String::as_str),
+        Some(
+            format!(
+                "acme-ops/{} ({})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS
+            )
+            .as_str()
+        ),
+        "{h:?}"
+    );
+}

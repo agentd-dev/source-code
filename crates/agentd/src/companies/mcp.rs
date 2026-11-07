@@ -123,7 +123,7 @@ pub fn connect(
     let client = McpClient::connect_signed(
         server,
         &url,
-        Vec::new(),
+        vec![("User-Agent".into(), super::http::company_user_agent())],
         timeout,
         Some(signer as Arc<dyn RequestSigner>),
     )

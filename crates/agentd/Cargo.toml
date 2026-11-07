@@ -238,7 +238,7 @@ mcp = { package = "agentd-mcp", path = "../mcp", version = "5.1.0" }
 # Shared transport primitives (workspace crate): the HTTP/1.1+SSE client, unix +
 # feature-gated tls connects, SSRF guard. Owns the rustls/webpki deps
 # (agentd's `tls` feature maps to `net/tls`).
-net = { package = "agentd-net", path = "../net", version = "3.0.1" }
+net = { package = "agentd-net", path = "../net", version = "3.1.0" }
 # The one non-negotiable dependency: JSON is the MCP + LLM wire format.
 # Keep all wire types in one module (json/, wire/) so a swap to miniserde
 # stays mechanical (rfcs/0002).

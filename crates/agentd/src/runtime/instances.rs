@@ -648,6 +648,11 @@ impl Runtime {
                 .cloned()
                 .unwrap_or_else(|| json!({}))
         });
+        // The template, not this process's value: an `{{instance}}` in it
+        // names the child.
+        if let Some(ua) = &self.settings.http.user_agent {
+            doc["http"]["user_agent"] = json!(ua);
+        }
         let mut security = json!({});
         if self.settings.security.allow_trifecta {
             security["allow_trifecta"] = json!(true);

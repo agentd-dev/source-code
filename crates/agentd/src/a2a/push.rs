@@ -80,10 +80,8 @@ pub fn deliver(
     let u = crate::net::http::Url::parse(&target.url).map_err(|e| e.to_string())?;
     let body = serde_json::to_vec(event).map_err(|e| e.to_string())?;
 
-    let mut headers: Vec<(String, String)> = vec![
-        ("content-type".into(), "application/a2a+json".into()),
-        ("user-agent".into(), format!("agentd/{}", crate::VERSION)),
-    ];
+    let mut headers: Vec<(String, String)> =
+        vec![("content-type".into(), "application/a2a+json".into())];
     if let Some(t) = trace {
         headers.extend(t.headers());
     }

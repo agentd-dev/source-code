@@ -1370,6 +1370,7 @@ Reply with ONLY one JSON object matching the schema.{route_block}\n\nWorkflows: 
             mcp_servers: servers,
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
+            user_agent: crate::net::http::user_agent().map(|u| u.to_string()),
             aauth: super::subagents::aauth_handoff(self.child_principal(&launch.kind).as_deref()),
             limits: Limits {
                 max_steps: launch.max_steps,

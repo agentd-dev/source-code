@@ -800,6 +800,7 @@ correlators.
 | trace context on calls | a trace of its own per unit of work and company, linked to the unit's only in agentd's telemetry | the unit's own |
 | trace context on the handshake, the tool list and a reader's requests | none | the process's |
 | `clientInfo.title` | never | the instance label |
+| `User-Agent` | `agentd/<version>`, never the operator's `http.user_agent` | the same |
 
 No company request carries an AAuth signature, under either profile. Set
 `privacy: standard` only for a company you also run; agentd logs

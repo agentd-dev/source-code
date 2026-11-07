@@ -5,6 +5,25 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+Every HTTP request agentd makes now says which software is calling:
+`User-Agent: agentd/<version>`. Until now only push notifications and
+stream webhooks carried one, so a model provider, an MCP server, a
+registry or a token endpoint saw no `User-Agent`, and servers that refuse
+such requests (GitHub's API, many CDN firewalls) refused agentd.
+
+- `http.user_agent` sets it from a template with `{{version}}`, `{{os}}`,
+  `{{arch}}` and `{{instance}}`; an unknown placeholder is refused at load,
+  and an empty value sends none. A request's own `User-Agent` header wins.
+  Restart-only.
+- Turn workers and subagents send the supervisor's value; an instance child
+  renders the template under its own name.
+- A Company is always sent `agentd/<version>`, the name and version its MCP
+  sessions already carry, never the operator's template.
+- `agentd-net` 3.1.0: `http::set_user_agent` and `http::user_agent`, a
+  process-wide `User-Agent` for requests whose caller names none.
+
 ## v1.27.0 — an instruction's events by its id, and its report off the loop
 
 When agentd follows an instruction from an `instruction://` URI, it asks

@@ -3071,6 +3071,55 @@ pub struct Company {
 #[serde(deny_unknown_fields, default)]
 pub struct Http {
     pub endpoints: BTreeMap<String, HttpEndpoint>,
+    /// The `User-Agent` every request agentd makes carries when its own
+    /// headers name none: a template over [`USER_AGENT_PLACEHOLDERS`]. Unset,
+    /// [`DEFAULT_USER_AGENT`]; empty, no `User-Agent` at all.
+    pub user_agent: Option<String>,
+}
+
+/// The `User-Agent` agentd sends when `http.user_agent` is unset.
+pub const DEFAULT_USER_AGENT: &str = "agentd/{{version}}";
+
+/// What an `http.user_agent` template may name, and what each is.
+pub const USER_AGENT_PLACEHOLDERS: &[&str] = &["version", "os", "arch", "instance"];
+
+/// `http.user_agent` rendered for the instance `instance`: each
+/// `{{placeholder}}` replaced, the default when unset. Refuses a placeholder
+/// it does not know and a control character, which would end the header line.
+pub fn render_user_agent(template: Option<&str>, instance: &str) -> Result<String, String> {
+    let template = template.unwrap_or(DEFAULT_USER_AGENT);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(at) = rest.find("{{") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let Some(end) = after.find("}}") else {
+            return Err(format!("an unclosed '{{{{' in {template:?}"));
+        };
+        let name = after[..end].trim();
+        out.push_str(match name {
+            "version" => crate::VERSION,
+            "os" => std::env::consts::OS,
+            "arch" => std::env::consts::ARCH,
+            "instance" => instance,
+            _ => {
+                return Err(format!(
+                    "unknown placeholder '{{{{{name}}}}}' (want one of: {})",
+                    USER_AGENT_PLACEHOLDERS
+                        .iter()
+                        .map(|p| format!("{{{{{p}}}}}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        });
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    if out.chars().any(char::is_control) {
+        return Err("a control character in the rendered value".into());
+    }
+    Ok(out)
 }
 
 /// One `http.endpoints.<name>`: a URL prefix and how it is reached. An
@@ -10403,6 +10452,9 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
             err(&mut d, format!("a2a.push.allow: {u:?}: {e}"));
         }
     }
+    if let Err(e) = render_user_agent(s.http.user_agent.as_deref(), "instance") {
+        err(&mut d, format!("http.user_agent: {e}"));
+    }
     // http.endpoints
     for (name, ep) in &s.http.endpoints {
         let at = format!("http.endpoints.{name}");
@@ -12392,6 +12444,9 @@ pub(crate) fn webhook_secrets(v: &Value, at: &str, out: &mut Vec<(String, String
 /// under any of these is refused (`restart_required`).
 pub const RESTART_ONLY_PATHS: &[&str] = &[
     "agent.name",
+    // Installed process-wide at start and handed to every worker and
+    // subagent as it is spawned: a reload could not reach the running ones.
+    "http.user_agent",
     "store.kind",
     "store.prefix",
     "store.mcp",
@@ -12852,6 +12907,41 @@ mod tests {
 
     use super::*;
     use std::io::Write;
+
+    /// `http.user_agent`: the default, each placeholder (spaces inside the
+    /// braces allowed), and the refusals — an unknown name, an unclosed
+    /// brace, a control character.
+    #[test]
+    fn the_user_agent_template_renders_and_refuses() {
+        let v = crate::VERSION;
+        assert_eq!(render_user_agent(None, "i").unwrap(), format!("agentd/{v}"));
+        assert_eq!(
+            render_user_agent(
+                Some("x/{{version}} ({{ os }}; {{arch}}) {{instance}}"),
+                "beacon"
+            )
+            .unwrap(),
+            format!(
+                "x/{v} ({}; {}) beacon",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        );
+        assert_eq!(render_user_agent(Some(""), "i").unwrap(), "");
+        assert_eq!(render_user_agent(Some("plain"), "i").unwrap(), "plain");
+        let e = render_user_agent(Some("a/{{commit}}"), "i").unwrap_err();
+        assert!(
+            e.contains("'{{commit}}'") && e.contains("{{version}}, {{os}}, {{arch}}, {{instance}}"),
+            "{e}"
+        );
+        assert!(
+            render_user_agent(Some("a/{{version"), "i")
+                .unwrap_err()
+                .contains("unclosed")
+        );
+        assert!(render_user_agent(Some("a\tb"), "i").is_err());
+        assert!(render_user_agent(Some("{{instance}}"), "a\r\nX: 1").is_err());
+    }
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

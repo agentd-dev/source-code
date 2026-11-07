@@ -270,6 +270,10 @@ pub struct SpawnPayload {
     /// frame that omits it parses as "no extra anchor".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<String>,
+    /// The `User-Agent` the supervisor's requests carry (`http.user_agent`,
+    /// rendered), for the child's to carry too; `None`, none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
     /// The supervisor's AAuth identity, handed to every turn worker and
     /// subagent so the whole process tree signs under ONE identity — a peer
     /// sees the tree as a single agent rather than a crowd of anonymous
@@ -882,6 +886,7 @@ mod tests {
             }],
             a2a_peers: Vec::new(),
             tls_ca: None,
+            user_agent: None,
             aauth: None,
             limits: Limits {
                 max_steps: 20,

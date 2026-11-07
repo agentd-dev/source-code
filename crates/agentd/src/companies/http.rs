@@ -183,6 +183,26 @@ impl Pace {
     }
 }
 
+/// The `User-Agent` a Company is sent, whatever `http.user_agent` says: the
+/// name and version its MCP sessions' `clientInfo` already carry, and nothing
+/// an operator's template could add — the instance it names is withheld from
+/// a Company under `privacy: strict`.
+pub fn company_user_agent() -> String {
+    format!("agentd/{}", crate::VERSION)
+}
+
+/// `headers` with [`company_user_agent`] when they name no `User-Agent`.
+fn as_agentd<'a>(headers: &[(&'a str, &'a str)], ua: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut out = headers.to_vec();
+    if !out
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+    {
+        out.push(("User-Agent", ua));
+    }
+    out
+}
+
 /// Where a Company's requests may go, and how they are dialled.
 #[derive(Debug, Clone)]
 pub struct Dialer {
@@ -242,7 +262,9 @@ impl Dialer {
         body: &[u8],
     ) -> Result<Reply, Failure> {
         self.may_send(url).map_err(Failure::Unsent)?;
-        let reply = ahttp::send_reaching(method, url, headers, body, self.timeout, self.dial())?;
+        let ua = company_user_agent();
+        let headers = as_agentd(headers, &ua);
+        let reply = ahttp::send_reaching(method, url, &headers, body, self.timeout, self.dial())?;
         self.pace.note(&reply);
         self.no_redirect(url, reply.status)?;
         Ok(reply)
@@ -260,7 +282,9 @@ impl Dialer {
     ) -> Result<crate::net::http::StreamingResponse<Box<dyn crate::net::http::Stream>>, Failure>
     {
         self.may_send(url).map_err(Failure::Unsent)?;
-        let r = ahttp::send_streaming(method, url, headers, &[], read_for, self.dial())?;
+        let ua = company_user_agent();
+        let headers = as_agentd(headers, &ua);
+        let r = ahttp::send_streaming(method, url, &headers, &[], read_for, self.dial())?;
         self.pace.learn(r.status, r.retry_after());
         self.pace.date(r.header("date"));
         self.no_redirect(url, r.status)?;
@@ -308,9 +332,10 @@ impl Dialer {
         loop {
             self.admits(&at)?;
             self.pace.check().map_err(Refused::Fetch)?;
+            let ua = company_user_agent();
             let reply = ahttp::get(
                 &at,
-                &[("Accept", "application/json")],
+                &as_agentd(&[("Accept", "application/json")], &ua),
                 DOCUMENT_TIMEOUT.min(self.timeout),
                 self.dial(),
             )

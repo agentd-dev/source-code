@@ -4069,6 +4069,10 @@
           },
           "description": "by name; an http step uses the entry its URL falls under, or names it with `endpoint:`",
           "type": "object"
+        },
+        "user_agent": {
+          "description": "the User-Agent every request agentd makes carries when its own headers name none; placeholders {{version}}, {{os}}, {{arch}}, {{instance}}. Unset: agentd/{{version}}; empty: none",
+          "type": "string"
         }
       },
       "type": "object"

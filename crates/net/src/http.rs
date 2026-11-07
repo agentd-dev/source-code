@@ -25,6 +25,55 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The `User-Agent` every request carries unless its caller names one: unset
+/// (the default), a request carries none. Process-wide, because it says which
+/// software is calling, not which call; an embedder sets it once, before its
+/// first request, with [`set_user_agent`].
+static USER_AGENT: std::sync::RwLock<Option<std::sync::Arc<str>>> = std::sync::RwLock::new(None);
+
+/// Set the `User-Agent` this process's requests carry when their caller
+/// names none — `None`, or an empty string, for none at all. Refuses a value
+/// with a control character, which would end the header line it is written on.
+pub fn set_user_agent(ua: Option<&str>) -> io::Result<()> {
+    let ua = ua.filter(|u| !u.is_empty());
+    if ua.is_some_and(|u| u.chars().any(char::is_control)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "control character in User-Agent",
+        ));
+    }
+    *USER_AGENT.write().unwrap_or_else(|p| p.into_inner()) = ua.map(std::sync::Arc::from);
+    Ok(())
+}
+
+/// The `User-Agent` set by [`set_user_agent`], if any.
+pub fn user_agent() -> Option<std::sync::Arc<str>> {
+    USER_AGENT.read().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
+/// Write the caller's headers, then the process `User-Agent` when they named
+/// none. CR/LF in a caller's header is refused: either would end the header
+/// line and let the rest be read as new headers.
+fn write_headers(req: &mut Vec<u8>, headers: &[(&str, &str)]) -> io::Result<()> {
+    for (k, v) in headers {
+        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "CR/LF in header",
+            ));
+        }
+        write!(req, "{k}: {v}\r\n")?;
+    }
+    if !headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        && let Some(ua) = user_agent()
+    {
+        write!(req, "User-Agent: {ua}\r\n")?;
+    }
+    Ok(())
+}
+
 /// Response body cap. LLM responses can be large; 8 MiB is generous without
 /// being an unbounded allocation from a hostile peer.
 pub const MAX_RESPONSE: usize = 8 * 1024 * 1024;
@@ -293,17 +342,7 @@ pub fn send<S: Read + Write + ?Sized>(
     write!(req, "{method} {path} HTTP/1.1\r\n")?;
     write!(req, "Host: {host_header}\r\n")?;
     req.extend_from_slice(b"Connection: close\r\n");
-    for (k, v) in headers {
-        // Reject CR/LF injection in caller-supplied headers: either would end
-        // the current header line and let the rest be read as new headers.
-        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "CR/LF in header",
-            ));
-        }
-        write!(req, "{k}: {v}\r\n")?;
-    }
+    write_headers(&mut req, headers)?;
     write!(req, "Content-Length: {}\r\n\r\n", body.len())?;
     req.extend_from_slice(body);
     stream.write_all(&req)?;
@@ -557,15 +596,7 @@ pub fn send_streaming<S: Read + Write>(
     write!(req, "{method} {path} HTTP/1.1\r\n")?;
     write!(req, "Host: {host_header}\r\n")?;
     req.extend_from_slice(b"Connection: close\r\n");
-    for (k, v) in headers {
-        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "CR/LF in header",
-            ));
-        }
-        write!(req, "{k}: {v}\r\n")?;
-    }
+    write_headers(&mut req, headers)?;
     write!(req, "Content-Length: {}\r\n\r\n", body.len())?;
     req.extend_from_slice(body);
     stream.write_all(&req)?;
@@ -844,6 +875,46 @@ mod tests {
         let evs = sse_events("data: only\n");
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].data, "only");
+    }
+
+    /// The process `User-Agent` goes on every request whose caller names
+    /// none, on both request paths; a caller's own, in any case, wins; unset,
+    /// a request carries none; a control character is refused. One test, as
+    /// the value is process-wide.
+    #[test]
+    fn the_process_user_agent_goes_where_the_caller_names_none() {
+        let ok = || FakeStream {
+            resp: Cursor::new(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            sink: Vec::new(),
+        };
+        let sent = |headers: &[(&str, &str)]| {
+            let mut s = ok();
+            send(&mut s, "h", "GET", "/", headers, b"").unwrap();
+            let buffered = String::from_utf8(s.sink).unwrap();
+            let r = send_streaming(ok(), "h", "GET", "/", headers, b"").unwrap();
+            let FakeStream { sink, .. } = r.into_reader().into_inner();
+            assert_eq!(String::from_utf8(sink).unwrap(), buffered);
+            buffered
+        };
+        set_user_agent(Some("agentd/9.9.9 (linux)")).unwrap();
+        let req = sent(&[("Accept", "*/*")]);
+        assert!(
+            req.contains("\r\nUser-Agent: agentd/9.9.9 (linux)\r\n"),
+            "{req}"
+        );
+        let req = sent(&[("user-agent", "mine/1")]);
+        assert!(req.contains("\r\nuser-agent: mine/1\r\n"), "{req}");
+        assert_eq!(
+            req.matches("ser-Agent").count() + req.matches("ser-agent").count(),
+            1,
+            "{req}"
+        );
+        assert!(set_user_agent(Some("a\r\nX-Evil: 1")).is_err());
+        assert_eq!(user_agent().as_deref(), Some("agentd/9.9.9 (linux)"));
+        set_user_agent(Some("")).unwrap();
+        assert!(!sent(&[]).to_ascii_lowercase().contains("user-agent"));
+        set_user_agent(None).unwrap();
+        assert_eq!(user_agent(), None);
     }
 
     #[test]

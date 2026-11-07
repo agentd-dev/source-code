@@ -169,7 +169,7 @@ from outside.
 
 | Crate | Library name | Version (v1.27.0) | Licence | Owns |
 |---|---|---|---|---|
-| `agentd-net` | `net` | 3.0.1 | AGPL-3.0-only | A blocking HTTP/1.1 and SSE client over any `Read + Write`, unix and TLS connects, the SSRF guard, X.509 field extraction. |
+| `agentd-net` | `net` | 3.1.0 | AGPL-3.0-only | A blocking HTTP/1.1 and SSE client over any `Read + Write`, unix and TLS connects, the SSRF guard, X.509 field extraction. |
 | `agentd-mcp` | `mcp` | 5.1.0 | AGPL-3.0-only | A blocking MCP client over the official `rmcp` SDK, on agentd's own credentialed Streamable-HTTP socket, plus a raw HTTP listener. |
 | `agentd-core` | `agentd` | 1.27.0 | AGPL-3.0-only | The engine: supervisor, agent loop, workflows, tool registry, configuration, durable state, A2A server. |
 | `agentd-cli` | binary `agentd` | 1.27.0 | AGPL-3.0-only | The binary: argument handling, exit codes, and the `tui` and `ui` launchers. |

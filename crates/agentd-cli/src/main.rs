@@ -27,6 +27,9 @@ fn dispatch() -> i32 {
     // without close-on-exec would reach every child the launcher, the daemon
     // or a subagent spawns.
     agentd::signals::cloexec_inherited_fds();
+    // Every request says it is agentd's until a configuration says otherwise
+    // (`http.user_agent`): the CLI's own asks and a subagent re-exec too.
+    let _ = agentd::net::http::set_user_agent(Some(&format!("agentd/{}", agentd::VERSION)));
     let argv: Vec<String> = std::env::args().collect();
 
     // `agentd tui …` / `agentd ui …`: the thin launcher — the daemon exactly as

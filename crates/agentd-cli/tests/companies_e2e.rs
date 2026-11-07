@@ -1908,7 +1908,10 @@ mod over_a2a {
         let (one, other) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let (shop, travel) = (fake(one.path(), &[], None), fake(other.path(), &[], None));
         let h = host();
-        let s = setup_with(&h, "", "", &two(&shop, &travel, ""), WORKFLOWS);
+        // The operator's User-Agent names the instance: a Company is sent
+        // agentd's name and version instead.
+        let top = "http:\n  user_agent: \"acme-ops/{{version}} {{instance}}\"\n";
+        let s = setup_with(&h, top, "", &two(&shop, &travel, ""), WORKFLOWS);
         let (d, addr) = start_listening(&s, "traces", &[]);
         wait_for(&d.log, "both joined", |l| {
             joined(l, "shop") && joined(l, "travel")
@@ -1961,6 +1964,11 @@ mod over_a2a {
             }
             for r in &record {
                 assert!(r["aauth"].is_null() && r["trace_header"].is_null(), "{r}");
+                assert_eq!(
+                    r["user_agent"],
+                    format!("agentd/{}", env!("CARGO_PKG_VERSION")),
+                    "{r}"
+                );
             }
         }
     }

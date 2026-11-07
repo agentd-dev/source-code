@@ -361,6 +361,18 @@ pub fn run_with(loaded: &Loaded, args: &[String], env: &[(String, String)], opts
     // Consumer presence (RFC-0028 §3.3): every MCP session this process opens
     // announces which workload it is, alongside name/version.
     crate::mcp::set_workload_label(&instance);
+    // Which software is calling, on every request this process and its
+    // children make (`http.user_agent`); validated with the settings.
+    let user_agent =
+        crate::config::settings::render_user_agent(settings.http.user_agent.as_deref(), &instance)
+            .and_then(|ua| crate::net::http::set_user_agent(Some(&ua)).map_err(|e| e.to_string()));
+    if let Err(e) = user_agent {
+        log.error(
+            "proc.exit",
+            json!({"code": crate::exit::USAGE, "err": format!("http.user_agent: {e}")}),
+        );
+        return crate::exit::USAGE;
+    }
     // A credential that cannot be produced is said on this log.
     crate::auth::report::set_logger(&log);
 

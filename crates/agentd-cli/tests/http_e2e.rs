@@ -24,6 +24,7 @@ struct Received {
     content_type: String,
     x_test: String,
     signature: String,
+    user_agent: Option<String>,
     body: String,
 }
 
@@ -64,6 +65,7 @@ fn handle_conn(stream: TcpStream, seen: &Arc<Mutex<Option<Received>>>) {
     let mut content_type = String::new();
     let mut x_test = String::new();
     let mut signature = String::new();
+    let mut user_agent = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() {
@@ -82,6 +84,8 @@ fn handle_conn(stream: TcpStream, seen: &Arc<Mutex<Option<Received>>>) {
                 x_test = v.trim().to_string();
             } else if lower.starts_with("x-signature:") {
                 signature = v.trim().to_string();
+            } else if lower.starts_with("user-agent:") {
+                user_agent = Some(v.trim().to_string());
             }
         }
     }
@@ -94,6 +98,7 @@ fn handle_conn(stream: TcpStream, seen: &Arc<Mutex<Option<Received>>>) {
         content_type,
         x_test,
         signature,
+        user_agent,
         body,
     });
     // A distinctive response the workflow can observe end-to-end.
@@ -212,6 +217,11 @@ fn an_http_node_posts_json_and_the_structured_response_flows_into_the_run() {
         got.content_type
     );
     assert_eq!(got.x_test, "abc", "a declared header was sent");
+    assert_eq!(
+        got.user_agent.as_deref(),
+        Some(format!("agentd/{}", env!("CARGO_PKG_VERSION")).as_str()),
+        "agentd says it is calling, by default"
+    );
     let sent: Value = serde_json::from_str(&got.body).expect("the body is the templated json");
     assert_eq!(sent["hello"], "world");
     assert_eq!(sent["n"], 7);
@@ -433,4 +443,95 @@ fn the_http_idempotency_key_is_derived_opaque_and_stable_across_retries() {
         "{keys:?}"
     );
     std::fs::remove_file(&cfg).ok();
+}
+
+/// One `http` step's request under `http.user_agent: <template>`, the step
+/// sending `step_headers`.
+fn user_agent_sent(template: Option<&str>, step_headers: &str) -> Option<String> {
+    let (port, seen, _mock) = spawn_mock_rest();
+    let cfg_path = common::unique_path("agentd-http-ua", "yaml");
+    let http = template
+        .map(|t| format!("http:\n  user_agent: {t:?}\n"))
+        .unwrap_or_default();
+    let cfg = format!(
+        "\
+         agent:\n  name: caller\n  instruction: make a call\n  preflight: never\n\
+         intelligence:\n  endpoints: http://127.0.0.1:1\n  model: mock\n\
+         store:\n  kind: memory\n\
+         {http}\
+         workflows:\n  - name: call\n    steps:\n\
+         \x20     s:    {{kind: once}}\n\
+         \x20     call: {{kind: http, depends_on: [s], method: GET, url: \"http://127.0.0.1:{port}/ua\", headers: {{{step_headers}}}, allow_private: true}}\n\
+         \x20     done: {{kind: finish, depends_on: [call]}}\n\
+         lifecycle:\n  run_until: drained\n"
+    );
+    std::fs::write(&cfg_path, &cfg).unwrap();
+    let daemon = spawn_daemon(&cfg_path);
+    assert!(
+        wait_for(|| seen.lock().unwrap().is_some(), 15),
+        "the step was sent:\n{}",
+        daemon.stderr()
+    );
+    std::fs::remove_file(&cfg_path).ok();
+    let got = seen.lock().unwrap().clone().unwrap();
+    got.user_agent
+}
+
+/// `http.user_agent` is a template: its placeholders are filled in; an
+/// empty one sends none; a step's own `User-Agent` wins over either.
+#[test]
+fn the_user_agent_is_the_operators_template_and_a_step_may_name_its_own() {
+    let version = env!("CARGO_PKG_VERSION");
+    let ua = user_agent_sent(
+        Some("acme-ops/{{version}} ({{os}}; {{arch}}) {{instance}}"),
+        "",
+    )
+    .expect("a User-Agent was sent");
+    assert!(
+        ua.starts_with(&format!(
+            "acme-ops/{version} ({}; {}) ",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )),
+        "{ua}"
+    );
+    assert!(
+        !ua.contains("{{") && ua.len() > format!("acme-ops/{version} () ").len(),
+        "{ua}"
+    );
+    assert_eq!(user_agent_sent(Some(""), ""), None, "empty: none at all");
+    assert_eq!(
+        user_agent_sent(Some("acme-ops/{{version}}"), "User-Agent: step/1").as_deref(),
+        Some("step/1"),
+        "the step's own wins"
+    );
+}
+
+/// A placeholder agentd does not know is refused at validation, naming the
+/// ones it does.
+#[test]
+fn an_unknown_user_agent_placeholder_is_refused() {
+    let cfg_path = common::unique_path("agentd-http-ua-bad", "yaml");
+    std::fs::write(
+        &cfg_path,
+        "agent:\n  name: caller\n  instruction: x\nintelligence:\n  endpoints: http://127.0.0.1:1\n  model: mock\nhttp:\n  user_agent: \"agentd/{{commit}}\"\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg_path, "--validate-config"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&cfg_path).ok();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{said}");
+    assert!(
+        said.contains("http.user_agent")
+            && said.contains("{{commit}}")
+            && said.contains("{{instance}}"),
+        "{said}"
+    );
 }

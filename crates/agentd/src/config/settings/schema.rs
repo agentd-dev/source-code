@@ -299,7 +299,9 @@ fn top_level_properties(
                 "description": "the plain-HTTP endpoints this deployment reaches: what an http step, a document fetched by url and a skill fetched by src are held to under security.egress: closed. Operator-only",
                 "properties": {
                 "endpoints": { "type": "object", "additionalProperties": { "$ref": "#/$defs/HttpEndpoint" },
-                               "description": "by name; an http step uses the entry its URL falls under, or names it with `endpoint:`" } } }),
+                               "description": "by name; an http step uses the entry its URL falls under, or names it with `endpoint:`" },
+                "user_agent": { "type": "string",
+                                "description": "the User-Agent every request agentd makes carries when its own headers name none; placeholders {{version}}, {{os}}, {{arch}}, {{instance}}. Unset: agentd/{{version}}; empty: none" } } }),
     );
     m.insert(
         "companies".to_string(),

@@ -910,13 +910,7 @@ impl crate::runtime::reactor::Runtime {
             "id": id, "stream": stream, "subject": subject, "seq": seq,
         });
         let body = serde_json::to_vec(&event).unwrap_or_default();
-        let mut headers = vec![
-            ("content-type".to_string(), "application/json".to_string()),
-            (
-                "user-agent".to_string(),
-                format!("agentd/{}", crate::VERSION),
-            ),
-        ];
+        let mut headers = vec![("content-type".to_string(), "application/json".to_string())];
         // The push is a span of the event's, named to the receiver.
         let hop = trace.map(TraceContext::child);
         if let Some(t) = &hop {

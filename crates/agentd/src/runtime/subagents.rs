@@ -531,6 +531,7 @@ impl Runtime {
             mcp_servers: servers.iter().filter_map(|s| self.spawn_spec(s)).collect(),
             a2a_peers: Vec::new(),
             tls_ca: self.settings.security.tls_ca.clone(),
+            user_agent: crate::net::http::user_agent().map(|u| u.to_string()),
             aauth: None,
             limits: Limits {
                 max_steps: steps,

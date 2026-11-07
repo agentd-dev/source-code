@@ -36,7 +36,7 @@ flowchart TD
 | `agentd-core` | `agentd` | 1.27.0 | AGPL-3.0-only | the engine: the agent loop, the supervisor, workflows, the A2A listener, code-registered tools |
 | `agentd-cli` | (binary) | 1.27.0 | AGPL-3.0-only | the stock `agentd` command, including the `tui` and `ui` launcher |
 | `agentd-mcp` | `mcp` | 5.1.0 | AGPL-3.0-only | a blocking MCP client over the official `rmcp` SDK, on agentd's credentialed Streamable HTTP socket, plus a raw HTTP listener for embedders that serve plain HTTP; it serves no MCP |
-| `agentd-net` | `net` | 3.0.1 | AGPL-3.0-only | a blocking HTTP/1.1 and SSE client, unix-socket and TLS connects, and the SSRF egress classifier |
+| `agentd-net` | `net` | 3.1.0 | AGPL-3.0-only | a blocking HTTP/1.1 and SSE client, unix-socket and TLS connects, and the SSRF egress classifier |
 
 The crates.io name `agentd` belongs to an unrelated project, which is why the
 engine's package is `agentd-core` while its library name is `agentd`.

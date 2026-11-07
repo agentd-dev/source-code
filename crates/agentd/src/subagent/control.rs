@@ -204,6 +204,13 @@ pub fn run() -> i32 {
     // logs do; the inherited environment variable is the fallback.
     crate::obs::otel::set_endpoint(payload.telemetry.otel_endpoint.clone());
 
+    // The supervisor's `User-Agent`, before the first dial: one agent, one
+    // name, whichever process of it calls.
+    if let Err(e) = crate::net::http::set_user_agent(payload.user_agent.as_deref()) {
+        eprintln!("agentd subagent: user agent: {e}");
+        return crate::exit::USAGE;
+    }
+
     // Outbound extra trust anchor (`--tls-ca`), inherited via the payload:
     // install process-wide BEFORE the first dial (the intel/MCP/A2A clients
     // below), exactly as the supervisor did in `main`. The path is public

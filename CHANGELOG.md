@@ -5,7 +5,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.30.0 — a document's integrations policy narrows what it connects
 
 - A document's integrations policy is enforced (instruction.md proposal
   S34, instruction-md 0.5): the host's `host-integrations` block merged

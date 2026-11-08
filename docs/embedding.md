@@ -33,8 +33,8 @@ flowchart TD
 
 | Package | Lib name | Version | License | What it is |
 |---|---|---|---|---|
-| `agentd-core` | `agentd` | 1.29.0 | AGPL-3.0-only | the engine: the agent loop, the supervisor, workflows, the A2A listener, code-registered tools |
-| `agentd-cli` | (binary) | 1.29.0 | AGPL-3.0-only | the stock `agentd` command, including the `tui` and `ui` launcher |
+| `agentd-core` | `agentd` | 1.30.0 | AGPL-3.0-only | the engine: the agent loop, the supervisor, workflows, the A2A listener, code-registered tools |
+| `agentd-cli` | (binary) | 1.30.0 | AGPL-3.0-only | the stock `agentd` command, including the `tui` and `ui` launcher |
 | `agentd-mcp` | `mcp` | 5.1.0 | AGPL-3.0-only | a blocking MCP client over the official `rmcp` SDK, on agentd's credentialed Streamable HTTP socket, plus a raw HTTP listener for embedders that serve plain HTTP; it serves no MCP |
 | `agentd-net` | `net` | 3.1.0 | AGPL-3.0-only | a blocking HTTP/1.1 and SSE client, unix-socket and TLS connects, and the SSRF egress classifier |
 

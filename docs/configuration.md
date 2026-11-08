@@ -787,7 +787,7 @@ hardening guide is [Harden a deployment](harden.md).
 Every HTTP request agentd makes says which software is calling: a model
 call, an MCP server, an A2A peer, a token endpoint, a registry, an OCI
 pull, an x402 payment, a push notification, a webhook and an `http` step.
-By default it is `agentd/<version>`, as in `agentd/1.29.0`. Some servers,
+By default it is `agentd/<version>`, as in `agentd/1.30.0`. Some servers,
 GitHub's API among them, and CDN firewalls refuse a request that carries
 none.
 
@@ -796,7 +796,7 @@ filled in, and any other is refused at load:
 
 | Placeholder | Becomes |
 |---|---|
-| `{{version}}` | agentd's version, `1.29.0` |
+| `{{version}}` | agentd's version, `1.30.0` |
 | `{{os}}` | the operating system, `linux` or `macos` |
 | `{{arch}}` | the CPU architecture, `x86_64` or `aarch64` |
 | `{{instance}}` | the instance's name |

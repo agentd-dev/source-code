@@ -674,6 +674,7 @@ fn fold_knowing(
         cuts,
         spending: DocumentSpending::default(),
     };
+    let policy = parsed.reading.policy.as_ref();
     for o in instruction_md::connected_objects(body) {
         if matches!(o.kind, "person" | "role" | "agent")
             && let Some(id) = o.id
@@ -724,6 +725,9 @@ fn fold_knowing(
         .get("extends")
         .is_some();
     f.spend(extends);
+    if let Some(policy) = policy {
+        f.integrations(policy);
+    }
     if f.errs.is_empty() {
         Ok(f.out)
     } else {
@@ -746,6 +750,130 @@ struct Folder<'a> {
 }
 
 impl Folder<'_> {
+    /// The document's integrations policy (S34: the host's
+    /// `host-integrations` merged with the author's `integrations`, which
+    /// only narrows), held to everything the document connects, however it
+    /// declared it — an object or a configuration block: an MCP server, an
+    /// A2A peer or a fetched skill whose target the policy does not allow is
+    /// not activated (`integration-not-allowed`); an MCP server's blocked
+    /// tools are excluded, and under `default: blocked` only the tools the
+    /// policy allows are offered. A server left with no tool to offer is a
+    /// denial, not an error: it is not activated, and said.
+    fn integrations(&mut self, policy: &instruction_md::Policy) {
+        let target = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_string);
+        let refused = |what: &str, name: &str, targets: &[String]| {
+            format!(
+                "{what} {name:?} is not activated: the integrations policy does not allow {} \
+                 (integration-not-allowed)",
+                targets.join(", ")
+            )
+        };
+        let mut warnings = Vec::new();
+        if let Some(Value::Array(servers)) = self
+            .out
+            .config
+            .get_mut("mcp")
+            .and_then(|m| m.get_mut("servers"))
+        {
+            servers.retain_mut(|server| {
+                let Some(server) = server.as_object_mut() else {
+                    return true;
+                };
+                let name = target(server.get("name")).unwrap_or_default();
+                let targets: Vec<String> = ["endpoint", "registry", "server"]
+                    .iter()
+                    .filter_map(|k| target(server.get(*k)))
+                    .filter(|t| !t.is_empty() && !t.starts_with('#'))
+                    .collect();
+                if !policy.targets_allowed(&targets) {
+                    warnings.push(refused("mcp server", &name, &targets));
+                    return false;
+                }
+                let rules: Vec<&instruction_md::ServerPolicy> = targets
+                    .iter()
+                    .filter_map(|t| policy.servers.get(&instruction_md::normalize_target(t)))
+                    .collect();
+                if rules.is_empty() {
+                    return true;
+                }
+                let list = |v: Option<&Value>| -> Vec<String> {
+                    v.and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let named = list(server.get("allow"));
+                let mut exclude = list(server.get("exclude"));
+                for r in &rules {
+                    for t in &r.blocked {
+                        if !exclude.contains(t) {
+                            exclude.push(t.clone());
+                        }
+                    }
+                }
+                // Under `default: blocked`, only what every such rule allows.
+                let mut offered: Option<Vec<String>> = (!named.is_empty()).then(|| named.clone());
+                for r in rules
+                    .iter()
+                    .filter(|r| r.default == instruction_md::ToolDefault::Blocked)
+                {
+                    let allowed = r.allowed.clone().unwrap_or_default();
+                    offered = Some(match offered {
+                        Some(o) => o.into_iter().filter(|t| allowed.contains(t)).collect(),
+                        None => allowed,
+                    });
+                }
+                if let Some(o) = &mut offered {
+                    o.retain(|t| !exclude.contains(t));
+                    if o.is_empty() {
+                        warnings.push(format!(
+                            "mcp server {name:?} is not activated: the integrations policy blocks \
+                             every tool it would offer (tool-blocked)"
+                        ));
+                        return false;
+                    }
+                    server.insert("allow".into(), o.clone().into());
+                }
+                if !exclude.is_empty() {
+                    server.insert("exclude".into(), exclude.into());
+                }
+                true
+            });
+        }
+        if let Some(Value::Array(peers)) = self
+            .out
+            .config
+            .get_mut("a2a")
+            .and_then(|m| m.get_mut("peers"))
+        {
+            peers.retain(|peer| {
+                let targets: Vec<String> = target(peer.get("endpoint")).into_iter().collect();
+                let ok = policy.targets_allowed(&targets);
+                if !ok {
+                    warnings.push(refused(
+                        "agent",
+                        &target(peer.get("name")).unwrap_or_default(),
+                        &targets,
+                    ));
+                }
+                ok
+            });
+        }
+        self.out.remote_skills.retain(|skill| {
+            let targets = [skill.src.clone()];
+            let ok = policy.targets_allowed(&targets);
+            if !ok {
+                warnings.push(refused("skill", &skill.name, &targets));
+            }
+            ok
+        });
+        self.out.warnings.extend(warnings);
+    }
+
     /// The document's wallets and allowances: under the [`SPENDING`] grant,
     /// handed to the configuration to map; without it — or over the wire
     /// without a pin that attests it — delivered as text only, nothing paid
@@ -1327,6 +1455,102 @@ mod tests {
         assert!(ex.warnings.is_empty(), "{:?}", ex.warnings);
         // The agent text is the SDK's, byte for byte.
         assert_eq!(ex.cleaned, instruction_md::deliver(HOME, None).0);
+    }
+
+    /// `HOME` as a host served it under `block` (S34's served form: right
+    /// after the opening `---`).
+    fn served(block: &str) -> String {
+        HOME.replacen("---\n", &format!("---\nhost-integrations:\n{block}"), 1)
+    }
+
+    /// The host's integrations policy, carried in the served text, is held
+    /// to what the document connects: a blocked tool is excluded, a target
+    /// outside `allowed` is not activated, and the author's own layer only
+    /// narrows.
+    #[test]
+    fn the_integrations_policy_narrows_what_a_document_connects() {
+        let granted = BTreeSet::from([IDENTITY.to_string()]);
+        // A blocked tool: excluded beside the author's own `deny`.
+        let ex = extract(
+            &served("  servers:\n    \"https://home.example/mcp/thermostat\": {\"blocked\": [\"vents.open\"]}\n"),
+            &granted,
+        )
+        .unwrap();
+        assert_eq!(
+            ex.config["mcp"]["servers"][0]["exclude"],
+            serde_json::json!(["target.set", "vents.open"])
+        );
+        // Blocking the one tool the author's `deny` leaves: nothing to offer.
+        let ex = extract(
+            &served("  servers:\n    \"https://home.example/mcp/thermostat\": {\"blocked\": [\"rooms.read\"]}\n"),
+            &granted,
+        )
+        .unwrap();
+        assert_eq!(ex.config["mcp"]["servers"], serde_json::json!([]));
+        // Every tool the server would offer blocked: a denial, said; the
+        // peer stays.
+        let ex = extract(
+            &served("  servers:\n    \"https://home.example/mcp/thermostat\": {\"default\": \"blocked\", \"allowed\": [\"target.set\"]}\n"),
+            &granted,
+        )
+        .unwrap();
+        assert_eq!(ex.config["mcp"]["servers"], serde_json::json!([]));
+        assert!(
+            ex.warnings.iter().any(
+                |w| w.contains("\"thermostat\" is not activated") && w.contains("tool-blocked")
+            ),
+            "{:?}",
+            ex.warnings
+        );
+        assert_eq!(ex.config["a2a"]["peers"][0]["name"], "home");
+        // `default: blocked` with an allowed tool the author named: only it.
+        let ex = extract(
+            &served("  servers:\n    \"https://home.example/mcp/thermostat\": {\"default\": \"blocked\", \"allowed\": [\"rooms.read\"]}\n"),
+            &granted,
+        )
+        .unwrap();
+        assert_eq!(
+            ex.config["mcp"]["servers"][0]["allow"],
+            serde_json::json!(["rooms.read"])
+        );
+        // Allowed targets: the server only (normalized), so the peer is out.
+        let ex = extract(
+            &served("  allowed: [\"HTTPS://Home.Example/mcp/thermostat/\"]\n"),
+            &granted,
+        )
+        .unwrap();
+        assert_eq!(ex.config["mcp"]["servers"][0]["name"], "thermostat");
+        assert_eq!(ex.config["a2a"]["peers"], serde_json::json!([]));
+        assert!(
+            ex.warnings
+                .iter()
+                .any(|w| w.contains("agent \"home\" is not activated")
+                    && w.contains("integration-not-allowed")),
+            "{:?}",
+            ex.warnings
+        );
+        // An empty `allowed`: nothing connects, and the document still loads.
+        let ex = extract(&served("  allowed: []\n"), &granted).unwrap();
+        assert_eq!(ex.config["mcp"]["servers"], serde_json::json!([]));
+        assert_eq!(ex.workflows[0]["name"], "warm");
+        // The author's layer alone narrows too; a server declared in a
+        // configuration block is held to it as an object is.
+        let doc = "---\nspec: \"1\"\nintegrations:\n  allowed: [\"https://a.example/mcp\"]\n---\nWork.\n\n\
+            :::config{id=c dialect=\"agentd/config\"}\nmcp:\n  servers:\n    - {name: a, endpoint: \"https://a.example/mcp\"}\n    - {name: b, endpoint: \"https://b.example/mcp\"}\n:::\n";
+        let ex = extract(doc, &granted).unwrap();
+        let names: Vec<&str> = ex.config["mcp"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["a"]);
+        // No policy: the document as before.
+        let ex = extract(HOME, &granted).unwrap();
+        assert_eq!(
+            ex.config["mcp"]["servers"][0]["exclude"],
+            serde_json::json!(["target.set"])
+        );
     }
 
     /// An agent outside the grants, or from the wire, stays text and is

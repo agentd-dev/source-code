@@ -527,6 +527,25 @@ With a publisher pinned:
   A block anywhere else in the front matter is the author's and is signed
   like the rest.
 
+### The integrations policy
+
+A document may say what it may use: its own `integrations` in the front
+matter, and the `host-integrations` block its registry serves it with. The
+registry's wins and the author's only narrows. agentd holds everything the
+document connects to the effective policy, whether it is declared as an
+object or in a configuration block:
+
+- An MCP server, an A2A agent or a fetched skill whose target the policy
+  does not allow is not activated (`integration-not-allowed`).
+- An MCP server's blocked tools are excluded. Under `default: blocked`, only
+  the tools the policy allows are offered.
+- A server left with nothing to offer is not activated, and said
+  (`tool-blocked`). The document still loads: a policy that blocks
+  everything is a denial, not an error.
+
+The policy covers what the document connects to. Servers the operator
+configures in `mcp.servers` are the operator's and are not narrowed by it.
+
 A registry read carries its signatures in the read's metadata. The other
 transports carry the author signature beside the document:
 

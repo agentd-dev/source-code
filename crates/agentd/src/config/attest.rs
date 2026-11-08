@@ -26,7 +26,7 @@ use crate::aauth::AgentKey;
 use crate::b64;
 use crate::config::idoc::Refusal;
 
-pub use instruction_md::{author_digest, digest, front_matter_id};
+pub use instruction_md::{author_digest, authored_candidates, digest, front_matter_id};
 
 /// The `spec` claim of every instruction/1 attestation.
 pub const SPEC_CLAIM: &str = "instruction/1";
@@ -71,9 +71,9 @@ fn now_secs() -> u64 {
 ///
 /// A served text may carry its host's `host-integrations` block (S34), which
 /// is outside the bytes the author signed: the signature verifies over the
-/// text as served or over any of its [`authored_candidates`]. The block only
-/// narrows what the document may use, so taking it out widens nothing the
-/// author signed.
+/// text as served or over any of its [`authored_candidates`] (the SDK's
+/// check). The block only narrows what the document may use, so taking it
+/// out widens nothing the author signed.
 pub fn verify_author(
     jws: &str,
     key: &[u8],
@@ -82,79 +82,17 @@ pub fn verify_author(
     publisher: &str,
     now: u64,
 ) -> Result<Claims, Refusal> {
-    let keys = [instruction_md::public_jwk(key, "")];
-    let options = instruction_md::VerifyOptions {
-        doc: doc.to_string(),
-        publisher: publisher.to_string(),
-        now: Some(now as i64),
-    };
-    let mut candidates = authored_candidates(authored).into_iter();
-    let first = candidates.next().unwrap_or_default();
-    let r = instruction_md::verify_author(jws, &first, &keys, &options);
-    // Only a digest that names other bytes is worth another candidate: any
-    // other refusal is the signature's, whichever bytes it is checked over.
-    if r.ok || r.code != "digest-mismatch" {
-        return typed(r);
-    }
-    candidates
-        .map(|text| instruction_md::verify_author(jws, &text, &keys, &options))
-        .find(|c| c.ok)
-        .map_or_else(|| typed(r), typed)
-}
-
-/// The front matter key only the host that serves a document writes (S34).
-pub const HOST_POLICY_KEY: &str = "host-integrations";
-
-/// What an author may have signed, given a served text (S34 §5): the text
-/// itself; when its front matter opens with a `host-integrations` line, the
-/// text without that line and the lines after it that start with a space or
-/// a tab; and, when that leaves an empty front matter, the text without it.
-/// The instruction.md SDK's `authored_candidates`, ahead of the release
-/// that carries it (instruction-md 0.5); replaced by it then.
-pub fn authored_candidates(text: &[u8]) -> Vec<Vec<u8>> {
-    const BOM: &[u8] = "\u{feff}".as_bytes();
-    // A `---` line with its ending, at the start of `b`.
-    let fence = |b: &[u8]| -> Option<usize> {
-        match b.strip_prefix(b"---")? {
-            [b'\r', b'\n', ..] => Some(5),
-            [b'\r', ..] | [b'\n', ..] => Some(4),
-            _ => None,
-        }
-    };
-    // A line ending in LF, with no CR in it, at the start of `b`.
-    let lf_line = |b: &[u8]| -> Option<usize> {
-        let end = b.iter().position(|&c| c == b'\n' || c == b'\r')?;
-        (b[end] == b'\n').then_some(end + 1)
-    };
-    let bom = if text.starts_with(BOM) { BOM.len() } else { 0 };
-    let rest = &text[bom..];
-    let Some(open) = fence(rest) else {
-        return vec![text.to_vec()];
-    };
-    let after = &rest[open..];
-    if !after.starts_with(format!("{HOST_POLICY_KEY}:").as_bytes()) {
-        return vec![text.to_vec()];
-    }
-    let Some(mut n) = lf_line(after) else {
-        return vec![text.to_vec()];
-    };
-    while matches!(after.get(n), Some(b' ' | b'\t')) {
-        match lf_line(&after[n..]) {
-            Some(k) => n += k,
-            None => break,
-        }
-    }
-    let mut stripped = text[..bom + open].to_vec();
-    stripped.extend_from_slice(&after[n..]);
-    let mut out = vec![text.to_vec(), stripped.clone()];
-    if let Some(a) = fence(&stripped[bom..])
-        && let Some(b) = fence(&stripped[bom + a..])
-    {
-        let mut empty = text[..bom].to_vec();
-        empty.extend_from_slice(&stripped[bom + a + b..]);
-        out.push(empty);
-    }
-    out
+    let r = instruction_md::verify_author(
+        jws,
+        authored,
+        &[instruction_md::public_jwk(key, "")],
+        &instruction_md::VerifyOptions {
+            doc: doc.to_string(),
+            publisher: publisher.to_string(),
+            now: Some(now as i64),
+        },
+    );
+    typed(r)
 }
 
 /// A verification refused carries the SDK's code (`instruction_md::VERIFY_CODES`)

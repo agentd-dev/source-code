@@ -5,6 +5,15 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+- A document's integrations policy is enforced (instruction.md proposal
+  S34, instruction-md 0.5): the host's `host-integrations` block merged
+  with the author's `integrations`. A target the policy does not allow is
+  not connected, a blocked tool is excluded, and a server left with no tool
+  to offer is not activated. The author check is the SDK's again, which
+  takes the host's block out itself.
+
 ## v1.29.0 — a signature verifies over a text served with its host's policy
 
 - An author signature verifies over an instruction served with its host's

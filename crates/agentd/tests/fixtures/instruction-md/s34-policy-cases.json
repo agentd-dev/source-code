@@ -1,0 +1,179 @@
+[
+  {
+    "name": "a front matter of its own",
+    "source": "# Planner\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.delete\"}\n\n::tool{id=del server=#cal name=events.delete}\n",
+    "host": {
+      "servers": {
+        "https://cal.example.org/mcp": {
+          "blocked": [
+            "events.delete"
+          ]
+        }
+      }
+    },
+    "served": "---\nhost-integrations:\n  servers:\n    \"https://cal.example.org/mcp\": {\"blocked\": [\"events.delete\"]}\n---\n# Planner\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.delete\"}\n\n::tool{id=del server=#cal name=events.delete}\n",
+    "authored": [
+      "---\nhost-integrations:\n  servers:\n    \"https://cal.example.org/mcp\": {\"blocked\": [\"events.delete\"]}\n---\n# Planner\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.delete\"}\n\n::tool{id=del server=#cal name=events.delete}\n",
+      "---\n---\n# Planner\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.delete\"}\n\n::tool{id=del server=#cal name=events.delete}\n",
+      "# Planner\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.delete\"}\n\n::tool{id=del server=#cal name=events.delete}\n"
+    ],
+    "policy": {
+      "servers": {
+        "https://cal.example.org/mcp": {
+          "blocked": [
+            "events.delete"
+          ],
+          "default": "allowed"
+        }
+      },
+      "from": {
+        "host": true,
+        "author": false
+      }
+    },
+    "codes": [
+      "tool-blocked",
+      "tool-blocked"
+    ]
+  },
+  {
+    "name": "after the opening line, the author narrowing",
+    "source": "---\ntitle: Planner\nintegrations:\n  allowed: [\"https://cal.example.org/mcp\"]\n  servers:\n    \"https://cal.example.org/mcp/\": { blocked: [events.purge] }\n---\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\"}\n\n::tool{id=purge server=#cal name=events.purge}\n\n::agent{id=far protocol=a2a src=\"https://far.example.org/.well-known/agent-card.json\"}\n",
+    "host": {
+      "allowed": [
+        "https://cal.example.org/mcp",
+        "https://far.example.org/.well-known/agent-card.json"
+      ],
+      "servers": {
+        "https://cal.example.org/mcp": {
+          "blocked": [
+            "events.delete"
+          ]
+        }
+      }
+    },
+    "served": "---\nhost-integrations:\n  allowed: [\"https://cal.example.org/mcp\", \"https://far.example.org/.well-known/agent-card.json\"]\n  servers:\n    \"https://cal.example.org/mcp\": {\"blocked\": [\"events.delete\"]}\ntitle: Planner\nintegrations:\n  allowed: [\"https://cal.example.org/mcp\"]\n  servers:\n    \"https://cal.example.org/mcp/\": { blocked: [events.purge] }\n---\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\"}\n\n::tool{id=purge server=#cal name=events.purge}\n\n::agent{id=far protocol=a2a src=\"https://far.example.org/.well-known/agent-card.json\"}\n",
+    "authored": [
+      "---\nhost-integrations:\n  allowed: [\"https://cal.example.org/mcp\", \"https://far.example.org/.well-known/agent-card.json\"]\n  servers:\n    \"https://cal.example.org/mcp\": {\"blocked\": [\"events.delete\"]}\ntitle: Planner\nintegrations:\n  allowed: [\"https://cal.example.org/mcp\"]\n  servers:\n    \"https://cal.example.org/mcp/\": { blocked: [events.purge] }\n---\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\"}\n\n::tool{id=purge server=#cal name=events.purge}\n\n::agent{id=far protocol=a2a src=\"https://far.example.org/.well-known/agent-card.json\"}\n",
+      "---\ntitle: Planner\nintegrations:\n  allowed: [\"https://cal.example.org/mcp\"]\n  servers:\n    \"https://cal.example.org/mcp/\": { blocked: [events.purge] }\n---\n\n::mcp{id=cal src=\"https://cal.example.org/mcp\"}\n\n::tool{id=purge server=#cal name=events.purge}\n\n::agent{id=far protocol=a2a src=\"https://far.example.org/.well-known/agent-card.json\"}\n"
+    ],
+    "policy": {
+      "allowed": [
+        "https://cal.example.org/mcp"
+      ],
+      "servers": {
+        "https://cal.example.org/mcp": {
+          "blocked": [
+            "events.delete",
+            "events.purge"
+          ],
+          "default": "allowed"
+        }
+      },
+      "from": {
+        "host": true,
+        "author": true
+      }
+    },
+    "codes": [
+      "tool-blocked",
+      "integration-not-allowed"
+    ]
+  },
+  {
+    "name": "only approved integrations, none named",
+    "source": "---\r\ntitle: CRLF\r\n---\r\n\r\nMUST: plan the day.\r\n",
+    "host": {
+      "allowed": []
+    },
+    "served": "---\r\nhost-integrations:\n  allowed: []\ntitle: CRLF\r\n---\r\n\r\nMUST: plan the day.\r\n",
+    "authored": [
+      "---\r\nhost-integrations:\n  allowed: []\ntitle: CRLF\r\n---\r\n\r\nMUST: plan the day.\r\n",
+      "---\r\ntitle: CRLF\r\n---\r\n\r\nMUST: plan the day.\r\n"
+    ],
+    "policy": {
+      "allowed": [],
+      "servers": {},
+      "from": {
+        "host": true,
+        "author": false
+      }
+    },
+    "codes": []
+  },
+  {
+    "name": "new tools blocked until reviewed",
+    "source": "﻿::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.new\"}\n",
+    "host": {
+      "allowed": [
+        "https://cal.example.org/mcp"
+      ],
+      "servers": {
+        "https://cal.example.org/mcp": {
+          "default": "blocked",
+          "allowed": [
+            "events.list"
+          ]
+        }
+      }
+    },
+    "served": "﻿---\nhost-integrations:\n  allowed: [\"https://cal.example.org/mcp\"]\n  servers:\n    \"https://cal.example.org/mcp\": {\"allowed\": [\"events.list\"], \"default\": \"blocked\"}\n---\n::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.new\"}\n",
+    "authored": [
+      "﻿---\nhost-integrations:\n  allowed: [\"https://cal.example.org/mcp\"]\n  servers:\n    \"https://cal.example.org/mcp\": {\"allowed\": [\"events.list\"], \"default\": \"blocked\"}\n---\n::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.new\"}\n",
+      "﻿---\n---\n::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.new\"}\n",
+      "﻿::mcp{id=cal src=\"https://cal.example.org/mcp\" tools=\"events.list,events.new\"}\n"
+    ],
+    "policy": {
+      "allowed": [
+        "https://cal.example.org/mcp"
+      ],
+      "servers": {
+        "https://cal.example.org/mcp": {
+          "blocked": [],
+          "default": "blocked",
+          "allowed": [
+            "events.list"
+          ]
+        }
+      },
+      "from": {
+        "host": true,
+        "author": false
+      }
+    },
+    "codes": [
+      "tool-blocked"
+    ]
+  },
+  {
+    "name": "nothing to say: served as it is",
+    "source": "# Plain\n\nText.\n",
+    "host": null,
+    "served": "# Plain\n\nText.\n",
+    "authored": [
+      "# Plain\n\nText.\n"
+    ],
+    "policy": null,
+    "codes": []
+  },
+  {
+    "name": "the author's alone",
+    "source": "---\nintegrations:\n  allowed: []\n---\n\n::skill{id=s src=\"https://github.com/acme/skills/tree/main/plan\"}\n",
+    "host": null,
+    "served": "---\nintegrations:\n  allowed: []\n---\n\n::skill{id=s src=\"https://github.com/acme/skills/tree/main/plan\"}\n",
+    "authored": [
+      "---\nintegrations:\n  allowed: []\n---\n\n::skill{id=s src=\"https://github.com/acme/skills/tree/main/plan\"}\n"
+    ],
+    "policy": {
+      "allowed": [],
+      "servers": {},
+      "from": {
+        "host": false,
+        "author": true
+      }
+    },
+    "codes": [
+      "integration-not-allowed"
+    ]
+  }
+]

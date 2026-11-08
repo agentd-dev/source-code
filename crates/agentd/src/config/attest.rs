@@ -68,6 +68,12 @@ fn now_secs() -> u64 {
 /// Verify an author signature over the authored bytes with a raw Ed25519
 /// public key: the SDK's checks (EdDSA, `spec`, `typ`, expiry, the digest,
 /// the `doc`, the publisher), then the claims typed.
+///
+/// A served text may carry its host's `host-integrations` block (S34), which
+/// is outside the bytes the author signed: the signature verifies over the
+/// text as served or over any of its [`authored_candidates`]. The block only
+/// narrows what the document may use, so taking it out widens nothing the
+/// author signed.
 pub fn verify_author(
     jws: &str,
     key: &[u8],
@@ -76,17 +82,79 @@ pub fn verify_author(
     publisher: &str,
     now: u64,
 ) -> Result<Claims, Refusal> {
-    let r = instruction_md::verify_author(
-        jws,
-        authored,
-        &[instruction_md::public_jwk(key, "")],
-        &instruction_md::VerifyOptions {
-            doc: doc.to_string(),
-            publisher: publisher.to_string(),
-            now: Some(now as i64),
-        },
-    );
-    typed(r)
+    let keys = [instruction_md::public_jwk(key, "")];
+    let options = instruction_md::VerifyOptions {
+        doc: doc.to_string(),
+        publisher: publisher.to_string(),
+        now: Some(now as i64),
+    };
+    let mut candidates = authored_candidates(authored).into_iter();
+    let first = candidates.next().unwrap_or_default();
+    let r = instruction_md::verify_author(jws, &first, &keys, &options);
+    // Only a digest that names other bytes is worth another candidate: any
+    // other refusal is the signature's, whichever bytes it is checked over.
+    if r.ok || r.code != "digest-mismatch" {
+        return typed(r);
+    }
+    candidates
+        .map(|text| instruction_md::verify_author(jws, &text, &keys, &options))
+        .find(|c| c.ok)
+        .map_or_else(|| typed(r), typed)
+}
+
+/// The front matter key only the host that serves a document writes (S34).
+pub const HOST_POLICY_KEY: &str = "host-integrations";
+
+/// What an author may have signed, given a served text (S34 §5): the text
+/// itself; when its front matter opens with a `host-integrations` line, the
+/// text without that line and the lines after it that start with a space or
+/// a tab; and, when that leaves an empty front matter, the text without it.
+/// The instruction.md SDK's `authored_candidates`, ahead of the release
+/// that carries it (instruction-md 0.5); replaced by it then.
+pub fn authored_candidates(text: &[u8]) -> Vec<Vec<u8>> {
+    const BOM: &[u8] = "\u{feff}".as_bytes();
+    // A `---` line with its ending, at the start of `b`.
+    let fence = |b: &[u8]| -> Option<usize> {
+        match b.strip_prefix(b"---")? {
+            [b'\r', b'\n', ..] => Some(5),
+            [b'\r', ..] | [b'\n', ..] => Some(4),
+            _ => None,
+        }
+    };
+    // A line ending in LF, with no CR in it, at the start of `b`.
+    let lf_line = |b: &[u8]| -> Option<usize> {
+        let end = b.iter().position(|&c| c == b'\n' || c == b'\r')?;
+        (b[end] == b'\n').then_some(end + 1)
+    };
+    let bom = if text.starts_with(BOM) { BOM.len() } else { 0 };
+    let rest = &text[bom..];
+    let Some(open) = fence(rest) else {
+        return vec![text.to_vec()];
+    };
+    let after = &rest[open..];
+    if !after.starts_with(format!("{HOST_POLICY_KEY}:").as_bytes()) {
+        return vec![text.to_vec()];
+    }
+    let Some(mut n) = lf_line(after) else {
+        return vec![text.to_vec()];
+    };
+    while matches!(after.get(n), Some(b' ' | b'\t')) {
+        match lf_line(&after[n..]) {
+            Some(k) => n += k,
+            None => break,
+        }
+    }
+    let mut stripped = text[..bom + open].to_vec();
+    stripped.extend_from_slice(&after[n..]);
+    let mut out = vec![text.to_vec(), stripped.clone()];
+    if let Some(a) = fence(&stripped[bom..])
+        && let Some(b) = fence(&stripped[bom + a..])
+    {
+        let mut empty = text[..bom].to_vec();
+        empty.extend_from_slice(&stripped[bom + a + b..]);
+        out.push(empty);
+    }
+    out
 }
 
 /// A verification refused carries the SDK's code (`instruction_md::VERIFY_CODES`)
@@ -610,6 +678,60 @@ mod tests {
         // A different key does not verify.
         let other = AgentKey::from_seed(&[9u8; 32]).unwrap();
         assert!(verify_author(&jws, other.public_bytes(), DOC, "", "", NOW).is_err());
+    }
+
+    /// S34's vectors (instruction.md `sdks/rust/conformance/vectors/policy`,
+    /// as of 04e57b3): the host's block comes out as the reference takes it
+    /// out, and an author signature over the source verifies over the served
+    /// text; a block the author did not sign elsewhere, or any other change,
+    /// still fails.
+    #[test]
+    fn an_author_signature_verifies_over_a_text_served_with_its_hosts_block() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/instruction-md/s34-policy-cases.json"
+        );
+        let cases: Vec<Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(cases.len(), 6);
+        let k = key();
+        for c in &cases {
+            let name = c["name"].as_str().unwrap();
+            let source = c["source"].as_str().unwrap().as_bytes();
+            let served = c["served"].as_str().unwrap().as_bytes();
+            let got: Vec<String> = authored_candidates(served)
+                .into_iter()
+                .map(|b| String::from_utf8(b).unwrap())
+                .collect();
+            let want: Vec<&str> = c["authored"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            assert_eq!(got, want, "{name}");
+            let jws = sign(&k, &claims("author", &digest(source), &[])).unwrap();
+            verify_author(&jws, k.public_bytes(), served, "", "", NOW)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let mut tampered = served.to_vec();
+            tampered.extend_from_slice(b"\nand also this\n");
+            let e = verify_author(&jws, k.public_bytes(), &tampered, "", "", NOW).unwrap_err();
+            assert_eq!(e.code, "digest-mismatch", "{name}");
+        }
+        // The block anywhere but first in the front matter is the author's.
+        let late = b"---\ntitle: x\nhost-integrations:\n  allowed: []\n---\nbody\n";
+        assert_eq!(authored_candidates(late), vec![late.to_vec()]);
+        // Another refusal is not retried: the wrong key fails as itself.
+        let source = b"---\n---\nbody\n";
+        let served = b"---\nhost-integrations:\n  allowed: []\n---\nbody\n";
+        let jws = sign(&k, &claims("author", &digest(source), &[])).unwrap();
+        let other = AgentKey::from_seed(&[9u8; 32]).unwrap();
+        assert_ne!(
+            verify_author(&jws, other.public_bytes(), served, "", "", NOW)
+                .unwrap_err()
+                .code,
+            "digest-mismatch"
+        );
     }
 
     #[test]

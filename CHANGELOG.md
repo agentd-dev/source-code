@@ -5,6 +5,15 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+- An author signature verifies over an instruction served with its host's
+  `host-integrations` block (instruction.md proposal S34): the block sits at
+  the top of the front matter, outside the signed bytes, and is taken out
+  before the digest is checked. A block anywhere else is the author's and
+  stays signed. This is the instruction.md SDK's rule, built into agentd
+  ahead of the SDK release that carries it.
+
 ## v1.28.0 — every request says it is agentd's
 
 Every HTTP request agentd makes now says which software is calling:

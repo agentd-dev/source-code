@@ -520,6 +520,12 @@ With a publisher pinned:
   are set, the shorter interval wins.
 - Every re-read is verified against the same pins. A refused re-read keeps
   the running instruction.
+- A registry may serve the document with its workspace's integrations policy
+  as a `host-integrations` block at the top of the front matter (instruction.md
+  proposal S34). The block is the registry's, outside the bytes the author
+  signed, so the signature verifies over the text with the block taken out.
+  A block anywhere else in the front matter is the author's and is signed
+  like the rest.
 
 A registry read carries its signatures in the read's metadata. The other
 transports carry the author signature beside the document:

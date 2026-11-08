@@ -75,7 +75,7 @@ let replied = null;
 
 /** An instance child's own log, as `subagent.log` returns it. */
 const LOG = [
-  { ts: '2026-09-01T09:00:02.114Z', level: 'info', event: 'proc.start', version: '1.28.0', instance: 'sa-review' },
+  { ts: '2026-09-01T09:00:02.114Z', level: 'info', event: 'proc.start', version: '1.29.0', instance: 'sa-review' },
   { ts: '2026-09-01T09:00:02.161Z', level: 'info', event: 'a2a.listen', addr: 'unix:///run/agentd/sa-review/a2a.sock' },
   { ts: '2026-09-01T09:00:02.170Z', level: 'info', event: 'proc.ready' },
   { ts: '2026-09-01T09:00:03.402Z', level: 'info', event: 'turn.start', conversation: 'parent' },
@@ -137,8 +137,8 @@ const feed = (m, kind, data) => m.apply({ seq: ++seq, ts: seq, kind, data });
 function populate(mirror) {
   seq = 0;
   mirror.setSession(session());
-  mirror.bootstrap({ version: '1.28.0', instance: 'triage-1', model: 'gpt-5.1' });
-  mirror.onHello({ seq: 0, resume: 0, resync: false, introspection: true, version: '1.28.0' });
+  mirror.bootstrap({ version: '1.29.0', instance: 'triage-1', model: 'gpt-5.1' });
+  mirror.onHello({ seq: 0, resume: 0, resync: false, introspection: true, version: '1.29.0' });
   mirror.setConn('ready');
   feed(mirror, 'run', { id: 'pipeline-01M0C0', workflow: 'pipeline', status: 'running', steps: '3/7' });
   const step = (s, extra = {}) => feed(mirror, 'step', { run: 'pipeline-01M0C0', step: s, ...extra });

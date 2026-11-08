@@ -5,7 +5,7 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
-## Unreleased
+## v1.29.0 — a signature verifies over a text served with its host's policy
 
 - An author signature verifies over an instruction served with its host's
   `host-integrations` block (instruction.md proposal S34): the block sits at

@@ -32,6 +32,8 @@ pub enum Job {
         generation: u64,
         client: Arc<McpClient>,
         params: Map<String, Value>,
+        /// The type's `inputSchema`, for its `Mcp-Param-*` headers.
+        schema: Option<Value>,
         bound: Duration,
     },
     /// A webhook arm or refresh: `events/subscribe`. An arm is a fresh
@@ -49,6 +51,8 @@ pub enum Job {
         fresh: bool,
         unsubscribe: Map<String, Value>,
         subscribe: Map<String, Value>,
+        /// The type's `inputSchema`, for its `Mcp-Param-*` headers.
+        schema: Option<Value>,
         bound: Duration,
     },
     /// An eager `events/unsubscribe`: a webhook binding stopped — on the
@@ -60,6 +64,8 @@ pub enum Job {
         client: Option<Arc<McpClient>>,
         prior: Option<Arc<McpClient>>,
         params: Map<String, Value>,
+        /// The type's `inputSchema`, for its `Mcp-Param-*` headers.
+        schema: Option<Value>,
         bound: Duration,
     },
 }
@@ -231,13 +237,16 @@ fn work(rx: &Mutex<Receiver<Job>>, events: &Sender<Event>) {
                 generation,
                 client,
                 params,
+                schema,
                 bound,
             } => Done::Poll {
                 generation,
-                result: call(&client, wire::method::POLL, params, bound).and_then(|v| {
-                    serde_json::from_value::<PollPage>(v)
-                        .map_err(|e| Failure::Transport(format!("events/poll: {e}")))
-                }),
+                result: call(&client, wire::method::POLL, params, schema.as_ref(), bound).and_then(
+                    |v| {
+                        serde_json::from_value::<PollPage>(v)
+                            .map_err(|e| Failure::Transport(format!("events/poll: {e}")))
+                    },
+                ),
                 key,
             },
             Job::Arm {
@@ -249,6 +258,7 @@ fn work(rx: &Mutex<Receiver<Job>>, events: &Sender<Event>) {
                 fresh,
                 unsubscribe,
                 subscribe,
+                schema,
                 bound,
             } => Done::Arm {
                 result: arm(
@@ -257,6 +267,7 @@ fn work(rx: &Mutex<Receiver<Job>>, events: &Sender<Event>) {
                     fresh,
                     &unsubscribe,
                     subscribe,
+                    schema.as_ref(),
                     bound,
                 ),
                 key,
@@ -273,14 +284,24 @@ fn work(rx: &Mutex<Receiver<Job>>, events: &Sender<Event>) {
                 client,
                 prior,
                 params,
+                schema,
                 bound,
             } => {
                 if let Some(prior) = &prior {
-                    let _ = call(prior, wire::method::UNSUBSCRIBE, params.clone(), bound);
+                    let _ = call(
+                        prior,
+                        wire::method::UNSUBSCRIBE,
+                        params.clone(),
+                        schema.as_ref(),
+                        bound,
+                    );
                 }
                 Done::Unsubscribe {
                     result: match &client {
-                        Some(c) => call(c, wire::method::UNSUBSCRIBE, params, bound).map(|_| ()),
+                        Some(c) => {
+                            call(c, wire::method::UNSUBSCRIBE, params, schema.as_ref(), bound)
+                                .map(|_| ())
+                        }
                         None => Ok(()),
                     },
                     key,
@@ -299,16 +320,13 @@ fn call(
     client: &McpClient,
     method: &str,
     params: Map<String, Value>,
+    schema: Option<&Value>,
     bound: Duration,
 ) -> Result<Value, Failure> {
-    match client.call_raw(method, params, wire::client_extensions(), bound) {
+    let headers = wire::request_headers(method, &params, schema);
+    match client.call_raw_with(method, params, wire::client_extensions(), &headers, bound) {
         Ok(Ok(v)) => Ok(v),
-        // Read in either numbering, so a server on MCPG's default
-        // (`-32011`…`-32015`) is answered as one on SEP-3415's.
-        Ok(Err(mut e)) => {
-            e.code = wire::code::normalize(e.code);
-            Err(Failure::Rpc(e))
-        }
+        Ok(Err(e)) => Err(Failure::Rpc(e)),
         Err(e) => Err(Failure::Transport(e.to_string())),
     }
 }
@@ -324,16 +342,24 @@ fn arm(
     fresh: bool,
     unsubscribe: &Map<String, Value>,
     subscribe: Map<String, Value>,
+    schema: Option<&Value>,
     bound: Duration,
 ) -> Result<Subscribed, Failure> {
     if fresh {
         if let Some(prior) = prior {
-            let _ = call(prior, wire::method::UNSUBSCRIBE, unsubscribe.clone(), bound);
+            let _ = call(
+                prior,
+                wire::method::UNSUBSCRIBE,
+                unsubscribe.clone(),
+                schema,
+                bound,
+            );
         }
         match call(
             client,
             wire::method::UNSUBSCRIBE,
             unsubscribe.clone(),
+            schema,
             bound,
         ) {
             Ok(_) => {}
@@ -341,7 +367,7 @@ fn arm(
             Err(e) => return Err(e),
         }
     }
-    let v = call(client, wire::method::SUBSCRIBE, subscribe, bound)?;
+    let v = call(client, wire::method::SUBSCRIBE, subscribe, schema, bound)?;
     serde_json::from_value::<Subscribed>(v)
         .map_err(|e| Failure::Transport(format!("events/subscribe: {e}")))
 }
@@ -355,6 +381,7 @@ fn list(client: &McpClient, bound: Duration) -> Result<Vec<Descriptor>, Failure>
             client,
             wire::method::LIST,
             wire::list_params(cursor.as_deref()),
+            None,
             bound,
         )?;
         let page: wire::ListPage = serde_json::from_value(v)

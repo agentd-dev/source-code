@@ -70,6 +70,18 @@ struct Inner {
     verified: BTreeSet<(String, String)>,
     policy: Policy,
     sender: bool,
+    /// Each delivered message's `webhook-id`, by (subscription, position):
+    /// high-entropy, never the `eventId`, the same on every retry [E L624].
+    ids: BTreeMap<(String, u64), String>,
+}
+
+/// A fresh `webhook-id`: `msg_` and 16 random bytes, base64url — ASCII
+/// letters, digits, `_` and `-` only [E L624].
+fn message_id() -> String {
+    format!(
+        "msg_{}",
+        crate::sec::random::b64url_token(16).unwrap_or_else(|_| "fallback".into())
+    )
 }
 
 /// The mock's webhook state.
@@ -405,7 +417,14 @@ impl Hooks {
                 o["cursor"] = json!(format!("c{seq}"));
                 let event_id = o["eventId"].as_str().unwrap_or("evt").to_string();
                 let body = serde_json::to_vec(&o).unwrap_or_default();
-                let posted = self.post(&url, &key, &event_id, &id, &body);
+                let message = {
+                    let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    g.ids
+                        .entry((k.clone(), seq))
+                        .or_insert_with(message_id)
+                        .clone()
+                };
+                let posted = self.post(&url, &key, &message, &id, &body);
                 let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 let policy = (g.policy.attempts, g.policy.window_ms);
                 let Some(h) = g.hooks.get_mut(&k) else {
@@ -531,7 +550,7 @@ impl Hooks {
                 for (url, key, id, cursor) in targets {
                     let body = serde_json::to_vec(&json!({"type": "gap", "cursor": cursor}))
                         .unwrap_or_default();
-                    answers.push(self.status(self.post(&url, &key, "msg_gap_1", &id, &body)));
+                    answers.push(self.status(self.post(&url, &key, &message_id(), &id, &body)));
                 }
                 Some(json!({"answers": answers}))
             }
@@ -550,7 +569,7 @@ impl Hooks {
                     answers.push(self.status(self.post(
                         &h.url,
                         &h.key,
-                        "msg_terminated_1",
+                        &message_id(),
                         &h.id,
                         &body,
                     )));

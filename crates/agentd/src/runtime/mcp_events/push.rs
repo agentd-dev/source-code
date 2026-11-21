@@ -26,7 +26,7 @@
 
 use super::pool::Done;
 use super::wire::{self, Frame};
-use super::{BACKOFF_MAX_MS, EXHAUSTED_MAX_MS, State, Taken, backoff, jitter, tame};
+use super::{BACKOFF_MAX_MS, EXHAUSTED_MAX_MS, State, Taken, jitter, reconnect_backoff, tame};
 use crate::config::settings::events::{Delivery, Replay};
 use crate::mcp::client::McpClient;
 use crate::runtime::events::Event;
@@ -38,18 +38,20 @@ use serde_json::{Value, json};
 use std::ops::ControlFlow;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// How long the dial, the request and the wait for the stream's first frame
 /// may take.
 const OPEN_BOUND: Duration = Duration::from_secs(30);
-/// How long an open stream may stay silent before its server's pace is known:
-/// three times the 30 s heartbeat ceiling [MCPG RFC 0031 §2.1].
+/// The heartbeat interval the spec recommends a server choose [E L366]: the
+/// pace an open stream is held to until its `active` grants one.
+const HEARTBEAT_DEFAULT: Duration = Duration::from_secs(30);
+/// How long an open stream may stay silent before its grant is known.
 const IDLE_DEFAULT: Duration = Duration::from_secs(90);
-/// The least idle bound a fast heartbeat sets.
+/// The least idle bound a fast grant sets.
 const IDLE_FLOOR: Duration = Duration::from_secs(1);
-/// Silence past this many of the server's heartbeat intervals is a stream
-/// gone.
+/// Silence past this many granted heartbeat intervals, counted from
+/// `notifications/events/active`, is a stream gone [E L366].
 const IDLE_HEARTBEATS: u32 = 3;
 /// Frames one stream may have handed to the loop and not yet taken: past it
 /// the reader waits, and TCP holds the server back — the flow control the
@@ -128,6 +130,7 @@ fn open(
     generation: u64,
     client: Arc<McpClient>,
     params: serde_json::Map<String, Value>,
+    headers: Vec<(String, String)>,
     events: Sender<Event>,
 ) -> Open {
     let arguments = params
@@ -144,7 +147,7 @@ fn open(
     );
     let _ = std::thread::Builder::new()
         .name("agentd-events-push".into())
-        .spawn(move || read(&key, generation, &conn, params, &events, &h, &c));
+        .spawn(move || read(&key, generation, &conn, params, &headers, &events, &h, &c));
     Open {
         handle,
         credit,
@@ -155,14 +158,16 @@ fn open(
     }
 }
 
-/// The reader: frames to the loop, in order, until the stream ends. The idle
-/// bound follows the server's own heartbeat interval once two heartbeats
-/// have shown it.
+/// The reader: frames to the loop, in order, until the stream ends. Each
+/// `active` sets the idle bound to three of the heartbeat intervals it grants
+/// (the spec's 30 s default when it grants none), counted from that frame.
+#[allow(clippy::too_many_arguments)]
 fn read(
     key: &str,
     generation: u64,
     client: &McpClient,
     params: serde_json::Map<String, Value>,
+    headers: &[(String, String)],
     events: &Sender<Event>,
     handle: &StreamHandle,
     credit: &Credit,
@@ -176,22 +181,19 @@ fn read(
             })))
             .is_ok()
     };
-    let mut beat: Option<Instant> = None;
-    let end = client.stream_raw(
+    let end = client.stream_raw_with(
         wire::method::STREAM,
         params,
         wire::client_extensions(),
+        headers,
         OPEN_BOUND,
         handle,
         |n| {
             let Some(frame) = wire::frame(&n) else {
                 return ControlFlow::Continue(()); // not a frame this reads
             };
-            if matches!(frame, Frame::Heartbeat { .. }) {
-                if let Some(prev) = beat {
-                    handle.set_idle(idle_bound(prev.elapsed()));
-                }
-                beat = Some(Instant::now());
+            if let Frame::Active { heartbeat_ms, .. } = &frame {
+                handle.set_idle(idle_bound(heartbeat_ms.map(Duration::from_millis)));
             }
             let last = matches!(frame, Frame::Terminated(_));
             if !credit.reserve(handle) || !send(Pushed::Frame(frame)) || last {
@@ -203,9 +205,10 @@ fn read(
     let _ = send(Pushed::Ended(end));
 }
 
-/// The idle bound a heartbeat interval of `interval` sets.
-fn idle_bound(interval: Duration) -> Duration {
-    (interval * IDLE_HEARTBEATS).clamp(IDLE_FLOOR, IDLE_DEFAULT)
+/// The idle bound a granted heartbeat interval sets: three of it, at least
+/// [`IDLE_FLOOR`]. The grant is authoritative, so a long one is kept long.
+fn idle_bound(granted: Option<Duration>) -> Duration {
+    (granted.unwrap_or(HEARTBEAT_DEFAULT) * IDLE_HEARTBEATS).max(IDLE_FLOOR)
 }
 
 /// Why a stream that could not be opened moves the binding to its next
@@ -214,7 +217,7 @@ fn idle_bound(interval: Duration) -> Duration {
 /// request refused outright. `None`: anything else, which push retries.
 fn refusal_moves_on(end: &StreamEnd) -> Option<&'static str> {
     match end {
-        StreamEnd::Refused(e) => match wire::code::normalize(e.code) {
+        StreamEnd::Refused(e) => match e.code {
             wire::code::METHOD_NOT_FOUND => Some("method_not_found"),
             wire::code::FORBIDDEN => Some("forbidden"),
             wire::code::UNSUPPORTED if !schema_changed(e) => Some("unsupported"),
@@ -346,6 +349,7 @@ impl Runtime {
         self.mcp_events.next_generation += 1;
         let generation = self.mcp_events.next_generation;
         let events = self.events_tx.clone();
+        let schema = self.events_schema(&server, &self.mcp_events.bindings[key].name);
         let Some(b) = self.mcp_events.bindings.get_mut(key) else {
             return;
         };
@@ -362,7 +366,15 @@ impl Runtime {
         };
         let params =
             wire::stream_params(&b.name, &b.sent_arguments(), b.cursor.as_deref(), max_age);
-        b.push = Some(open(key.to_string(), generation, client, params, events));
+        let headers = wire::request_headers(wire::method::STREAM, &params, schema.as_ref());
+        b.push = Some(open(
+            key.to_string(),
+            generation,
+            client,
+            params,
+            headers,
+            events,
+        ));
     }
 
     /// Close `key`'s stream, said with `reason`; its frames still queued are
@@ -413,7 +425,9 @@ impl Runtime {
         };
         let (server, name) = (b.server.clone(), b.name.clone());
         match frame {
-            Frame::Active { cursor, truncated } => {
+            Frame::Active {
+                cursor, truncated, ..
+            } => {
                 let open = b.push.as_mut().expect("held by the caller");
                 if !open.acked {
                     open.acked = true;
@@ -476,13 +490,13 @@ impl Runtime {
             Frame::Error(e) => self.log.warn(
                 "mcp.events.error",
                 json!({"server": server, "event_type": name,
-                       "code": wire::code::normalize(e.code), "err": tame(&e.message)}),
+                       "code": e.code, "err": tame(&e.message)}),
             ),
             Frame::Terminated(e) => {
                 self.log.error(
                     "mcp.events.terminated",
                     json!({"server": server, "event_type": name,
-                           "code": wire::code::normalize(e.code), "mode": "push"}),
+                           "code": e.code, "mode": "push"}),
                 );
                 self.events_push_close(key, "terminated", None);
                 self.events_push_refused(key, e, true);
@@ -573,7 +587,7 @@ impl Runtime {
             return;
         };
         let (server, name) = (b.server.clone(), b.name.clone());
-        match wire::code::normalize(e.code) {
+        match e.code {
             // The type is gone: list again, which refuses it if so.
             wire::code::NOT_FOUND => self.events_rediscover(key),
             wire::code::FORBIDDEN => self.events_refuse(key, "forbidden", &e.message),
@@ -626,12 +640,13 @@ impl Runtime {
     }
 
     /// The next stream waits the backoff the failures in a row have earned
-    /// (from 1 s, doubling, to `max`, with jitter); how long.
+    /// (up to 1 s, doubling, to `max`, drawn uniformly — full jitter
+    /// [E L369]); how long.
     fn events_push_backoff(&mut self, key: &str, max: u64) -> u64 {
         let Some(b) = self.mcp_events.bindings.get_mut(key) else {
             return 0;
         };
-        let wait = backoff(b.failures, max);
+        let wait = reconnect_backoff(b.failures, max);
         b.failures += 1;
         b.due_at = now_ms() + wait;
         wait
@@ -687,10 +702,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_idle_bound_is_three_heartbeats_within_its_floor_and_ceiling() {
-        assert_eq!(idle_bound(Duration::from_secs(20)), Duration::from_secs(60));
-        assert_eq!(idle_bound(Duration::from_millis(100)), IDLE_FLOOR);
-        assert_eq!(idle_bound(Duration::from_secs(45)), IDLE_DEFAULT);
+    fn the_idle_bound_is_three_granted_heartbeats() {
+        let s = |n| Some(Duration::from_secs(n));
+        assert_eq!(idle_bound(s(20)), Duration::from_secs(60));
+        assert_eq!(idle_bound(Some(Duration::from_millis(100))), IDLE_FLOOR);
+        // A grant past the old 30 s ceiling is the server's to make [E L366].
+        assert_eq!(idle_bound(s(45)), Duration::from_secs(135));
+        // No grant: the spec's recommended 30 s.
+        assert_eq!(idle_bound(None), IDLE_DEFAULT);
     }
 
     #[test]
@@ -706,28 +725,28 @@ mod tests {
             refusal_moves_on(&refused(-32601, None)),
             Some("method_not_found")
         );
-        // Either numbering.
-        for code in [-32014, -32026] {
-            assert_eq!(
-                refusal_moves_on(&refused(
-                    code,
-                    Some(json!({"feature": "deliveryMode", "value": "push"}))
-                )),
-                Some("unsupported")
-            );
-            assert_eq!(
-                refusal_moves_on(&refused(code, Some(json!({"reason": "schema_changed"})))),
-                None,
-                "a schema change is the type's, not the mode's"
-            );
-        }
-        for code in [-32012, -32024] {
-            assert_eq!(refusal_moves_on(&refused(code, None)), Some("forbidden"));
+        // The spec's numbering only [E L780-791].
+        let code = -32026;
+        assert_eq!(
+            refusal_moves_on(&refused(
+                code,
+                Some(json!({"feature": "deliveryMode", "value": "push"}))
+            )),
+            Some("unsupported")
+        );
+        assert_eq!(
+            refusal_moves_on(&refused(code, Some(json!({"reason": "schema_changed"})))),
+            None,
+            "a schema change is the type's, not the mode's"
+        );
+        assert_eq!(refusal_moves_on(&refused(-32024, None)), Some("forbidden"));
+        // The design sketch's codes are nobody's: push retries them.
+        for code in [-32012, -32014] {
+            assert_eq!(refusal_moves_on(&refused(code, None)), None, "{code}");
         }
         assert_eq!(refusal_moves_on(&StreamEnd::Status(404)), Some("refused"));
         // What may pass is push's to retry.
         for end in [
-            refused(-32013, None),
             refused(-32025, None),
             refused(-32603, None),
             StreamEnd::Status(503),

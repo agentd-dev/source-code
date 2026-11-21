@@ -292,8 +292,8 @@ The design follows from four decisions:
   stream, and how many subscriptions may be live. An instruction document
   can declare neither.
 
-MCP Events tracks a draft extension (SEP-3415) defined only for
-MCP 2026-07-28, and agentd says so at load whenever a binding is declared.
+MCP Events is a Beta extension (SEP-3415) defined only for MCP
+2026-07-28, and agentd says so at load whenever a binding is declared.
 A binding the server cannot honour is refused once, loudly, with a reason,
 and nothing is sent where nothing may be.
 [React to changes and events](react-to-events.md) shows the configuration.

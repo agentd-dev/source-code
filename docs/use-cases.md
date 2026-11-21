@@ -195,8 +195,9 @@ A workflow consumes the stream with `{kind: stream, stream: incidents}`.
 Operators can also grant event types that a workflow's `wait` or the model
 subscribes to at runtime, inside fixed limits.
 
-> **Note.** MCP Events tracks SEP-3415, a draft extension of MCP 2026-07-28.
-> agentd says so at load, and its methods may change between releases.
+> **Note.** MCP Events (SEP-3415) is a Beta extension of MCP 2026-07-28.
+> agentd says so at load; a Beta extension may still change under the same
+> identifier.
 
 **Start from:**
 [`examples/mcp-events-poll.yaml`](../examples/mcp-events-poll.yaml)

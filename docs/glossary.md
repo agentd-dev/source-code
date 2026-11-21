@@ -92,7 +92,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | **lethal trifecta** | One agent holding all three capability tags — `untrusted_input`, `sensitive` and `egress` — at once. agentd refuses it at load unless `security.allow_trifecta` is set. See [Security model](security.md). |
 | **machinery** | What a block declares that becomes configuration — a workflow, an MCP server, an A2A peer — beside the agent text the model reads. It maps in at load. See [Instruction documents](directives.md). |
 | **MCP** | The Model Context Protocol. agentd is an MCP client: every task tool and resource comes from an MCP server you declare. See [MCP: tools and context](mcp.md). |
-| **MCP Events** | A draft MCP extension (SEP-3415) through which a server's event occurrences reach declared streams, polled or delivered by webhook. See [React to changes and events](react-to-events.md). |
+| **MCP Events** | A Beta MCP extension (SEP-3415) through which a server's event occurrences reach declared streams, polled, streamed or delivered by webhook. See [React to changes and events](react-to-events.md). |
 | **MCP server** | A remote service, reached over Streamable HTTP, that offers tools, resources and prompts. agentd dials it and spawns no local process. See [Connect MCP servers](connect-mcp.md). |
 | **mock endpoint** | The built-in mock model, `mock:final` or `mock:file:<playbook.json>`: scripted answers for trying an agent or a workflow without a provider. Release binaries and the image carry it (the `mock-models` feature). See [Build features and crates](features.md). |
 | **model** | A named wire model on a connection (`intelligence.models.<name>`), of kind `chat`, `reasoning` or `decision`. See [Models, providers and roles](intelligence.md). |

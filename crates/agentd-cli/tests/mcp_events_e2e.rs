@@ -384,14 +384,31 @@ fn every_refusal_is_said_once_with_its_reason() {
 }
 
 #[test]
-fn the_sketchs_top_level_declaration_is_read_too() {
-    let mock =
-        common::spawn_mock_mcp_with(REVISION, "mock://res", false, &["--events", "top-level"]);
+fn a_declaration_at_a_revision_agentd_does_not_know_is_not_used() {
+    // SEP-3392: a peer that receives a `revision` it does not know SHOULD NOT
+    // enable the extension.
+    let mock = common::spawn_mock_mcp_with(
+        REVISION,
+        "mock://res",
+        false,
+        &["--events", "next-revision"],
+    );
     let daemon = Daemon::start(
-        "events-top-level",
+        "events-next-revision",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
-    ready(&daemon, &mock, "mock.tick");
+    daemon.wait_for("the refusal", |l| {
+        events(l, "mcp.events.refused").iter().any(|x| {
+            x["reason"] == "unknown_revision"
+                && x["detail"].as_str().is_some_and(|e| e.contains("\"next\""))
+        })
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !mock.log().contains("MOCK_EVENTS_"),
+        "events/* sent:\n{}",
+        mock.log()
+    );
 }
 
 #[test]
@@ -1165,26 +1182,28 @@ fn the_instruction_is_polled_where_its_server_offers_no_push() {
 /// (`-32011`…`-32015`): a poll answered `-32012` (Forbidden) is refused, not
 /// backed off and asked again.
 #[test]
-fn a_poll_refused_in_mcpgs_numbering_is_read_as_the_code_it_means() {
+fn a_poll_refused_in_the_design_sketchs_numbering_is_not_read_as_the_spec_code() {
+    // Only the spec's codes mean what they mean [E L780-791]: the design
+    // sketch's -32012 is an unknown code, retried, never a refusal.
     let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
     let daemon = Daemon::start(
-        "events-mcpg-codes",
+        "events-sketch-codes",
         &config(&mock.uri(), MEMORY, &tick_binding("")),
     );
     ready(&daemon, &mock, "mock.tick");
     mock.control(
         "mock.events_fail",
-        json!({"code": -32012, "message": "forbidden", "times": 5}),
+        json!({"code": -32012, "message": "forbidden", "times": 2}),
     );
-    daemon.wait_for("refused as forbidden", |l| {
-        events(l, "mcp.events.refused")
+    daemon.wait_for("retried", |l| {
+        events(l, "mcp.events.poll.fail")
             .iter()
-            .any(|e| e["reason"] == "forbidden")
+            .any(|e| e["code"] == -32012)
     });
     let log = daemon.log();
     assert!(
-        events(&log, "mcp.events.poll.fail").is_empty(),
-        "refused, not retried:\n{log}"
+        events(&log, "mcp.events.refused").is_empty(),
+        "retried, not refused:\n{log}"
     );
 }
 
@@ -1478,12 +1497,12 @@ fn a_refused_stream_moves_to_poll_once_and_a_failure_that_may_pass_retries_push(
     assert_eq!(streams(&mock).len(), 3);
     drop(daemon);
 
-    // The type does not offer push after all (MCPG's numbering, -32014):
-    // on to poll, said once, and never asked again.
+    // The type does not offer push after all (-32026 [E L780-791]): on to
+    // poll, said once, and never asked again.
     let mock = common::spawn_mock_mcp_at(REVISION, "mock://res", false);
     mock.control(
         "mock.stream_refuse",
-        json!({"code": -32014, "message": "Unsupported",
+        json!({"code": -32026, "message": "Unsupported",
                "data": {"feature": "deliveryMode", "value": "push"}}),
     );
     let daemon = Daemon::start(

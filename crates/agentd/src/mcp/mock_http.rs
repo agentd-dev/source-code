@@ -621,6 +621,11 @@ fn stateless_refusal(http: &Http, body: &Value) -> Option<(i64, String, Option<V
         method::TASKS_GET | method::TASKS_UPDATE | method::TASKS_CANCEL => {
             params["taskId"].as_str()
         }
+        // The named MCP Events requests [E L738-745]; `events/list` names
+        // nothing.
+        "events/poll" | "events/stream" | "events/subscribe" | "events/unsubscribe" => {
+            params["name"].as_str()
+        }
         _ => None,
     };
     if let Some(name) = name
@@ -634,6 +639,13 @@ fn stateless_refusal(http: &Http, body: &Value) -> Option<(i64, String, Option<V
             || http.header("mcp-param-region") != params["arguments"]["region"].as_str())
     {
         return mismatch("Mcp-Param-Region does not match the argument");
+    }
+    if called.starts_with("events/")
+        && called != "events/list"
+        && params["name"] == "mock.tick"
+        && http.header("mcp-param-topic") != params["arguments"]["topic"].as_str()
+    {
+        return mismatch("Mcp-Param-Topic does not match the argument");
     }
     None
 }
@@ -1696,7 +1708,8 @@ fn serve_events_stream(stream: &mut TcpStream, id: &Value, body: &Value, state: 
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
     let active = tag(
         "notifications/events/active",
-        json!({"cursor": format!("c{}", start.after), "truncated": start.truncated}),
+        json!({"cursor": format!("c{}", start.after), "truncated": start.truncated,
+               "heartbeatMs": start.heartbeat_ms}),
     );
     if stream.write_all(head.as_bytes()).is_err() || !send_frame(stream, &active) {
         eprintln!("MOCK_EVENTS_STREAM_CLOSED client");
@@ -1723,7 +1736,8 @@ fn serve_events_stream(stream: &mut TcpStream, id: &Value, body: &Value, state: 
             after = floor;
             let f = tag(
                 "notifications/events/active",
-                json!({"cursor": format!("c{floor}"), "truncated": true}),
+                json!({"cursor": format!("c{floor}"), "truncated": true,
+                       "heartbeatMs": start.heartbeat_ms}),
             );
             if !send_frame(socket, &f) {
                 return false;

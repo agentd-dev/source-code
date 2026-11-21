@@ -228,11 +228,11 @@ fn mock_mcp_http(args: &[String]) -> i32 {
                 use agentd::mcp::mock_events::Spelling;
                 opts.events = match it.next().map(String::as_str) {
                     Some("extension") => Spelling::Extension,
-                    Some("top-level") => Spelling::TopLevel,
+                    Some("next-revision") => Spelling::NextRevision,
                     Some("none") => Spelling::None,
                     other => {
                         eprintln!(
-                            "--internal-mock-mcp-http: --events {other:?}: extension, top-level or none"
+                            "--internal-mock-mcp-http: --events {other:?}: extension, next-revision or none"
                         );
                         return exit::USAGE;
                     }

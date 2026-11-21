@@ -608,7 +608,8 @@ its `jti`.
 | `mcp.events.listed` | info | `server`, `types` |  |
 | `mcp.events.mode_changed` | warn | `cause`, `event_type`, `from`, `server`, `to` |  |
 | `mcp.events.paused` | warn | `server`, `event_type`, `cause`, `detail?` | A binding is held at its cursor. `cause`: `pressure`, `store_degraded`, `rate`, `refusal`. |
-| `mcp.events.poll.fail` | error, warn | `server`, `event_type`, `err`, `code?`, `retry_ms` |  |
+| `mcp.events.poll.fail` | warn | `server`, `event_type`, `err`, `code?`, `retry_ms`, `relist?` | `relist: true` on `-32020`: the server is listed again before the retry |
+| `mcp.events.type.dropped` | warn | `server`, `event_type`, `reason` | A listed type with invalid `x-mcp-header` annotations, left out |
 | `mcp.events.refused` | error | `detail`, `event_type`, `reason`, `server` | A binding was refused and is not polled until a reload, re-dial or new listing allows it. |
 | `mcp.events.rejected` | warn | `cause`, `event_id`, `event_type`, `server` |  |
 | `mcp.events.removed` | info | `event_type`, `reason`, `server` |  |

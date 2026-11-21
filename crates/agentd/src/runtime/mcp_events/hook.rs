@@ -486,7 +486,7 @@ impl Runtime {
     /// `{"type":"terminated","error":…}`: the server ended the subscription.
     fn events_hook_terminated(&mut self, key: &str, error: &Value) {
         let now = now_ms();
-        let code = wire::code::normalize(error.get("code").and_then(Value::as_i64).unwrap_or(0));
+        let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
         let Some(b) = self.mcp_events.bindings.get_mut(key) else {
             return;
         };
@@ -682,6 +682,7 @@ impl Runtime {
                 json!({"server": server, "event_type": name, "cause": "no_replay", "refused": lost}),
             );
         }
+        let schema = self.events_schema(&server, &self.mcp_events.bindings[key].name);
         if let Some(pool) = &self.mcp_events.pool {
             pool.submit(Job::Arm {
                 key: key.to_string(),
@@ -692,6 +693,7 @@ impl Runtime {
                 fresh,
                 unsubscribe,
                 subscribe,
+                schema,
                 bound: super::REQUEST_BOUND,
             });
         }
@@ -1013,6 +1015,7 @@ impl Runtime {
             client,
             prior,
             params: wire::unsubscribe_params(name, arguments, &url(base, key)),
+            schema: self.events_schema(server, name),
             bound: super::REQUEST_BOUND,
         });
         true
@@ -1114,12 +1117,17 @@ impl Runtime {
                     if result.is_ok()
                         && let Some(pool) = &self.mcp_events.pool
                     {
+                        let schema = unsubscribe
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .and_then(|n| self.events_schema(&server, n));
                         pool.submit(Job::Unsubscribe {
                             key: String::new(),
                             generation: 0,
                             server,
                             client: Some(client),
                             prior: None,
+                            schema,
                             params: unsubscribe,
                             bound: super::REQUEST_BOUND,
                         });

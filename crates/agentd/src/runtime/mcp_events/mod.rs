@@ -497,8 +497,8 @@ impl Events {
 }
 
 /// What a supervisor connection adds to its listen for MCP Events: when the
-/// server declares the extension with `listChanged: true` (either spelling,
-/// Q2), `eventsListChanged` in the filter, and `notifications/events/
+/// server declares the extension with `listChanged: true`, `eventsListChanged`
+/// in the filter, and `notifications/events/
 /// list_changed` taken off the stream for the loop [SEP L192-208].
 pub(crate) fn listen_extension() -> ::mcp::rmcp_client::ListenExtensionFn {
     std::sync::Arc::new(|caps: &Value| {
@@ -527,6 +527,30 @@ fn jitter(base: u64) -> u64 {
     }
     let offset = u64::from_le_bytes(b) % spread.saturating_mul(2).saturating_add(1);
     (base - spread).saturating_add(offset)
+}
+
+/// The least wait [`full_jitter`] draws.
+const RECONNECT_FLOOR_MS: u64 = 50;
+
+/// A wait drawn uniformly from `[RECONNECT_FLOOR_MS, base]` ("full
+/// jitter"): how long a dropped push stream waits to reconnect, so a server
+/// restart does not bring every client back at the same moment [E L369].
+fn full_jitter(base: u64) -> u64 {
+    let mut b = [0u8; 8];
+    if crate::sec::random::fill(&mut b).is_err() || base <= RECONNECT_FLOOR_MS {
+        return base.max(RECONNECT_FLOOR_MS);
+    }
+    RECONNECT_FLOOR_MS + u64::from_le_bytes(b) % (base - RECONNECT_FLOOR_MS + 1)
+}
+
+/// The reconnect wait after `failures` failures in a row, capped at `max`:
+/// [`full_jitter`] over the doubling backoff.
+fn reconnect_backoff(failures: u32, max: u64) -> u64 {
+    full_jitter(
+        BACKOFF_MIN_MS
+            .saturating_mul(1u64 << failures.min(20))
+            .min(max),
+    )
 }
 
 /// The backoff after `failures` failures in a row, capped at `max`.
@@ -940,11 +964,12 @@ impl Runtime {
             let refusal = if revision.as_deref() != Some(wire::REVISION) {
                 Some("revision")
             } else {
-                let caps = json!({
-                    "extensions": client.capability("extensions"),
-                    "events": client.capability("events"),
-                });
-                wire::declared(&caps).is_none().then_some("no_capability")
+                let caps = json!({"extensions": client.capability("extensions")});
+                match wire::declaration(&caps) {
+                    ::mcp::extensions::Declared::Yes(_) => None,
+                    ::mcp::extensions::Declared::No => Some("no_capability"),
+                    ::mcp::extensions::Declared::UnknownRevision(_) => Some("unknown_revision"),
+                }
             };
             if let Some(reason) = refusal {
                 let detail = match reason {
@@ -952,6 +977,12 @@ impl Runtime {
                         "the connection reached {}; MCP Events is defined only from {} — no events/* request is sent",
                         revision.as_deref().unwrap_or("no revision"),
                         wire::REVISION
+                    ),
+                    "unknown_revision" => format!(
+                        "{} — no events/* request is sent",
+                        wire::declaration(&json!({"extensions": client.capability("extensions")}))
+                            .refusal(wire::EXTENSION)
+                            .unwrap_or_default()
                     ),
                     _ => "the server does not declare the io.modelcontextprotocol/events extension — no events/* request is sent".to_string(),
                 };
@@ -1147,15 +1178,32 @@ impl Runtime {
         if let Some(b) = self.mcp_events.bindings.get_mut(key) {
             b.generation = generation;
         }
+        let schema = self
+            .mcp_events
+            .bindings
+            .get(key)
+            .and_then(|b| self.events_schema(&b.server, &b.name));
         if let Some(pool) = &self.mcp_events.pool {
             pool.submit(Job::Poll {
                 key: key.to_string(),
                 generation,
                 client,
                 params,
+                schema,
                 bound: REQUEST_BOUND,
             });
         }
+    }
+
+    /// The `inputSchema` `server` lists for event type `name`, whose
+    /// `x-mcp-header` annotations its requests carry as headers [E L749-776].
+    pub(crate) fn events_schema(&self, server: &str, name: &str) -> Option<Value> {
+        self.mcp_events
+            .listings
+            .get(server)
+            .and_then(|l| l.descriptors.as_ref())
+            .and_then(|d| d.get(name))
+            .and_then(|d| d.input_schema.clone())
     }
 
     /// The server said its event types changed: list them again now, rather
@@ -1251,6 +1299,26 @@ impl Runtime {
         };
         listing.failures = 0;
         listing.due_at = now + jitter(RELIST_MS);
+        // A type whose `x-mcp-header` annotations are invalid is left out of
+        // the listing, with a warning [E L764-768]: no request for it could
+        // carry its headers.
+        let mut dropped = Vec::new();
+        let descriptors: Vec<Descriptor> = descriptors
+            .into_iter()
+            .filter(|d| {
+                match d
+                    .input_schema
+                    .as_ref()
+                    .map(::mcp::headers::validate_annotations)
+                {
+                    Some(Err(why)) => {
+                        dropped.push(json!({"event_type": d.name, "reason": why}));
+                        false
+                    }
+                    _ => true,
+                }
+            })
+            .collect();
         let types = descriptors.len();
         listing.descriptors = Some(
             descriptors
@@ -1258,6 +1326,11 @@ impl Runtime {
                 .map(|d| (d.name.clone(), d))
                 .collect(),
         );
+        for d in dropped {
+            let mut f = d;
+            f["server"] = json!(server);
+            self.log.warn("mcp.events.type.dropped", f);
+        }
         self.log.info(
             "mcp.events.listed",
             json!({"server": server, "types": types}),
@@ -1785,13 +1858,18 @@ impl Runtime {
                     b.failures += 1;
                     let wait = backoff(b.failures, max);
                     b.due_at = now + wait;
-                    let level_error = code == wire::code::HEADER_MISMATCH;
-                    let line = json!({"server": server, "event_type": name, "code": code,
-                                      "err": tame(&r.message), "retry_ms": wait});
-                    if level_error {
-                        self.log.error("mcp.events.poll.fail", line);
-                    } else {
-                        self.log.warn("mcp.events.poll.fail", line);
+                    let mismatch = code == wire::code::HEADER_MISMATCH;
+                    let mut line = json!({"server": server, "event_type": name, "code": code,
+                                          "err": tame(&r.message), "retry_ms": wait});
+                    if mismatch {
+                        line["relist"] = json!(true);
+                    }
+                    self.log.warn("mcp.events.poll.fail", line);
+                    // The headers disagreed with the body: the type's schema
+                    // may have changed, so it is listed again before the
+                    // retry [E L776].
+                    if mismatch {
+                        rediscover(self);
                     }
                 }
             },
@@ -2574,5 +2652,25 @@ impl Runtime {
                 .map(str::to_string)
                 .collect()
         })
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    #[test]
+    fn a_reconnect_wait_spreads_over_the_whole_backoff() {
+        let draws: Vec<u64> = (0..400)
+            .map(|_| reconnect_backoff(0, BACKOFF_MAX_MS))
+            .collect();
+        assert!(
+            draws
+                .iter()
+                .all(|&w| (RECONNECT_FLOOR_MS..=BACKOFF_MIN_MS).contains(&w))
+        );
+        // Spread, not clustered at the base: some under half of it.
+        assert!(draws.iter().any(|&w| w < BACKOFF_MIN_MS / 2), "{draws:?}");
+        assert_eq!(full_jitter(10), RECONNECT_FLOOR_MS);
     }
 }

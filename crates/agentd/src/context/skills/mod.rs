@@ -340,6 +340,11 @@ pub trait SkillServer {
     /// What the server declared of the extension; `None` unless declared on
     /// a 2026-07-28 connection.
     fn skills_support(&self) -> Option<ext::Support>;
+    /// Why a 2026-07-28 server's declaration is not used, when it is not: not
+    /// declared, or declared at a revision agentd does not know (SEP-3392).
+    fn skills_refusal(&self) -> Option<String> {
+        None
+    }
     fn list_skills(&self, meta: Option<&Map<String, Value>>) -> Result<ext::Listing, String>;
     fn get_skill(&self, uri: &str, meta: Option<&Map<String, Value>>) -> Result<Got, String>;
     /// `resources/read`: its `contents`.
@@ -360,6 +365,10 @@ impl SkillServer for crate::mcp::client::McpClient {
     }
     fn skills_support(&self) -> Option<ext::Support> {
         crate::mcp::client::McpClient::skills_support(self)
+    }
+    fn skills_refusal(&self) -> Option<String> {
+        ::mcp::extensions::declared(self.capability("extensions").as_ref(), ext::EXTENSION)
+            .refusal(ext::EXTENSION)
     }
     fn list_skills(&self, meta: Option<&Map<String, Value>>) -> Result<ext::Listing, String> {
         crate::mcp::client::McpClient::list_skills(self, meta, ext::REQUEST_BOUND)
@@ -436,9 +445,9 @@ impl Catalogue {
             // The extension is defined only from 2026-07-28: a connection at
             // any other revision is not asked, whatever its server names.
             let why = match server.revision() {
-                Some(r) if r == ::mcp::wire::DISCOVER_PROTOCOL_VERSION => {
-                    format!("the server does not declare {}", ext::EXTENSION)
-                }
+                Some(r) if r == ::mcp::wire::DISCOVER_PROTOCOL_VERSION => server
+                    .skills_refusal()
+                    .unwrap_or_else(|| format!("the server does not declare {}", ext::EXTENSION)),
                 r => format!(
                     "the connection reached MCP {}; the Skills extension is defined only from {}",
                     r.as_deref().unwrap_or("no revision"),

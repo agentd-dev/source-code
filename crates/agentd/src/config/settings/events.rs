@@ -177,7 +177,7 @@ impl<'de> Deserialize<'de> for InstructionEvent {
 }
 
 /// Said at load wherever MCP Events is configured.
-const DRAFT_WARNING: &str = "MCP Events tracks SEP-3415, a draft: its methods, codes and capability may change between releases";
+const BETA_WARNING: &str = "MCP Events is a Beta extension (SEP-3415): it may still change under the same identifier, and agentd does not use a revision it does not implement";
 
 /// Bindings one server may declare.
 pub const MAX_BINDINGS_PER_SERVER: usize = 64;
@@ -473,7 +473,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
         .collect();
     if declared.is_empty() {
         if followed > 0 {
-            d.warnings.push(DRAFT_WARNING.into());
+            d.warnings.push(BETA_WARNING.into());
         }
         return;
     }
@@ -573,7 +573,7 @@ pub(crate) fn validate(s: &Settings, d: &mut Diagnostics) {
             "mcp.servers[].events (with agent.instruction.mcp.events): {total} bindings, at most {MAX_SUBSCRIPTIONS} per instance"
         ));
     }
-    d.warnings.push(DRAFT_WARNING.into());
+    d.warnings.push(BETA_WARNING.into());
     let weak = match (&s.store.kind, &s.store.on_error) {
         (StoreKind::Memory, _) => {
             Some("the store is the memory store, so a binding's cursor does not survive a restart")

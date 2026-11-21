@@ -239,14 +239,14 @@ Bindings are hot-reloadable and are not part of how the server is dialed: a
 reload applies an edited binding in place, stops a removed one and arms an
 added one, without re-dialing the server.
 
-**Requirements.** MCP Events is a draft extension (SEP-3415), defined only
-for MCP 2026-07-28. The server must reach that revision and declare the
+**Requirements.** MCP Events is a Beta extension (SEP-3415, the
+`ext-events` Beta specification), defined only for MCP 2026-07-28. The server must reach that revision and declare the
 extension; otherwise the binding is refused at runtime with a reason
 (`mcp.events.refused`). agentd says at load, on every config that declares a
-binding, that it tracks a draft:
+binding, that it is Beta:
 
 ```text
-{"event":"config.warning","msg":"MCP Events tracks SEP-3415, a draft: its methods, codes and capability may change between releases"}
+{"event":"config.warning","msg":"MCP Events is a Beta extension (SEP-3415): it may still change under the same identifier, and agentd does not use a revision it does not implement"}
 ```
 
 ### Delivery modes
@@ -262,11 +262,20 @@ credential for it, though a server may stream only to authenticated
 callers. The stream is read on its own thread, through the same connection
 settings as every other request to the server, so its credential, client
 certificate and endpoint checks apply.
-The server sends a heartbeat at least every 30 seconds. A stream that stays
-silent for three of the server's heartbeat intervals, or 90 seconds before
-two heartbeats have shown the interval, counts as dropped. A dropped,
-closed or failed stream reopens from the stored cursor, after a backoff
-from 1 second to 5 minutes with jitter, and push stays the mode.
+The server grants a heartbeat interval in the stream's first
+`notifications/events/active` frame (`heartbeatMs`), and that grant is
+authoritative; without one agentd assumes the spec's recommended 30 seconds.
+A stream that stays silent for three granted intervals, counted from the
+latest `active` frame, counts as dropped. A dropped, closed or failed stream
+reopens from the stored cursor after a randomized wait: drawn uniformly up
+to a backoff that starts at 1 second and doubles to 5 minutes, so a server
+restart does not bring every client back at once. Push stays the mode.
+
+Each `events/poll`, `events/stream`, `events/subscribe` and
+`events/unsubscribe` carries `Mcp-Name` (the event type), and an
+`Mcp-Param-{Name}` header for each argument the type's `inputSchema`
+annotates with `x-mcp-header`. A type whose annotations are invalid is left
+out of the listing (`mcp.events.type.dropped`).
 
 agentd moves to the next mode you list, and says so once in
 `mcp.events.delivery` with the mode and a `reason`, in two cases:

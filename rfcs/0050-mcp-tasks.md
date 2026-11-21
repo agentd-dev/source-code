@@ -1,6 +1,7 @@
 # RFC 0050: MCP Tasks — a server's long tool calls, followed to the end
 
 **Status:** Accepted 2026-10-19, as track T of RFC 0048 (§5.1); implemented
+**Standards update (2026-11-21):** `ext-tasks` v0.2.3: the `2026-07-28` specification is unchanged since the pin; the overview now names `-32021` (which agentd uses) and the SDK keeps extension fields on `CreateTaskResult` and `GetTaskResult` (agentd reads past them; pinned by a test). Under SEP-3392 a server that declares the extension at a `revision` agentd does not implement is not sent it.
 **Author:** Andrii Tsok (drafted with Claude)
 **Date:** 2026-10-19
 **Builds on:** RFC 0045 (MCP Events: an extension declared per request on 2026-07-28 connections, durable state, `subscriptions/listen`), RFC 0027 (durable waits), RFC 0026 (turn workers), ADR 0001 (MCP extensions: the client side only)

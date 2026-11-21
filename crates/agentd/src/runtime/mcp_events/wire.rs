@@ -30,8 +30,7 @@ pub mod method {
     pub const LIST_CHANGED: &str = "notifications/events/list_changed";
 }
 
-/// The codes the extension requests — provisional until SEP-3415 is
-/// accepted [SEP L750-763] — and the base ones it uses.
+/// The codes the extension defines [E L780-791] and the base ones it uses.
 pub mod code {
     pub const NOT_FOUND: i64 = -32023;
     pub const FORBIDDEN: i64 = -32024;
@@ -41,33 +40,46 @@ pub mod code {
     pub const INVALID_PARAMS: i64 = -32602;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const HEADER_MISMATCH: i64 = -32020;
-
-    /// The code a server means, read under either numbering: SEP-3415's
-    /// `-32023`…`-32027`, or `-32011`…`-32015`, the design sketch's and
-    /// ChatGPT's — which MCPG 0.1.0 sends by default (its `error_codes`
-    /// numbering `draft`, MCPG RFC 0031 §2.6). Every path reads it: every
-    /// `events/*` answer (`pool::call`), a push stream's frames and end, and a
-    /// webhook `terminated` envelope. Any other code is unchanged.
-    pub fn normalize(code: i64) -> i64 {
-        if (-32015..=-32011).contains(&code) {
-            code - 12
-        } else {
-            code
-        }
-    }
 }
 
-/// The server's settings object for the extension, read from its raw
-/// `capabilities` in either spelling (decision Q2): SEP-3415's extension key
-/// [SEP L54-75], or the design sketch's top-level `events`, which ChatGPT's
-/// profile still has servers send [SEP L866]. `None`: it does not offer
-/// Events, and no `events/*` request may be sent [SEP L94].
+/// How the server's raw `capabilities` stand on the extension: its settings
+/// under `extensions["io.modelcontextprotocol/events"]` [E L40-78] when it
+/// may be used, else why not (not declared, or a `revision` agentd does not
+/// know, SEP-3392). Without it no `events/*` request is sent.
+pub fn declaration(capabilities: &Value) -> ::mcp::extensions::Declared<'_> {
+    ::mcp::extensions::declared(capabilities.get("extensions"), EXTENSION)
+}
+
+/// The server's settings object for the extension, when it may be used.
 pub fn declared(capabilities: &Value) -> Option<&Value> {
-    capabilities
-        .get("extensions")
-        .and_then(|e| e.get(EXTENSION))
-        .or_else(|| capabilities.get("events"))
-        .filter(|v| v.is_object())
+    declaration(capabilities).settings()
+}
+
+/// The SEP-2243 headers one `events/*` request carries beyond `Mcp-Method`
+/// [E L738-776]: `Mcp-Name` mirroring `params.name` on `events/poll`,
+/// `events/stream`, `events/subscribe` and `events/unsubscribe` (never on
+/// `events/list`), and an `Mcp-Param-{Name}` for each argument the type's
+/// `inputSchema` annotates with `x-mcp-header`.
+pub fn request_headers(
+    method: &str,
+    params: &Map<String, Value>,
+    input_schema: Option<&Value>,
+) -> Vec<(String, String)> {
+    use self::method as m;
+    if ![m::POLL, m::STREAM, m::SUBSCRIBE, m::UNSUBSCRIBE].contains(&method) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    if let Some(name) = params.get("name").and_then(Value::as_str) {
+        out.push((
+            ::mcp::headers::NAME.to_string(),
+            ::mcp::headers::encode_value(name),
+        ));
+    }
+    if let (Some(schema), Some(args)) = (input_schema, params.get("arguments")) {
+        out.extend(::mcp::headers::param_headers(schema, args));
+    }
+    out
 }
 
 /// The `subscriptions/listen` filter field that asks for
@@ -90,11 +102,9 @@ pub struct Descriptor {
     /// not know is kept and never chosen.
     #[serde(default)]
     pub delivery: Vec<String>,
-    /// `inputSchema`; `input_schema`, the spelling a registry's
-    /// own listing has been seen in, is read too.
-    #[serde(default, alias = "input_schema")]
+    #[serde(default)]
     pub input_schema: Option<Value>,
-    #[serde(default, alias = "payload_schema")]
+    #[serde(default)]
     pub payload_schema: Option<Value>,
 }
 
@@ -191,17 +201,20 @@ pub fn stream_params(
 /// request's id (2026-07-28 `basic/patterns/subscriptions`).
 pub const SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
 
-/// One frame of an `events/stream` body [MCPG RFC 0031 §2.1, §5.3]:
-/// `active {cursor, truncated}` first, and again with `truncated: true`
-/// where events were skipped mid-stream; an `event` per occurrence, whose
-/// `cursor` is the position after it; a `heartbeat {cursor}` as an SSE data
-/// frame at least every 30 s; an `error {error}` that is transient; and
-/// `terminated {error}`, after which the stream closes.
+/// One frame of an `events/stream` body [E L338-366]: `active {cursor,
+/// truncated, heartbeatMs}` first, and again with `truncated: true` where
+/// events were skipped mid-stream; an `event` per occurrence, whose `cursor`
+/// is the position after it; a `heartbeat {cursor}` as an SSE data frame
+/// whenever the granted interval passes without another message; an
+/// `error {error}` that is transient; and `terminated {error}`, after which
+/// the stream closes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Frame {
     Active {
         cursor: Option<String>,
         truncated: bool,
+        /// The heartbeat interval the server grants, authoritative [E L366].
+        heartbeat_ms: Option<u64>,
     },
     /// The occurrence, raw: checked on its own like a poll page's.
     Event(Value),
@@ -229,6 +242,10 @@ pub fn frame(n: &Value) -> Option<Frame> {
         method::ACTIVE => Frame::Active {
             cursor: cursor(),
             truncated: p.get("truncated").and_then(Value::as_bool) == Some(true),
+            heartbeat_ms: p
+                .get("heartbeatMs")
+                .and_then(Value::as_u64)
+                .filter(|&ms| ms > 0),
         },
         method::EVENT => {
             let mut o = p.clone();
@@ -414,18 +431,65 @@ mod tests {
     }
 
     #[test]
-    fn the_declaration_is_read_in_either_spelling() {
-        // SEP-3415's extension key [SEP L60-73].
+    fn named_requests_carry_mcp_name_and_their_annotated_arguments() {
+        let schema = json!({"type": "object", "properties": {
+            "repo": {"type": "string", "x-mcp-header": "Repo"},
+            "label": {"type": "string"}}});
+        let mut p = Map::new();
+        p.insert("name".into(), json!("issue.opened"));
+        p.insert(
+            "arguments".into(),
+            json!({"repo": "acme/web", "label": "bug"}),
+        );
+        for m in [
+            method::POLL,
+            method::STREAM,
+            method::SUBSCRIBE,
+            method::UNSUBSCRIBE,
+        ] {
+            assert_eq!(
+                request_headers(m, &p, Some(&schema)),
+                vec![
+                    ("Mcp-Name".to_string(), "issue.opened".to_string()),
+                    ("Mcp-Param-Repo".to_string(), "acme/web".to_string()),
+                ],
+                "{m}"
+            );
+        }
+        // events/list names nothing [E L745].
+        assert!(request_headers(method::LIST, &p, Some(&schema)).is_empty());
+        // A name that is not printable ASCII travels in the Base64 sentinel.
+        p.insert("name".into(), json!("événement"));
+        assert_eq!(
+            request_headers(method::POLL, &p, None)[0].1,
+            ::mcp::headers::encode_value("événement")
+        );
+        assert!(
+            request_headers(method::POLL, &p, None)[0]
+                .1
+                .starts_with("=?base64?")
+        );
+    }
+
+    #[test]
+    fn the_declaration_is_read_from_the_extension_key_only() {
+        // The extension key [E L40-78].
         let sep = json!({"extensions": {EXTENSION: {"listChanged": true}}});
         assert_eq!(declared(&sep).unwrap()["listChanged"], true);
-        // The sketch's top-level key, which ChatGPT's profile sends.
-        let top = json!({"events": {}});
-        assert!(declared(&top).is_some());
+        // The design sketch's top-level key is not the spec's.
+        assert!(declared(&json!({"events": {}})).is_none());
         // Neither: no Events.
         assert!(declared(&json!({"tools": {}})).is_none());
         assert!(declared(&json!({"extensions": {"io.example/x": {}}})).is_none());
         // A declaration that is not an object is not one.
-        assert!(declared(&json!({"events": true})).is_none());
+        assert!(declared(&json!({"extensions": {EXTENSION: true}})).is_none());
+        // A revision agentd does not know leaves it off (SEP-3392).
+        let next = json!({"extensions": {EXTENSION: {"revision": "2"}}});
+        assert!(declared(&next).is_none());
+        assert!(matches!(
+            declaration(&next),
+            ::mcp::extensions::Declared::UnknownRevision(_)
+        ));
     }
 
     #[test]
@@ -478,20 +542,31 @@ mod tests {
         assert_eq!(u["delivery"], json!({"url": "https://h/x"}));
     }
 
-    /// MCPG 0.1.0's own frames (`libs/mcp-wire/…/events/wire.rs`,
-    /// `stream_frames_match_the_sketch`), read through [`frame`].
+    /// The spec's stream frames [E L344], read through [`frame`].
     #[test]
-    fn mcpgs_stream_frames_read_through_the_frame_type() {
+    fn the_specs_stream_frames_read_through_the_frame_type() {
         let sub = json!({SUBSCRIPTION_ID: 1});
         let active = json!({"jsonrpc": "2.0", "method": "notifications/events/active",
-            "params": {"cursor": "c1", "truncated": false, "_meta": sub}});
+            "params": {"cursor": "historyId_99840", "truncated": false, "heartbeatMs": 15000,
+                       "_meta": sub}});
         assert_eq!(
             frame(&active),
             Some(Frame::Active {
-                cursor: Some("c1".into()),
-                truncated: false
+                cursor: Some("historyId_99840".into()),
+                truncated: false,
+                heartbeat_ms: Some(15000),
             })
         );
+        // No grant, or one that is not a positive integer, is none.
+        let ungranted = json!({"method": "notifications/events/active",
+            "params": {"cursor": "c1", "truncated": false, "heartbeatMs": 0}});
+        assert!(matches!(
+            frame(&ungranted),
+            Some(Frame::Active {
+                heartbeat_ms: None,
+                ..
+            })
+        ));
         let gap = json!({"jsonrpc": "2.0", "method": "notifications/events/active",
             "params": {"cursor": "c9", "truncated": true, "_meta": sub}});
         assert!(matches!(
@@ -526,13 +601,12 @@ mod tests {
         };
         assert!(o.get("_meta").is_none(), "{o}");
         let ended = json!({"jsonrpc": "2.0", "method": "notifications/events/terminated",
-            "params": {"error": {"code": -32012, "message": "forbidden",
+            "params": {"error": {"code": -32024, "message": "forbidden",
                                  "data": {"reason": "revoked"}}, "_meta": sub}});
         let Some(Frame::Terminated(e)) = frame(&ended) else {
             panic!("terminated")
         };
-        assert_eq!(e.code, -32012);
-        assert_eq!(code::normalize(e.code), code::FORBIDDEN);
+        assert_eq!(e.code, code::FORBIDDEN);
         let transient = json!({"method": "notifications/events/error",
             "params": {"error": {"code": -32603, "message": "store"}}});
         assert!(matches!(frame(&transient), Some(Frame::Error(e)) if e.code == -32603));
@@ -550,26 +624,6 @@ mod tests {
             frame(&json!({"jsonrpc": "2.0", "id": 1, "result": {"resultType": "complete"}})),
             None
         );
-    }
-
-    #[test]
-    fn either_numbering_reads_as_the_same_code() {
-        for (draft, sep) in [
-            (-32011, code::NOT_FOUND),
-            (-32012, code::FORBIDDEN),
-            (-32013, code::RESOURCE_EXHAUSTED),
-            (-32014, code::UNSUPPORTED),
-            (-32015, code::CALLBACK_ENDPOINT_ERROR),
-        ] {
-            assert_eq!(code::normalize(draft), sep);
-            assert_eq!(code::normalize(sep), sep);
-        }
-        assert_eq!(
-            code::normalize(code::METHOD_NOT_FOUND),
-            code::METHOD_NOT_FOUND
-        );
-        assert_eq!(code::normalize(-32010), -32010);
-        assert_eq!(code::normalize(-32016), -32016);
     }
 
     #[test]
@@ -603,18 +657,22 @@ mod tests {
     }
 
     #[test]
-    fn an_argument_is_declared_by_the_input_schemas_properties_in_either_spelling() {
+    fn an_argument_is_declared_by_the_input_schemas_properties() {
         let activity = json!({"type": "object", "additionalProperties": false,
                               "properties": {"instructionId": {"type": "string"},
                                              "orgId": {"type": "string"}}});
-        for spelling in ["inputSchema", "input_schema"] {
-            let d: Descriptor = serde_json::from_value(
-                json!({"name": "md.instruction.activity", "delivery": ["poll"], spelling: activity}),
-            )
-            .unwrap();
-            assert!(d.declares_argument("instructionId"), "{spelling}");
-            assert!(!d.declares_argument("topic"), "{spelling}");
-        }
+        let d: Descriptor = serde_json::from_value(
+            json!({"name": "md.instruction.activity", "delivery": ["poll"], "inputSchema": activity}),
+        )
+        .unwrap();
+        assert!(d.declares_argument("instructionId"));
+        assert!(!d.declares_argument("topic"));
+        // `input_schema` is not the spec's spelling [E L115-181]: unread.
+        let snake: Descriptor = serde_json::from_value(
+            json!({"name": "md.instruction.activity", "input_schema": activity}),
+        )
+        .unwrap();
+        assert!(!snake.declares_argument("instructionId"));
         let bare: Descriptor =
             serde_json::from_value(json!({"name": "x", "inputSchema": {"type": "object"}}))
                 .unwrap();

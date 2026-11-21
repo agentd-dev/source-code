@@ -22,12 +22,12 @@
 //!
 //! `events/stream` is served as MCPG 0.1.0 serves it (MCPG RFC 0031 §2.1,
 //! §5.3): one SSE body of `notifications/events/*` frames tagged with the
-//! request's id — `active {cursor, truncated}`, an `event` per occurrence
+//! request's id — `active {cursor, truncated, heartbeatMs}`, an `event` per occurrence
 //! with the position after it, `heartbeat {cursor}` data frames (every
 //! 250 ms here, `heartbeat_ms` to change it), and `active {truncated: true}`
-//! again where the log was trimmed under it. Its refusals carry MCPG's
-//! default numbering (`-32014` for a mode the type does not offer), not
-//! SEP-3415's, which the poll path answers with.
+//! again where the log was trimmed under it. Its refusals carry the spec's
+//! codes, as the poll path's do (`-32026` for a mode the type does not
+//! offer).
 //!
 //! Control tools (`tools/call`, unlisted): `mock.event {topic, count, id?,
 //! bad_schema?, oversize?, malformed?, traceparent?, tracestate?}` appends
@@ -54,8 +54,8 @@ use std::sync::Mutex;
 pub enum Spelling {
     /// SEP-3415's `capabilities.extensions["io.modelcontextprotocol/events"]`.
     Extension,
-    /// The design sketch's top-level `capabilities.events`.
-    TopLevel,
+    /// Declared at a `revision` no client knows yet (SEP-3392).
+    NextRevision,
     /// Not declared: a server without Events.
     None,
 }
@@ -103,8 +103,6 @@ const NOT_FOUND: i64 = -32023;
 const FORBIDDEN: i64 = -32024;
 const UNSUPPORTED: i64 = -32026;
 const INVALID_PARAMS: i64 = -32602;
-/// MCPG 0.1.0's default numbering of `Unsupported`, the push path's.
-const UNSUPPORTED_DRAFT: i64 = -32014;
 /// The heartbeat interval when `heartbeat_ms` names none.
 const HEARTBEAT_MS: u64 = 250;
 
@@ -139,7 +137,10 @@ pub fn declare(caps: &mut Value, spelling: Spelling) {
         Spelling::Extension => {
             caps["extensions"] = json!({"io.modelcontextprotocol/events": {"listChanged": true}});
         }
-        Spelling::TopLevel => caps["events"] = json!({"listChanged": true}),
+        Spelling::NextRevision => {
+            caps["extensions"] = json!({"io.modelcontextprotocol/events":
+                {"listChanged": true, "revision": "next"}});
+        }
         Spelling::None => {}
     }
 }
@@ -207,8 +208,9 @@ fn descriptors(later: bool, push: bool, activity_bare: bool) -> Vec<Value> {
             "name": "mock.tick",
             "description": "an occurrence the mock.event control tool appends",
             "delivery": tick_modes,
+            // `topic` travels as `Mcp-Param-Topic` too [E L749-776].
             "inputSchema": {"type": "object", "additionalProperties": false,
-                            "properties": {"topic": {"type": "string"}}},
+                            "properties": {"topic": {"type": "string", "x-mcp-header": "Topic"}}},
             "payloadSchema": {"type": "object", "required": ["n"],
                               "properties": {"n": {"type": "integer"}, "topic": {"type": "string"}}}
         }),
@@ -394,6 +396,9 @@ pub struct StreamStart {
     /// `md.instruction.activity`: the instruction it delivers for, if it
     /// names one.
     pub filter: Option<String>,
+    /// The heartbeat interval granted on its `active` [E L366]: the client's
+    /// suggestion when it made one, else the mock's own.
+    pub heartbeat_ms: u64,
 }
 
 /// Open one `events/stream`: checked as a poll is, then from the cursor (or
@@ -409,7 +414,7 @@ pub fn stream_open(events: &Events, params: &Value) -> Result<StreamStart, Value
         "mock.tick" | ACTIVITY if !g.no_push => {}
         "mock.tick" | ACTIVITY | "mock.webhook_only" | "mock.later" => {
             return Err(refusal(
-                UNSUPPORTED_DRAFT,
+                UNSUPPORTED,
                 "Unsupported",
                 Some(json!({"feature": "deliveryMode", "value": "push"})),
             ));
@@ -445,12 +450,21 @@ pub fn stream_open(events: &Events, params: &Value) -> Result<StreamStart, Value
         }
     };
     let drops = g.drops;
+    let own = if g.heartbeat_ms == 0 {
+        HEARTBEAT_MS
+    } else {
+        g.heartbeat_ms
+    };
     Ok(StreamStart {
         topic,
         after,
         truncated,
         drops,
         filter,
+        heartbeat_ms: params["heartbeatMs"]
+            .as_u64()
+            .filter(|&ms| ms > 0)
+            .unwrap_or(own),
     })
 }
 

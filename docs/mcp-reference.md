@@ -138,7 +138,7 @@ A tool call and its two kinds of failure:
 | Tasks of 2025-11-25 (core, experimental) | no | Not declared |
 | `notifications/message`, `notifications/progress` | received | Not acted on |
 | Response cache (`ttlMs`, `cacheScope`) | off | Every read and list goes to the server |
-| MCP Events (SEP-3415, draft) | yes, at 2026-07-28 only | Bindings and grants; the server declares `io.modelcontextprotocol/events`, or a top-level `events` capability |
+| MCP Events (SEP-3415, Beta) | yes, at 2026-07-28 only | Bindings and grants; the server declares `extensions["io.modelcontextprotocol/events"]`. Poll, push and webhook delivery |
 
 agentd refuses at load any configured header the client sets itself:
 `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, every `Mcp-Param-*`,
@@ -280,6 +280,7 @@ A line names a server's skill by `server` and `uri`, a folder's by `path`.
 | Event | Level | Fields | When |
 |---|---|---|---|
 | `mcp.events.listed` | info | `server`, `types` | A server's event types were listed |
+| `mcp.events.type.dropped` | warn | `server`, `event_type`, `reason` | A listed type's `x-mcp-header` annotations are invalid: it is left out of the listing, as a tool with invalid annotations is |
 | `mcp.events.list.fail` | warn | `server`, `err`, `retry_ms` | Listing failed; retried |
 | `mcp.events.list_changed` | info | `server` | The server said its event types changed; listed again |
 | `mcp.events.armed` | info | `server`, `event_type`, `mode`, `cursor_present` | A binding is polling or streaming, or its webhook subscription is live |
@@ -289,7 +290,7 @@ A line names a server's skill by `server` and `uri`, a folder's by `path`.
 | `mcp.events.error` | warn | `server`, `event_type`, `code`, `err` | A push stream's transient `error` frame; the stream goes on |
 | `mcp.events.arm.fail` | warn, error | `server`, `event_type`, `err`, `retry_ms` | Arming a binding failed; retried |
 | `mcp.events.refused` | error | `server`, `event_type`, `reason`, `detail` | The binding cannot work; see [refusals](#mcp-events-refusals) |
-| `mcp.events.poll.fail` | warn, error | `server`, `event_type`, `code`, `err`, `retry_ms` | A poll failed; retried. Error level for `-32020` |
+| `mcp.events.poll.fail` | warn | `server`, `event_type`, `code`, `err`, `retry_ms`, `relist?` | A poll failed; retried. On `-32020` (the headers disagreed with the body) the server is listed again first, `relist: true` |
 | `mcp.events.paused` | warn | `server`, `event_type`, `cause`, `detail` | Intake is held: `cause` is `pressure`, `rate` or `store_degraded`; the cursor is kept |
 | `mcp.events.resumed` | info | `server`, `event_type`, `cause` | A paused binding resumed |
 | `mcp.events.gap` | warn | `server`, `event_type`, `cause` | A loss the wire shows: `truncated`, `no_replay` or `schema_changed` |
@@ -298,7 +299,7 @@ A line names a server's skill by `server` and `uri`, a folder's by `path`.
 | `mcp.events.subscribed` | info | `server`, `event_type`, `owner`, `reason`, `subscription` | A runtime subscription was made; also audited |
 | `mcp.events.unsubscribed` | info | `server`, `event_type`, `owner`, `reason`, `subscription` | A runtime subscription was released; also audited |
 | `mcp.events.removed` | info | `server`, `event_type`, `reason` | A binding was removed and its records deleted |
-| `mcp.events.terminated` | error | `server`, `event_type`, `code`, `mode?` | The server ended a webhook subscription, or a push stream (`mode: push`): `-32024` refuses the binding, `-32023` or `-32026 {reason: schema_changed}` lists the server again, a push stream's `-32026` moves to the next listed mode, anything else re-arms after a backoff. A push stream's code is read in either numbering (`-32011`…`-32015` as `-32023`…`-32027`) |
+| `mcp.events.terminated` | error | `server`, `event_type`, `code`, `mode?` | The server ended a webhook subscription, or a push stream (`mode: push`): `-32024` refuses the binding, `-32023` or `-32026 {reason: schema_changed}` lists the server again, a push stream's `-32026` moves to the next listed mode, anything else re-arms after a backoff |
 | `mcp.events.delivery_suspended` | warn | `server`, `event_type`, `last_error`, `active` | The server reported failed deliveries; re-armed from the stored cursor |
 | `mcp.events.throttled` | info | `server`, `event_type`, `retry_after_ms` | The server is throttling deliveries |
 | `mcp.events.mode_changed` | warn | `server`, `event_type`, `from`, `to`, `cause` | A binding moved to the next delivery mode the operator listed, until a reload or a re-dial decides afresh |
@@ -484,6 +485,7 @@ re-dial or a reload shows the cause has cleared.
 |---|---|
 | `revision` | The connection reached 2025-11-25; no `events/*` request is sent |
 | `no_capability` | The server does not declare the events extension; no `events/*` request is sent |
+| `unknown_revision` | The server declares the extension at a `revision` agentd does not implement (SEP-3392); no `events/*` request is sent |
 | `method_not_found` | `events/list` answered `-32601`; a gateway may not pass Events through |
 | `unknown_event` | The server's listing does not name the type |
 | `no_common_mode` | No listed delivery mode is one the type offers and agentd supports |
@@ -610,8 +612,12 @@ resources. It reads one resource by URI.
   fixed 60 s timeout; a per-server `timeout` does not reach them.
 - **Tags are per server.** The union of every key under `tags` applies to
   every tool of the server.
-- **MCP Events is a draft.** Its methods, error codes and capability key may
-  change. Push delivery is not implemented; `poll` and `webhook` are.
+- **MCP Events is Beta.** agentd follows the Beta specification
+  (`ext-events` `specification/beta/events`). A Beta extension may still
+  change under the same identifier; a change that breaks compatibility bumps
+  the `revision` in its settings, and agentd does not use a revision it does
+  not implement. Only the spec's error codes (`-32023`…`-32027`, `-32020`)
+  are read as what they mean.
 - **Invisible losses.** Two losses do not show on the wire: a server that
   omits its delivery status and gives up deliveries that never reached
   agentd, and anything missed on a type without replay.

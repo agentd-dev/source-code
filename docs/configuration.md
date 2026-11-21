@@ -690,7 +690,7 @@ servers:
 
 ### MCP Events
 
-Bindings and grants need the `mcp-events` feature, which tracks the draft
+Bindings and grants need the `mcp-events` feature, which follows the Beta
 extension SEP-3415; a config that declares one says so at load. A served
 document or a subagent template that declares either is refused.
 
@@ -2060,7 +2060,7 @@ alone and exits 0 or 2.
 Warnings use the same channel as `{"event":"config.warning",…}` and do not
 change the exit code. Common ones: a one-shot with no durable store, a
 `memory` store, a TCP listener with no credential, a discovered config that
-sets an intelligence endpoint, and the MCP Events draft notice. The full event
+sets an intelligence endpoint, and the MCP Events Beta notice. The full event
 list is in [Events and metrics reference](telemetry-reference.md).
 
 ## A complete example

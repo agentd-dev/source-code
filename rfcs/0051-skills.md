@@ -5,6 +5,7 @@
 **Date:** 2026-10-19
 **Builds on:** RFC 0028 §7 (the skills catalogue, which this replaces), RFC 0050 (an MCP extension on 2026-07-28 connections), RFC 0042 (what a served document may set), ADR 0001 (MCP extensions: the client side only)
 **Standards:** the MCP Skills extension `io.modelcontextprotocol/skills`, SEP-2640 (Final), on the MCP base revision 2026-07-28. Pinned text: [ext-skills `specification/stable/skills.mdx` at `c1aa87e4c3`](https://github.com/modelcontextprotocol/ext-skills/blob/c1aa87e4c381c82b99aa37471d0eae4ab50f9985/specification/stable/skills.mdx) (2026-10-16), cited as [S]. Agent Skills, the `SKILL.md` format: [agentskills `docs/specification.mdx` at `69ef37e942`](https://github.com/agentskills/agentskills/blob/69ef37e9424c0a7ea9dd2293b559e43ec8176379/docs/specification.mdx) (unversioned), cited as [AS], and its non-normative [integration guide](https://github.com/agentskills/agentskills/blob/69ef37e9424c0a7ea9dd2293b559e43ec8176379/docs/client-implementation/adding-skills-support.mdx), cited as [G].
+**Standards update (2026-11-21):** the specification moved to [`ext-skills` `specification/beta/skills.mdx`](https://github.com/modelcontextprotocol/ext-skills/blob/92eca3c/specification/beta/skills.mdx) (SEP-3392; Beta), its text unchanged, and the repository now publishes JSON schemas that agentd's parser already meets. A server that declares the extension at a `revision` agentd does not implement is treated as not declaring it.
 
 agentd paths are relative to `crates/agentd/src` unless they start with
 `crates/`, `docs/` or `rfcs/`.

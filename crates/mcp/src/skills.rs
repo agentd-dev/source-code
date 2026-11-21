@@ -56,7 +56,7 @@ pub struct Support {
 /// What `capabilities.extensions` says of the Skills extension: `None` when
 /// the server did not declare it.
 pub fn declared(extensions: Option<&Value>) -> Option<Support> {
-    let settings = extensions?.get(EXTENSION)?;
+    let settings = crate::extensions::declared(extensions, EXTENSION).settings()?;
     Some(Support {
         directory_read: settings.get("directoryRead") == Some(&Value::Bool(true)),
     })
@@ -679,6 +679,8 @@ mod tests {
                 directory_read: true
             })
         );
+        // A revision agentd does not know leaves it off (SEP-3392).
+        assert_eq!(declared(Some(&json!({EXTENSION: {"revision": "2"}}))), None);
     }
 
     #[test]

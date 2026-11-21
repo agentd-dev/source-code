@@ -1039,6 +1039,20 @@ impl McpClient {
         self.sdk()?.call_raw(method, params, extensions, bound)
     }
 
+    /// [`Self::call_raw`] with headers of the method's own; see
+    /// [`crate::rmcp_client::RmcpClient::call_raw_with`].
+    pub fn call_raw_with(
+        &self,
+        method: &str,
+        params: serde_json::Map<String, Value>,
+        extensions: Value,
+        extra: &[(String, String)],
+        bound: Duration,
+    ) -> Result<Result<Value, rpc::RpcError>, McpError> {
+        self.sdk()?
+            .call_raw_with(method, params, extensions, extra, bound)
+    }
+
     /// One long-lived request the SDK does not model, on this connection; see
     /// [`crate::rmcp_client::RmcpClient::stream_raw`].
     pub fn stream_raw(
@@ -1052,6 +1066,27 @@ impl McpClient {
     ) -> crate::rmcp_client::StreamEnd {
         match self.sdk() {
             Ok(c) => c.stream_raw(method, params, extensions, open_bound, handle, on_frame),
+            Err(e) => crate::rmcp_client::StreamEnd::Failed(e.to_string()),
+        }
+    }
+
+    /// [`Self::stream_raw`] with headers of the method's own; see
+    /// [`crate::rmcp_client::RmcpClient::stream_raw_with`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_raw_with(
+        &self,
+        method: &str,
+        params: serde_json::Map<String, Value>,
+        extensions: Value,
+        extra: &[(String, String)],
+        open_bound: Duration,
+        handle: &crate::http::StreamHandle,
+        on_frame: impl FnMut(Value) -> std::ops::ControlFlow<()>,
+    ) -> crate::rmcp_client::StreamEnd {
+        match self.sdk() {
+            Ok(c) => c.stream_raw_with(
+                method, params, extensions, extra, open_bound, handle, on_frame,
+            ),
             Err(e) => crate::rmcp_client::StreamEnd::Failed(e.to_string()),
         }
     }

@@ -1035,6 +1035,32 @@ impl RmcpClient {
         extensions: Value,
         open_bound: Duration,
         handle: &crate::http::StreamHandle,
+        on_frame: impl FnMut(Value) -> std::ops::ControlFlow<()>,
+    ) -> StreamEnd {
+        self.stream_raw_with(
+            method,
+            params,
+            extensions,
+            &[],
+            open_bound,
+            handle,
+            on_frame,
+        )
+    }
+
+    /// [`Self::stream_raw`] with headers of the method's own: an
+    /// extension's SEP-2243 `Mcp-Name` and `Mcp-Param-*` (see
+    /// [`crate::headers`]). They are sent only at a revision without
+    /// `initialize`, as `Mcp-Method` is.
+    #[allow(clippy::too_many_arguments)]
+    pub fn stream_raw_with(
+        &self,
+        method: &str,
+        params: serde_json::Map<String, Value>,
+        extensions: Value,
+        extra: &[(String, String)],
+        open_bound: Duration,
+        handle: &crate::http::StreamHandle,
         mut on_frame: impl FnMut(Value) -> std::ops::ControlFlow<()>,
     ) -> StreamEnd {
         let (id, bytes, version) = match self.raw_request(method, params, extensions) {
@@ -1044,6 +1070,7 @@ impl RmcpClient {
         let mut headers: Vec<(&str, &str)> = vec![("MCP-Protocol-Version", &version)];
         if self.listens() {
             headers.push(("Mcp-Method", method));
+            headers.extend(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         }
         let subscription = json!(id);
         let mut stopped = false;
@@ -1107,8 +1134,8 @@ impl RmcpClient {
     /// `MCP-Protocol-Version`, and at a revision without `initialize`
     /// `Mcp-Method` and the per-request `_meta` — the revision, the client's
     /// info, and its capabilities with `extensions` declared in them (a
-    /// method's own `_meta` keys are kept). `Mcp-Name` is not set: the
-    /// revision defines it for tools, resources and prompts only. The id comes
+    /// method's own `_meta` keys are kept). An extension's own `Mcp-Name` and
+    /// `Mcp-Param-*` go through [`Self::call_raw_with`]. The id comes
     /// from a range the SDK's counter never reaches, and a notification sent
     /// on the answer's stream reaches the host's queue as the handler would
     /// queue it.
@@ -1129,10 +1156,24 @@ impl RmcpClient {
         extensions: Value,
         bound: Duration,
     ) -> Result<Result<Value, rpc::RpcError>, McpError> {
+        self.call_raw_with(method, params, extensions, &[], bound)
+    }
+
+    /// [`Self::call_raw`] with headers of the method's own (see
+    /// [`Self::stream_raw_with`]).
+    pub fn call_raw_with(
+        &self,
+        method: &str,
+        params: serde_json::Map<String, Value>,
+        extensions: Value,
+        extra: &[(String, String)],
+        bound: Duration,
+    ) -> Result<Result<Value, rpc::RpcError>, McpError> {
         let (id, bytes, version) = self.raw_request(method, params, extensions)?;
         let mut headers: Vec<(&str, &str)> = vec![("MCP-Protocol-Version", &version)];
         if self.listens() {
             headers.push(("Mcp-Method", method));
+            headers.extend(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         }
         let queue = Arc::clone(&self.notifications);
         // The socket's timeout bounds each read; the exchange as a whole is
@@ -1521,7 +1562,20 @@ impl RmcpClient {
     /// asked for it and the revision defines it — 2026-07-28 on, the
     /// revisions without an `initialize`.
     pub fn declares_tasks(&self) -> bool {
-        self.tasks && self.listens()
+        self.tasks && self.listens() && self.tasks_revision_known()
+    }
+
+    /// Whether the server's own declaration of the Tasks extension, if it
+    /// makes one, is at a revision agentd implements: a `revision` agentd
+    /// does not know leaves the extension undeclared (SEP-3392).
+    fn tasks_revision_known(&self) -> bool {
+        !matches!(
+            crate::extensions::declared(
+                self.capability("extensions").as_ref(),
+                crate::wire::TASKS_EXTENSION
+            ),
+            crate::extensions::Declared::UnknownRevision(_)
+        )
     }
 
     /// The `_meta` that declares the Tasks extension on one request: the
@@ -2618,7 +2672,9 @@ impl Abandoned {
 impl Drop for Abandoned {
     fn drop(&mut self) {
         let Some(id) = self.id.take() else { return };
-        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         let peer = self.peer.clone();
         rt.spawn(async move {
             let _ = peer

@@ -19,6 +19,8 @@
 //! agentd's own `net` transport — plus serde/serde_json.
 
 pub mod client;
+pub mod extensions;
+pub mod headers;
 pub mod http;
 pub mod http_server;
 pub mod inbound;

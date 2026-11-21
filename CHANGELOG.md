@@ -5,6 +5,38 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 [Keep a Changelog](https://keepachangelog.com); versions are the released git tags
 (`vX.Y.Z`) and the published image `ghcr.io/agentd-dev/agentd:X.Y.Z`.
 
+## Unreleased
+
+- **MCP Events follows the Beta specification** (SEP-3415, merged; the
+  `ext-events` Beta text). The server's `heartbeatMs` grant on
+  `notifications/events/active` sets a push stream's idle bound: three
+  grants, counted from `active`, with no ceiling. `events/poll`,
+  `events/stream`, `events/subscribe` and `events/unsubscribe` carry
+  `Mcp-Name` and an `Mcp-Param-{Name}` for each argument the type's
+  `inputSchema` annotates with `x-mcp-header`. A type with invalid
+  annotations is left out of the listing (`mcp.events.type.dropped`). On
+  `-32020` the server is listed again before the retry. A dropped push
+  stream reconnects after a full-jitter wait.
+- **Breaking:** the design sketch's spellings are no longer read. Events is
+  declared only under `extensions["io.modelcontextprotocol/events"]`, not a
+  top-level `events` capability; only the spec's codes (`-32023`…`-32027`)
+  mean what they mean, and `-32011`…`-32015` are unknown codes; a
+  descriptor's schemas are read from `inputSchema`/`payloadSchema` only.
+- **Extension revisions (SEP-3392).** A server that declares Skills, Events
+  or Tasks with a `revision` agentd does not implement is treated as not
+  declaring it: Skills says why in `skills.source.unavailable`, Events
+  refuses its bindings with `unknown_revision`, and Tasks is not declared on
+  the calls.
+- **rmcp 3.11** (from 3.5). Tools whose `x-mcp-header` annotations are
+  nested on a `properties` path now list. A bounded call that expires is
+  cancelled at the server (`notifications/cancelled`, and its response
+  stream closed); agentd's own declaring `tools/call` path arms the same
+  guard on each MRTR round. Also from the SDK: 401/403 keep their status,
+  SSE reconnects stop on permanent errors, and tool results without
+  `content` are accepted.
+- `agentd-mcp`: the `extensions` and `headers` modules, and `call_raw_with`
+  and `stream_raw_with` for an extension method's own headers.
+
 ## v1.30.0 — a document's integrations policy narrows what it connects
 
 - A document's integrations policy is enforced (instruction.md proposal

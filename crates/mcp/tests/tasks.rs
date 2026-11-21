@@ -87,8 +87,13 @@ fn declares(req: &Req) -> bool {
 }
 
 fn task_json(id: &str, status: &str, extra: Value) -> Value {
+    // An extension field beside the task's own, on every seed and every
+    // `tasks/get`: CreateTaskResult and GetTaskResult extend the open Result
+    // type, so a client keeps reading past keys it does not know (ext-tasks
+    // v0.2.3).
     let mut t = json!({"taskId": id, "status": status, "createdAt": "2026-10-19T10:00:00Z",
-                       "lastUpdatedAt": "2026-10-19T10:00:00Z", "ttlMs": 60000, "pollIntervalMs": POLL_MS});
+                       "lastUpdatedAt": "2026-10-19T10:00:00Z", "ttlMs": 60000, "pollIntervalMs": POLL_MS,
+                       "io.example/vendor": {"region": "eu"}});
     if let (Some(o), Value::Object(e)) = (t.as_object_mut(), extra) {
         o.extend(e);
     }
@@ -107,6 +112,11 @@ fn ask_request() -> Value {
 
 /// The server. `requires` answers a call without the extension `-32021`.
 fn server(requires: bool) -> (String, Seen, Arc<Tasks>) {
+    server_declaring(requires, json!({}))
+}
+
+/// [`server`], declaring the extension with `settings`.
+fn server_declaring(requires: bool, settings: Value) -> (String, Seen, Arc<Tasks>) {
     let state = Arc::new(Tasks::default());
     let s = Arc::clone(&state);
     let (ep, seen) = spawn(move |req, w| {
@@ -133,7 +143,7 @@ fn server(requires: bool) -> (String, Seen, Arc<Tasks>) {
         match req.method() {
             "server/discover" => {
                 let opts = StatelessOpts {
-                    caps: json!({"tools": {}, "prompts": {}, "extensions": {TASKS: {}}}),
+                    caps: json!({"tools": {}, "prompts": {}, "extensions": {TASKS: settings.clone()}}),
                     ..StatelessOpts::default()
                 };
                 respond(w, 200, &[], &discover_answer(&id, &opts))
@@ -709,4 +719,16 @@ fn a_connection_reached_through_initialize_declares_nothing() {
         c.get_task("t", None, Duration::from_secs(1)),
         Err(McpError::Capability(_))
     ));
+}
+
+#[test]
+fn a_server_declaring_an_unknown_revision_is_not_sent_the_extension() {
+    // SEP-3392: a `revision` agentd does not know leaves the extension off,
+    // so the call is made, and answered, inline.
+    let (ep, seen, _) = server_declaring(false, json!({"revision": "next"}));
+    let c = connect(&ep, true, None);
+    assert!(!c.declares_tasks());
+    let r = within(&c, "job").expect("answered inline");
+    assert!(format!("{r:?}").contains("inline"), "{r:?}");
+    assert!(!declares(&requests(&seen, "tools/call")[0]));
 }

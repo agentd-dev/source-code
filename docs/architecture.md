@@ -249,7 +249,7 @@ SigV4, mTLS identities, refreshed OAuth tokens — apply under both SDKs.
 |---|---|---|
 | Model providers | out | HTTPS: OpenAI-compatible chat completions, Anthropic Messages, Bedrock Converse, or a decisions resource (`dialect: decisions`). Each provider is its own connection with ordered endpoint failover and breakers |
 | MCP servers | out | Streamable HTTP through `rmcp`. A connection starts with `server/discover` (revision 2026-07-28) and falls back to the 2025-11-25 `initialize` handshake; it holds a `subscriptions/listen` stream and allows up to 16 requests in flight. The supervisor and every worker dial their own |
-| MCP Events | out, or in | occurrences polled on four threads, or POSTed by the server to the webhook listener under `/hooks/_mcp/`. A draft extension |
+| MCP Events | out, or in | occurrences polled on four threads, or POSTed by the server to the webhook listener under `/hooks/_mcp/`, or streamed by `events/stream`. A Beta extension |
 | State store | out | an MCP server's tools or HTTP; or local files with no network at all |
 | A2A, inbound | in | JSON-RPC over `https://`, loopback `http://`, or `unix://`. Peers, the TUI, the web UI and operator commands all arrive here |
 | A2A, outbound | out | to declared peers over `https://` or `unix://` |

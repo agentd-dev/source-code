@@ -180,8 +180,10 @@ deduplicate:
 | A turn's task | the turn's call bound, less half of it or 30 s, whichever is less | then the task is handed to the supervisor |
 
 A timeout bounds silence: a call that streams progress is not cut off by
-the connection timeout. A call abandoned at its bound holds up no other call
-on the connection.
+the connection timeout. A call abandoned at its bound is cancelled:
+agentd sends `notifications/cancelled` for the round in flight and closes its
+response stream, which at 2026-07-28 is the cancellation. It holds up no other
+call on the connection.
 
 At shutdown agentd closes its connections. There is no server process to
 signal, and the close counts inside `lifecycle.drain_timeout` (default
@@ -587,8 +589,9 @@ resources. It reads one resource by URI.
 - **Revision changes.** A server that changes revision is probed again only
   when it refuses `initialize`, or when a reload dials it afresh.
 - **Dropped tools.** At 2026-07-28 the SDK leaves out of a listing any tool
-  whose `x-mcp-header` annotation it rejects, a nested one for instance.
-  agentd logs each as `mcp.tool.dropped`.
+  whose `x-mcp-header` annotation is invalid: one on the schema root or off a
+  `properties`-only path, a value that is empty or not an HTTP token, or a
+  duplicate name. agentd logs each as `mcp.tool.dropped`.
 - **Message order.** When a server sends a request ahead of a `tools/list`
   answer on the same stream, the SDK may miss the tools' header schemas,
   and an annotated call lacks its `Mcp-Param-*` headers until the next

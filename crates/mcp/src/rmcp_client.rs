@@ -1321,19 +1321,15 @@ impl RmcpClient {
     /// operator's answer to an elicitation included; on expiry the call is
     /// abandoned and the caller gets a timeout error.
     ///
-    /// **An abandoned call is not cancelled, and its exchange is not hung
-    /// up.** Dropping the SDK's call future drops a request handle that does
-    /// nothing when dropped — only a subscription cancels that way — so the
-    /// request stays pending in the SDK's worker, which keeps its response
-    /// stream open. The exchange therefore runs on until the server answers,
-    /// the socket's idle bound (this connection's timeout) fires, or the
-    /// client is closed (the SDK then aborts its streams, which hangs them
-    /// up), without holding up the calls behind it (see
-    /// [`crate::rmcp_transport`]). The
-    /// server is told nothing meanwhile: no `notifications/cancelled` (the
-    /// SDK's call helper, which drives the MRTR rounds, does not expose the
-    /// request id), and at 2026-07-28 no closed stream either. Without a
-    /// bound, only the socket's timeout on each silence can end the call.
+    /// **An abandoned call is cancelled.** When the bound expires, the call's
+    /// future is dropped and the round in flight sends
+    /// `notifications/cancelled` for its request id: the SDK's own helpers do
+    /// that since rmcp 3.6, and the declaring path arms the same guard
+    /// ([`Abandoned`]). The transport takes that notification as the cue to
+    /// drop the request's response stream, which hangs up its exchange: at
+    /// 2026-07-28 the closed stream is the cancellation, and at 2025-11-25 the
+    /// server also reads the notification. Without a bound, only the socket's
+    /// timeout on each silence can end the call.
     pub fn call_tool(
         &self,
         name: &str,
@@ -1460,16 +1456,20 @@ impl RmcpClient {
         let max = rmcp::model::DEFAULT_MRTR_MAX_ROUNDS;
         let mut state_only = 0u32;
         for _ in 0..max {
-            let answer = self
+            let handle = self
                 .service
                 .peer()
                 .send_request_with_option(
                     ClientRequest::CallToolRequest(CallToolRequest::new(params.clone())),
                     rmcp::service::PeerRequestOptions::no_options().with_meta(self.tasks_meta()),
                 )
-                .await?
-                .await_response()
                 .await?;
+            // A round its caller stops waiting for (a bound that expires) is
+            // cancelled, as the SDK's own helpers cancel theirs.
+            let mut abandoned = Abandoned::new(self.service.peer().clone(), handle.id.clone());
+            let answer = handle.await_response().await;
+            abandoned.disarm();
+            let answer = answer?;
             let round = match answer {
                 rmcp::model::ServerResult::CallToolResult(r) => {
                     return Ok(CallToolResponse::Complete(r));
@@ -2587,6 +2587,47 @@ fn ended(end: Option<&SubscriptionEnd>) -> String {
             format!("notifications outran the {capacity}-slot buffer")
         }
         _ => "the stream closed".into(),
+    }
+}
+
+/// Tells the server about a request round whose caller stopped waiting for it.
+///
+/// Armed while a declaring `tools/call` round is awaited; dropped armed (the
+/// caller's bound expired and dropped the future), it sends
+/// `notifications/cancelled` for that round's request id. The SDK's transport
+/// takes that notification as the cue to drop the request's response stream,
+/// which at 2026-07-28 is itself the cancellation; at 2025-11-25 the server
+/// reads the notification.
+struct Abandoned {
+    peer: rmcp::service::Peer<rmcp::RoleClient>,
+    id: Option<rmcp::model::RequestId>,
+}
+
+impl Abandoned {
+    const REASON: &'static str = "request abandoned by the caller";
+
+    fn new(peer: rmcp::service::Peer<rmcp::RoleClient>, id: rmcp::model::RequestId) -> Self {
+        Self { peer, id: Some(id) }
+    }
+
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let peer = self.peer.clone();
+        rt.spawn(async move {
+            let _ = peer
+                .notify_cancelled(rmcp::model::CancelledNotificationParam::new(
+                    Some(id),
+                    Some(Self::REASON.to_string()),
+                ))
+                .await;
+        });
     }
 }
 

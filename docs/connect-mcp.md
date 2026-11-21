@@ -422,8 +422,9 @@ and follows its `retry` policy.
 | the step's `timeout`, else `limits.step_timeout` | `600s` | the whole of an `mcp.tool` step's call |
 | what is left of the turn's deadline, at most | `600s` | the whole of a tool call the model makes in a turn |
 
-A call abandoned at its bound does not block other calls on the same
-connection.
+A call abandoned at its bound is cancelled at the server
+(`notifications/cancelled`, and its response stream closed), and does not
+block other calls on the same connection.
 
 ## Long-running tool calls
 

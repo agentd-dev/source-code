@@ -43,9 +43,9 @@
 //! replaces, or a request it cancels, stops at the server too rather than
 //! holding a connection and a subscription until the socket's timeout. At
 //! 2025-11-25 a closed stream cancels nothing, and the SDK still sends the
-//! notification. A call its caller merely abandons is NOT hung up: the SDK
-//! keeps that stream until it ends or the client closes (see
-//! `RmcpClient::call_tool`).
+//! notification. A call its caller abandons is cancelled the same way: the
+//! dropped round sends `notifications/cancelled`, and the SDK drops that
+//! request's stream (see `RmcpClient::call_tool`).
 //!
 //! ## How far a `tools/call` got
 //!

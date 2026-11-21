@@ -151,11 +151,15 @@ fn a_list_streamed_behind_a_notification_still_gives_its_tools_their_headers() {
 
 #[test]
 fn a_tool_rmcp_drops_is_reported_once() {
+    // A header name that is not an HTTP token is one rmcp refuses; a nested
+    // annotation on a `properties`-only path is valid (SEP-2243) and lists.
+    let bad = json!({"name": "bad", "inputSchema": {"type": "object", "properties": {
+        "region": {"type": "string", "x-mcp-header": "Bad Name"}}}});
     let nested = json!({"name": "nested", "inputSchema": {"type": "object", "properties": {
         "outer": {"type": "object", "properties": {
             "inner": {"type": "string", "x-mcp-header": "Inner"}}}}}});
     let ok = json!({"name": "ok", "inputSchema": {"type": "object"}});
-    let (ep, _) = server(vec![nested, ok], json!({"tools": {}}), List::Tools);
+    let (ep, _) = server(vec![bad, nested, ok], json!({"tools": {}}), List::Tools);
     let c = connect(&ep, FirstRequest::Discover).unwrap();
     let names: Vec<String> = c
         .list_tools()
@@ -163,8 +167,8 @@ fn a_tool_rmcp_drops_is_reported_once() {
         .into_iter()
         .map(|t| t.name)
         .collect();
-    assert_eq!(names, ["ok"]);
-    assert_eq!(c.drain_dropped_tools(), ["nested"]);
+    assert_eq!(names, ["nested", "ok"]);
+    assert_eq!(c.drain_dropped_tools(), ["bad"]);
     c.list_tools().unwrap();
     assert!(
         c.drain_dropped_tools().is_empty(),

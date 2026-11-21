@@ -57,14 +57,16 @@ fn binary() -> &'static PathBuf {
         // the local command its check runs beside a delegation, as root;
         // `x402` agentd paying, which the `payments` family holds to x402
         // and ADR 0003 against its mock resource server.
-        build(&[
-            "build",
-            "-p",
-            "agentd-cli",
-            "--features",
-            "a2a,cron,internal-mocks,oauth,companies,xaa,hot-reload,exec,x402",
-        ]);
-        let agentd = target_dir().join("agentd");
+        let agentd = build_binary(
+            &[
+                "build",
+                "-p",
+                "agentd-cli",
+                "--features",
+                "a2a,cron,internal-mocks,oauth,companies,xaa,hot-reload,exec,x402",
+            ],
+            "agentd",
+        );
         assert!(
             agentd.exists(),
             "agentd binary not found at {}",
@@ -74,23 +76,26 @@ fn binary() -> &'static PathBuf {
     })
 }
 
-fn build(args: &[&str]) {
-    let status = Command::new(env!("CARGO"))
+/// Run `cargo <args>` and return where it put the executable of the binary
+/// target `bin`, as cargo itself reports it (`--message-format=json`, the
+/// `compiler-artifact` message's `executable`). Cargo's directory layout is
+/// not part of its interface — Rust 1.100 moved test executables out of
+/// `target/<profile>/deps/` — so the path is asked for, never derived.
+fn build_binary(args: &[&str], bin: &str) -> PathBuf {
+    let out = Command::new(env!("CARGO"))
         .args(args)
-        .status()
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(std::process::Stdio::inherit())
+        .output()
         .unwrap_or_else(|e| panic!("failed to run cargo {args:?}: {e}"));
-    assert!(status.success(), "cargo {args:?} failed");
-}
-
-/// The `target/<profile>/` dir, derived from our own executable's location
-/// (`.../target/<profile>/[deps/]<exe>`).
-fn target_dir() -> PathBuf {
-    let mut p = std::env::current_exe().expect("current_exe");
-    p.pop(); // drop the exe file
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p
+    assert!(out.status.success(), "cargo {args:?} failed");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == bin)
+        .filter_map(|m| m["executable"].as_str().map(PathBuf::from))
+        .last()
+        .unwrap_or_else(|| panic!("cargo {args:?} reported no executable for `{bin}`"))
 }
 
 /// The harness: holds the resolved binary paths. Cheap to clone-by-reference;

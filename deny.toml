@@ -22,6 +22,12 @@ ignore = [
     # arrives only through cel-interpreter, the `cel` feature's one crate.
     # Drop this when cel-interpreter moves off paste.
     { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time proc-macro pulled in by cel-interpreter; no known vulnerability" },
+    # `chrono` is unmaintained (2026-11), not vulnerable: no advisory names a
+    # flaw in it, and there is no maintained release to move to. agentd uses
+    # it only because the official SDKs' types carry it (a2a-lf's instants,
+    # rmcp, pbjson-types, cel-interpreter). Drop this when those move to
+    # `jiff` or `time`, and move agentd's own A2A conversions with them.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known vulnerability; required by the official A2A and MCP SDKs' types" },
 ]
 
 [bans]

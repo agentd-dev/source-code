@@ -1784,6 +1784,16 @@ impl Runtime {
                 "a2a.message.delivered",
                 json!({"inbox_event": ev.id, "conversation": ctx, "runs": woken}),
             );
+            // The message's own task is done: it was the answer a step waited
+            // for, so a blocking send settles (A2A 1.0 §3.2.2) rather than
+            // waiting on work that will never be its own.
+            #[cfg(feature = "a2a")]
+            self.a2a_task_for_event(
+                Some(&ev.id),
+                crate::a2a::tasks::State::Completed,
+                None,
+                Some(json!({"delivered_to": woken})),
+            );
             return "wait";
         }
         // 2. An `a2a` START node whose command and roles match — a peer or an
@@ -1921,12 +1931,30 @@ impl Runtime {
                                    "links": links}),
                         );
                         crate::runtime::streams::append_span(&event_trace, stream, seq, appended);
+                        // Appending IS the message's work: its task completes
+                        // with where the message went.
+                        self.a2a_task_for_event(
+                            Some(&ev.id),
+                            crate::a2a::tasks::State::Completed,
+                            None,
+                            Some(json!({"stream": stream, "subject": subject, "seq": seq})),
+                        );
                     }
-                    Err(e) => self.log.warn(
-                        "start.a2a.into.refused",
-                        json!({"workflow": workflow, "node": node, "stream": stream,
-                               "err": e}),
-                    ),
+                    Err(e) => {
+                        self.log.warn(
+                            "start.a2a.into.refused",
+                            json!({"workflow": workflow, "node": node, "stream": stream,
+                                   "err": e}),
+                        );
+                        self.a2a_task_for_event(
+                            Some(&ev.id),
+                            crate::a2a::tasks::State::Failed,
+                            Some(format!(
+                                "the message could not be appended to stream {stream}: {e}"
+                            )),
+                            None,
+                        );
+                    }
                 }
                 return true;
             }

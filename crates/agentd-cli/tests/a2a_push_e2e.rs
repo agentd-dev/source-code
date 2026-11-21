@@ -308,10 +308,13 @@ fn a_registered_webhook_receives_the_task_and_the_callers_credentials() {
         -32602
     );
     assert_eq!(list(23), 2, "an id-less delete removed nothing");
-    // An id the task does not have is "not found", on both.
+    // An id the task does not have: a get is "not found"; a delete is
+    // idempotent (A2A 1.0 §3.1.10) and answers `{}`.
     let unknown = json!({"taskId": task_id, "id": "no-such-config"});
     assert_eq!(get(24, unknown.clone())["error"]["code"], -32001);
-    assert_eq!(delete(25, unknown)["error"]["code"], -32001);
+    let gone = delete(25, unknown);
+    assert!(gone.get("error").is_none(), "{gone}");
+    assert_eq!(gone["result"], json!({}), "{gone}");
 
     let named = json!({"taskId": task_id, "id": config_id});
     let got = get(26, named.clone());

@@ -45,6 +45,11 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   which agentd already sent, so a client that validates annotations no longer
   refuses a task waiting on an MCP sign-in; `code` is left out for a browser
   sign-in rather than sent as `null`.
+- A message's task settles when another reader takes the message: it
+  completes when a waiting step takes it as its answer (`delivered_to` the
+  runs it woke), or when an `into` start appends it to a stream (the stream,
+  subject and position), and fails when that append is refused. Before, such
+  a task stayed `working`, which the old 25 s cap hid.
 - **A2A SDK:** `a2a-lf` 0.4.2, `a2a-pb` 0.3.2, `a2a-server-lf` 0.5.3.
 
 ## v1.30.0 — a document's integrations policy narrows what it connects

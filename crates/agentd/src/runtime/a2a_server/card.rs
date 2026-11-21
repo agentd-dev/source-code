@@ -621,7 +621,8 @@ mod tests {
     /// the SDK's own type parsed.
     #[test]
     fn the_sdk_client_negotiates_a_transport_from_our_card() {
-        // a2a-client-lf 0.2.7 `factory.rs`, `TransportKey::from_interface`.
+        // a2a-client-lf 0.2.9 `factory.rs`, `TransportKey::from_interface`
+        // (unchanged since 0.2.7; re-read for a2a-lf 0.4.2).
         fn version_compatible(version: &str) -> bool {
             version
                 .split('.')
@@ -642,7 +643,7 @@ mod tests {
             .and_then(|p| p.lines().find_map(|l| l.strip_prefix("version = ")))
             .expect("a2a-lf is locked");
         assert_eq!(
-            locked, "\"0.4.1\"",
+            locked, "\"0.4.2\"",
             "the A2A SDK moved: re-check version_compatible against a2a-client's factory.rs"
         );
         let s = settings(

@@ -691,7 +691,7 @@ fn a_tool_rmcp_drops_is_logged_once_by_the_daemon() {
     assert_eq!(dropped.len(), 1, "{log}");
     assert_eq!(dropped[0]["level"], "warn", "{log}");
     assert_eq!(dropped[0]["server"], "mock", "{log}");
-    assert_eq!(dropped[0]["tool"], "mock.nested", "{log}");
+    assert_eq!(dropped[0]["tool"], "mock.bad_header", "{log}");
     assert_eq!(
         dropped[0]["reason"], "invalid x-mcp-header annotation",
         "{log}"

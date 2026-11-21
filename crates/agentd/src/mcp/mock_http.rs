@@ -1447,9 +1447,9 @@ fn corpus() -> Vec<(&'static str, &'static str, &'static str)> {
 
 /// The tool list, plus — at 2026-07-28, where a tool's `x-mcp-header`
 /// annotation names a header its argument travels in — `mock.regional`, whose
-/// `region` is `Mcp-Param-Region`, and `mock.nested`, whose annotation sits on
-/// a nested property, which the client rejects and drops: the tool a host must
-/// say it lost.
+/// `region` is `Mcp-Param-Region`, and `mock.bad_header`, whose annotation
+/// names a header that is not an HTTP token, which the client rejects and
+/// drops: the tool a host must say it lost.
 fn with_revision_tools(state: &State, mut list: Value) -> Value {
     if state.lifecycle == Lifecycle::Discover
         && let Some(tools) = list["tools"].as_array_mut()
@@ -1461,10 +1461,10 @@ fn with_revision_tools(state: &State, mut list: Value) -> Value {
                 "region": {"type": "string", "x-mcp-header": "Region"}}}
         }));
         tools.push(json!({
-            "name": "mock.nested",
-            "description": "a nested x-mcp-header annotation the client drops",
-            "inputSchema": {"type": "object", "properties": {"outer": {"type": "object",
-                "properties": {"inner": {"type": "string", "x-mcp-header": "Inner"}}}}}
+            "name": "mock.bad_header",
+            "description": "an x-mcp-header annotation that is not an HTTP token, which the client drops",
+            "inputSchema": {"type": "object", "properties": {
+                "inner": {"type": "string", "x-mcp-header": "Bad Name"}}}
         }));
     }
     list

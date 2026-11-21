@@ -94,7 +94,7 @@ fn build_binary(args: &[&str], bin: &str) -> PathBuf {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter(|m| m["reason"] == "compiler-artifact" && m["target"]["name"] == bin)
         .filter_map(|m| m["executable"].as_str().map(PathBuf::from))
-        .last()
+        .next_back()
         .unwrap_or_else(|| panic!("cargo {args:?} reported no executable for `{bin}`"))
 }
 

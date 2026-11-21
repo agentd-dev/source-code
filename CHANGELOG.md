@@ -36,6 +36,16 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   `content` are accepted.
 - `agentd-mcp`: the `extensions` and `headers` modules, and `call_raw_with`
   and `stream_raw_with` for an extension method's own headers.
+- **A2A compliance.** A blocking `SendMessage` waits until its task is
+  terminal or interrupted, as A2A 1.0 §3.2.2 requires; the 25 s cap is gone,
+  and `a2a.blocking_wait` lets an operator set one (unset by default).
+  Deleting a push config is idempotent (§3.1.10): one already gone answers
+  `{}`. A push config's `authentication` may carry a scheme alone (only
+  `scheme` is required). The task-annotations schema publishes `mcpSignIn`,
+  which agentd already sent, so a client that validates annotations no longer
+  refuses a task waiting on an MCP sign-in; `code` is left out for a browser
+  sign-in rather than sent as `null`.
+- **A2A SDK:** `a2a-lf` 0.4.2, `a2a-pb` 0.3.2, `a2a-server-lf` 0.5.3.
 
 ## v1.30.0 — a document's integrations policy narrows what it connects
 

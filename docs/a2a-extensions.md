@@ -301,7 +301,12 @@ that activated it:
 | `principal` | no | who started the task |
 | `askSchema` | no | the JSON Schema of the answer an `input-required` gate asks for |
 | `askChannel` | no | where the gate is also announced, from the operator's `agent.gate_channels` |
+| `securityGate` | no | `true` when the gate is a security approval, not a question |
+| `consentGate` | no | the person's consent gate the task waits on |
+| `signIn` | no | where the person signs in at their IdP for the enrolment the task is |
+| `mcpSignIn` | no | the MCP server sign-in the task's gate is: `{server, method, url, code?}` |
 | `command` | no | the command op that started the task |
+| `traceId`, `spanId` | no | the W3C trace and span the task's work is done in |
 
 A webhook body never carries the annotations. The normative specification is
 at

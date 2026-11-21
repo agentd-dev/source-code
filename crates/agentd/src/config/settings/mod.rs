@@ -1308,6 +1308,7 @@ pub const OPERATOR_ONLY: &[&str] = &[
     "a2a.events",
     "a2a.inbound_tokens",
     "a2a.introspection",
+    "a2a.blocking_wait",
     "a2a.listen",
     "a2a.login",
     "a2a.principals",
@@ -5409,6 +5410,10 @@ pub struct A2a {
     pub inbound_tokens: Vec<inbound::InboundIssuer>,
     pub events: A2aEvents,
     pub introspection: A2aIntrospection,
+    /// The longest a blocking `SendMessage` waits for its task to reach a
+    /// terminal or interrupted state before answering with the task as it
+    /// stands. Unset: as long as the task takes (A2A 1.0 §3.2.2 MUST).
+    pub blocking_wait: Option<Dur>,
 }
 
 /// Which browser origins may call the listener.
@@ -12459,6 +12464,7 @@ pub const RESTART_ONLY_PATHS: &[&str] = &[
     "lifecycle.run_id",
     "lifecycle.exit_code_map",
     "lifecycle.watch_config",
+    "a2a.blocking_wait",
     "a2a.listen",
     "a2a.tls",
     "a2a.bearer",
@@ -13289,6 +13295,7 @@ mod tests {
                         || p.ends_with("_age")
                         || p.ends_with("_lifetime")
                         || p.ends_with("_validity")
+                        || p.ends_with("_wait")
                         || p == "observability.audit.chain.retention" =>
                     {
                         json!("10s")

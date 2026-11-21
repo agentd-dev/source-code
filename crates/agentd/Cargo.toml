@@ -200,11 +200,11 @@ decrypt = ["sign"]
 # SDK's TLS listener nor its push sender is used.
 # Named `a2a-types` here because the SDK's library is called `a2a`, which is
 # also agentd's own `crate::a2a` module.
-a2a-types = { package = "a2a-lf", version = "0.4.1", optional = true }
+a2a-types = { package = "a2a-lf", version = "0.4.2", optional = true }
 # The SDK's types carry instants as `chrono::DateTime<Utc>`.
 chrono = { version = "0.4", optional = true, default-features = false, features = ["std"] }
-a2a-pb = { version = "0.3.1", optional = true }
-a2a-server = { package = "a2a-server-lf", version = "0.5.1", optional = true, default-features = false }
+a2a-pb = { version = "0.3.2", optional = true }
+a2a-server = { package = "a2a-server-lf", version = "0.5.3", optional = true, default-features = false }
 # The async runtime + HTTP server the A2A listener runs on (feature `a2a`).
 # The SDK's JSON-RPC router is an axum `Router`, so agentd serves it directly
 # and merges its own routes onto the same listener.

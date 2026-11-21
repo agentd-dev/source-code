@@ -127,6 +127,9 @@ pub struct Opts {
     pub tls: Option<TlsConfigProvider>,
     /// How long a unary request may wait on the runtime.
     pub request_timeout: Duration,
+    /// The longest a blocking `SendMessage` waits for its task to settle
+    /// (`a2a.blocking_wait`); `None`, as long as the task takes (§3.2.2).
+    pub blocking_wait: Option<Duration>,
     /// How long an observation-feed stream is held open before it hands the
     /// client a cursor and asks it to come back.
     pub stream_deadline: Duration,
@@ -378,7 +381,9 @@ pub fn spawn(
 impl App {
     /// The listener's state, with the SDK's router over agentd's handler.
     fn new(bridge: Arc<A2aBridge>, opts: Opts, streams: Arc<ports::Fanout>, log: Logger) -> App {
-        let handler = Arc::new(RuntimePorts::new(Arc::clone(&bridge), streams));
+        let handler = Arc::new(
+            RuntimePorts::new(Arc::clone(&bridge), streams).with_blocking_wait(opts.blocking_wait),
+        );
         // The liveness hook comes from the sessions: a caller holding one is
         // served only while that session — its sid — lives.
         let liveness = opts
@@ -1050,6 +1055,7 @@ mod tests {
             cors_origins: Arc::new(std::sync::RwLock::new(origins)),
             tls: None,
             request_timeout: Duration::from_secs(5),
+            blocking_wait: None,
             stream_deadline: Duration::from_secs(5),
             documents: Vec::new(),
             callback: None,
@@ -2476,6 +2482,7 @@ mod tests {
                 ))),
                 tls: None,
                 request_timeout: Duration::from_secs(5),
+                blocking_wait: None,
                 stream_deadline: Duration::from_secs(5),
                 documents: Vec::new(),
                 callback: None,

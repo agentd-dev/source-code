@@ -48,14 +48,6 @@ use crate::a2a::wire::{from_wire, message_from_wire, message_to_wire, to_wire};
 use crate::runtime::a2a_server::A2aBridge;
 use crate::runtime::surface::Active;
 
-/// How long a blocking send waits for its task to settle before answering with
-/// the task as it stands. The specification's "MUST wait" has no escape
-/// clause, and an agent that never finishes would otherwise hold the
-/// connection for as long as the client tolerates; the task it gets back is
-/// true — `WORKING` says the agent has not finished — and carries the id to
-/// follow it by.
-const SEND_WAIT: Duration = Duration::from_secs(25);
-
 /// The transitions a slow stream may fall behind by before it is handed the
 /// task as it now is instead of the ones it missed. A channel allocates every
 /// slot up front, so this is kept small: falling behind costs a read, not a
@@ -67,11 +59,25 @@ pub struct RuntimePorts {
     bridge: Arc<A2aBridge>,
     /// Where the reactor publishes transitions, and every stream reads them.
     streams: Arc<Fanout>,
+    /// The operator's cap on a blocking send's wait (`a2a.blocking_wait`).
+    /// `None`: it waits until the task is terminal or interrupted, as A2A 1.0
+    /// §3.2.2 says it MUST; the caller's own timeout is the only other bound.
+    blocking_wait: Option<Duration>,
 }
 
 impl RuntimePorts {
     pub fn new(bridge: Arc<A2aBridge>, streams: Arc<Fanout>) -> RuntimePorts {
-        RuntimePorts { bridge, streams }
+        RuntimePorts {
+            bridge,
+            streams,
+            blocking_wait: None,
+        }
+    }
+
+    /// The same ports, a blocking send capped at `wait` when it is set.
+    pub fn with_blocking_wait(mut self, wait: Option<Duration>) -> RuntimePorts {
+        self.blocking_wait = wait;
+        self
     }
 
     /// Run one reactor round trip without blocking the async runtime.
@@ -206,7 +212,7 @@ impl RequestHandler for RuntimePorts {
         if immediately || settles(&task.status.state) {
             return Ok(SendMessageResponse::Task(with_history(task, history)));
         }
-        let _ = tokio::time::timeout(SEND_WAIT, async {
+        let settle = async {
             let mut seq = seq;
             loop {
                 match updates.recv().await {
@@ -226,8 +232,13 @@ impl RequestHandler for RuntimePorts {
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
-        })
-        .await;
+        };
+        match self.blocking_wait {
+            Some(cap) => {
+                let _ = tokio::time::timeout(cap, settle).await;
+            }
+            None => settle.await,
+        }
         // Read back rather than assembled from the event: an event carries a
         // status, not the artifacts and history the caller is owed.
         let (task, _) = self.read_task(&task_id, &who).await?;
@@ -1131,6 +1142,50 @@ mod tests {
         };
         assert_eq!(task.status.state, TaskState::Completed);
         assert_eq!(*reads.lock().unwrap(), 1, "read back once it settled");
+    }
+
+    /// Uncapped, a blocking send on a task that never settles keeps waiting
+    /// (§3.2.2 MUST); `a2a.blocking_wait` answers with the task as it stands
+    /// once the cap passes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocking_send_waits_until_settled_unless_the_operator_caps_it() {
+        let working = |req: &crate::runtime::a2a_server::A2aRequest| match req.method.as_str() {
+            "SendMessage" => {
+                let id = req.params["taskId"].as_str().unwrap().to_string();
+                json!({"task": wire_task(&id, "TASK_STATE_WORKING"), "_seq": 0})
+            }
+            _ => {
+                let id = req.params["id"].as_str().unwrap().to_string();
+                json!({"id": id, "contextId": "c", "status": {"state": "TASK_STATE_WORKING"}, "_seq": 0})
+            }
+        };
+        let (ports, _streams) = ports_with(working);
+        let waited = tokio::time::timeout(
+            Duration::from_millis(600),
+            with_request(scope(), async {
+                ports
+                    .send_message(&ServiceParams::new(), send_request(None, false))
+                    .await
+            }),
+        )
+        .await;
+        assert!(waited.is_err(), "uncapped, it is still waiting");
+
+        let (ports, _streams) = ports_with(working);
+        let ports = ports.with_blocking_wait(Some(Duration::from_millis(200)));
+        let started = std::time::Instant::now();
+        let answer = with_request(scope(), async {
+            ports
+                .send_message(&ServiceParams::new(), send_request(None, false))
+                .await
+        })
+        .await
+        .expect("an answer at the cap");
+        let SendMessageResponse::Task(task) = answer else {
+            panic!("a task")
+        };
+        assert_eq!(task.status.state, TaskState::Working);
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     /// A subscription opens with the task as it is, skips every transition the

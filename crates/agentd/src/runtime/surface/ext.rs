@@ -420,6 +420,18 @@ pub fn task_annotations_bundle() -> Value {
                 },
                 "additionalProperties": false,
             },
+            "mcpSignIn": {
+                "description": "the MCP server sign-in the task's gate is (RFC 0055): the mcp.servers entry, how the person signs in (device code or browser), where, and — for the device grant — the code they enter there",
+                "type": "object",
+                "required": ["server", "method", "url"],
+                "properties": {
+                    "server": {"type": "string"},
+                    "method": {"enum": ["device", "browser"]},
+                    "url": {"type": "string"},
+                    "code": {"type": "string"},
+                },
+                "additionalProperties": false,
+            },
             "command": {"description": "the command op that started the task", "type": "string"},
             "traceId": {
                 "description": "the W3C trace id of the task's work, 32 lowercase hex digits",
@@ -1284,6 +1296,20 @@ mod tests {
         full.ask_channel = Some("@channel/ops".into());
         full.security_gate = true;
         full.command = Some("workflow.run".into());
+        // Every optional member the wire writes is set here, so a member the
+        // closed schema does not publish fails this test.
+        full.consent_gate = Some(json!({"gate": "g-1", "kind": "device", "server": "s",
+            "verification_uri": "https://idp.example/device", "user_code": "ABCD", "expires_at": 1}));
+        full.sign_in_link =
+            Some(json!({"idp": "corp", "start_uri": "https://a.example/s", "expires_at": 1}));
+        full.mcp_sign_in = Some(crate::a2a::tasks::McpSignInGate {
+            server: "tracker".into(),
+            standalone: false,
+            method: "device".into(),
+            url: "https://idp.example/device".into(),
+            code: Some("WXYZ".into()),
+        });
+        full.trace = Some(crate::obs::trace::TraceContext::mint());
         full.transition(State::Working, None);
         full.transition(State::InputRequired, Some("which one?".into()));
         let bare = Task::new(
@@ -1294,7 +1320,15 @@ mod tests {
                 handle: "sa-1".into(),
             },
         );
-        for t in [&full, &bare] {
+        let mut browser = full.clone();
+        browser.mcp_sign_in = Some(crate::a2a::tasks::McpSignInGate {
+            server: "tracker".into(),
+            standalone: true,
+            method: "browser".into(),
+            url: "https://a.example/start".into(),
+            code: None,
+        });
+        for t in [&full, &browser, &bare] {
             let a = crate::a2a::wire::annotations(t);
             let r = crate::jsonschema::validate(&bundle, &a);
             assert!(r.is_ok(), "{a}: {r:?}");

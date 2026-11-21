@@ -226,10 +226,12 @@ request; fields it does not define are ignored.
 - **Parts:** text parts are accepted, and a DataPart without the `agentd` key
   is read as JSON. A raw or url part refuses the whole message with `-32005`.
   A DataPart under `agentd` is a command (see [Command ops](#command-ops)).
-- **Blocking.** A unary send waits for the task to reach a terminal state or
-  `input-required`, for at most 25 seconds, unless
-  `configuration.returnImmediately` is set. It then answers with the task as
-  it stands.
+- **Blocking.** A unary send waits for the task to reach a terminal or
+  interrupted state (`input-required`, `auth-required`), as A2A 1.0 §3.2.2
+  requires, unless `configuration.returnImmediately` is set. The caller's own
+  HTTP timeout is the only bound unless the operator sets
+  `a2a.blocking_wait`, after which the send answers with the task as it
+  stands.
 - **Inline push config.** A push config sent with the message is checked like
   a registration and attached only once the message is accepted.
 - **While draining**, a send is `-32603` with reason `DRAINING`.
@@ -293,7 +295,9 @@ updates to it.
 | `a2a.push.allow` | `[]` | push targets beyond the peers' endpoints; under `security.egress: closed` a target must match a peer's endpoint or an entry here |
 
 **Registration.** The config takes `url` (required), `token` and
-`authentication {scheme, credentials}`. A config registered without an `id`
+`authentication {scheme, credentials}`, where `credentials` is optional: a
+scheme alone is sent as a whole credential. Deleting a config is idempotent:
+one already gone answers `{}`. A config registered without an `id`
 gets `push-<ULID>`. The URL must be `https`, or `http` to a loopback host,
 and it must pass the SSRF guard, which refuses private and loopback addresses
 unless `allow_private` is on. It is checked at registration, where a refusal
@@ -309,7 +313,7 @@ conversation with `GetTask`.
 
 | Header | From |
 |---|---|
-| `Authorization: <scheme> <credentials>` | the registration's `authentication`; reads echo the scheme only |
+| `Authorization: <scheme> <credentials>` | the registration's `authentication` (the scheme alone when it has no credentials); reads echo the scheme only |
 | `X-A2A-Notification-Token` | the registration's `token`; an interop header the official a2a-python receiver reads |
 | `traceparent`, `tracestate` | the task's trace: a span of its own per delivery, under the span the task's work is done in |
 
@@ -748,7 +752,7 @@ The load refuses these with exit code 2, before anything starts.
 
 | What | Value |
 |---|---|
-| Blocking `SendMessage` wait | 25 s, then the task as it stands |
+| Blocking `SendMessage` wait | until the task is terminal or interrupted; `a2a.blocking_wait` caps it (unset by default) |
 | A unary request's wait on the runtime | 120 s |
 | Card build | 5 s, then `503` with `Retry-After: 5` |
 | Card caching | `Cache-Control: public, max-age=60`, with an `ETag` |

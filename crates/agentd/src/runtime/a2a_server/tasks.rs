@@ -489,8 +489,9 @@ impl Runtime {
         push_page(targets, &task_id, params).unwrap_or_else(|e| e)
     }
 
-    /// `{taskId, id}` → `{}`. Deletes exactly the config named; one the task
-    /// does not have is `-32001`, not a quiet success.
+    /// `{taskId, id}` → `{}`. Deletes exactly the config named. Delete is
+    /// idempotent (§3.1.10): a config the task no longer has answers `{}`
+    /// too; only a task the caller may not see is `-32001`.
     pub(super) fn a2a_push_delete(&mut self, principal: &Principal, params: &Value) -> Value {
         if let Err(e) = self.push_enabled() {
             return e;
@@ -508,11 +509,10 @@ impl Runtime {
         };
         let before = t.push.len();
         t.push.retain(|p| p.id != want);
-        if t.push.len() == before {
-            return err_obj(TASK_NOT_FOUND, "no such push notification config");
+        if t.push.len() != before {
+            t.dirty = true;
+            self.task_persist(&task_id);
         }
-        t.dirty = true;
-        self.task_persist(&task_id);
         json!({})
     }
 

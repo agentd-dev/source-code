@@ -93,7 +93,13 @@ pub fn deliver(
     if let Some(a) = &target.auth {
         headers.push((
             "authorization".into(),
-            format!("{} {}", a.scheme, a.credentials),
+            // A scheme alone is a whole credential (RFC 9110 §11.4); the
+            // spec requires only `scheme` (AuthenticationInfo).
+            if a.credentials.is_empty() {
+                a.scheme.clone()
+            } else {
+                format!("{} {}", a.scheme, a.credentials)
+            },
         ));
     }
     let refs: Vec<(&str, &str)> = headers
@@ -155,8 +161,9 @@ pub fn to_wire(task_id: &str, t: &PushTarget) -> Value {
 ///
 /// * `scheme` is REQUIRED by the proto and must be an RFC 9110 `token`
 ///   (`tchar`s only), so it cannot carry a space, a colon or a line break;
-/// * `credentials` must be non-empty and free of control characters, so a CR
-///   or LF cannot end the header and start another.
+/// * `credentials` are optional (the proto requires only `scheme`; a scheme
+///   alone is a whole RFC 9110 credential) and must be free of control
+///   characters, so a CR or LF cannot end the header and start another.
 ///
 /// The `token` rides in a header line too (`x-a2a-notification-token`, an
 /// interop header the a2a-python 1.x receiver reads),
@@ -205,9 +212,6 @@ fn auth_of(a: &Value) -> Result<PushAuth, String> {
         return Err(format!(
             "authentication scheme {scheme:?} is not an HTTP token (RFC 9110 §5.6.2)"
         ));
-    }
-    if credentials.is_empty() {
-        return Err("authentication needs credentials".into());
     }
     if credentials.chars().any(char::is_control) {
         return Err("authentication credentials may not contain control characters".into());
@@ -317,9 +321,18 @@ mod tests {
         refused(json!({"scheme": "Bearer x", "credentials": "k"}));
         refused(json!({"scheme": "Bea:rer", "credentials": "k"}));
         refused(json!({"scheme": "Bearer\r\nX-Evil: 1", "credentials": "k"}));
-        // Credentials must exist and must not end the header early.
-        refused(json!({"scheme": "Bearer"}));
-        refused(json!({"scheme": "Bearer", "credentials": ""}));
+        // Credentials are optional, and must not end the header early.
+        for alone in [
+            json!({"scheme": "Negotiate"}),
+            json!({"scheme": "Negotiate", "credentials": ""}),
+        ] {
+            let cfg = typed(json!({"url": "https://hooks.example/x", "authentication": alone}));
+            let t = from_wire(&cfg, "p".into()).expect("a scheme alone is a credential");
+            assert_eq!(
+                t.auth.as_ref().map(|a| a.scheme.as_str()),
+                Some("Negotiate")
+            );
+        }
         refused(json!({"scheme": "Bearer", "credentials": "k\r\nX-Evil: 1"}));
         refused(json!({"scheme": "Bearer", "credentials": "k\u{7f}"}));
         // The token is a header value too.

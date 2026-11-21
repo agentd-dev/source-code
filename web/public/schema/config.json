@@ -3127,6 +3127,13 @@
           "description": "a secret — from a file it MUST be a `{{secret:NAME}}` / `{{secret-file:PATH}}` reference; env/flag values may be inline",
           "type": "string"
         },
+        "blocking_wait": {
+          "description": "the longest a blocking SendMessage waits for its task to finish or need input, then answers with the task as it stands; unset (the default), as long as the task takes, as A2A 1.0 §3.2.2 requires",
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
         "cors": {
           "additionalProperties": false,
           "properties": {

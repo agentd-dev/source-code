@@ -368,6 +368,7 @@ fn top_level_properties(
                     "rate": { "type": "string", "description": "`<burst>/<per>s` applied to every session principal" } } });
     m.insert("a2a".to_string(), json!({ "type": "object", "additionalProperties": false, "properties": {
                 "listen": { "type": "string", "description": "https://host:port (loopback http:// for dev)" },
+                "blocking_wait": { "type": ["string", "integer"], "description": "the longest a blocking SendMessage waits for its task to finish or need input, then answers with the task as it stands; unset (the default), as long as the task takes, as A2A 1.0 §3.2.2 requires" },
                 "url": { "type": "string", "description": "the public origin callers reach this listener at (scheme://host[:port], no path, query or fragment; https unless the host is loopback) — the Agent Card's interface URL and the OAuth issuer. Required when a2a.listen binds a wildcard host (0.0.0.0, ::). Restart-only" },
                 "cors": { "type": "object", "additionalProperties": false, "properties": {
                     "origins": { "type": "array", "items": { "type": "string" }, "description": "browser origins (scheme://host[:port]) allowed to call the listener, matched exactly; `*` and paths are refused, and a loopback UI origin must be listed too" } } },

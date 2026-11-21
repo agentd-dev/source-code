@@ -1432,6 +1432,7 @@ is [A2A API reference](a2a-reference.md).
 | `a2a.tls.cert`, `.key` | paths | — | restart · op | The listener's certificate and key. |
 | `a2a.tls.client_ca` | path | — | restart · op | Verify client certificates: every caller then needs one. |
 | `a2a.bearer` | secret | — | restart · op | A static operator bearer. |
+| `a2a.blocking_wait` | duration | unset | restart · op | The longest a blocking `SendMessage` waits for its task to finish or need input before answering with the task as it stands. Unset, it waits as long as the task takes, as A2A 1.0 §3.2.2 requires. |
 | `a2a.cors.origins` | list of origins | `[]` | live · op | Browser origins admitted, matched exactly. `*` and paths are refused. A loopback UI must be listed too. |
 | `a2a.events.enabled` | bool | `false` | restart · op | Declare the events extension and serve the observation feed the display clients render. |
 | `a2a.introspection.enabled` | bool | `false` | live · op | Serve the operator introspection ops (transcripts, step detail, the log ring). `admin.set` can change it at runtime. |

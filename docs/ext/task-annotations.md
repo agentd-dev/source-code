@@ -68,6 +68,10 @@ it.
 | `principal` | no | who started the task |
 | `askSchema` | no | the JSON Schema of the answer an `INPUT_REQUIRED` gate asks for, so a client can render a control rather than a text box |
 | `askChannel` | no | where an `INPUT_REQUIRED` gate is also announced: the channel the operator's `agent.gate_channels` names for the gate. A place a bridge routes the question to; it never decides who may answer |
+| `securityGate` | no | `true` when the `INPUT_REQUIRED` gate is a security approval (a human-gated tool call), not a question |
+| `consentGate` | no | the person's consent gate the task waits on (RFC 0044 §5.10): `{gate, kind, server?, start_uri?, verification_uri?, user_code?, expires_at?}`, `kind` being `action`, `authorize` or `device` |
+| `signIn` | no | where the person signs in at their IdP for the enrolment the task is: `{idp, start_uri, expires_at}`, a single-use start link on the listener's origin |
+| `mcpSignIn` | no | the MCP server sign-in the task's gate is (RFC 0055): `{server, method, url, code?}`, `method` being `device` or `browser`; `code` is the device grant's user code |
 | `command` | no | the [command](command.md) op that started the task |
 | `traceId` | no | the W3C trace id the task's work is in, 32 lowercase hex digits |
 | `spanId` | no | the W3C span id the task's work is done in, 16 lowercase hex digits: the span the answer's `traceparent` header names |

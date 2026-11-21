@@ -80,6 +80,33 @@
       ],
       "type": "object"
     },
+    "mcpSignIn": {
+      "additionalProperties": false,
+      "description": "the MCP server sign-in the task's gate is (RFC 0055): the mcp.servers entry, how the person signs in (device code or browser), where, and — for the device grant — the code they enter there",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "method": {
+          "enum": [
+            "device",
+            "browser"
+          ]
+        },
+        "server": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "server",
+        "method",
+        "url"
+      ],
+      "type": "object"
+    },
     "principal": {
       "description": "who started the task",
       "type": "string"

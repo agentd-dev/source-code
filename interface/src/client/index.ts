@@ -9,7 +9,7 @@ export { CARD_PATH, CardCache, capabilitiesOf, cardUrlOf, fetchCard, openSession
 export type { AgentCard, Capabilities, OpenOptions, SelectedInterface, Session } from './discovery.js';
 export { AgentdClient, commandReply, normalizeTask } from './client.js';
 export type { CommandReply, NormalizeOptions, RevokeTarget, SendOptions } from './client.js';
-export { badRequest, classify, describe, errorInfo } from './errors.js';
+export { badRequest, classify, describe, errorInfo, reasonOf } from './errors.js';
 export type { Failure, FailureKind } from './errors.js';
 export * from './auth.js';
 export * from './credstore.js';

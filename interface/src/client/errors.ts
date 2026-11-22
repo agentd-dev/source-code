@@ -174,6 +174,20 @@ export function errorInfo(
   return out;
 }
 
+/**
+ * The reason agentd coined for a refusal. The SDK renders every protocol error
+ * with the protocol's own `ErrorInfo` (domain `a2a-protocol.org`) and keeps an
+ * application's reason only in its metadata, as `agentdReason`; agentd's two
+ * identity codes (-31401, -31403) carry agentd's own `ErrorInfo` (domain
+ * `agentd.dev`), whose `reason` is it.
+ */
+export function reasonOf(e: unknown): string | undefined {
+  const info = errorInfo(e);
+  if (!info) return undefined;
+  if (info.metadata?.agentdReason) return info.metadata.agentdReason;
+  return info.domain === 'agentd.dev' ? info.reason : undefined;
+}
+
 /** The `google.rpc.BadRequest` field violations an error carries, if any. */
 export function badRequest(e: unknown): { field: string; description: string }[] | undefined {
   const d = detailOf(e, 'BadRequest');
@@ -272,7 +286,7 @@ export function classify(e: unknown, ctx: { extensionCall?: boolean } = {}): Fai
       const which = info?.metadata?.extensions ?? e.message;
       return { kind: 'incompatible', message: `agent requires extensions this client does not speak: ${which}` };
     }
-    if (status === 429 || info?.reason === 'RATE_LIMITED') {
+    if (status === 429 || reasonOf(e) === 'RATE_LIMITED') {
       const secs = Number(info?.metadata?.retryAfterSeconds);
       const retryAfterMs = e.retryAfterMs ?? (Number.isFinite(secs) ? secs * 1000 : undefined);
       const f: Failure = { kind: 'rate-limited', message: e.message };

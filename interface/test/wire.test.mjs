@@ -21,6 +21,7 @@ import {
   describe,
   errorInfo,
   parseChallenge,
+  reasonOf,
   parseRetryAfter,
 } from '../dist/client/errors.js';
 import { ClientError, RpcError } from '../dist/client/types.js';
@@ -292,6 +293,7 @@ test('errors keep status, data, challenge and Retry-After', async (t) => {
     assert.deepEqual(e.data, [info]);
     assert.equal(errorInfo(e).reason, 'UNAUTHENTICATED');
     assert.equal(errorInfo(e).domain, 'agentd.dev');
+    assert.equal(reasonOf(e), 'UNAUTHENTICATED', "an identity code's reason is agentd's own");
   });
 
   // A non-JSON-RPC body keeps -status and the text.
@@ -644,6 +646,24 @@ test('classify() sorts failures', () => {
       4000,
     ],
     ['-32603 DRAINING', new RpcError(-32603, 'draining', { data: [info('DRAINING')] }), {}, 'transient', /draining/],
+    [
+      'RATE_LIMITED in the SDK\'s ErrorInfo metadata',
+      new RpcError(-32603, 'slow', {
+        status: 200,
+        data: [
+          {
+            '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+            reason: 'INTERNAL_ERROR',
+            domain: 'a2a-protocol.org',
+            metadata: { agentdReason: 'RATE_LIMITED', retryAfterSeconds: '4' },
+          },
+        ],
+      }),
+      {},
+      'rate-limited',
+      /slow/,
+      4000,
+    ],
     ['TypeError', new TypeError('fetch failed'), {}, 'transient', /network error/],
     ['502', new RpcError(-502, 'HTTP 502', { status: 502 }), {}, 'transient', /502/],
     ['-32700', new RpcError(-32700, 'parse'), {}, 'protocol', /parse/],

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -515,7 +515,11 @@ async fn dispatch(
         }
         _ => {
             let scope = ports::RequestScope::new(principal, via, active).in_trace(trace);
-            sdk(&app, headers, body, peeked.method, scope).await
+            let identity = Identity {
+                token: via == Via::Token,
+                resource_metadata: rm.map(str::to_string),
+            };
+            sdk(&app, headers, body, peeked.method, scope, identity).await
         }
     };
     echoed(resp, active)
@@ -638,12 +642,21 @@ fn extension_method(
 /// the end of an answer whose caller's session died, and the `traceparent`
 /// of the span the work was done in — and [`sdk_gaps`] bridges what the
 /// released SDK gets wrong.
+/// Who the caller proved to be, for the HTTP status an identity refusal of
+/// the runtime's answers with.
+struct Identity {
+    /// Authenticated by an access token: a `-31403` is its scopes' refusal.
+    token: bool,
+    resource_metadata: Option<String>,
+}
+
 async fn sdk(
     app: &Arc<App>,
     headers: HeaderMap,
     body: Bytes,
     method: Option<String>,
     scope: ports::RequestScope,
+    identity: Identity,
 ) -> Response {
     let body = sdk_gaps::request(&body).map_or(body, Bytes::from);
     let mut request = axum::http::Request::builder()
@@ -669,7 +682,7 @@ async fn sdk(
         None => answered.await,
     };
     let resp = match alive {
-        _ if !is_stream(&resp) => completed(resp, method.as_deref()).await,
+        _ if !is_stream(&resp) => completed(resp, method.as_deref(), &identity).await,
         Some(check) => until_revoked(streamed(resp), check),
         None => streamed(resp),
     };
@@ -677,13 +690,37 @@ async fn sdk(
     traced(resp, span)
 }
 
-/// `resp`, a unary answer to `method`, with [`sdk_gaps::answer`] applied.
-async fn completed(resp: Response, method: Option<&str>) -> Response {
-    let (parts, body) = resp.into_parts();
+/// `resp`, a unary answer to `method`, with [`sdk_gaps::answer`] applied,
+/// and agentd's two identity codes at their HTTP status: they are an
+/// authentication answer, not a protocol one, so a `-31401` is a 401 and a
+/// `-31403` a 403 — with RFC 6750's `insufficient_scope` challenge when the
+/// caller presented an access token (§3.1). The body stays the SDK's.
+async fn completed(resp: Response, method: Option<&str>, identity: &Identity) -> Response {
+    let (mut parts, body) = resp.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
         return Response::from_parts(parts, Body::empty());
     };
-    if let Ok(mut envelope) = serde_json::from_slice::<Value>(&bytes)
+    let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+    if let Some(code) = parsed
+        .as_ref()
+        .and_then(|e| e.pointer("/error/code"))
+        .and_then(Value::as_i64)
+    {
+        let status = errors::http_status_of(code);
+        if status != 200 {
+            parts.status = StatusCode::from_u16(status).unwrap_or(parts.status);
+        }
+        if code == errors::PERMISSION_DENIED && identity.token {
+            let mut www = String::from("Bearer realm=\"agentd\", error=\"insufficient_scope\"");
+            if let Some(url) = &identity.resource_metadata {
+                www.push_str(&format!(", resource_metadata=\"{url}\""));
+            }
+            if let Ok(v) = HeaderValue::from_str(&www) {
+                parts.headers.insert(header::WWW_AUTHENTICATE, v);
+            }
+        }
+    }
+    if let Some(mut envelope) = parsed
         && sdk_gaps::answer(method, &mut envelope)
     {
         return json_with(parts.status, &envelope);

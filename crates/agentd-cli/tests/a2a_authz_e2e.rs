@@ -653,8 +653,8 @@ fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
         "an ungranted command, streamed",
     );
     // The runtime's own refusal — a workflow this user may not run, which only
-    // the runtime can judge — is the SDK's answer: at 200, as JSON, even to a
-    // caller that asked for a stream.
+    // the runtime can judge — is the SDK's JSON body, at 403 because -31403 is
+    // an identity answer, even to a caller that asked for a stream.
     let run = SendMessage::command("workflow.run", json!({"workflow": "nope"}))
         .bearer(TOKEN_A)
         .streaming();
@@ -664,7 +664,7 @@ fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let (status, v) = json_refusal(&a2a_post(&addr, &run.body(9), &extra));
-    assert_eq!((status, &v["error"]["code"]), (200, &json!(-31403)), "{v}");
+    assert_eq!((status, &v["error"]["code"]), (403, &json!(-31403)), "{v}");
     assert_eq!(v["id"], 9, "{v}");
 
     // The denial is audited with the rule that named the caller.
@@ -1889,8 +1889,8 @@ fn listed_workflows_are_exactly_the_runnable_ones() {
                 runnable.push(name.to_string());
                 continue;
             }
-            // The runtime's refusal, which the SDK answers at 200.
-            assert_eq!(reply.status, 200, "{who} runs {name}: {v}");
+            // The runtime's refusal: an identity code, so a 403.
+            assert_eq!(reply.status, 403, "{who} runs {name}: {v}");
             assert_eq!(v["error"]["code"], -31403, "{who} runs {name}: {v}");
             assert_eq!(
                 v["error"]["data"][0]["metadata"]["agentdReason"], "PERMISSION_DENIED",

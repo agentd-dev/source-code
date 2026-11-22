@@ -175,7 +175,7 @@ The two identity codes are agentd's, not the protocol's, so the listener's
 | `-32009` | 200 | | `A2A-Version` missing (read as 0.3) or of another major than 1 |
 | `-31401` | 401 | | who you are: no credential, or one that is invalid, expired or revoked |
 | `-31403` | 403 | | what you may do: a known principal whose role and grants do not reach the call |
-| `-31403` | 200 | `PERMISSION_DENIED` | the same, decided by the runtime: a workflow whose start does not admit the caller, an envelope its grants do not reach |
+| `-31403` | 403 | `PERMISSION_DENIED` | the same, decided by the runtime: a workflow whose start does not admit the caller, an envelope its grants do not reach; with an access token, `WWW-Authenticate: Bearer error="insufficient_scope"` |
 
 `-32007` (no extended card configured) and `-32008` (a required extension
 not activated) are never sent. A listener either declares a scheme and serves
@@ -186,8 +186,9 @@ extensions is required.
 range so a client that branches on a specification code is never told the
 wrong thing. The listener's travel with their HTTP status so a proxy, a
 browser and a plain HTTP client all see them. A `-31403` the runtime decides
-— which only it can, holding the workflows and their start roles — is
-answered by the SDK, at 200.
+— which only it can, holding the workflows and their start roles — is the
+SDK's body at 403: the listener sets the HTTP status of agentd's two identity
+codes, and a token caller's `insufficient_scope` challenge, and nothing else.
 
 | Response | `WWW-Authenticate` | `id` |
 |---|---|---|

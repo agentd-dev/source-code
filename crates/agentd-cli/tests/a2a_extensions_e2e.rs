@@ -531,22 +531,18 @@ fn the_echo_is_exactly_what_was_activated() {
     );
     assert_eq!(forbidden.status, 403, "{forbidden:?}");
     assert_eq!(forbidden.header("a2a-extensions"), None, "{forbidden:?}");
-    // A refusal the runtime made after the handler ran — a user may run
-    // workflows, but not one whose start admits only operators — is the
-    // SDK's answer at 200, a handler's error like any other, and echoed.
+    // …a refusal the runtime made after the handler ran: a user may run
+    // workflows, but not one whose start admits only operators. An identity
+    // code keeps its 403, and nothing is echoed off a 200.
     let refused = post_with(
         &addr,
         USER,
         &SendMessage::command("workflow.run", json!({"workflow": "ops-only"})).body(4),
         &[&all],
     );
-    assert_eq!(refused.status, 200, "{refused:?}");
+    assert_eq!(refused.status, 403, "{refused:?}");
     assert_eq!(refused.json()["error"]["code"], -31403, "{refused:?}");
-    assert_eq!(
-        refused.header("a2a-extensions"),
-        Some(all.as_str()),
-        "{refused:?}"
-    );
+    assert_eq!(refused.header("a2a-extensions"), None, "{refused:?}");
     let unparsed = post_with(&addr, OPERATOR, "{not json", &[&all]);
     assert_eq!(unparsed.json()["error"]["code"], -32700, "{unparsed:?}");
     assert_eq!(unparsed.header("a2a-extensions"), None, "{unparsed:?}");

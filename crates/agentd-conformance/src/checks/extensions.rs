@@ -297,10 +297,9 @@ fn results_are_spec_shaped(h: &Harness) -> Outcome {
     Outcome::require(
         read_frames.len() == 1
             && read_frames[0].data["result"].get("message").is_some()
-            && read_frames[0].id.is_none()
             && read_frames[0].data["id"] == 6,
         format!(
-            "a streamed read should be exactly one message frame, carrying the request id and no SSE id: {read_frames:?}"
+            "a streamed read should be exactly one message frame, carrying the request id: {read_frames:?}"
         ),
     )
 }

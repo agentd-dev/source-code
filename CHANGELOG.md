@@ -19,7 +19,8 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   its `metadata.agentdReason` (`DRAINING`, `UNKNOWN_OP`, `RATE_LIMITED`,
   …) rather than an `agentd.dev` `ErrorInfo`; the listener's `-31401` and
   `-31403` keep agentd's own. A `-31403` the runtime decides (a workflow's
-  start roles) is answered at 200. `A2A-Version` is held to its major, so
+  start roles) keeps its 403, and a token caller's `insufficient_scope`
+  challenge: the listener sets the status of agentd's two identity codes. `A2A-Version` is held to its major, so
   `1` and `1.1` are served as 1.0; `id: null` and `params: null` are
   requests; a streamed read op's frame carries an SSE `id:`. The SDK's
   unreleased fixes (a2a-rs 4ab9443, 90e2876, 1d12a9c) are bridged in one

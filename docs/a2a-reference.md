@@ -107,9 +107,14 @@ curl -s https://agent.example.com:8443/ \
 
 ## The request pipeline
 
-Every `POST /` runs these checks in this order. Each refusal is final and is
-plain `application/json`, never an SSE frame, and no refused request reaches
-the runtime.
+Every `POST /` runs agentd's gates in this order, then hands the request to
+the official A2A SDK (`a2a-server-lf`), whose JSON-RPC router parses it,
+checks its envelope and `A2A-Version`, decodes its params, calls agentd and
+writes the answer. Each gate's refusal is final and is plain
+`application/json`, never an SSE frame, and no refused request reaches the
+runtime. The gates read the request's `id`, its `method` and, of a send,
+the op its command DataPart names (and whether the message names a task),
+and nothing else of it.
 
 | Step | Check | Refusal |
 |---|---|---|
@@ -117,45 +122,60 @@ the runtime.
 | 2 | a source over its failed-credential limit presents a bearer that is not a live session | `429`, `RATE_LIMITED` |
 | 3 | `Content-Type` is `application/json` | `415`, empty body |
 | 4 | who is calling, from the headers and connection ([evidence](#principals)) | `401` nobody or a failed credential; `403` a certificate no rule gives a role |
-| 5 | the body is JSON | `-32700` |
-| 6 | the JSON-RPC envelope | `-32600`, `-32602` |
-| 7 | `A2A-Version` is 1.0 | `-32009` |
-| 8 | the caller's rate quota | `429`, `RATE_LIMITED` |
-| 9 | the method is in the route table | `-32601` |
-| 10 | the extensions `A2A-Extensions` activates; an extension method needs its extension declared and activated | `-32601` |
-| 11 | the caller may call the method; the extended card needs a declared scheme's credential | `403`; `401` |
-| 12 | the params: a send's message shape, the task it names, its command envelope and the caller's reach to the op | `-32602`, `-32001`, `-32004`, `-32005`, `403` |
-| 13 | the answer | |
+| 5 | the caller's rate quota | `429`, `RATE_LIMITED` |
+| 6 | the extensions `A2A-Extensions` activates; an extension method needs its extension declared and activated | `-32601` |
+| 7 | the caller may call the method; the extended card needs a declared scheme's credential; a send's op is within the caller's reach (an instance child's reports, an inbound token's scopes, the op's floor and grants) | `403`; `401` |
+| 8 | the SDK: the body is JSON, the JSON-RPC envelope, `A2A-Version` (major 1; missing is 0.3), the method, the params | `-32700`, `-32600`, `-32009`, `-32601`, `-32602` |
+| 9 | the answer: the runtime's, through the SDK — a send's message shape, the task it names and its command envelope are checked here | see [Errors](#errors) |
+
+A method that is no route skips steps 6 and 7 and is the SDK's `-32601`, for
+an operator and a stranger alike. `agentd.events/SubscribeToEvents` is
+agentd's own and the SDK does not serve it: agentd reads it with the SDK's
+request type and holds its `A2A-Version` to the SDK's rule.
 
 ## Errors
 
 A peer branches on the code, never on the message, so every code means one
-thing. A refusal that has a machine-readable reason carries a
-`google.rpc.ErrorInfo` in `error.data`: its `reason` names the case, and its
-`domain` is `a2a-protocol.org` for a reason the specification defines and
-`agentd.dev` for one agentd coined. The plain protocol errors carry the code
-and a message only.
+thing. Every error is the SDK's JSON-RPC error: `error.data` ends with the
+protocol's `google.rpc.ErrorInfo`, whose `reason` is the one the code names
+(`TASK_NOT_FOUND`, `INVALID_PARAMS`, `INTERNAL_ERROR`, …) under `domain`
+`a2a-protocol.org`, with a `timestamp` in its `metadata`. Any other detail —
+a `google.rpc.BadRequest` naming each field — comes before it. Where agentd
+coined a reason of its own for the refusal, that `ErrorInfo`'s metadata
+names it as `agentdReason`, beside the rest of agentd's metadata:
 
-| Code | HTTP | Reason | Meaning |
+```json
+{"code": -32603, "message": "the agent is draining", "data": [
+  {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "INTERNAL_ERROR",
+   "domain": "a2a-protocol.org",
+   "metadata": {"agentdReason": "DRAINING", "timestamp": "2026-11-22T01:14:26.735Z"}}]}
+```
+
+The two identity codes are agentd's, not the protocol's, so the listener's
+`-31401` and `-31403` carry agentd's own `ErrorInfo` instead:
+`{"reason": "UNAUTHENTICATED"}` or `{"reason": "PERMISSION_DENIED"}` under
+`domain` `agentd.dev`.
+
+| Code | HTTP | `agentdReason` | Meaning |
 |---|---|---|---|
 | `-32700` | 200 | | the body is not JSON |
 | `-32600` | 200 | | not a JSON-RPC request: a batch, a missing `id`, a bad `jsonrpc` or `method` |
 | `-32601` | 200 | | no such method |
 | `-32601` | 200 | `EXTENSION_NOT_DECLARED`, `EXTENSION_NOT_ACTIVATED` | an extension method whose extension is not declared or not activated |
-| `-32602` | 200 | | bad params: a malformed message, a filter the server cannot honour, a bad page size or token, a message that names a task and a different `contextId` |
+| `-32602` | 200 | | bad params: a malformed message, a message not in the user's role, a filter the server cannot honour, a bad page size or token, a message that names a task and a different `contextId` |
 | `-32602` | 200 | see [A2A extensions](a2a-extensions.md#errors-the-extensions-add) | a malformed or unknown command |
 | `-32603` | 200 | `DRAINING` | the agent is draining and takes no new work |
 | `-32603` | 429 | `RATE_LIMITED` | a rate quota or the failed-credential limit; `Retry-After` and the `retryAfterSeconds` metadata say how long |
 | `-32001` | 200 | | no such task, or one the caller may not see: the same answer, so ids cannot be probed |
 | `-32002` | 200 | | the task is already terminal and cannot be canceled |
 | `-32003` | 200 | | push notifications are not enabled on this agent |
-| `-32004` | 200 | `UNSUPPORTED_OPERATION` | the extended card where no scheme is declared |
+| `-32004` | 200 | | the extended card where no scheme is declared; a message to a terminal task; subscribing to a task that has ended |
 | `-32004` | 200 | `INTROSPECTION_DISABLED` | an introspection op while introspection is off |
-| `-32004` | 200 | | a message to a terminal task; subscribing to a task that has ended |
-| `-32005` | 200 | `CONTENT_TYPE_NOT_SUPPORTED` | a raw or url part, or `acceptedOutputModes` excludes what a command answers with |
-| `-32009` | 200 | `VERSION_NOT_SUPPORTED` | `A2A-Version` missing or not 1.0; metadata `supportedVersions: "1.0"` |
-| `-31401` | 401 | `UNAUTHENTICATED` | who you are: no credential, or one that is invalid, expired or revoked |
-| `-31403` | 403 | `PERMISSION_DENIED` | what you may do: a known principal whose role and grants do not reach the call |
+| `-32005` | 200 | | a raw or url part, or `acceptedOutputModes` excludes what a command answers with |
+| `-32009` | 200 | | `A2A-Version` missing (read as 0.3) or of another major than 1 |
+| `-31401` | 401 | | who you are: no credential, or one that is invalid, expired or revoked |
+| `-31403` | 403 | | what you may do: a known principal whose role and grants do not reach the call |
+| `-31403` | 200 | `PERMISSION_DENIED` | the same, decided by the runtime: a workflow whose start does not admit the caller, an envelope its grants do not reach |
 
 `-32007` (no extended card configured) and `-32008` (a required extension
 not activated) are never sent. A listener either declares a scheme and serves
@@ -164,8 +184,10 @@ extensions is required.
 
 **The identity codes.** `-31401` and `-31403` sit outside JSON-RPC's reserved
 range so a client that branches on a specification code is never told the
-wrong thing. They travel with their HTTP status so a proxy, a browser and a
-plain HTTP client all see them.
+wrong thing. The listener's travel with their HTTP status so a proxy, a
+browser and a plain HTTP client all see them. A `-31403` the runtime decides
+— which only it can, holding the workflows and their start roles — is
+answered by the SDK, at 200.
 
 | Response | `WWW-Authenticate` | `id` |
 |---|---|---|

@@ -7,6 +7,24 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+- **Breaking: the A2A SDK owns the inbound protocol.** The listener keeps
+  only the host's gates — origin, failure limit, `415`, who is calling, the
+  rate quota, the extensions, and the method's and a command op's
+  authorization — and hands every request to `a2a-server-lf`'s router,
+  which checks the envelope and `A2A-Version`, decodes the params and writes
+  every answer and error. agentd's own envelope checks, version gate, send
+  decoding, read-op reply framing and error rewriting are gone. On the
+  wire: every error carries the protocol's `google.rpc.ErrorInfo` (reason by
+  code, `a2a-protocol.org`, a `timestamp`), and a reason agentd coined is
+  its `metadata.agentdReason` (`DRAINING`, `UNKNOWN_OP`, `RATE_LIMITED`,
+  …) rather than an `agentd.dev` `ErrorInfo`; the listener's `-31401` and
+  `-31403` keep agentd's own. A `-31403` the runtime decides (a workflow's
+  start roles) is answered at 200. `A2A-Version` is held to its major, so
+  `1` and `1.1` are served as 1.0; `id: null` and `params: null` are
+  requests; a streamed read op's frame carries an SSE `id:`. The SDK's
+  unreleased fixes (a2a-rs 4ab9443, 90e2876, 1d12a9c) are bridged in one
+  module, `a2a::sdk_gaps`, until they ship.
+
 - **MCP Events follows the Beta specification** (SEP-3415, merged; the
   `ext-events` Beta text). The server's `heartbeatMs` grant on
   `notifications/events/active` sets a push stream's idle bound: three

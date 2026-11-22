@@ -332,12 +332,13 @@ card, and it serves no session ops. The normative specification is at
 ## Errors the extensions add
 
 These refusals sit beside the core error table in the
-[A2A API reference](a2a-reference.md#errors). Each carries a
-`google.rpc.ErrorInfo` in `error.data` whose `reason` names the case, under
-`domain` `agentd.dev`, except `CONTENT_TYPE_NOT_SUPPORTED`, which is the
-specification's own reason and carries `a2a-protocol.org`. A malformed
-command also carries a `google.rpc.BadRequest` naming each field. Nothing
-refused is run, and no task is created.
+[A2A API reference](a2a-reference.md#errors). Each is the SDK's JSON-RPC
+error, whose last detail is the protocol's `google.rpc.ErrorInfo`; agentd's
+reason for the case is that `ErrorInfo`'s `metadata.agentdReason`, except
+`CONTENT_TYPE_NOT_SUPPORTED`, which is the specification's own reason and is
+the `ErrorInfo`'s `reason`. A malformed command also carries a
+`google.rpc.BadRequest` naming each field, before it. Nothing refused is
+run, and no task is created.
 
 | Code | Reason | When |
 |---|---|---|
@@ -351,7 +352,7 @@ refused is run, and no task is created.
 | `-32602` | `INVALID_COMMAND_ARGS` | the arguments do not match the op's schema |
 | `-32005` | `CONTENT_TYPE_NOT_SUPPORTED` | `acceptedOutputModes` excludes `application/json`, which every command answers with |
 | `-32004` | `INTROSPECTION_DISABLED` | an introspection op while `a2a.introspection.enabled` is off |
-| `-31403` | `PERMISSION_DENIED` | the caller's role and grants do not reach the op (HTTP 403) |
+| `-31403` | `PERMISSION_DENIED` | the caller's role and grants do not reach the op: HTTP 403 with agentd's own `ErrorInfo` from the listener's op gate, 200 when the runtime decides it (a workflow's start roles) |
 
 ## Clients
 

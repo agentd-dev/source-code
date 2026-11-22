@@ -1375,7 +1375,8 @@ mod tests {
             &[],
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        // An identity code keeps its HTTP status; the body is the SDK's.
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let v = json_of(resp).await;
         assert_eq!(v["error"]["code"], -31403, "{v}");
         assert_eq!(

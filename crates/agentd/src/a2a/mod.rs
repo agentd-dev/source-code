@@ -37,6 +37,9 @@ pub mod push;
 pub mod reply;
 /// The listener: identity in, protocol out.
 #[cfg(feature = "a2a")]
+pub mod sdk_gaps;
+
+#[cfg(feature = "a2a")]
 pub mod serve;
 /// Where a unix-socket listener binds. Always compiled, so the instance tier
 /// can choose a socket its child's listener will bind.

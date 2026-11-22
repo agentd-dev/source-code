@@ -175,7 +175,7 @@ pub fn message_input(message: &Value) -> Result<String, UnsupportedPart> {
         match part.content {
             PartContent::Text(text) => out.push(text),
             PartContent::Data(data) => {
-                let data = whole_numbers(data);
+                let data = crate::a2a::sdk_gaps::whole_numbers(data);
                 if data.get("agentd").is_none() {
                     let pretty = serde_json::to_string_pretty(&data).unwrap_or_default();
                     out.push(format!("```json\n{pretty}\n```"));
@@ -187,27 +187,6 @@ pub fn message_input(message: &Value) -> Result<String, UnsupportedPart> {
         }
     }
     Ok(out.join("\n"))
-}
-
-/// `v` with every integral number written as an integer.
-///
-/// A DataPart's payload is a `google.protobuf.Value`, whose only number is a
-/// double, so the `1` a caller sent comes back `1.0`. JSON has one number type
-/// and the caller wrote an integer; a model reading `1.0` for a count or an id
-/// is reading something the caller did not say.
-fn whole_numbers(v: Value) -> Value {
-    const EXACT: f64 = 9_007_199_254_740_992.0; // 2^53
-    match v {
-        Value::Number(n) => match n.as_f64() {
-            Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() < EXACT => json!(f as i64),
-            _ => Value::Number(n),
-        },
-        Value::Array(a) => Value::Array(a.into_iter().map(whole_numbers).collect()),
-        Value::Object(o) => {
-            Value::Object(o.into_iter().map(|(k, v)| (k, whole_numbers(v))).collect())
-        }
-        other => other,
-    }
 }
 
 /// A status `Message` the agent authored, addressed to its task and context.

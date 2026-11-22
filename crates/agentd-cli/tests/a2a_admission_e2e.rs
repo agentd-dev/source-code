@@ -190,7 +190,10 @@ fn rate_limits_are_admission_not_results() {
     assert!(retry >= 1, "{retry}");
     let v = json_of(&over);
     assert_eq!(v["error"]["code"], -32603, "{v}");
-    assert_eq!(v["error"]["data"][0]["reason"], "RATE_LIMITED", "{v}");
+    assert_eq!(
+        v["error"]["data"][0]["metadata"]["agentdReason"], "RATE_LIMITED",
+        "{v}"
+    );
     assert_eq!(
         v["error"]["data"][0]["metadata"]["retryAfterSeconds"],
         json!(retry.to_string()),
@@ -244,7 +247,10 @@ fn auth_failures_are_limited_per_source() {
     assert_eq!(limited.status, 429, "the 22nd failure: {limited:?}");
     assert!(limited.header("retry-after").is_some(), "{limited:?}");
     let v = json_of(&limited);
-    assert_eq!(v["error"]["data"][0]["reason"], "RATE_LIMITED", "{v}");
+    assert_eq!(
+        v["error"]["data"][0]["metadata"]["agentdReason"], "RATE_LIMITED",
+        "{v}"
+    );
 
     let valid = [("Authorization", format!("Bearer {OPS_TOKEN}"))];
     let valid: Vec<(&str, &str)> = valid.iter().map(|(k, v)| (*k, v.as_str())).collect();

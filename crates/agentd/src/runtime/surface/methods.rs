@@ -103,20 +103,14 @@ pub fn route_of(method: &str) -> Option<Route> {
 }
 
 /// Whether an `A2A-Version` header value names a version this listener
-/// speaks: the same major and minor as [`A2A_PROTOCOL_VERSION`], any patch.
-///
-/// The spec's rule is that the version is `major.minor` and a patch does not
-/// change the protocol, so `1.0.3` is `1.0`. A bare `1` names no minor and is
-/// not accepted: a server that guessed would be choosing the client's
-/// protocol for it.
+/// speaks, by the rule the SDK's router holds every core method to
+/// (a2a-server-lf's `check_a2a_version`, A2A §3.6.2): the major version is
+/// [`A2A_PROTOCOL_VERSION`]'s, and a minor or patch is not read. Only
+/// agentd's own extension method, which the SDK does not serve, asks this; a
+/// missing header is the caller's to read as 0.3.
 pub fn accepts_version(header: &str) -> bool {
-    let (want_major, want_minor) = A2A_PROTOCOL_VERSION
-        .split_once('.')
-        .expect("A2A_PROTOCOL_VERSION is major.minor");
-    let mut parts = header.trim().split('.');
-    let number = |p: Option<&str>| p.and_then(|p| p.parse::<u32>().ok());
-    let (major, minor) = (number(parts.next()), number(parts.next()));
-    major.is_some() && major == want_major.parse().ok() && minor == want_minor.parse().ok()
+    let major = |v: &str| v.trim().split('.').next()?.parse::<u32>().ok();
+    major(header).is_some_and(|m| Some(m) == major(A2A_PROTOCOL_VERSION))
 }
 
 #[cfg(test)]
@@ -211,13 +205,11 @@ mod tests {
     }
 
     #[test]
-    fn the_version_gate_accepts_one_zero_and_any_patch() {
-        for ok in ["1.0", " 1.0 ", "1.0.0", "1.0.7", "1.0.x"] {
+    fn the_version_gate_reads_the_major_as_the_sdk_does() {
+        for ok in ["1.0", " 1.0 ", "1.0.0", "1.0.7", "1.0.x", "1", "1.", "1.1"] {
             assert!(accepts_version(ok), "{ok:?}");
         }
-        for no in [
-            "", " ", "1", "1.", "0.3", "0.3.0", "1.1", "2.0", "v1.0", "1.0beta", "one", ".0",
-        ] {
+        for no in ["", " ", "0.3", "0.3.0", "2.0", "v1.0", "one", ".0"] {
             assert!(!accepts_version(no), "{no:?}");
         }
     }

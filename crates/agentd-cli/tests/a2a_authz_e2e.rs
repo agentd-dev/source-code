@@ -653,8 +653,8 @@ fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
         "an ungranted command, streamed",
     );
     // The runtime's own refusal — a workflow this user may not run, which only
-    // the runtime can judge — travels with its status too, as JSON, even to
-    // a caller that asked for a stream.
+    // the runtime can judge — is the SDK's answer: at 200, as JSON, even to a
+    // caller that asked for a stream.
     let run = SendMessage::command("workflow.run", json!({"workflow": "nope"}))
         .bearer(TOKEN_A)
         .streaming();
@@ -664,7 +664,7 @@ fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     let (status, v) = json_refusal(&a2a_post(&addr, &run.body(9), &extra));
-    assert_eq!((status, &v["error"]["code"]), (403, &json!(-31403)), "{v}");
+    assert_eq!((status, &v["error"]["code"]), (200, &json!(-31403)), "{v}");
     assert_eq!(v["id"], 9, "{v}");
 
     // The denial is audited with the rule that named the caller.
@@ -1022,7 +1022,14 @@ fn every_command_op_that_names_an_object_is_owner_scoped() {
         let v = command_as(&addr, TOKEN_B, op, args.clone());
         assert_eq!(v["error"]["code"], -32001, "B's {op} {args}: {v}");
         assert_eq!(v["error"]["message"], msg, "B's {op} {args}: {v}");
-        v["error"].clone()
+        // Everything but the time the SDK stamped it with.
+        let mut e = v["error"].clone();
+        for d in e["data"].as_array_mut().into_iter().flatten() {
+            if let Some(m) = d.get_mut("metadata").and_then(Value::as_object_mut) {
+                m.remove("timestamp");
+            }
+        }
+        e
     };
     let cases = [
         ("workflow.status", json!({"run": a.run}), "no such run"),
@@ -1882,10 +1889,11 @@ fn listed_workflows_are_exactly_the_runnable_ones() {
                 runnable.push(name.to_string());
                 continue;
             }
-            assert_eq!(reply.status, 403, "{who} runs {name}: {v}");
+            // The runtime's refusal, which the SDK answers at 200.
+            assert_eq!(reply.status, 200, "{who} runs {name}: {v}");
             assert_eq!(v["error"]["code"], -31403, "{who} runs {name}: {v}");
             assert_eq!(
-                v["error"]["data"][0]["reason"], "PERMISSION_DENIED",
+                v["error"]["data"][0]["metadata"]["agentdReason"], "PERMISSION_DENIED",
                 "{who} runs {name}: {v}"
             );
         }

@@ -190,27 +190,42 @@ fn is_json(r: &HttpReply) -> bool {
         .is_some_and(|t| t.starts_with("application/json"))
 }
 
-/// No part of an error is the SDK's own rendering of it — the time-stamped
-/// `ErrorInfo` it writes in place of the runtime's details.
-fn no_sdk_domain(error: &Value) {
-    let data = error["data"].as_array().cloned().unwrap_or_default();
-    assert!(
-        data.iter()
-            .all(|d| d["metadata"].get("timestamp").is_none()),
-        "a runtime refusal carries the SDK's ErrorInfo: {error}"
-    );
+/// The error is the SDK's rendering: its last detail is the protocol's
+/// `ErrorInfo`, time-stamped, under the protocol's domain.
+fn sdk_rendered(error: &Value) -> &Value {
+    let info = error["data"]
+        .as_array()
+        .and_then(|d| d.last())
+        .unwrap_or_else(|| panic!("no details: {error}"));
+    assert_eq!(info["domain"], "a2a-protocol.org", "{error}");
+    assert!(info["metadata"]["timestamp"].is_string(), "{error}");
+    info
 }
 
-/// A client that does not state the version is refused -32009 at HTTP 200,
-/// told which version is served, and nothing is done for it. A 1.0 client
-/// with a patch number is fine.
+/// `error` without the protocol `ErrorInfo`'s time stamp, which no two
+/// answers share.
+fn untimed(error: &Value) -> Value {
+    let mut e = error.clone();
+    if let Some(data) = e["data"].as_array_mut() {
+        for d in data {
+            if let Some(m) = d.get_mut("metadata").and_then(Value::as_object_mut) {
+                m.remove("timestamp");
+            }
+        }
+    }
+    e
+}
+
+/// A client that does not state the version — read as 0.3 — or states one
+/// whose major is not 1 is refused -32009 at HTTP 200, by the SDK, and
+/// nothing is done for it. A 1.0 client with a patch number is fine.
 #[test]
 fn version_gate() {
     let d = boot();
     let before = task_count(&d, USER_A);
     let send = SendMessage::text("hello").return_immediately();
     let auth_a = auth(USER_A);
-    for version in [None, Some("0.3"), Some("1.1"), Some("")] {
+    for version in [None, Some("0.3"), Some("2.0"), Some("")] {
         let mut extra = vec![("Authorization", auth_a.as_str())];
         if let Some(v) = version {
             extra.push(("A2A-Version", v));
@@ -223,7 +238,6 @@ fn version_gate() {
         let info = &v["error"]["data"][0];
         assert_eq!(info["reason"], "VERSION_NOT_SUPPORTED", "{v}");
         assert_eq!(info["domain"], "a2a-protocol.org", "{v}");
-        assert_eq!(info["metadata"]["supportedVersions"], "1.0", "{v}");
     }
     assert_eq!(task_count(&d, USER_A), before, "a refused send made a task");
 
@@ -338,11 +352,6 @@ fn stream_shapes() {
         got[0]
     );
     assert!(got[0]["result"].get("task").is_none(), "{}", got[0]);
-    assert!(
-        !reply.body.lines().any(|l| l.starts_with("id:")),
-        "a single reply has nothing to resume from: {}",
-        reply.body
-    );
 
     let reply = SendMessage::text("hello")
         .streaming()
@@ -418,12 +427,11 @@ fn subscribe_to_an_invisible_task() {
     }
 }
 
-/// A refusal the runtime made reaches the caller exactly as the runtime made
-/// it — code, message and data — even though the SDK answered the call. Left
-/// to the SDK, the runtime's reasons would be replaced by an `ErrorInfo` of
-/// its own.
+/// A refusal the runtime made is the SDK's answer: the runtime's code and
+/// message, the protocol's `ErrorInfo` last in `data`, and the reason agentd
+/// coined for it named in that `ErrorInfo`'s metadata.
 #[test]
-fn runtime_refusals_survive_the_sdk() {
+fn runtime_refusals_are_the_sdks_answer() {
     let d = boot();
     // A message with nothing a turn could be made of: the runtime refuses the
     // turn, on the natural-language path the SDK serves.
@@ -433,11 +441,12 @@ fn runtime_refusals_survive_the_sdk() {
         let reply = call(&d, USER_A, 71, method, empty.clone());
         assert!(is_json(&reply), "{method}: {reply:?}");
         let v = reply.json();
+        assert_eq!(v["error"]["code"], -32602, "{method}: {v}");
         assert_eq!(
-            v["error"],
-            json!({"code": -32602, "message": "message has no text or command part"}),
+            v["error"]["message"], "message has no text or command part",
             "{method}: {v}"
         );
+        assert_eq!(sdk_rendered(&v["error"])["reason"], "INVALID_PARAMS");
         assert_eq!(v["id"], 71);
     }
 
@@ -450,23 +459,25 @@ fn runtime_refusals_survive_the_sdk() {
         json!({"id": "task-nobody-holds"}),
     )
     .json();
-    assert_eq!(
-        v["error"],
-        json!({"code": -32001, "message": "task not found"}),
-        "{v}"
-    );
+    assert_eq!(v["error"]["code"], -32001, "{v}");
+    assert_eq!(v["error"]["message"], "task not found", "{v}");
+    assert_eq!(sdk_rendered(&v["error"])["reason"], "TASK_NOT_FOUND");
 
-    // A command no table row names travels the SDK's path too (only a read's
-    // Message is answered by the listener), and its reason survives.
+    // A command no table row names travels the SDK's path too, and its
+    // reason is named.
     let v = SendMessage::command("no.such.op", json!({}))
         .bearer(OPERATOR)
         .post(&d.addr);
     let error = &v["error"];
     assert_eq!(error["code"], -32602, "{v}");
     assert_eq!(error["message"], "unknown command \"no.such.op\"", "{v}");
-    assert_eq!(error["data"][1]["reason"], "UNKNOWN_OP", "{v}");
-    assert_eq!(error["data"][1]["domain"], "agentd.dev", "{v}");
-    no_sdk_domain(error);
+    let info = sdk_rendered(error);
+    assert_eq!(info["reason"], "INVALID_PARAMS", "{v}");
+    assert_eq!(info["metadata"]["agentdReason"], "UNKNOWN_OP", "{v}");
+    assert_eq!(
+        error["data"][0]["fieldViolations"][0]["field"], "message.parts[0].data.agentd.op",
+        "{v}"
+    );
 }
 
 /// Whether `id` is a UUIDv7 in its canonical lower-case form — the id the
@@ -546,10 +557,10 @@ fn task_id_rules() {
         assert_eq!(v["error"]["code"], -32001, "streaming {streaming}: {v}");
         // A settled task.
         let v = with(SendMessage::text("again").task(&id).bearer(USER_A)).post(&d.addr);
+        assert_eq!(v["error"]["code"], -32004, "streaming {streaming}: {v}");
         assert_eq!(
-            v["error"],
-            json!({"code": -32004,
-                   "message": format!("task {id} is TASK_STATE_COMPLETED; it accepts no further messages")}),
+            v["error"]["message"],
+            format!("task {id} is TASK_STATE_COMPLETED; it accepts no further messages"),
             "streaming {streaming}: {v}"
         );
     }
@@ -589,7 +600,7 @@ fn task_id_rules() {
             let v = reply.json();
             assert_eq!(v["error"]["code"], -32602, "{op} {task}: {v}");
             assert_eq!(
-                v["error"]["data"][1]["reason"], "COMMAND_TASK_ID",
+                v["error"]["data"][1]["metadata"]["agentdReason"], "COMMAND_TASK_ID",
                 "{op}: {v}"
             );
             assert_eq!(
@@ -656,10 +667,10 @@ fn errors_codes() {
             "{method}: {v}"
         );
         assert_eq!(
-            v["error"]["data"][0]["reason"], "CONTENT_TYPE_NOT_SUPPORTED",
+            sdk_rendered(&v["error"])["reason"],
+            "CONTENT_TYPE_NOT_SUPPORTED",
             "{v}"
         );
-        no_sdk_domain(&v["error"]);
     }
     let v = call(&d, USER_A, 22, "SendMessage", file(json!({"raw": "aGk="}))).json();
     assert_eq!(v["error"]["code"], -32005, "{v}");
@@ -710,9 +721,8 @@ fn unknown_fields_are_ignored() {
 }
 
 /// While the agent drains, every send is refused with one object — code,
-/// message and reason — whichever path answers it: the SDK's for a message and
-/// for a command that does work, the listener's own for a read. A stream asked
-/// for is answered as JSON: a refusal is never a frame.
+/// message and reason — whether it is a message, a command that does work or
+/// a read. A stream asked for is answered as JSON: a refusal is never a frame.
 #[test]
 fn draining_is_identical_on_both_paths() {
     // A shutdown workflow that waits for a signal nobody sends holds the drain
@@ -735,10 +745,9 @@ fn draining_is_identical_on_both_paths() {
         let error = &v["error"];
         assert_eq!(error["code"], -32603, "{what}: {v}");
         assert_eq!(error["message"], "the agent is draining", "{what}: {v}");
-        assert_eq!(error["data"][0]["reason"], "DRAINING", "{what}: {v}");
-        assert_eq!(error["data"][0]["domain"], "agentd.dev", "{what}: {v}");
-        no_sdk_domain(error);
-        error.clone()
+        let info = sdk_rendered(error);
+        assert_eq!(info["metadata"]["agentdReason"], "DRAINING", "{what}: {v}");
+        untimed(error)
     };
     let words = SendMessage::text("hello").bearer(USER_A).post(&d.addr);
     let one = expected(&words, "a message");

@@ -51,8 +51,8 @@ pub(super) fn context_wire(message: &Value) -> String {
 /// that named none, and watches it before the work starts — so `newTask` says
 /// which it is (see `ports::RuntimePorts::send_message`); anything but `true`
 /// is read as named, so a malformed bridge request can never create a task
-/// under an id it did not reserve. A read op the listener answers itself
-/// carries the message exactly as the caller sent it.
+/// under an id it did not reserve. A bridge call that carries no `newTask`
+/// reads the task off the message itself.
 fn named_task(params: &Value) -> Option<&str> {
     let named = match params.get("newTask") {
         Some(new) => (new.as_bool() != Some(true))
@@ -92,9 +92,9 @@ fn role_name(role: crate::config::settings::Role) -> &'static str {
     }
 }
 
-/// The command a send carries, held to what the listener already held it
-/// to: the command extension's envelope — activated, marked, one of it
-/// ([`surface::check_command`]) — then the caller's reach
+/// The command a send carries, held to the command extension's envelope —
+/// activated, marked, one of it ([`surface::check_command`]) — then the
+/// caller's reach
 /// ([`Principal::authorize_command`]). `Ok(None)` is a message that carries
 /// no command; `Err` is the reply that refuses it.
 ///
@@ -175,8 +175,7 @@ impl Runtime {
     /// can be told about while it is still there:
     ///
     /// - a draining agent takes no new work (`-32603`, `DRAINING`) — the same
-    ///   object on every path, which the listener's fidelity filter keeps
-    ///   whole when the SDK rendered it;
+    ///   refusal for a message, a command and a read;
     /// - a task id is the server's: a message that names a task continues it,
     ///   and one it cannot see is "not found" (`-32001`) rather than a new task
     ///   under the caller's id; a settled task takes no more (`-32004`);

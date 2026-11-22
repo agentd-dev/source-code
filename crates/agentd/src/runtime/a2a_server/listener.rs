@@ -255,7 +255,6 @@ pub(crate) fn spawn_a2a_listener(
             },
             cors_origins: Arc::clone(&origins),
             tls,
-            request_timeout: bridge.request_timeout,
             blocking_wait: a2a.blocking_wait.map(|d| d.0),
             stream_deadline: bridge.stream_deadline,
             documents,

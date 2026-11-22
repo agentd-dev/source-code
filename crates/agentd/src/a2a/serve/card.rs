@@ -438,7 +438,6 @@ mod tests {
             auth: super::super::Auth::default(),
             cors_origins: Arc::default(),
             tls: None,
-            request_timeout: Duration::from_secs(120),
             blocking_wait: None,
             stream_deadline: Duration::from_secs(5),
             documents: Vec::new(),

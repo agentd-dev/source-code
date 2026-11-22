@@ -173,11 +173,13 @@ fn refuse_params(id: Value, violations: &[(String, String)]) -> Response {
         .map(|(f, w)| format!("{f}: {w}"))
         .collect::<Vec<_>>()
         .join("; ");
-    let body = errors::rpc_error(
+    let body = errors::response(
         id,
-        errors::INVALID_PARAMS,
-        &format!("invalid params for {EVENTS_METHOD} (it takes only fromSeq): {list}"),
-        vec![errors::bad_request(&fields)],
+        &errors::error_object(
+            errors::INVALID_PARAMS,
+            &format!("invalid params for {EVENTS_METHOD} (it takes only fromSeq): {list}"),
+            vec![errors::bad_request(&fields)],
+        ),
     );
     super::identity::json_with(axum::http::StatusCode::OK, &body)
 }

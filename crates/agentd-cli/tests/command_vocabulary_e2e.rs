@@ -454,14 +454,14 @@ fn introspection_works_without_the_feed_and_follows_admin_set() {
     );
     assert_eq!(v["error"]["code"], -32601, "there is no feed: {v}");
     assert_eq!(
-        v["error"]["data"][0]["reason"], "EXTENSION_NOT_DECLARED",
+        v["error"]["data"][0]["metadata"]["agentdReason"], "EXTENSION_NOT_DECLARED",
         "{v}"
     );
 
     let refused = SendMessage::command("debug.events", json!({})).post(&d.addr);
     assert_eq!(refused["error"]["code"], -32004, "{refused}");
     assert_eq!(
-        refused["error"]["data"][0]["reason"], "INTROSPECTION_DISABLED",
+        refused["error"]["data"][0]["metadata"]["agentdReason"], "INTROSPECTION_DISABLED",
         "{refused}"
     );
 
@@ -546,7 +546,10 @@ fn a_user_with_every_grant_cannot_reach_operator_controls() {
     let held = SendMessage::command("ask_human", json!({}))
         .bearer(USER_TOKEN)
         .post(&d.addr);
-    assert_eq!(held["error"]["data"][1]["reason"], "UNKNOWN_OP", "{held}");
+    assert_eq!(
+        held["error"]["data"][1]["metadata"]["agentdReason"], "UNKNOWN_OP",
+        "{held}"
+    );
 
     // Nothing moved: the instance is not draining or paused.
     let st = SendMessage::command("status", json!({}))
@@ -598,11 +601,13 @@ fn workflow_run_asks_the_grants_and_the_default_starts_roles_before_any_task_exi
          \x20 - name: ops-only\n    steps:\n      s: {kind: a2a, command: ops-only.go, roles: [operator]}\n      f: {kind: finish, depends_on: [s], output: \"ran\"}\n",
     ));
     let feed = watch_feed_as(&d.addr, Some(OPS_TOKEN));
+    // Which workflow a caller may start is the runtime's to judge, so the
+    // refusal is the SDK's answer, naming agentd's reason in its metadata.
     let denied = |v: &Value, what: &str| {
         let (code, _) = error_of(v);
         assert_eq!(code, agentd::a2a::errors::PERMISSION_DENIED, "{what}: {v}");
         assert_eq!(
-            v["error"]["data"][0]["reason"], "PERMISSION_DENIED",
+            v["error"]["data"][0]["metadata"]["agentdReason"], "PERMISSION_DENIED",
             "{what}: {v}"
         );
     };

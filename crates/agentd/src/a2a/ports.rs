@@ -36,14 +36,16 @@ use a2a_types::{
     GetExtendedAgentCardRequest, GetTaskPushNotificationConfigRequest, GetTaskRequest,
     ListTaskPushNotificationConfigsRequest, ListTaskPushNotificationConfigsResponse,
     ListTasksRequest, ListTasksResponse, SendMessageRequest, SendMessageResponse, StreamResponse,
-    SubscribeToTaskRequest, Task as WireTask, TaskPushNotificationConfig, TaskState, TypedDetail,
+    SubscribeToTaskRequest, Task as WireTask, TaskPushNotificationConfig, TaskState,
 };
 use futures_util::stream::{self, BoxStream};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
 use crate::a2a::Principal;
+use crate::a2a::errors;
 use crate::a2a::principals::Via;
+use crate::a2a::sdk_gaps;
 use crate::a2a::wire::{from_wire, message_from_wire, message_to_wire, to_wire};
 use crate::runtime::a2a_server::A2aBridge;
 use crate::runtime::surface::Active;
@@ -82,12 +84,10 @@ impl RuntimePorts {
 
     /// Run one reactor round trip without blocking the async runtime.
     ///
-    /// The reply is either a result value or agentd's JSON-RPC error object;
-    /// the latter is turned back into the spec's error type so the protocol
-    /// layer maps it to the right code, rather than being passed off as a
-    /// successful result that happens to contain an error — and it is
-    /// recorded on the request's [`RequestScope`], because the SDK renders an
-    /// error in its own words (see [`record_error`]).
+    /// The reply is either a result value or agentd's error object; the
+    /// latter is turned into the spec's typed error ([`errors::to_a2a`]),
+    /// which the SDK renders, rather than being passed off as a successful
+    /// result that happens to contain an error.
     ///
     /// An error is recognised under either spelling — the reactor's `_error`
     /// marker, or a plain JSON-RPC `error` member. Fail closed: no reply the
@@ -98,10 +98,7 @@ impl RuntimePorts {
         let (active, trace) = serving().map_or((Active::NONE, None), |s| (s.active, s.trace));
         let v = round_trip(&self.bridge, method, params, who, active, trace).await?;
         match error_of(&v) {
-            Some(e) => {
-                record_error(e);
-                Err(from_error_object(e))
-            }
+            Some(e) => Err(errors::to_a2a(e)),
             None => Ok(v),
         }
     }
@@ -125,8 +122,10 @@ impl RuntimePorts {
         new: bool,
         who: &Principal,
     ) -> Result<(SendMessageResponse, u64), A2AError> {
+        // The message as the caller wrote it: a DataPart's integers are
+        // integers ([`sdk_gaps::whole_numbers`]).
         let mut params = json!({
-            "message": message_to_wire(&req.message),
+            "message": sdk_gaps::whole_numbers(message_to_wire(&req.message)),
             "taskId": task_id,
             "newTask": new,
             "_attach": true,
@@ -166,6 +165,19 @@ fn named_task(req: &SendMessageRequest) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A send's message, which is a user's: `ROLE_AGENT` is the agent's own
+/// voice, and a caller does not get to speak in it.
+fn user_message(req: &SendMessageRequest) -> Result<(), A2AError> {
+    if req.message.role == a2a_types::Role::User {
+        return Ok(());
+    }
+    let role = serde_json::to_value(&req.message.role).unwrap_or_default();
+    Err(A2AError::invalid_params(format!(
+        "invalid params: message.role must be ROLE_USER, not {}",
+        role.as_str().unwrap_or("?")
+    )))
+}
+
 /// A request's `historyLength`, which must not be negative (A2A 1.0 §3.2.4).
 fn history_of(n: Option<i32>) -> Result<Option<i32>, A2AError> {
     match n {
@@ -195,6 +207,7 @@ impl RequestHandler for RuntimePorts {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<SendMessageResponse, A2AError> {
+        user_message(&req)?;
         let who = caller();
         let named = named_task(&req);
         let task_id = named.clone().unwrap_or_else(a2a_types::new_task_id);
@@ -253,6 +266,7 @@ impl RequestHandler for RuntimePorts {
         _params: &ServiceParams,
         req: SendMessageRequest,
     ) -> Result<BoxStream<'static, Result<StreamResponse, A2AError>>, A2AError> {
+        user_message(&req)?;
         let who = caller();
         let named = named_task(&req);
         let task_id = named.clone().unwrap_or_else(a2a_types::new_task_id);
@@ -453,7 +467,7 @@ impl RuntimePorts {
                         )
                         .await
                         .and_then(|v| match error_of(&v) {
-                            Some(e) => Err(from_error_object(e)),
+                            Some(e) => Err(errors::to_a2a(e)),
                             None => attached(v, &w.id),
                         });
                         return match read {
@@ -544,18 +558,9 @@ pub struct RequestScope {
     pub caller: Principal,
     /// Which evidence named them.
     pub via: Via,
-    /// The first error object the runtime answered this request with, kept
-    /// whole. The handler returns a typed [`A2AError`], which the SDK renders
-    /// in its own words — its `ErrorInfo` under the protocol's domain — so a
-    /// refusal agentd's runtime made (a draining agent, an op nobody may run)
-    /// would reach the caller with the runtime's reason gone. The listener
-    /// reads this back and puts the runtime's object on the wire instead
-    /// (`serve::dispatch`'s fidelity filter), so a refusal is the same code,
-    /// message and data whichever path answered it.
-    pub error: Arc<Mutex<Option<Value>>>,
-    /// The extensions the request activated (pipeline step 9). Every runtime
-    /// call carries it, which projects a task's annotations only while
-    /// task-annotations is in it.
+    /// The extensions the request activated (the listener's extension
+    /// gate). Every runtime call carries it, which projects a task's
+    /// annotations only while task-annotations is in it.
     pub active: Active,
     /// The span the request's `traceparent`/`tracestate` headers named, which
     /// the work it starts continues. Every runtime call carries it.
@@ -573,7 +578,6 @@ impl RequestScope {
         RequestScope {
             caller,
             via,
-            error: Arc::default(),
             active,
             trace: None,
             span: Arc::default(),
@@ -611,22 +615,6 @@ pub fn caller() -> Principal {
         .unwrap_or_else(|_| Principal::anonymous())
 }
 
-/// Keep `error` — a runtime error object, `{code, message, data?}` — as the
-/// answer to the request being served, unless one is kept already.
-///
-/// The first write wins because the first refusal is the one that ended the
-/// request: a method that fails returns at once. Outside a request it is
-/// dropped; there is nobody to answer.
-pub(crate) fn record_error(error: &Value) {
-    let _ = SCOPE.try_with(|s| {
-        if let Ok(mut kept) = s.error.lock()
-            && kept.is_none()
-        {
-            *kept = Some(error.clone());
-        }
-    });
-}
-
 /// Keep the span a runtime reply names (`_trace`, the traceparent of the
 /// task it answers with) as the request's, taking it out of the reply. The
 /// first wins: every later answer to the same request names the same task.
@@ -656,34 +644,6 @@ fn serving() -> Option<RequestScope> {
 /// [`RuntimePorts::call`]).
 pub(crate) fn error_of(v: &Value) -> Option<&Value> {
     v.get("_error").or_else(|| v.get("error"))
-}
-
-/// The reactor's error, as the spec's error type: its code — the spec's, or
-/// agentd's own outside the reserved range — and message as they are, and its
-/// `data` as the typed details the SDK carries. The reactor marks a failed
-/// answer with an `_error` member rather than returning a `Result`, because
-/// its reply channel carries one JSON value; going through the typed error is
-/// what makes the protocol layer emit an error instead of passing it off as a
-/// successful result that happens to contain one.
-pub(crate) fn from_error_object(e: &Value) -> A2AError {
-    use crate::a2a::errors as code;
-    let n = e
-        .get("code")
-        .and_then(Value::as_i64)
-        .unwrap_or(code::INTERNAL_ERROR);
-    let msg = e
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("internal error");
-    let error = A2AError::new(i32::try_from(n).unwrap_or(code::INTERNAL_ERROR as i32), msg);
-    match e
-        .get("data")
-        .cloned()
-        .and_then(|d| serde_json::from_value::<Vec<TypedDetail>>(d).ok())
-    {
-        Some(details) if !details.is_empty() => error.with_details(details),
-        _ => error,
-    }
 }
 
 /// Read a `Task` out of a reactor reply, which may be the task itself or the
@@ -997,39 +957,6 @@ mod tests {
         }
     }
 
-    /// The runtime's error object is kept exactly as the runtime answered it —
-    /// code, message and data — because the SDK renders the typed error in its
-    /// own words. The first one wins: it is the refusal that ended the request.
-    #[tokio::test]
-    async fn a_runtime_refusal_is_kept_whole_and_the_first_wins() {
-        let refusal = json!({"code": -32603, "message": "the agent is draining",
-            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
-                      "reason": "DRAINING", "domain": "agentd.dev"}]});
-        let ports = ports_answering(json!({"_error": refusal}));
-        let s = scope();
-        let kept = Arc::clone(&s.error);
-        with_request(s, async {
-            let req = CancelTaskRequest {
-                id: "task-1".into(),
-                metadata: None,
-                tenant: None,
-            };
-            let e = ports
-                .cancel_task(&ServiceParams::new(), req)
-                .await
-                .unwrap_err();
-            assert_eq!(e.code, -32603);
-            assert_eq!(e.details.map(|d| d.len()), Some(1));
-            // A second refusal in the same request does not replace it.
-            record_error(&json!({"code": -32001, "message": "later"}));
-        })
-        .await;
-        assert_eq!(kept.lock().unwrap().clone(), Some(refusal));
-
-        // Outside a request there is nobody to answer, and nothing is kept.
-        record_error(&json!({"code": -32001, "message": "nobody"}));
-    }
-
     /// What the caller meant crosses with the message: a new task under an id
     /// minted here, or the task the caller named — and the push config the
     /// send carried, which the runtime attaches to the task.
@@ -1321,13 +1248,13 @@ mod tests {
         assert!(same_task("task-2", t).is_err());
 
         // Every code keeps its number, and its data travels as typed details.
-        let e = from_error_object(&json!({"code": -31403, "message": "no",
+        let e = errors::to_a2a(&json!({"code": -31403, "message": "no",
             "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "PERMISSION_DENIED"}]}));
         assert_eq!(e.code, -31403);
         assert_eq!(e.message, "no");
         assert_eq!(e.details.map(|d| d.len()), Some(1));
         assert_eq!(
-            from_error_object(&json!({"code": -32001, "message": "gone"})).code,
+            errors::to_a2a(&json!({"code": -32001, "message": "gone"})).code,
             -32001
         );
     }

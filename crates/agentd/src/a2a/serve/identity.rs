@@ -182,15 +182,17 @@ pub(super) fn challenge_at(
         Some(url) => format!("{www}, resource_metadata=\"{url}\""),
         None => www,
     };
-    let body = errors::rpc_error(
+    let body = errors::response(
         Value::Null,
-        errors::UNAUTHENTICATED,
-        message,
-        vec![errors::error_info(
-            errors::AGENTD_DOMAIN,
-            reason::UNAUTHENTICATED,
-            &[],
-        )],
+        &errors::error_object(
+            errors::UNAUTHENTICATED,
+            message,
+            vec![errors::error_info(
+                errors::AGENTD_DOMAIN,
+                reason::UNAUTHENTICATED,
+                &[],
+            )],
+        ),
     );
     let mut resp = json_with(StatusCode::UNAUTHORIZED, &body);
     if let Ok(v) = HeaderValue::from_str(&www) {
@@ -209,15 +211,17 @@ pub(super) fn insufficient_scope(
     scopes: &[String],
     resource_metadata: Option<&str>,
 ) -> Response {
-    let body = errors::rpc_error(
+    let body = errors::response(
         id,
-        errors::PERMISSION_DENIED,
-        message,
-        vec![errors::error_info(
-            errors::AGENTD_DOMAIN,
-            reason::PERMISSION_DENIED,
-            &[],
-        )],
+        &errors::error_object(
+            errors::PERMISSION_DENIED,
+            message,
+            vec![errors::error_info(
+                errors::AGENTD_DOMAIN,
+                reason::PERMISSION_DENIED,
+                &[],
+            )],
+        ),
     );
     let mut resp = json_with(StatusCode::FORBIDDEN, &body);
     let mut www = String::from("Bearer realm=\"agentd\", error=\"insufficient_scope\"");
@@ -236,15 +240,17 @@ pub(super) fn insufficient_scope(
 /// The 403 refusal. `id` is echoed when the body was parsed; a bearer caller
 /// is told the credential lacks the scope (RFC 6750 §3.1).
 pub(super) fn forbidden(id: Value, message: &str, bearer_used: bool) -> Response {
-    let body = errors::rpc_error(
+    let body = errors::response(
         id,
-        errors::PERMISSION_DENIED,
-        message,
-        vec![errors::error_info(
-            errors::AGENTD_DOMAIN,
-            reason::PERMISSION_DENIED,
-            &[],
-        )],
+        &errors::error_object(
+            errors::PERMISSION_DENIED,
+            message,
+            vec![errors::error_info(
+                errors::AGENTD_DOMAIN,
+                reason::PERMISSION_DENIED,
+                &[],
+            )],
+        ),
     );
     let mut resp = json_with(StatusCode::FORBIDDEN, &body);
     if bearer_used {
@@ -259,15 +265,17 @@ pub(super) fn forbidden(id: Value, message: &str, bearer_used: bool) -> Response
 /// A 429: `Retry-After`, and the `RATE_LIMITED` reason with the same wait.
 pub(super) fn too_many(id: Value, message: &str, retry_after: u64) -> Response {
     let secs = retry_after.to_string();
-    let body = errors::rpc_error(
+    let body = errors::response(
         id,
-        errors::INTERNAL_ERROR,
-        message,
-        vec![errors::error_info(
-            errors::AGENTD_DOMAIN,
-            reason::RATE_LIMITED,
-            &[("retryAfterSeconds", &secs)],
-        )],
+        &errors::error_object(
+            errors::INTERNAL_ERROR,
+            message,
+            vec![errors::error_info(
+                errors::AGENTD_DOMAIN,
+                reason::RATE_LIMITED,
+                &[("retryAfterSeconds", &secs)],
+            )],
+        ),
     );
     let mut resp = json_with(StatusCode::TOO_MANY_REQUESTS, &body);
     if let Ok(v) = HeaderValue::from_str(&secs) {

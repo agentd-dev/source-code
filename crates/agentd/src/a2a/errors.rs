@@ -3,10 +3,8 @@
 //! `reason`s and the `google.rpc` detail shapes that carry them.
 //!
 //! One table, so a refusal means the same thing whichever layer raises it —
-//! the listener before a request reaches the runtime, the runtime on its
-//! single-writer loop, or the filter that keeps the runtime's words when the SDK
-//! renders an error. The
-//! table is always compiled: code outside the `a2a` feature (the manifest, the
+//! the listener before a request reaches the SDK, or the runtime on its
+//! single-writer loop. The table is always compiled: code outside the `a2a` feature (the manifest, the
 //! reload path, a test) names a code from here instead of retyping the number.
 //!
 //! The spec's codes are **not** reused for anything else. `-32003` means push
@@ -16,10 +14,26 @@
 //! branches on a spec code is never told the wrong thing
 //! (`crates/agentd-cli/tests/error_codes_guard.rs` holds the listener to it).
 //!
-//! The builders emit plain `serde_json` in the shapes the official SDKs read —
-//! an `error.data` array of `google.rpc` `Any`s tagged by `@type` — rather than
-//! the SDK's own types, so the listener can answer before the protocol layer is
-//! involved and the table needs no feature gate.
+//! Two layers. The builders below emit the runtime's error *objects*,
+//! `{code, message, data}` with `data` an array of `google.rpc` `Any`s tagged
+//! by `@type` — the shape the reactor answers a refused request with on its
+//! reply channel, and one the table needs no feature gate for. None of them
+//! is written to the wire as it is: with the `a2a` feature, [`to_a2a`] turns
+//! one into the SDK's typed [`a2a_types::A2AError`], which is what a handler
+//! returns and the SDK renders, and [`response`] renders a refusal the
+//! listener makes before the SDK is reached with the SDK's own types.
+//!
+//! **What the SDK keeps.** The SDK's JSON-RPC error always ends `error.data`
+//! with the protocol's `ErrorInfo` — the reason its code names, under
+//! `a2a-protocol.org`, stamped with a `timestamp` — and keeps an `ErrorInfo`
+//! of the application's only for its `metadata`, which it merges in. So the
+//! reason agentd coined for a refusal travels as that metadata's
+//! [`AGENTD_REASON`]: `{"reason": "INTERNAL_ERROR", "domain":
+//! "a2a-protocol.org", "metadata": {"agentdReason": "DRAINING", …}}`. Every
+//! other detail (a `BadRequest`) goes through as it is. The two identity
+//! codes are agentd's and not the protocol's — the SDK has no reason for
+//! them — so a `-31401` or `-31403` the listener answers carries agentd's own
+//! `ErrorInfo` (`UNAUTHENTICATED`, `PERMISSION_DENIED` under `agentd.dev`).
 
 use serde_json::{Map, Value, json};
 
@@ -100,9 +114,10 @@ pub fn domain_of(reason: &str) -> &'static str {
     }
 }
 
-/// The HTTP status a JSON-RPC error travels with. The two identity refusals
-/// carry their status so a proxy, a browser and a plain HTTP client all see
-/// them; every other JSON-RPC error is an answer, delivered with 200.
+/// The HTTP status a refusal the listener makes before the SDK travels with.
+/// The two identity refusals carry their status so a proxy, a browser and a
+/// plain HTTP client all see them; every other JSON-RPC error is an answer,
+/// delivered with 200 — as the SDK delivers every error it renders.
 pub fn http_status_of(code: i64) -> u16 {
     match code {
         UNAUTHENTICATED => 401,
@@ -141,14 +156,102 @@ pub fn bad_request(violations: &[(&str, &str)]) -> Value {
     })
 }
 
-/// A whole JSON-RPC error response. `details` become `error.data`, and an
-/// empty list leaves `data` out rather than sending `[]`.
-pub fn rpc_error(id: Value, code: i64, message: &str, details: Vec<Value>) -> Value {
+/// An error object, `{code, message, data?}`. `details` become `data`, and
+/// an empty list leaves `data` out rather than sending `[]`.
+pub fn error_object(code: i64, message: &str, details: Vec<Value>) -> Value {
     let mut error = json!({"code": code, "message": message});
     if !details.is_empty() {
         error["data"] = Value::Array(details);
     }
-    json!({"jsonrpc": "2.0", "id": id, "error": error})
+    error
+}
+
+/// The `ErrorInfo.metadata` key the reason agentd coined for a refusal is
+/// carried under, in the protocol's `ErrorInfo` the SDK writes.
+pub const AGENTD_REASON: &str = "agentdReason";
+
+#[cfg(feature = "a2a")]
+pub use typed::{response, to_a2a, to_wire};
+
+#[cfg(feature = "a2a")]
+mod typed {
+    use super::{AGENTD_DOMAIN, AGENTD_REASON, INTERNAL_ERROR, PERMISSION_DENIED, UNAUTHENTICATED};
+    use a2a_types::{
+        A2AError, ERROR_INFO_TYPE, JsonRpcError, JsonRpcId, JsonRpcResponse, TypedDetail,
+    };
+    use serde_json::{Value, json};
+
+    /// An error object's details, as the SDK's typed details.
+    fn details_of(e: &Value) -> Vec<TypedDetail> {
+        e.get("data")
+            .cloned()
+            .and_then(|d| serde_json::from_value::<Vec<TypedDetail>>(d).ok())
+            .unwrap_or_default()
+    }
+
+    /// An `ErrorInfo` of agentd's, with its reason named in its metadata —
+    /// the part of it the SDK keeps.
+    fn reason_in_metadata(mut d: TypedDetail) -> TypedDetail {
+        let ours = d.type_url == ERROR_INFO_TYPE
+            && d.value.get("domain").and_then(Value::as_str) == Some(AGENTD_DOMAIN);
+        if let (true, Some(reason)) = (ours, d.value.get("reason").cloned()) {
+            let meta = d
+                .value
+                .entry("metadata".to_string())
+                .or_insert_with(|| json!({}));
+            if let Some(m) = meta.as_object_mut() {
+                m.insert(AGENTD_REASON.to_string(), reason);
+            }
+        }
+        d
+    }
+
+    /// The runtime's error object as the spec's typed error: its code — the
+    /// spec's, or agentd's own outside the reserved range — and message as
+    /// they are, and its `data` as the typed details the SDK carries, each of
+    /// agentd's reasons named where the SDK keeps it.
+    pub fn to_a2a(e: &Value) -> A2AError {
+        let code = e
+            .get("code")
+            .and_then(Value::as_i64)
+            .and_then(|n| i32::try_from(n).ok())
+            .unwrap_or(INTERNAL_ERROR as i32);
+        let message = e
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("internal error");
+        let details: Vec<TypedDetail> = details_of(e).into_iter().map(reason_in_metadata).collect();
+        let error = A2AError::new(code, message);
+        if details.is_empty() {
+            error
+        } else {
+            error.with_details(details)
+        }
+    }
+
+    /// The error object as the JSON-RPC error that goes on the wire: the
+    /// SDK's rendering of [`to_a2a`], except for agentd's two identity codes,
+    /// which carry agentd's own `ErrorInfo` (the SDK names no reason for a
+    /// code outside the protocol).
+    pub fn to_wire(e: &Value) -> JsonRpcError {
+        let a = to_a2a(e);
+        if matches!(i64::from(a.code), UNAUTHENTICATED | PERMISSION_DENIED) {
+            let details = details_of(e);
+            return JsonRpcError {
+                code: a.code,
+                message: a.message,
+                data: (!details.is_empty())
+                    .then(|| serde_json::to_value(details).unwrap_or_default()),
+            };
+        }
+        a.to_jsonrpc_error()
+    }
+
+    /// The whole JSON-RPC response refusing request `id` with `e`.
+    pub fn response(id: Value, e: &Value) -> Value {
+        let id = serde_json::from_value::<JsonRpcId>(id).unwrap_or(JsonRpcId::Null);
+        serde_json::to_value(JsonRpcResponse::error(id, to_wire(e))).unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -215,16 +318,57 @@ mod tests {
     }
 
     #[test]
-    fn rpc_error_leaves_out_empty_data() {
-        let bare = rpc_error(json!(7), TASK_NOT_FOUND, "no such task", vec![]);
-        assert_eq!(
-            bare,
-            json!({"jsonrpc": "2.0", "id": 7, "error": {"code": -32001, "message": "no such task"}})
-        );
+    fn error_object_leaves_out_empty_data() {
+        let bare = error_object(TASK_NOT_FOUND, "no such task", vec![]);
+        assert_eq!(bare, json!({"code": -32001, "message": "no such task"}));
         let info = error_info(AGENTD_DOMAIN, reason::DRAINING, &[]);
         assert!(info.get("metadata").is_none(), "{info}");
-        let full = rpc_error(Value::Null, INTERNAL_ERROR, "draining", vec![info.clone()]);
-        assert_eq!(full["error"]["data"], json!([info]));
+        let full = error_object(INTERNAL_ERROR, "draining", vec![info.clone()]);
+        assert_eq!(full["data"], json!([info]));
+    }
+
+    /// A refusal on the wire is the SDK's: the protocol's `ErrorInfo` last,
+    /// agentd's reason in its metadata, every other detail as it was — and
+    /// the identity codes with agentd's own `ErrorInfo`.
+    #[cfg(feature = "a2a")]
+    #[test]
+    fn the_wire_error_is_the_sdks() {
+        let bad = bad_request(&[("message.parts[0].data.agentd.op", "unknown")]);
+        let e = error_object(
+            INVALID_PARAMS,
+            "unknown command",
+            vec![
+                bad.clone(),
+                error_info(AGENTD_DOMAIN, reason::UNKNOWN_OP, &[("op", "x")]),
+            ],
+        );
+        let v = response(json!("r1"), &e);
+        assert_eq!(v["id"], "r1");
+        assert_eq!(v["error"]["code"], -32602);
+        assert_eq!(v["error"]["message"], "unknown command");
+        let data = v["error"]["data"].as_array().unwrap();
+        assert_eq!(data.len(), 2, "{v}");
+        assert_eq!(data[0], bad);
+        assert_eq!(data[1]["reason"], "INVALID_PARAMS", "{v}");
+        assert_eq!(data[1]["domain"], A2A_DOMAIN);
+        assert_eq!(data[1]["metadata"][AGENTD_REASON], "UNKNOWN_OP");
+        assert_eq!(data[1]["metadata"]["op"], "x");
+        assert!(data[1]["metadata"]["timestamp"].is_string(), "{v}");
+
+        let denied = error_object(
+            PERMISSION_DENIED,
+            "no",
+            vec![error_info(AGENTD_DOMAIN, reason::PERMISSION_DENIED, &[])],
+        );
+        let v = response(json!(3), &denied);
+        assert_eq!(
+            v["error"],
+            json!({"code": -31403, "message": "no", "data": [
+                {"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                 "reason": "PERMISSION_DENIED", "domain": "agentd.dev"}]})
+        );
+        // An id the request did not carry usably is null.
+        assert_eq!(response(json!([1]), &denied)["id"], Value::Null);
     }
 
     /// The table and the A2A project's SDK agree on every code both define.
@@ -307,9 +451,9 @@ mod tests {
         assert_eq!(serde_json::to_value(&typed).unwrap(), bad);
 
         // And the whole error: `data` is the list the SDK's client reads.
-        let whole = rpc_error(json!("r1"), VERSION_NOT_SUPPORTED, "no", vec![info, bad]);
+        let whole = error_object(VERSION_NOT_SUPPORTED, "no", vec![info, bad]);
         let data: Vec<TypedDetail> =
-            serde_json::from_value(whole["error"]["data"].clone()).expect("detail list");
+            serde_json::from_value(whole["data"].clone()).expect("detail list");
         assert_eq!(data.len(), 2);
     }
 }

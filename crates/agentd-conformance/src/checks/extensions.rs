@@ -76,11 +76,13 @@ fn boot(h: &Harness, feed: bool) -> Booted {
     }
 }
 
-/// The `reason` of the refusal's agentd.dev `ErrorInfo`, if it carries one.
+/// The reason agentd coined for the refusal, if it names one: the
+/// `agentdReason` in the metadata of the protocol's `ErrorInfo` the SDK
+/// writes.
 fn reason(env: &Value) -> Option<&str> {
     env["error"]["data"].as_array()?.iter().find_map(|d| {
-        (d["domain"] == "agentd.dev")
-            .then(|| d["reason"].as_str())
+        (d["@type"] == "type.googleapis.com/google.rpc.ErrorInfo")
+            .then(|| d["metadata"]["agentdReason"].as_str())
             .flatten()
     })
 }

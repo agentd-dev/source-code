@@ -1692,13 +1692,12 @@ fn is_json(media_type: &str) -> bool {
 /// the JSON-RPC error object refusing it. `Ok(None)` is a message that
 /// carries no command at all.
 ///
-/// `task` is the task the message names (the listener reads it off the
-/// message; the runtime from what the protocol layer passed it), and
+/// `task` is the task the message names (as the handler passed it), and
 /// `activated` whether the request activated [`super::COMMAND_EXTENSION`].
 ///
-/// The listener asks this before authorization, and the runtime asks it
-/// again for whatever reaches a send another way, so the two refuse the same
-/// requests the same way. In order:
+/// The runtime asks this of every send: the listener authorizes the op a
+/// command DataPart names before the SDK is reached, and the envelope is
+/// held to the extension here, on the loop. In order:
 ///
 /// 1. a command needs the command extension activated by the `A2A-Extensions` header
 ///    (`EXTENSION_NOT_ACTIVATED`) — a DataPart under `agentd` sent without it

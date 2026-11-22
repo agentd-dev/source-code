@@ -132,9 +132,10 @@ fn version_and_vocabulary(h: &Harness) -> Outcome {
     wait_ready(&addr);
 
     // The version gate stands before the method: a send the server would
-    // otherwise run is refused, and runs nothing (A2A 1.0.1 §3.6.2).
+    // otherwise run is refused, and runs nothing (A2A 1.0.1 §3.6.2). A
+    // missing header is 0.3; the major is what is served.
     let send = rpc_body(1, "SendMessage", text_params("hi", None, false));
-    for version in [None, Some(""), Some("0.3"), Some("1.1")] {
+    for version in [None, Some(""), Some("0.3"), Some("2.0")] {
         let env = post_stating(&addr, version, &send);
         let reason = env["error"]["data"]
             .as_array()

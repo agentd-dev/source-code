@@ -424,7 +424,7 @@ fn feed_contract() {
     let v = bare.json();
     assert_eq!(v["error"]["code"], -32601, "{v}");
     assert_eq!(
-        v["error"]["data"][0]["reason"], "EXTENSION_NOT_ACTIVATED",
+        v["error"]["data"][0]["metadata"]["agentdReason"], "EXTENSION_NOT_ACTIVATED",
         "{v}"
     );
 
@@ -540,7 +540,7 @@ fn the_feed_is_gated_off_by_default() {
     let v = refused.json();
     assert_eq!(v["error"]["code"], -32601, "{v}");
     assert_eq!(
-        v["error"]["data"][0]["reason"], "EXTENSION_NOT_DECLARED",
+        v["error"]["data"][0]["metadata"]["agentdReason"], "EXTENSION_NOT_DECLARED",
         "{v}"
     );
     // …and the core surface still answers (status command untouched).
@@ -990,7 +990,7 @@ fn admin_set_toggles_introspection_live() {
     let (code, msg) = error_of(&v);
     assert_eq!(code, -32602, "{v}");
     assert_eq!(
-        v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+        v["error"]["data"][1]["metadata"]["agentdReason"], "INVALID_COMMAND_ARGS",
         "{v}"
     );
     assert!(

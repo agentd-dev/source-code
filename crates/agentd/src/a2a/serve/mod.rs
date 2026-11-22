@@ -125,8 +125,6 @@ pub struct Opts {
     /// cert-manager renewal needed a restart even though the machinery to
     /// avoid one already existed and was being called — once.
     pub tls: Option<TlsConfigProvider>,
-    /// How long a unary request may wait on the runtime.
-    pub request_timeout: Duration,
     /// The longest a blocking `SendMessage` waits for its task to settle
     /// (`a2a.blocking_wait`); `None`, as long as the task takes (§3.2.2).
     pub blocking_wait: Option<Duration>,
@@ -232,9 +230,6 @@ struct App {
     /// listener that stops honouring it, not a reload that reported success
     /// and changed nothing.
     cors_origins: OriginList,
-    /// How long a call handed to the SDK may take to produce its first byte:
-    /// the fidelity filter waits this long for a stream's first event.
-    request_timeout: Duration,
     stream_deadline: Duration,
     /// Whether a caller's session is still alive, consulted while its
     /// requests are in flight. `None` on a listener with no sessions.
@@ -399,7 +394,6 @@ impl App {
             denials: limits::DenialLog::listener(),
             rates: limits::PrincipalRates::default(),
             cors_origins: opts.cors_origins,
-            request_timeout: opts.request_timeout,
             stream_deadline: opts.stream_deadline,
             liveness,
             documents: opts.documents,
@@ -1054,7 +1048,6 @@ mod tests {
             auth,
             cors_origins: Arc::new(std::sync::RwLock::new(origins)),
             tls: None,
-            request_timeout: Duration::from_secs(5),
             blocking_wait: None,
             stream_deadline: Duration::from_secs(5),
             documents: Vec::new(),
@@ -1107,17 +1100,15 @@ mod tests {
         json!({"_error": {"code": -32001, "message": "task not found"}})
     }
 
-    /// Every POST states the protocol it speaks. A missing header, an empty
-    /// one and any version but 1.0 are -32009 at HTTP 200, with the id echoed
-    /// and the version this listener does speak — and nothing reaches the
-    /// runtime. A 1.0 client with any patch is let through.
-    /// What reaches the SDK is the envelope the pipeline read: a request with
-    /// no `params` — which JSON-RPC allows, and the specification's own
-    /// `GetExtendedAgentCard` example sends — is answered, and a caller's
-    /// integer past ±2^53 reaches the runtime as the double the protocol
-    /// carries it as rather than refusing the request.
+    /// What the SDK is handed has its known gaps bridged ([`sdk_gaps`]): a
+    /// request with no `params` — which JSON-RPC allows, and the
+    /// specification's own `GetExtendedAgentCard` example sends — is
+    /// answered, and a caller's integer past ±2^53 reaches the runtime as the
+    /// double the protocol carries it as rather than refusing the request.
+    ///
+    /// [`sdk_gaps`]: crate::a2a::sdk_gaps
     #[tokio::test]
-    async fn the_sdk_is_handed_the_envelope_the_pipeline_read() {
+    async fn the_sdk_is_handed_a_request_it_can_read() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let log = Arc::clone(&seen);
         let (router, _) = listener(
@@ -1162,18 +1153,15 @@ mod tests {
         );
     }
 
+    /// Every POST states the protocol it speaks, and the SDK holds it to
+    /// that: a missing header (read as 0.3), an empty one and any major but
+    /// 1 are -32009 at HTTP 200, with the id echoed — and nothing reaches the
+    /// runtime. A 1.x client is let through.
     #[tokio::test]
     async fn version_gate() {
         let (router, reached) = listener(|_| task_not_found(), None);
         let body = r#"{"jsonrpc":"2.0","id":"v1","method":"GetTask","params":{"id":"task-1"}}"#;
-        for header in [
-            None,
-            Some(""),
-            Some("0.3"),
-            Some("1.1"),
-            Some("2.0"),
-            Some("1"),
-        ] {
+        for header in [None, Some(""), Some("0.3"), Some("2.0")] {
             let extra: Vec<(&str, &str)> = header.map(|h| ("a2a-version", h)).into_iter().collect();
             let resp = post(&router, body, &["a2a-version"], &extra).await;
             assert_eq!(resp.status(), StatusCode::OK, "{header:?}");
@@ -1183,10 +1171,9 @@ mod tests {
             let info = &v["error"]["data"][0];
             assert_eq!(info["reason"], "VERSION_NOT_SUPPORTED", "{v}");
             assert_eq!(info["domain"], "a2a-protocol.org", "{v}");
-            assert_eq!(info["metadata"]["supportedVersions"], "1.0", "{v}");
         }
-        // Before the route table: a 0.3 client asking for a 0.3 method is
-        // told about the version, which is what it can act on.
+        // Before the method: a 0.3 client asking for a 0.3 method is told
+        // about the version, which is what it can act on.
         let v = json_of(
             post(
                 &router,
@@ -1204,7 +1191,7 @@ mod tests {
             "a refusal reached the runtime"
         );
 
-        for ok in ["1.0", "1.0.3", " 1.0 "] {
+        for ok in ["1.0", "1.0.3", " 1.0 ", "1", "1.1"] {
             let v =
                 json_of(post(&router, body, &["a2a-version"], &[("a2a-version", ok)]).await).await;
             assert_eq!(v["error"]["code"], -32001, "{ok:?} is let through: {v}");
@@ -1212,10 +1199,10 @@ mod tests {
         assert!(reached.load(Ordering::SeqCst) > 0);
     }
 
-    /// Every malformed envelope is refused before it can be anything else,
-    /// and none reaches the runtime. A request with no `id` — a JSON-RPC
-    /// notification — and one with `id: null` are refused rather than run: a
-    /// send nobody can be answered about is a task nobody can find.
+    /// Every malformed envelope is the SDK's to refuse, and none reaches the
+    /// runtime. A request with no `id` — a JSON-RPC notification — is
+    /// refused rather than run: a send nobody can be answered about is a task
+    /// nobody can find.
     #[tokio::test]
     async fn envelope_validation() {
         let (router, reached) = listener(|_| task_not_found(), None);
@@ -1251,11 +1238,6 @@ mod tests {
                 Value::Null,
             ),
             (
-                r#"{"jsonrpc":"2.0","id":null,"method":"GetTask"}"#,
-                -32600,
-                Value::Null,
-            ),
-            (
                 r#"{"jsonrpc":"2.0","id":1.5,"method":"GetTask"}"#,
                 -32600,
                 Value::Null,
@@ -1287,11 +1269,6 @@ mod tests {
                 json!("p"),
             ),
             (
-                r#"{"jsonrpc":"2.0","id":"p","method":"GetTask","params":null}"#,
-                -32602,
-                json!("p"),
-            ),
-            (
                 r#"{"jsonrpc":"2.0","id":3,"method":"SendMessage","params":7}"#,
                 -32602,
                 json!(3),
@@ -1304,17 +1281,6 @@ mod tests {
             assert_eq!(v["error"]["code"], *code, "{body}: {v}");
             assert_eq!(v["id"], *id, "{body}: {v}");
         }
-        let v =
-            json_of(post(&router, r#"{"jsonrpc":"2.0","method":"GetTask"}"#, &[], &[]).await).await;
-        assert_eq!(
-            v["error"]["message"], "A2A requests must carry an id",
-            "{v}"
-        );
-        let v = json_of(post(&router, "[]", &[], &[]).await).await;
-        assert_eq!(
-            v["error"]["message"], "batch requests are not supported",
-            "{v}"
-        );
 
         // The content type comes first, and its refusal has no body at all.
         for ct in [
@@ -1342,6 +1308,16 @@ mod tests {
             "a refusal reached the runtime"
         );
 
+        // A null id and null params are a request the SDK reads — the id
+        // echoed as null, the params as `{}` (`sdk_gaps::request`).
+        for body in [
+            r#"{"jsonrpc":"2.0","id":null,"method":"GetTask","params":{"id":"t"}}"#,
+            r#"{"jsonrpc":"2.0","id":"p","method":"GetTask","params":null}"#,
+        ] {
+            let v = json_of(post(&router, body, &[], &[]).await).await;
+            assert_eq!(v["error"]["code"], -32001, "{body}: {v}");
+        }
+
         // With parameters and in any case, JSON is JSON.
         let v = json_of(
             post(
@@ -1356,149 +1332,77 @@ mod tests {
         assert_eq!(v["error"]["code"], -32001, "{v}");
     }
 
-    /// An error envelope as the SDK writes it.
-    fn sdk_error(code: i64, message: &str) -> Value {
-        json!({"jsonrpc": "2.0", "id": 1, "error": {"code": code, "message": message,
-            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "INVALID_PARAMS", "domain": "a2a-protocol.org"}]}})
-    }
-
-    fn unary_response(v: &Value) -> Response {
-        axum::response::IntoResponse::into_response(axum::Json(v.clone()))
-    }
-
-    fn sse_response(body: &'static str) -> Response {
-        Response::builder()
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(Body::from(body))
-            .unwrap()
-    }
-
-    fn fidelity(kept: Option<Value>, bearer_used: bool) -> dispatch::Fidelity {
-        dispatch::Fidelity {
-            kept,
-            bearer_used,
-            page: None,
-            empty_result: false,
-        }
-    }
-
-    async fn filtered(resp: Response, f: dispatch::Fidelity) -> Response {
-        dispatch::faithful(resp, f, Duration::from_secs(5), None).await
-    }
-
-    /// What the SDK answers reaches the caller in the runtime's words: the
-    /// runtime's error object replaces the SDK's rendering of it byte for
-    /// byte, with the status its code travels with; an error the SDK raised
-    /// on its own keeps the SDK's answer; and a stream that opens with an
-    /// error is answered as JSON.
+    /// A refusal the runtime makes is the SDK's answer, in the SDK's words:
+    /// the code and message the runtime gave, the protocol's `ErrorInfo`
+    /// last in `data`, and agentd's own reason in its metadata. A refusal of
+    /// the caller the runtime makes is answered by the SDK too, at 200.
     #[tokio::test]
-    async fn error_fidelity_filter() {
-        let draining = json!({"code": -32603, "message": "the agent is draining",
-            "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "DRAINING", "domain": "agentd.dev"}]});
-        let resp = filtered(
-            unary_response(&sdk_error(-32603, "JSON-RPC error: -32603 - x")),
-            fidelity(Some(draining.clone()), false),
+    async fn a_runtime_refusal_is_the_sdks_answer() {
+        let (router, _) = listener(
+            |req| match req.method.as_str() {
+                "CancelTask" => {
+                    json!({"_error": {"code": -32603, "message": "the agent is draining",
+                    "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                              "reason": "DRAINING", "domain": "agentd.dev"}]}})
+                }
+                _ => json!({"_error": {"code": -31403, "message": "no",
+                    "data": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                              "reason": "PERMISSION_DENIED", "domain": "agentd.dev"}]}}),
+            },
+            None,
+        );
+        let resp = post(
+            &router,
+            r#"{"jsonrpc":"2.0","id":1,"method":"CancelTask","params":{"id":"t"}}"#,
+            &[],
+            &[],
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let v = json_of(resp).await;
-        assert_eq!(v["error"], draining, "the runtime's object, whole: {v}");
         assert_eq!(v["id"], 1);
+        assert_eq!(v["error"]["code"], -32603, "{v}");
+        assert_eq!(v["error"]["message"], "the agent is draining", "{v}");
+        let info = &v["error"]["data"][0];
+        assert_eq!(info["reason"], "INTERNAL_ERROR", "{v}");
+        assert_eq!(info["domain"], "a2a-protocol.org", "{v}");
+        assert_eq!(info["metadata"]["agentdReason"], "DRAINING", "{v}");
 
-        // A kept refusal of the caller carries its status and its challenge.
-        let denied = json!({"code": -31403, "message": "admin.drain is not permitted for user:a"});
-        let resp = filtered(
-            unary_response(&sdk_error(-31403, "JSON-RPC error: -31403 - admin.drain")),
-            fidelity(Some(denied.clone()), true),
+        let resp = post(
+            &router,
+            r#"{"jsonrpc":"2.0","id":2,"method":"GetTask","params":{"id":"t"}}"#,
+            &[],
+            &[],
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(
-            resp.headers()[header::WWW_AUTHENTICATE]
-                .to_str()
-                .unwrap()
-                .contains("error=\"insufficient_scope\"")
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = json_of(resp).await;
+        assert_eq!(v["error"]["code"], -31403, "{v}");
+        assert_eq!(
+            v["error"]["data"][0]["metadata"]["agentdReason"], "PERMISSION_DENIED",
+            "{v}"
         );
-        assert_eq!(json_of(resp).await["error"], denied);
+    }
 
-        // The SDK's own error is left as it wrote it.
-        let own = sdk_error(-32602, "Invalid params: x");
-        let v = json_of(filtered(unary_response(&own), fidelity(None, false)).await).await;
-        assert_eq!(v, own);
-        // A kept refusal is not borrowed by an error with another code.
+    /// The last page of a listing says so, as the spec's response does
+    /// ([`crate::a2a::sdk_gaps::answer`]).
+    #[tokio::test]
+    async fn a_listing_keeps_its_required_fields() {
+        let (router, _) = listener(|_| json!({"pageSize": 50}), None);
         let v = json_of(
-            filtered(
-                unary_response(&own),
-                fidelity(Some(draining.clone()), false),
+            post(
+                &router,
+                r#"{"jsonrpc":"2.0","id":1,"method":"ListTasks","params":{}}"#,
+                &[],
+                &[],
             )
             .await,
         )
         .await;
-        assert_eq!(v, own);
-
-        // A stream whose first event is an error is a JSON answer instead.
-        let resp = filtered(
-            sse_response("data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"JSON-RPC error: -32603 - x\"}}\n\n"),
-            fidelity(Some(draining.clone()), false),
-        )
-        .await;
-        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
-        assert_eq!(json_of(resp).await["error"], draining);
-
-        // A normal first event goes out unchanged, `id:` and all; a later
-        // error frame is restored in place and keeps its own `id:`.
-        let resp = filtered(
-            sse_response(concat!(
-                ":keep-alive\n\n",
-                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"t\"}}}\nid: 3\n\n",
-                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32603,\"message\":\"Internal error\"}}\nid: 4\n\n",
-            )),
-            fidelity(Some(draining.clone()), false),
-        )
-        .await;
-        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            body.starts_with(concat!(
-                ":keep-alive\n\n",
-                "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"task\":{\"id\":\"t\"}}}\nid: 3\n\n",
-            )),
-            "{body}"
-        );
-        let last = body.split("\n\n").nth(2).unwrap();
-        assert!(last.ends_with("\nid: 4"), "{last}");
-        let frame: Value =
-            serde_json::from_str(last.lines().next().unwrap().strip_prefix("data: ").unwrap())
-                .unwrap();
-        assert_eq!(frame["error"], draining);
-
-        // The last page of a listing says so, as the spec's response does.
-        let page = json!({"jsonrpc": "2.0", "id": 1, "result": {"pageSize": 50}});
-        let resp = dispatch::faithful(
-            unary_response(&page),
-            dispatch::Fidelity {
-                kept: None,
-                bearer_used: false,
-                page: Some(dispatch::Page::Tasks),
-                empty_result: false,
-            },
-            Duration::from_secs(5),
-            None,
-        )
-        .await;
-        let v = json_of(resp).await;
         assert_eq!(v["result"]["nextPageToken"], "", "{v}");
         assert_eq!(v["result"]["tasks"], json!([]), "{v}");
-        assert_eq!(
-            v["result"]["totalSize"], 0,
-            "an empty listing counts nothing: {v}"
-        );
+        assert_eq!(v["result"]["totalSize"], 0, "{v}");
         assert_eq!(v["result"]["pageSize"], 50, "a field present is kept: {v}");
-        let v = json_of(filtered(unary_response(&page), fidelity(None, false)).await).await;
-        assert_eq!(v, page, "only a listing is completed");
     }
 
     /// A subscription reads its task first, as the caller: a task the runtime
@@ -2481,7 +2385,6 @@ mod tests {
                     Some(&slot),
                 ))),
                 tls: None,
-                request_timeout: Duration::from_secs(5),
                 blocking_wait: None,
                 stream_deadline: Duration::from_secs(5),
                 documents: Vec::new(),

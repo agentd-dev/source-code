@@ -531,16 +531,22 @@ fn the_echo_is_exactly_what_was_activated() {
     );
     assert_eq!(forbidden.status, 403, "{forbidden:?}");
     assert_eq!(forbidden.header("a2a-extensions"), None, "{forbidden:?}");
-    // …a refusal the runtime made after the handler ran: a user may run
-    // workflows, but not one whose start admits only operators.
+    // A refusal the runtime made after the handler ran — a user may run
+    // workflows, but not one whose start admits only operators — is the
+    // SDK's answer at 200, a handler's error like any other, and echoed.
     let refused = post_with(
         &addr,
         USER,
         &SendMessage::command("workflow.run", json!({"workflow": "ops-only"})).body(4),
         &[&all],
     );
-    assert_eq!(refused.status, 403, "{refused:?}");
-    assert_eq!(refused.header("a2a-extensions"), None, "{refused:?}");
+    assert_eq!(refused.status, 200, "{refused:?}");
+    assert_eq!(refused.json()["error"]["code"], -31403, "{refused:?}");
+    assert_eq!(
+        refused.header("a2a-extensions"),
+        Some(all.as_str()),
+        "{refused:?}"
+    );
     let unparsed = post_with(&addr, OPERATOR, "{not json", &[&all]);
     assert_eq!(unparsed.json()["error"]["code"], -32700, "{unparsed:?}");
     assert_eq!(unparsed.header("a2a-extensions"), None, "{unparsed:?}");
@@ -552,7 +558,11 @@ fn the_echo_is_exactly_what_was_activated() {
 #[test]
 fn the_feed_needs_its_extension_declared_and_activated() {
     let feed = rpc_body(7, EVENTS_METHOD, json!({"fromSeq": 0}));
-    let reason = |v: &Value| v["error"]["data"][0]["reason"].as_str().map(str::to_string);
+    let reason = |v: &Value| {
+        v["error"]["data"][0]["metadata"]["agentdReason"]
+            .as_str()
+            .map(str::to_string)
+    };
 
     let (_on, addr) = boot_with(&format!("{PRINCIPALS}  events:\n    enabled: true\n"), "");
     let card = get_card(&addr);
@@ -572,10 +582,14 @@ fn the_feed_needs_its_extension_declared_and_activated() {
         Some("EXTENSION_NOT_ACTIVATED"),
         "{v}"
     );
-    assert_eq!(v["error"]["data"][0]["domain"], "agentd.dev", "{v}");
+    assert_eq!(v["error"]["data"][0]["reason"], "METHOD_NOT_FOUND", "{v}");
+    assert_eq!(v["error"]["data"][0]["domain"], "a2a-protocol.org", "{v}");
     assert_eq!(
-        v["error"]["data"][0]["metadata"],
-        json!({"extension": EVENTS_EXTENSION, "method": EVENTS_METHOD}),
+        v["error"]["data"][0]["metadata"]["extension"], EVENTS_EXTENSION,
+        "{v}"
+    );
+    assert_eq!(
+        v["error"]["data"][0]["metadata"]["method"], EVENTS_METHOD,
         "{v}"
     );
     assert_eq!(
@@ -780,7 +794,7 @@ fn a_command_without_activation_is_refused_and_not_run() {
         let v = reply.json();
         assert_eq!(v["error"]["code"], -32602, "{op}: {v}");
         assert_eq!(
-            v["error"]["data"][1]["reason"], "EXTENSION_NOT_ACTIVATED",
+            v["error"]["data"][1]["metadata"]["agentdReason"], "EXTENSION_NOT_ACTIVATED",
             "{op}: {v}"
         );
         assert_eq!(
@@ -812,7 +826,7 @@ fn a_command_without_activation_is_refused_and_not_run() {
     let v = reply.json();
     assert_eq!(v["error"]["code"], -32602, "{v}");
     assert_eq!(
-        v["error"]["data"][1]["reason"], "EXTENSION_NOT_MARKED",
+        v["error"]["data"][1]["metadata"]["agentdReason"], "EXTENSION_NOT_MARKED",
         "{v}"
     );
     assert_eq!(
@@ -835,7 +849,7 @@ fn a_command_without_activation_is_refused_and_not_run() {
         "{streamed:?}"
     );
     assert_eq!(
-        streamed.json()["error"]["data"][1]["reason"],
+        streamed.json()["error"]["data"][1]["metadata"]["agentdReason"],
         "EXTENSION_NOT_ACTIVATED"
     );
 
@@ -870,7 +884,7 @@ fn an_argument_the_op_does_not_take_is_refused() {
         .post(&addr);
     assert_eq!(v["error"]["code"], -32602, "{v}");
     assert_eq!(
-        v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+        v["error"]["data"][1]["metadata"]["agentdReason"], "INVALID_COMMAND_ARGS",
         "{v}"
     );
 
@@ -890,7 +904,7 @@ fn an_argument_the_op_does_not_take_is_refused() {
         .post(&taddr);
     assert_eq!(v["error"]["code"], -32602, "{v}");
     assert_eq!(
-        v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+        v["error"]["data"][1]["metadata"]["agentdReason"], "INVALID_COMMAND_ARGS",
         "{v}"
     );
     assert_eq!(v["error"]["data"][1]["metadata"]["op"], "typed.go", "{v}");
@@ -977,13 +991,16 @@ fn instance_ops_are_refused_synchronously_for_non_operators() {
         let v = SendMessage::command("_instance.nope", json!({}))
             .bearer(bearer)
             .post(&addr);
-        assert_eq!(v["error"]["data"][1]["reason"], "UNKNOWN_OP", "{v}");
+        assert_eq!(
+            v["error"]["data"][1]["metadata"]["agentdReason"], "UNKNOWN_OP",
+            "{v}"
+        );
     }
     let v = SendMessage::command("_instance.emit", json!({"handle": "c1"}))
         .bearer(OPERATOR)
         .post(&addr);
     assert_eq!(
-        v["error"]["data"][1]["reason"], "INVALID_COMMAND_ARGS",
+        v["error"]["data"][1]["metadata"]["agentdReason"], "INVALID_COMMAND_ARGS",
         "{v}"
     );
 }

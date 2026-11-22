@@ -526,8 +526,9 @@ pub fn parse_extension_header<'a>(lines: impl IntoIterator<Item = &'a [u8]>) -> 
     out
 }
 
-/// Pipeline step 9: what `requested` activates on `route`, given what the
-/// instance `declared` — or the JSON-RPC `error` object refusing the request.
+/// The listener's extension gate: what `requested` activates on `route`,
+/// given what the instance `declared` — or the JSON-RPC `error` object
+/// refusing the request.
 ///
 /// * An extension method is `-32601` unless its extension is declared
 ///   (`EXTENSION_NOT_DECLARED`) and activated (`EXTENSION_NOT_ACTIVATED`):

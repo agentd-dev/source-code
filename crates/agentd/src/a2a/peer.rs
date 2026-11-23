@@ -28,8 +28,7 @@
 
 use a2a_types::{
     AgentCard, AgentInterface, GetTaskRequest, Message, Part, PartContent, Role,
-    SendMessageConfiguration, SendMessageRequest, StreamResponse, TRANSPORT_PROTOCOL_JSONRPC, Task,
-    TaskState,
+    SendMessageConfiguration, SendMessageRequest, TRANSPORT_PROTOCOL_JSONRPC, Task, TaskState,
 };
 use serde_json::{Value, json};
 
@@ -410,20 +409,30 @@ pub fn reply_text_of(v: &Value) -> String {
     }
 }
 
-/// One `artifactUpdate` stream frame: the artifact it belongs to, whether it
-/// appends to that artifact's earlier chunks, and its rendered text.
-pub fn artifact_update_of(update: &Value) -> Option<(String, bool, String)> {
-    let StreamResponse::ArtifactUpdate(ev) =
-        from_wire::<StreamResponse>(json!({ "artifactUpdate": without_documents(update) })).ok()?
-    else {
-        return None;
-    };
-    let text = rendered(&ev.artifact.parts, update.pointer("/artifact/parts")).join("\n");
-    Some((
-        ev.artifact.artifact_id.clone(),
-        ev.append.unwrap_or(false),
-        text,
-    ))
+/// The readable text of `parts` the SDK's client has already read: rendered
+/// as [`artifact_text_of`] renders an artifact's, a DataPart's whole numbers
+/// integers again ([`crate::a2a::sdk_gaps::whole_numbers`]) — there are no
+/// raw bytes to take its document from.
+pub fn parts_text(parts: &[Part]) -> String {
+    let mut out = Vec::new();
+    for part in parts {
+        match &part.content {
+            PartContent::Text(t) => out.push(t.clone()),
+            PartContent::Data(d) => {
+                out.push(crate::a2a::sdk_gaps::whole_numbers(d.clone()).to_string())
+            }
+            _ => {}
+        }
+    }
+    out.join("\n")
+}
+
+/// A task state's proto name (`TASK_STATE_FAILED`), as the wire spells it.
+pub fn state_name(state: &TaskState) -> String {
+    serde_json::to_value(state)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{state:?}"))
 }
 
 /// How a peer's terminal state reads to the caller.

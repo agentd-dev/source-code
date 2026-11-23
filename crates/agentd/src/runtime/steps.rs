@@ -1024,6 +1024,19 @@ impl Runtime {
             return false;
         }
         run.dirty = false;
+        // The message a declared command came in is tracked by a task; the
+        // run it started is that task's work from here on, linked as a
+        // `workflow.run` task is, so `CancelTask` on it cancels the run.
+        #[cfg(feature = "a2a")]
+        if let Some(tid) = run.task.clone()
+            && self
+                .tasks
+                .get_mut(&tid)
+                .is_some_and(|t| t.link_run(&run_id))
+        {
+            self.task_persist(&tid);
+            self.task_sync(&tid);
+        }
         #[cfg(feature = "xaa")]
         if let Some((_, sid, a)) = &firing {
             self.firing_began(&run_id, sid, &w, a);

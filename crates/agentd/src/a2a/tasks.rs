@@ -382,6 +382,23 @@ impl Task {
         self.dirty = true;
     }
 
+    /// Link a message's task to the run the message started: a declared
+    /// command's run, which an `a2a` start node fired from the message the
+    /// task tracks. From then on the task is the run's, as a `workflow.run`
+    /// task is — its annotations say so, and `CancelTask` on it cancels the
+    /// run. Only a turn's link is replaced: a task already tracking a run
+    /// or a subagent keeps what it tracks. Whether it changed.
+    pub fn link_run(&mut self, run: &str) -> bool {
+        if !matches!(self.link, Link::Turn { .. }) {
+            return false;
+        }
+        self.link = Link::Run {
+            id: run.to_string(),
+        };
+        self.dirty = true;
+        true
+    }
+
     /// Whether a `contextId` filter names this task's conversation.
     ///
     /// An operator addresses conversations by the runtime's key — the one the

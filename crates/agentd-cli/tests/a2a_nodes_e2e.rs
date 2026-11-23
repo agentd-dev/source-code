@@ -119,6 +119,97 @@ fn an_a2a_start_node_turns_an_inbound_command_into_a_run() {
     let _ = std::fs::remove_file(&cfg);
 }
 
+/// The task a declared command's message is tracked by is the run's once the
+/// start node fires it: its annotations link the run, `GetTask` reads it, and
+/// the core `CancelTask` on it cancels the run — as for a `workflow.run`
+/// task, so a caller needs no op of agentd's to stop work it asked for.
+#[test]
+fn cancel_task_on_a_declared_commands_task_cancels_its_run() {
+    let cfg = common::unique_path("a2a-cancel", "yaml");
+    let (d, addr) = common::spawn_bound(|port| {
+        std::fs::write(
+            &cfg,
+            format!(
+                "\
+                 agent:\n  name: a2a-nodes\n  instruction: test\n  preflight: never\n\
+                 intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+                 store:\n  kind: memory\n\
+                 a2a:\n  listen: http://127.0.0.1:{port}\n\
+                 lifecycle:\n  run_until: drained\n\
+                 observability:\n  log_level: info\n\
+                 workflows:\n\
+                 \x20 - name: holder\n\
+                 \x20   steps:\n\
+                 \x20     trigger: {{kind: a2a, command: \"hold.start\"}}\n\
+                 \x20     w:       {{kind: wait, on: signal, signal: never, depends_on: [trigger]}}\n\
+                 \x20     fin:     {{kind: finish, depends_on: [w], status: completed}}\n"
+            ),
+        )
+        .unwrap();
+        let d = spawn(&cfg);
+        let log = d.stderr_path.clone();
+        (d, log)
+    });
+
+    let sent = SendMessage::command("hold.start", json!({}))
+        .return_immediately()
+        .post(&addr);
+    let task = sent["result"]["task"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the command's task: {sent}"))
+        .to_string();
+    // The run is listed, parked, and its task is linked to it.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let run = loop {
+        let st = common::OperatorCall::new("status", json!({})).result(&addr);
+        if let Some(r) = st["runs"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["workflow"] == "holder"))
+            && r["status"] == "running"
+            && r["task"] == task.as_str()
+        {
+            break r["id"].as_str().unwrap().to_string();
+        }
+        assert!(Instant::now() < deadline, "the run never parked: {st}");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let ann = agentd::runtime::surface::TASK_ANNOTATIONS_EXTENSION;
+    let got = common::rpc_activating(&addr, 2, "GetTask", json!({"id": task}), &[ann]);
+    assert_eq!(
+        got["result"]["metadata"][ann]["link"],
+        json!({"kind": "run", "id": run}),
+        "{got}"
+    );
+    assert_eq!(
+        got["result"]["status"]["state"], "TASK_STATE_WORKING",
+        "{got}"
+    );
+
+    let cancelled = common::rpc(&addr, 3, "CancelTask", json!({"id": task}));
+    assert_eq!(
+        cancelled["result"]["status"]["state"], "TASK_STATE_CANCELED",
+        "{cancelled}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let st = common::OperatorCall::new("status", json!({})).result(&addr);
+        let status = st["runs"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["id"] == run.as_str()))
+            .map(|r| r["status"].clone());
+        if status.as_ref().is_none_or(|s| s == "cancelled") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "CancelTask left the run going: {st}\n{}",
+            d.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_file(&cfg);
+}
+
 /// A message whose command does NOT match any start node is still a
 /// conversation, not a trigger. The router must narrow, not swallow: a start
 /// node that matched everything would silently stop the agent answering anyone.
@@ -150,7 +241,7 @@ fn a_non_matching_message_is_still_a_conversation() {
     });
 
     // A different command: must NOT fire the start node.
-    let _ = SendMessage::command("status", json!({}))
+    let _ = SendMessage::command("workflow.signal", json!({"name": "unrelated"}))
         .context("conv-b")
         .post_raw(&addr);
     std::thread::sleep(Duration::from_millis(500));

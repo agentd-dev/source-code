@@ -75,8 +75,9 @@ const INSTANCE_KEY_FILE: &str = "aauth-key";
 /// The process-global AAuth client. Installed once — in the root by
 /// [`setup`] and, across the re-exec boundary, in each turn worker and
 /// subagent from its spawn payload by [`adopt`] (the agent has ONE identity
-/// for its whole process tree). The MCP connect chokepoint (`mcp::from_spec`),
-/// the model dial and the A2A client read it to sign outbound requests. Empty
+/// for its whole process tree). The MCP connect chokepoint (`mcp::from_spec`)
+/// and the model dial read it to sign outbound requests; an A2A dial is not
+/// signed (the A2A SDK's client has no per-request signing hook). Empty
 /// in a process that configured no `--aauth-provider`, so the signing path is
 /// inert.
 static INSTALLED: OnceLock<AAuthClient> = OnceLock::new();

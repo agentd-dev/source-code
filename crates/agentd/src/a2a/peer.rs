@@ -18,15 +18,13 @@
 //! built typed, and its document is placed into the serialized part afterwards
 //! — the same rule [`crate::a2a::reply`] follows on the way in.
 //!
-//! What is **not** delegated to the SDK is the transport. agentd presents real
-//! credentials to a peer — a bearer that may be an OAuth token it refreshes, an
-//! mTLS client identity, a per-request AWS SigV4 signature, an AAuth HTTP
-//! Message Signature — and it does so from a blocking turn worker
-//! with no async runtime in sight. The SDK's client is async reqwest, so
-//! adopting it would mean an async runtime in every worker and dropping the
-//! kinds of peer authentication it does not carry, to gain a wire format we
-//! build from its types anyway. The types are the part that has to be right;
-//! the socket is agentd's.
+//! These params are what [`crate::mcp::a2a_client`] hands the SDK's client,
+//! which reads them back into its request type and owns the wire from there:
+//! the envelope, the ProtoJSON, the stream and the errors. So a document
+//! placed byte for byte here still reaches a peer as the SDK writes it — its
+//! whole numbers as doubles ([`crate::a2a::sdk_gaps`]). The one request sent
+//! exactly as built is an instance child's report to its parent, which goes
+//! through the child's channel on agentd's own transport.
 
 use a2a_types::{
     AgentCard, AgentInterface, GetTaskRequest, Message, Part, PartContent, Role,

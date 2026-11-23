@@ -15,6 +15,15 @@
 //! | [`whole_numbers`], [`answer`], [`Frames`]: an integer read back as `1.0` | 90e2876 "fix(a2a-pb): decode integral Value numbers as integers" |
 //! | [`answer`]: `ListTasks`' empty fields | 1d12a9c "fix(a2a-pb): keep the REQUIRED fields of ListTasksResponse and AgentCard" |
 //! | [`answer`]: the push-config page's empty fields, and `Delete…`'s `null` | no upstream fix yet (a2a-rs main, 2026-11-22) |
+//! | [`outbound`]: an integer past ±2^53 in a request the client sends | no upstream fix yet (a2a-rs main, 2026-11-22) |
+//! | [`whole_numbers`] on what the client reads back: an integer read as `1.0` | 90e2876 "fix(a2a-pb): decode integral Value numbers as integers" |
+//!
+//! The client side (`mcp::a2a_client`) hands the SDK a typed request and
+//! takes a typed answer, so it cannot touch the bytes: a DataPart's or a
+//! metadata's whole number goes on the wire as the double the released
+//! `a2a-pb` writes (`7` as `7.0`), which agentd's own listener reads back as
+//! the integer ([`whole_numbers`]); and a peer's reply carrying an integer
+//! past ±2^53 in one is refused by the SDK as a whole.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -46,6 +55,14 @@ pub fn request(body: &[u8]) -> Option<Vec<u8>> {
         changed |= as_doubles(params);
     }
     changed.then(|| serde_json::to_vec(&req).unwrap_or_default())
+}
+
+/// The params of a request the client sends, as the SDK can read them into
+/// its types: an integer no double holds exactly is the double it becomes,
+/// as [`request`] does for one the listener is sent.
+pub fn outbound(mut params: Value) -> Value {
+    as_doubles(&mut params);
+    params
 }
 
 /// Integers past ±2^53 in `v`, as doubles. Returns whether any was.

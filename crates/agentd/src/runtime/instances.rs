@@ -2520,7 +2520,6 @@ fn send_one(handle: &str, out: &Outgoing) -> Option<Value> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let auth = crate::mcp::a2a_client::PeerAuth {
         trace: out.hop.clone(),
-        tree: true,
         ..Default::default()
     };
     let sent = crate::mcp::a2a_client::send(
@@ -2610,7 +2609,6 @@ fn follow_child(
                 };
                 let auth = crate::mcp::a2a_client::PeerAuth {
                     trace: out.hop.clone(),
-                    tree: true,
                     ..Default::default()
                 };
                 match crate::mcp::a2a_client::settle_sent(&out.endpoint, auth, &reply) {

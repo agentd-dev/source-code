@@ -55,6 +55,8 @@ a2a = [
     "dep:futures-util",
     "dep:async-trait",
     "dep:tokio-stream",
+    "dep:a2a-sdk-client",
+    "dep:reqwest",
 ]
 # Optional cron-expression scheduling (internal time event source).
 # Hand-rolled 5-field UTC parser — no dep (the minimalism moat, rfcs/0002).
@@ -205,6 +207,17 @@ a2a-types = { package = "a2a-lf", version = "0.4.2", optional = true }
 chrono = { version = "0.4", optional = true, default-features = false, features = ["std"] }
 a2a-pb = { version = "0.3.2", optional = true }
 a2a-server = { package = "a2a-server-lf", version = "0.5.3", optional = true, default-features = false }
+# The SDK's client: every A2A method agentd sends a peer goes through its
+# `A2AClient` over its `JsonRpcTransport`, which owns the envelope, the
+# ProtoJSON, the SSE framing and the error decoding. Its default `rustls-tls`
+# would bring aws-lc-rs; `rustls-no-provider` keeps rustls without a
+# provider, and agentd hands reqwest its own ring `ClientConfig` (the bundled
+# roots, the extra CA, the mTLS identity). Named `a2a-sdk-client` because
+# agentd's own module is `mcp::a2a_client`.
+a2a-sdk-client = { package = "a2a-client-lf", version = "0.2.9", optional = true, default-features = false }
+# The HTTP client the SDK's transport takes, built by agentd: its TLS config,
+# its unix socket, no proxy. Already in the graph through `a2a-server`.
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls-no-provider"] }
 # The async runtime + HTTP server the A2A listener runs on (feature `a2a`).
 # The SDK's JSON-RPC router is an axum `Router`, so agentd serves it directly
 # and merges its own routes onto the same listener.

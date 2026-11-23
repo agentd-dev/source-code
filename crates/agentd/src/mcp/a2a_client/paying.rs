@@ -14,13 +14,13 @@
 //! came. [`PaidPeer::reject`] answers it with `payment-rejected` instead.
 
 use super::{
-    DelegateOutcome, Follow, Followed, HttpConn, HttpEp, POLL_INTERVAL, PeerAuth, delegate_with,
-    mint_message_id, request_timeout, terminal_outcome, transport_error,
+    DelegateOutcome, Failed, Follow, Followed, HttpConn, HttpEp, POLL_INTERVAL, PeerAuth,
+    delegate_with, mint_message_id, terminal_outcome,
 };
 use crate::a2a::peer as a2a;
 use crate::a2a::x402;
 use crate::config::A2aEndpoint;
-use ::mcp::rpc::{Id, Request};
+use a2a_types::error_code;
 use serde_json::Value;
 use std::time::Instant;
 
@@ -48,10 +48,11 @@ pub struct PaidPeer {
 /// How far a payment message got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reached {
-    /// It never left: the peer could not be reached, or no credential was.
+    /// It never left: the peer could not be reached, or the request could
+    /// not be built.
     Unsent(String),
-    /// The peer answered that it did not take it: an HTTP 4xx, or a JSON-RPC
-    /// error other than an internal one.
+    /// The peer answered that it did not take it: a JSON-RPC error other
+    /// than an internal one, as the SDK decodes it.
     Refused(String),
     /// It left and no readable answer came, or the peer failed inside: the
     /// peer may have acted on it.
@@ -259,49 +260,26 @@ impl PaidPeer {
         }
     }
 
-    /// The paying `SendMessage`: its result, or how far it got.
+    /// The paying `SendMessage`, through the SDK: its result, or how far it
+    /// got. A connection that could not be made never left; a bound that ran
+    /// out, or a reply the SDK could not read or that reports an internal
+    /// error, may have been acted on; any other JSON-RPC error is the peer
+    /// refusing it.
     fn send(&mut self, params: Value, deadline: Instant) -> Result<Value, Reached> {
-        let conn = &mut self.conn;
-        let id = conn.next_id;
-        conn.next_id += 1;
-        let timeout = request_timeout(deadline);
-        let marked = a2a::extensions_of(&params);
-        let req = Request::new(Id::Num(id), "SendMessage", Some(params));
-        let body = serde_json::to_vec(&req)
-            .map_err(|e| Reached::Unsent(format!("a2a: encode SendMessage: {e}")))?;
-        let owned = conn
-            .request_headers("POST", &conn.ep.path, &body, &marked)
-            .map_err(Reached::Unsent)?;
-        let mut stream = conn.connect(timeout).map_err(Reached::Unsent)?;
-        let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
-        headers.extend(owned.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let resp = crate::net::http::send(
-            &mut *stream,
-            &conn.ep.host_header,
-            "POST",
-            &conn.ep.path,
-            &headers,
-            &body,
-        )
-        .map_err(|e| Reached::Unanswered(transport_error("SendMessage", &e)))?;
-        let status = format!("a2a: SendMessage HTTP {}", resp.status);
-        if resp.status >= 500 {
-            return Err(Reached::Unanswered(status));
-        }
-        if !resp.is_success() {
-            return Err(Reached::Refused(status));
-        }
-        let response: ::mcp::rpc::Response = serde_json::from_slice(&resp.body)
-            .map_err(|e| Reached::Unanswered(format!("a2a: SendMessage bad reply: {e}")))?;
-        if let Some(err) = response.error {
-            let why = format!("a2a: SendMessage rpc error {}: {}", err.code, err.message);
-            return Err(if err.code == ::mcp::rpc::INTERNAL_ERROR {
-                Reached::Unanswered(why)
-            } else {
-                Reached::Refused(why)
-            });
-        }
-        Ok(response.result.unwrap_or(Value::Null))
+        const METHOD: &str = "SendMessage";
+        self.conn
+            .exchange(METHOD, params, deadline)
+            .map_err(|failed| {
+                let why = failed.say(METHOD);
+                match failed {
+                    Failed::Unsent(_) => Reached::Unsent(why),
+                    Failed::TimedOut => Reached::Unanswered(why),
+                    Failed::Peer(e) if e.code == error_code::INTERNAL_ERROR => {
+                        Reached::Unanswered(why)
+                    }
+                    Failed::Peer(_) => Reached::Refused(why),
+                }
+            })
     }
 }
 

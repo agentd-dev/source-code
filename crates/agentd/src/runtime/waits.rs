@@ -1891,7 +1891,7 @@ impl Runtime {
     }
 
     /// Resolve a configured A2A peer into a dialable endpoint plus its client
-    /// auth (bearer headers, a per-request SigV4 signer, an mTLS identity).
+    /// auth (bearer headers, an mTLS identity).
     ///
     /// Shared by `a2a.delegate` and `a2a.send`, which differ only in what they
     /// do once connected — everything up to the socket is identical, and it is
@@ -1933,15 +1933,11 @@ impl Runtime {
         what: &str,
     ) -> Result<(crate::config::A2aEndpoint, crate::mcp::a2a_client::PeerAuth), String> {
         // An instance child's parent: through the channel it was handed at
-        // spawn, which names it, presenting nothing — a link of the tree's
-        // own, so no AAuth signature either.
+        // spawn, which names it, presenting nothing.
         if super::instances::is_parent_link(peer_name) {
             return Ok((
                 crate::config::A2aEndpoint::Parent,
-                crate::mcp::a2a_client::PeerAuth {
-                    tree: true,
-                    ..Default::default()
-                },
+                crate::mcp::a2a_client::PeerAuth::default(),
             ));
         }
         let configured = self
@@ -1954,26 +1950,21 @@ impl Runtime {
         // Live instance children are dialable as peers too — by handle, or by
         // template name when that template has a single instance. A configured
         // peer wins the name, so an operator can always override the lookup.
-        // Either way round, a link of the tree's own is `tree`: the parent an
-        // instance child reports to, or an instance child its parent dials.
-        let (peer, tree) = match configured {
-            Some(p) => (p, false),
+        let peer = match configured {
+            Some(p) => p,
             None => match self.instance_peer_endpoint(peer_name) {
-                Some(endpoint) => (
-                    crate::config::settings::A2aPeer {
-                        name: peer_name.to_string(),
-                        endpoint,
-                        headers: std::collections::BTreeMap::new(),
-                        rate: None,
-                        timeout: None,
-                        client_cert: None,
-                        client_key: None,
-                        auth: None,
-                        reports_to: None,
-                        title: None,
-                    },
-                    true,
-                ),
+                Some(endpoint) => crate::config::settings::A2aPeer {
+                    name: peer_name.to_string(),
+                    endpoint,
+                    headers: std::collections::BTreeMap::new(),
+                    rate: None,
+                    timeout: None,
+                    client_cert: None,
+                    client_key: None,
+                    auth: None,
+                    reports_to: None,
+                    title: None,
+                },
                 None => {
                     return Err(format!(
                         "{what}: no such peer {peer_name:?} (a2a.peers or a live instance child)"
@@ -2009,23 +2000,24 @@ impl Runtime {
         #[allow(unused_mut)]
         let mut headers = crate::mcp::auth::resolve_headers(&spec.headers)
             .map_err(|e| format!("{what}: peer headers: {e}"))?;
-        // A peer `auth:` block resolves at dial time. A body-INDEPENDENT
-        // bearer (static / oauth2 device-login / spiffe jwt) is baked into the
-        // static headers; SigV4 (`kind: aws`) covers the exact body, so it rides
-        // as a PER-REQUEST signer on `PeerAuth` (re-run on every POST).
-        #[cfg(feature = "oauth")]
-        let mut peer_signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>> = None;
+        // A peer `auth:` block resolves at dial time, to a body-INDEPENDENT
+        // bearer (static / oauth2 device-login / spiffe jwt) baked into the
+        // static headers: the A2A SDK's client signs nothing per request, so
+        // `kind: aws` (SigV4 over the body) is refused at validation, and
+        // here too should one reach a dial.
         #[cfg(feature = "oauth")]
         if let Some(a) = &peer.auth {
             let aspec = self.settings.auth_spec_at(a, &peer.endpoint, false);
+            if aspec.kind == "aws" {
+                return Err(format!(
+                    "{what}: a2a peer '{}': auth kind `aws` is not supported for A2A peers",
+                    peer.name
+                ));
+            }
             // A peer's credential is cached under `a2a:<name>`, the target
             // `agentd --login a2a:<name>` writes.
             let target = format!("a2a:{}", peer.name);
-            if aspec.kind == "aws" {
-                let s = crate::auth::aws::SigV4Signer::from_spec(&aspec, &target)
-                    .map_err(|e| format!("{what}: peer aws auth: {e}"))?;
-                peer_signer = Some(s as std::sync::Arc<dyn ::mcp::http::RequestSigner>);
-            } else if let Some(signer) = crate::auth::device::signer_for(&aspec, &target, timeout)
+            if let Some(signer) = crate::auth::device::signer_for(&aspec, &target, timeout)
                 .map_err(|e| format!("{what}: peer auth: {e}"))?
             {
                 // A credential it cannot produce fails this dial, unsent.
@@ -2038,13 +2030,8 @@ impl Runtime {
         #[allow(unused_mut)]
         let mut auth = crate::mcp::a2a_client::PeerAuth {
             headers,
-            tree,
             ..Default::default()
         };
-        #[cfg(feature = "oauth")]
-        {
-            auth.signer = peer_signer;
-        }
         #[cfg(feature = "tls")]
         if let (Some(cert), Some(key)) = (&spec.client_cert, &spec.client_key) {
             let id = std::fs::read(cert)

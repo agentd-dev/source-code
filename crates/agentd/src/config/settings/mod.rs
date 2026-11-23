@@ -11458,7 +11458,7 @@ pub fn validate(loaded: &Loaded) -> Diagnostics {
                 err(
                     &mut d,
                     format!(
-                        "a2a peer '{}': auth kind `aws` is not accepted for peers — use static, oauth2 or spiffe",
+                        "a2a peer '{}': auth kind `aws` is not supported for A2A peers — the A2A client signs no request (no SigV4); use static, oauth2 or spiffe",
                         p.name
                     ),
                 );
@@ -18331,6 +18331,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("a2a peer 'pal' rate"), "{e}");
+    }
+
+    /// An A2A peer signs nothing per request, so a peer gated by AWS SigV4
+    /// is refused at load, by name, rather than dialled unsigned.
+    #[cfg(all(feature = "a2a", feature = "oauth"))]
+    #[test]
+    fn an_aws_signed_peer_is_refused() {
+        let e = load_yaml(
+            "store: {kind: memory}\na2a:\n  peers:\n    - {name: iam, endpoint: \"https://peer.example\", auth: {kind: aws, service: execute-api, region: us-east-1}}\n",
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("a2a peer 'iam': auth kind `aws` is not supported for A2A peers"),
+            "{e}"
+        );
     }
 
     /// A document's server is the operator's when its endpoint falls under

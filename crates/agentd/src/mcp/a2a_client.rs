@@ -6,9 +6,19 @@
 //! (`subagent.spawn`) or to a REMOTE A2A agent. Both wear the same abstraction
 //! (objective → distilled result); this module is the remote backend. It connects
 //! to a declared peer (an [`A2aEndpoint`] — `https://host[:port]`, loopback
-//! `http://` for dev, or `unix:///path` for a co-located one) and speaks A2A 1.0
-//! JSON-RPC over agentd's own transport: one request per connection (the
-//! [`HttpConn`] caller), every one of them stating `A2A-Version: 1.0`.
+//! `http://` for dev, or `unix:///path` for a co-located one).
+//!
+//! **The protocol is the A2A SDK's.** Every A2A method this client sends
+//! (`SendMessage`, `SendStreamingMessage`, `GetTask`) goes through the official
+//! SDK's `A2AClient` over its `JsonRpcTransport` (`a2a-client-lf`): the SDK
+//! writes the JSON-RPC envelope and the ProtoJSON, states `A2A-Version: 1.0` on
+//! every request, parses the SSE stream and decodes every error into its
+//! `A2AError`. What is agentd's is the **policy** below, and the `reqwest`
+//! client the SDK's transport is handed: agentd's ring TLS configuration (the
+//! bundled roots, the extra CA, the mTLS client identity), the unix socket of a
+//! co-located peer, no proxy, one connection per request. The SDK is async;
+//! every call runs on this module's own runtime and the blocking caller waits
+//! for its answer, so a caller already inside a runtime never nests a second.
 //!
 //! A delegation is several requests, not one:
 //!
@@ -23,10 +33,15 @@
 //!      streams, and which extensions it will not work without — a peer
 //!      requiring one agentd does not implement is refused before anything is
 //!      sent. A peer that serves no card is still dialled, streaming first.
+//!      The read is a plain GET on the same `reqwest` client, not the SDK's
+//!      `AgentCardResolver`: the resolver hands back the card alone, and the
+//!      cache's lifetime is the response's `Cache-Control`.
 //!   2. **send the objective** — `SendStreamingMessage` when the peer streams,
 //!      whose frames carry the run to its end (working → artifact → terminal
 //!      state); `SendMessage` with `returnImmediately` when it does not, or,
-//!      once, when a stream is refused as unsupported (`-32004`).
+//!      once, when a stream is refused as unsupported (`-32004`). A peer that
+//!      answers the streaming method with a plain JSON result is refused by
+//!      the SDK ("expected streaming response"), and that is the answer.
 //!   3. **recover by polling** — `GetTask` (~[`POLL_INTERVAL`] apart) whenever
 //!      the answer is not yet in hand: a unary send, a stream that broke after
 //!      the run started, a terminal frame whose artifact never arrived. The
@@ -38,9 +53,9 @@
 //!      a transport failure is an error string.
 //!
 //! An A2A client does **not** send MCP `initialize` — A2A is its own surface, so
-//! the client just calls the A2A methods. What goes on the wire and what is read
-//! back are the specification's own types ([`crate::a2a::peer`]); this module is
-//! the delegation *policy* over agentd's authenticated transport.
+//! the client just calls the A2A methods. The requests are built from the
+//! specification's own types ([`crate::a2a::peer`]) and handed to the SDK; its
+//! answers are read back the same way.
 //!
 //! The card never chooses where agentd connects: the interface it selects
 //! decides the protocol and the tenant, and the dial always goes to the URL the
@@ -49,14 +64,28 @@
 //!
 //! Trust: agentd dials the peer over HTTP(S), presenting the peer client-auth
 //! material on every request — a resolved **bearer/framing header** (static /
-//! oauth2 device-login / SPIFFE JWT-SVID), an **mTLS** client identity (SPIFFE
-//! X.509-SVID), a per-request **AWS SigV4** signature (`kind: aws`), and an
-//! ambient **AAuth** signature when a process identity is installed.
+//! oauth2 device-login / SPIFFE JWT-SVID) and an **mTLS** client identity
+//! (SPIFFE X.509-SVID). Nothing is signed per request: the SDK's interceptor
+//! sees the method and the headers, never the URL or the body a signature
+//! covers, so an A2A peer takes no AWS SigV4 (`kind: aws` is refused at
+//! validation) and no AAuth signature.
 //!
 //! Trace: a hop a unit of work makes is a span of its own
 //! ([`PeerAuth::trace`]), sent as `traceparent` and `tracestate` on every
 //! request of the hop, so a peer that reads W3C Trace Context continues the
-//! caller's trace.
+//! caller's trace. With the credential and `A2A-Extensions` (what the peer
+//! requires, what the work offers, what the message is marked with) it rides
+//! the SDK's `CallInterceptor`.
+//!
+//! The parent link: an instance child reports home ([`A2aEndpoint::Parent`])
+//! through the channel it was handed at spawn — a door with no path, whose
+//! every connection is a socket passed over `SCM_RIGHTS`. `reqwest` dials a
+//! socket by path only, and its connector cannot be handed a stream of
+//! agentd's (a connector layer must yield `reqwest`'s own `Conn`, which only
+//! `reqwest` constructs), so that link stays on agentd's own transport
+//! ([`parent`]): one `SendMessage` carrying an `_instance.result` or
+//! `_instance.emit` report, which is all the parent accepts from a child.
+//! Nothing else is dialled over it — no card, no stream, no poll.
 //!
 //! Paying: a task that asks to be paid (a2a-x402) will not go on by itself,
 //! so a send or a delegation that may not pay ends there, saying so; one
@@ -66,15 +95,28 @@
 mod paying;
 #[cfg(feature = "x402")]
 pub use paying::{PaidAnswer, PaidPeer, Paying, Reached, delegate_paying, send_paying};
+mod parent;
 
 use crate::a2a::peer::{self as a2a, PeerCard};
+use crate::a2a::sdk_gaps;
+use crate::a2a::wire::{from_wire, to_wire};
 use crate::config::A2aEndpoint;
 use crate::runtime::surface::{A2A_PROTOCOL_VERSION, COMMAND_EXTENSION};
-use ::mcp::rpc::{Id, Request};
-use a2a_types::TaskState;
+use a2a_sdk_client::A2AClient;
+use a2a_sdk_client::jsonrpc::JsonRpcTransport;
+use a2a_sdk_client::middleware::CallInterceptor;
+use a2a_sdk_client::transport::ServiceParams;
+use a2a_types::{
+    A2AError, GetTaskRequest, SendMessageRequest, StreamResponse, TaskState, error_code,
+};
+use futures_util::StreamExt as _;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 /// Poll cadence between `GetTask` reads while a remote Task is in flight: short
@@ -83,10 +125,15 @@ use std::time::{Duration, Instant};
 /// the caller passes in.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Per-request read/write timeout on the peer socket — bounds a single
-/// SendMessage/GetTask round-trip so a wedged peer can't hang the connect/read.
-/// The overall delegation is separately bounded by the caller's deadline.
+/// Per-request bound — a single SendMessage/GetTask round trip, so a wedged
+/// peer can't hang the connect/read. The overall delegation is separately
+/// bounded by the caller's deadline.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a stream may stay silent before it is declared dead and the run
+/// recovered over `GetTask`: agentd's listener writes a keep-alive comment
+/// every ~15 s, so this is three missed beats.
+const STREAM_QUIET: Duration = Duration::from_secs(45);
 
 /// Where a peer publishes its card, on the configured origin.
 const CARD_PATH: &str = "/.well-known/agent-card.json";
@@ -363,6 +410,9 @@ fn delegate_unary(
 /// is picked up by `a2a.wait` (or a `wait {on: message}`), which is the async
 /// half a delegation cannot express.
 ///
+/// To [`A2aEndpoint::Parent`] the send goes through the instance child's
+/// channel ([`parent`]); to any other peer, through the SDK.
+///
 /// Errors on connect / write / read / RPC error. Accepting is not the same as
 /// succeeding: a peer that answers 200 and then fails internally is invisible
 /// here by construction, which is what "fire and forget" means.
@@ -377,12 +427,14 @@ pub fn send(
     message_id: Option<&str>,
     deadline: Instant,
 ) -> Result<Value, String> {
-    let ep = HttpEp::of(endpoint)?;
-    let mut conn = HttpConn::new(ep, auth);
     let message_id = message_id
         .map(str::to_string)
         .unwrap_or_else(mint_message_id);
     let params = a2a::send_message_params_parts(parts, context, &message_id, None)?;
+    if matches!(endpoint, A2aEndpoint::Parent) {
+        return parent::send(params, &auth, deadline);
+    }
+    let mut conn = HttpConn::new(HttpEp::of(endpoint)?, auth);
     conn.call("SendMessage", params, deadline)
 }
 
@@ -460,10 +512,10 @@ impl SentTask {
     }
 }
 
-/// One call of `method` to the A2A peer at `endpoint`, with `params`: its
-/// JSON-RPC `result`, or why there is none. What a thin client of a daemon
-/// on this host asks with (`agentd --login company:<name>`), one request per
-/// connection like every other.
+/// One `method` call — `SendMessage` or `GetTask` — to the A2A peer at
+/// `endpoint`, with `params`: the SDK's answer as the wire carries it, or why
+/// there is none. What a thin client of a daemon on this host asks with
+/// (`agentd --login company:<name>`).
 pub fn call(
     endpoint: &A2aEndpoint,
     auth: PeerAuth,
@@ -476,11 +528,11 @@ pub fn call(
 }
 
 /// How a streaming attempt resolved: a terminal outcome; a task id whose
-/// terminal state must be RECOVERED over unary `GetTask` (a peer that answered
-/// with one unary final frame rather than a stream, or a stream that broke after
-/// the run had started — in both cases the run exists on the peer already, so it
-/// is polled to a conclusion and never re-sent); or a peer that refused the
-/// streaming method itself before anything started.
+/// terminal state must be RECOVERED over unary `GetTask` (a stream that broke,
+/// went quiet or ran into the deadline after the run had started, or stopped
+/// at a gate — the run exists on the peer already, so it is polled to a
+/// conclusion and never re-sent); or a peer that refused the streaming method
+/// itself before anything started.
 enum StreamOutcome {
     Done(DelegateOutcome),
     Recover(String),
@@ -575,33 +627,18 @@ pub struct PeerAuth {
     /// body-INDEPENDENT (a bearer / framing header), baked once at resolution.
     pub headers: Vec<(String, String)>,
     /// The mutual-TLS client identity presented during the handshake.
-    #[cfg(feature = "tls")]
     pub identity: Option<crate::net::tls::ClientIdentity>,
-    /// A per-request AWS SigV4 signer for an AWS-IAM-gated peer. Unlike
-    /// [`PeerAuth::headers`], its signature covers the exact request body, so it
-    /// must be re-run on every request. `None` means no SigV4 (bearer, mTLS and
-    /// AAuth still apply). Alongside it, an ambient process AAuth identity signs
-    /// every outbound A2A dial when one is configured, unless the peer is
-    /// [`PeerAuth::tree`].
-    pub signer: Option<std::sync::Arc<dyn ::mcp::http::RequestSigner>>,
-    /// The peer is a process of this agent's own tree: the parent an instance
-    /// child reports to, or an instance child its parent dials. The link is
-    /// authenticated by the socket's peer credential or the bearer the parent
-    /// composed, and agentd's listener checks no AAuth signature, so the AAuth
-    /// identity is not presented on it: the tree's own links do not wait on
-    /// the Agent Provider.
-    pub tree: bool,
     /// The span this hop is, when a unit of work makes it: sent as
     /// `traceparent` and `tracestate` on every request of the hop — the card
-    /// read, the send, each poll — ahead of the signatures, so an agentd peer
-    /// continues the caller's trace. Not a credential: a card is never cached
-    /// under it.
+    /// read, the send, each poll — so an agentd peer continues the caller's
+    /// trace. Not a credential: a card is never cached under it.
     pub trace: Option<crate::obs::trace::TraceContext>,
 }
 
 /// A one-in-flight-request-at-a-time A2A caller: `call(method, params)` → the
-/// `result` Task value or an error string. Implemented by [`HttpConn`] (one HTTP
-/// POST per call); the trait keeps [`poll_task`] testable against a fixture.
+/// `result` Task value or an error string. Implemented by [`HttpConn`] (one
+/// SDK call per call); the trait keeps [`poll_task`] testable against a
+/// fixture.
 trait Caller {
     fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, String>;
 }
@@ -626,39 +663,30 @@ fn terminal_outcome(task: &Value) -> Option<DelegateOutcome> {
     })
 }
 
-/// A resolved HTTP(S) A2A peer endpoint: the dial coordinates + framing.
+/// A resolved HTTP(S) or unix A2A peer endpoint.
 struct HttpEp {
     /// The endpoint as the operator configured it — what the card's
-    /// interfaces are matched against.
+    /// interfaces are matched against, and where a TCP peer is dialled.
     url: String,
     host: String,
-    port: u16,
-    path: String,
     host_header: String,
     tls: bool,
     /// `unix:///path` peer: dial this socket instead of TCP — the co-located
     /// fast lane (no TLS handshake, no TCP stack; the kernel authenticates).
     socket: Option<String>,
-    /// The parent of an instance child, through its channel: every request
-    /// a fresh connection passed through it.
-    channel: bool,
 }
 
 impl HttpEp {
-    /// The dial coordinates of `endpoint`.
+    /// The dial coordinates of `endpoint`. The parent link is not one: it
+    /// carries an instance child's reports, which [`send`] puts through the
+    /// channel, and nothing else.
     fn of(endpoint: &A2aEndpoint) -> Result<HttpEp, String> {
         match endpoint {
             A2aEndpoint::Https(url) => HttpEp::parse(url),
-            A2aEndpoint::Parent => Ok(HttpEp {
-                url: "parent:".to_string(),
-                host: String::new(),
-                port: 0,
-                path: "/".to_string(),
-                host_header: "localhost".to_string(),
-                tls: false,
-                socket: None,
-                channel: true,
-            }),
+            A2aEndpoint::Parent => Err(
+                "a2a: the parent link carries this instance's reports (`_instance.result`, `_instance.emit`) with a2a.send, and nothing else"
+                    .to_string(),
+            ),
         }
     }
 
@@ -673,45 +701,30 @@ impl HttpEp {
             return Ok(HttpEp {
                 url: url.to_string(),
                 host: String::new(),
-                port: 0,
-                path: "/".to_string(),
                 host_header: "localhost".to_string(),
                 tls: false,
                 socket: Some(path.to_string()),
-                channel: false,
             });
         }
         let u = crate::net::http::Url::parse(url)
             .map_err(|e| format!("a2a: bad peer url {url}: {e}"))?;
-        let path = if u.path.is_empty() || u.path == "/" {
-            "/".to_string()
-        } else {
-            u.path.clone()
-        };
         Ok(HttpEp {
             url: url.to_string(),
             host_header: u.host_header(),
             tls: u.is_tls(),
             host: u.host,
-            port: u.port,
-            path,
             socket: None,
-            channel: false,
         })
     }
 
-    /// Whether the peer is on this host: a unix socket, the parent's
-    /// channel, or a loopback address.
+    /// Whether the peer is on this host: a unix socket or a loopback address.
     fn local(&self) -> bool {
-        self.socket.is_some() || self.channel || crate::net::http::is_loopback_host(&self.host)
+        self.socket.is_some() || crate::net::http::is_loopback_host(&self.host)
     }
 
     /// The origin a card is published on: the scheme and authority for TCP,
-    /// the socket path for unix, the parent for its channel.
+    /// the socket path for unix.
     fn origin(&self) -> String {
-        if self.channel {
-            return "parent:".to_string();
-        }
         match &self.socket {
             Some(socket) => format!("unix:{socket}"),
             None => format!(
@@ -719,6 +732,24 @@ impl HttpEp {
                 if self.tls { "https" } else { "http" },
                 self.host_header
             ),
+        }
+    }
+
+    /// The URL the SDK's transport posts to: the configured one, or — over a
+    /// unix socket, which the client dials whatever the URL says — the
+    /// socket's root.
+    fn rpc_url(&self) -> String {
+        match &self.socket {
+            Some(_) => "http://localhost/".to_string(),
+            None => self.url.clone(),
+        }
+    }
+
+    /// Where the card is read: [`CARD_PATH`] on the configured origin.
+    fn card_url(&self) -> String {
+        match &self.socket {
+            Some(_) => format!("http://localhost{CARD_PATH}"),
+            None => format!("{}{CARD_PATH}", self.origin()),
         }
     }
 }
@@ -762,16 +793,134 @@ fn card_ttl(cache_control: Option<&str>) -> Duration {
     ttl.min(CARD_TTL_MAX)
 }
 
-/// An HTTP(S) A2A caller: each call is one request (Connection: close),
-/// mirroring the MCP client's dialer — server-auth TLS for `https://`, plaintext
-/// for a loopback `http://` peer, a socket for `unix://`. Presents the peer
-/// client-auth material on every request: static bearer/framing headers, and
-/// per-request AAuth/SigV4 signatures over the exact body
-/// ([`HttpConn::signature_headers`]); mTLS rides the handshake.
+/// The runtime the SDK's client runs on: this module's own, process-wide, so
+/// a blocking caller — a turn worker, a workflow step, a CLI — needs none of
+/// its own, and one already inside a runtime never starts a second within it
+/// (which panics).
+fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("agentd-a2a-client")
+            .build()
+            .map_err(|e| format!("a2a: the client's runtime: {e}"))
+    })
+    .as_ref()
+    .map_err(Clone::clone)
+}
+
+/// Run `fut` on `rt` and wait for it on this thread: spawned rather than
+/// `block_on`, which panics on a thread already inside a runtime.
+fn block<F>(rt: &tokio::runtime::Runtime, fut: F) -> Result<F::Output, String>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    rt.spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    rx.recv()
+        .map_err(|_| "a2a: the call ended without an answer".to_string())
+}
+
+/// A connector layer that notes a connection that could not be made — the
+/// one failure that proves a request never left, which a payment's ledger
+/// tells from one that left and had no answer ([`Failed::Unsent`]).
+#[derive(Clone)]
+struct NoteUnreached(Arc<AtomicBool>);
+
+impl<S> tower::Layer<S> for NoteUnreached {
+    type Service = Noted<S>;
+
+    fn layer(&self, inner: S) -> Noted<S> {
+        Noted {
+            inner,
+            unreached: Arc::clone(&self.0),
+        }
+    }
+}
+
+/// The connector [`NoteUnreached`] wraps.
+#[derive(Clone)]
+struct Noted<S> {
+    inner: S,
+    unreached: Arc<AtomicBool>,
+}
+
+impl<S, R> tower::Service<R> for Noted<S>
+where
+    S: tower::Service<R>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<S::Response, S::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), S::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: R) -> Self::Future {
+        let connecting = self.inner.call(req);
+        let unreached = Arc::clone(&self.unreached);
+        Box::pin(async move {
+            let conn = connecting.await;
+            if conn.is_err() {
+                unreached.store(true, Ordering::SeqCst);
+            }
+            conn
+        })
+    }
+}
+
+/// The headers agentd adds to every request the SDK sends: the extensions it
+/// activates, the hop's trace context and the peer credential. (`A2A-Version`
+/// is the SDK's own.)
+struct Present(Vec<(String, String)>);
+
+#[async_trait::async_trait]
+impl CallInterceptor for Present {
+    async fn before(&self, _method: &str, params: &mut ServiceParams) -> Result<(), A2AError> {
+        for (name, value) in &self.0 {
+            params.entry(name.clone()).or_default().push(value.clone());
+        }
+        Ok(())
+    }
+}
+
+/// Why an SDK call has no answer.
+enum Failed {
+    /// It never left: no connection could be made, or no request built.
+    Unsent(String),
+    /// The bound on the call ran out first.
+    TimedOut,
+    /// The SDK's error: the peer's own JSON-RPC error, or a reply it could
+    /// not read (`INTERNAL_ERROR`).
+    Peer(A2AError),
+}
+
+impl Failed {
+    /// What a caller is told.
+    fn say(&self, method: &str) -> String {
+        match self {
+            Failed::Unsent(e) => e.clone(),
+            Failed::TimedOut => format!("a2a: {method}: timed out waiting for the peer"),
+            Failed::Peer(e) => format!("a2a: {method} rpc error {}: {}", e.code, e.message),
+        }
+    }
+}
+
+/// An A2A peer as one delegation (or send, or payment) talks to it: the
+/// endpoint, the credential, and the terms its card set — each call is one
+/// SDK call on a `reqwest` client of its own, one connection per request.
 struct HttpConn {
     ep: HttpEp,
     auth: PeerAuth,
-    next_id: i64,
     /// The tenant the selected card interface declares, echoed on every call.
     tenant: Option<String>,
     /// Extensions the peer requires (and this client implements), activated
@@ -789,58 +938,18 @@ impl HttpConn {
         HttpConn {
             ep,
             auth,
-            next_id: 1,
             tenant: None,
             required: Vec::new(),
             offered: Vec::new(),
         }
     }
 
-    /// Per-request AAuth and AWS SigV4 signature headers over the exact `body`,
-    /// method and path — mirroring the intelligence dial. The static bearer /
-    /// framing headers ([`PeerAuth::headers`]) and the mTLS identity ride
-    /// separately; this covers only the signatures that depend on the request,
-    /// which is why it must be recomputed per request rather than cached. Empty
-    /// when neither AAuth nor SigV4 is configured, so no extra headers ride; an
-    /// `Err` is a signature whose credential cannot be produced, and the
-    /// request is not sent.
-    fn signature_headers(
-        &self,
-        method: &str,
-        path: &str,
-        body: &[u8],
-    ) -> Result<Vec<(String, String)>, String> {
-        let mut out = Vec::new();
-        // AAuth: sign the outbound A2A dial so the peer can attest the agent by
-        // signature. With AAuth configured the dial is not sent without it, as
-        // the intel dial is not — except on the tree's own links.
-        #[cfg(feature = "aauth")]
-        if !self.auth.tree
-            && let Some(signer) = crate::aauth::signer()
-        {
-            out.extend(signer.sign(method, &self.ep.host_header, path, body)?);
-        }
-        // SigV4: an AWS-IAM-gated peer, signed over the exact body.
-        if let Some(signer) = &self.auth.signer {
-            out.extend(signer.sign(method, &self.ep.host_header, path, body)?);
-        }
-        Ok(out)
-    }
-
-    /// The headers every request carries: the protocol version, the
+    /// The headers every request carries beyond the SDK's own: the
     /// extensions it activates (those the peer requires, those the work
     /// offers, plus `marked` — the ones the message itself is marked with),
-    /// the hop's W3C trace context, the peer credential, and the signatures
-    /// over this exact request. Taken before the dial: a signature whose
-    /// credential cannot be produced fails the request unsent.
-    fn request_headers(
-        &self,
-        method: &str,
-        path: &str,
-        body: &[u8],
-        marked: &[String],
-    ) -> Result<Vec<(String, String)>, String> {
-        let mut out = vec![("A2A-Version".to_string(), A2A_PROTOCOL_VERSION.to_string())];
+    /// the hop's W3C trace context, and the peer credential.
+    fn request_headers(&self, marked: &[String]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
         let mut active: Vec<&str> = self.required.iter().map(String::as_str).collect();
         for uri in self.offered.iter().chain(marked) {
             if !active.contains(&uri.as_str()) {
@@ -854,41 +963,108 @@ impl HttpConn {
             out.extend(t.headers());
         }
         out.extend(self.auth.headers.iter().cloned());
-        out.extend(
-            self.signature_headers(method, path, body)
-                .map_err(|e| format!("a2a: not sent, no credential: {e}"))?,
-        );
-        Ok(out)
+        out
     }
 
-    fn connect(&self, timeout: Duration) -> Result<Box<dyn crate::net::http::Stream>, String> {
-        #[cfg(unix)]
-        if self.ep.channel {
-            let s = crate::a2a::channel::connect(timeout)
-                .map_err(|e| format!("a2a: cannot reach the parent through its channel: {e}"))?;
-            return Ok(Box::new(s));
+    /// The `reqwest` client one request goes out on: agentd's TLS
+    /// configuration (with the mTLS identity, when there is one), the peer's
+    /// socket for a unix peer, no proxy, no connection kept, and a read
+    /// bound of `quiet` when one is given. With it, the flag its connector
+    /// raises when no connection could be made.
+    fn http(&self, quiet: Option<Duration>) -> Result<(reqwest::Client, Arc<AtomicBool>), String> {
+        let tls = crate::net::tls::client_config_for(self.auth.identity.as_ref())
+            .map_err(|e| format!("a2a: tls to peer {}: {e}", self.ep.origin()))?;
+        let unreached = Arc::new(AtomicBool::new(false));
+        let mut builder = reqwest::Client::builder()
+            .tls_backend_preconfigured((*tls).clone())
+            .no_proxy()
+            .pool_max_idle_per_host(0)
+            .connector_layer(NoteUnreached(Arc::clone(&unreached)));
+        if let Some(quiet) = quiet {
+            builder = builder.read_timeout(quiet);
         }
         if let Some(socket) = &self.ep.socket {
-            let s = crate::net::unixsock::connect(socket, timeout)
-                .map_err(|e| format!("a2a: cannot reach peer socket {socket}: {e}"))?;
-            return Ok(Box::new(s));
-        }
-        let tcp = crate::net::http::connect_tcp(&self.ep.host, self.ep.port, timeout)
-            .map_err(|e| format!("a2a: cannot reach peer {}: {e}", self.ep.host))?;
-        if self.ep.tls {
-            #[cfg(feature = "tls")]
+            #[cfg(unix)]
             {
-                let tls = crate::net::tls::connect(tcp, &self.ep.host, self.auth.identity.as_ref())
-                    .map_err(|e| format!("a2a: tls to peer {}: {e}", self.ep.host))?;
-                Ok(Box::new(tls))
+                builder = builder.unix_socket(std::path::PathBuf::from(socket));
             }
-            #[cfg(not(feature = "tls"))]
-            {
-                Err("a2a: https peer requires the 'tls' build feature".to_string())
-            }
-        } else {
-            Ok(Box::new(tcp))
+            #[cfg(not(unix))]
+            return Err(format!("a2a: unix peer {socket} needs a unix host"));
         }
+        let client = builder
+            .build()
+            .map_err(|e| format!("a2a: http client for peer {}: {e}", self.ep.origin()))?;
+        Ok((client, unreached))
+    }
+
+    /// The SDK's client for one call, presenting [`Self::request_headers`].
+    fn sdk(
+        &self,
+        marked: &[String],
+        quiet: Option<Duration>,
+    ) -> Result<(A2AClient<JsonRpcTransport>, Arc<AtomicBool>), String> {
+        let (http, unreached) = self.http(quiet)?;
+        let present: Arc<dyn CallInterceptor> = Arc::new(Present(self.request_headers(marked)));
+        let client = A2AClient::new(JsonRpcTransport::new(http, self.ep.rpc_url()))
+            .with_interceptors(vec![present]);
+        Ok((client, unreached))
+    }
+
+    /// One unary SDK call, bounded by [`request_timeout`].
+    fn unary<T, F, Fut>(&self, marked: &[String], deadline: Instant, call: F) -> Result<T, Failed>
+    where
+        F: FnOnce(A2AClient<JsonRpcTransport>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, A2AError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let rt = runtime().map_err(Failed::Unsent)?;
+        let (sdk, unreached) = self.sdk(marked, None).map_err(Failed::Unsent)?;
+        let bound = request_timeout(deadline);
+        let out = block(
+            rt,
+            async move { tokio::time::timeout(bound, call(sdk)).await },
+        )
+        .map_err(|e| Failed::Peer(A2AError::internal(e)))?;
+        match out {
+            Err(_) => Err(Failed::TimedOut),
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) if unreached.load(Ordering::SeqCst) => Err(Failed::Unsent(format!(
+                "a2a: cannot reach peer {}: {}",
+                self.ep.origin(),
+                e.message
+            ))),
+            Ok(Err(e)) => Err(Failed::Peer(e)),
+        }
+    }
+
+    /// `method` with `params` (as the wire carries them) through the SDK:
+    /// its answer, as the wire carries it.
+    fn exchange(&self, method: &str, params: Value, deadline: Instant) -> Result<Value, Failed> {
+        // The header activates what the message is marked with, and nothing
+        // else of the message's own: the mark is the one source.
+        let marked = a2a::extensions_of(&params);
+        let params = sdk_gaps::outbound(params);
+        let unreadable = |e: String| Failed::Unsent(format!("a2a: encode {method}: {e}"));
+        let answer = match method {
+            "SendMessage" => {
+                let req: SendMessageRequest = from_wire(params).map_err(unreadable)?;
+                self.unary(&marked, deadline, move |sdk| async move {
+                    sdk.send_message(&req).await.map(|r| to_wire(&r))
+                })?
+            }
+            "GetTask" => {
+                let req: GetTaskRequest = from_wire(params).map_err(unreadable)?;
+                self.unary(&marked, deadline, move |sdk| async move {
+                    sdk.get_task(&req).await.map(|t| to_wire(&t))
+                })?
+            }
+            other => {
+                return Err(Failed::Unsent(format!(
+                    "a2a: {other} is not a method this client sends"
+                )));
+            }
+        };
+        Ok(sdk_gaps::whole_numbers(answer))
     }
 
     /// What this connection's card is cached under — `None` when it is not
@@ -897,15 +1073,11 @@ impl HttpConn {
     /// The origin, AND the credential it is read with: a gated peer may show
     /// different callers different cards, so two peers configured on one
     /// origin with different bearers never share one. A card read under a
-    /// per-request signature or a client certificate is not cached: neither
-    /// identity can be told apart here, and one extra GET is cheaper than
-    /// handing one identity's card to another.
+    /// client certificate is not cached: that identity cannot be told apart
+    /// here, and one extra GET is cheaper than handing one identity's card to
+    /// another.
     fn card_key(&self) -> Option<String> {
-        #[cfg(feature = "tls")]
         if self.auth.identity.is_some() {
-            return None;
-        }
-        if self.auth.signer.is_some() {
             return None;
         }
         let mut credential = String::new();
@@ -959,30 +1131,46 @@ impl HttpConn {
         }
     }
 
-    /// One `GET` of the card, with the version, the credential and the
-    /// signatures every request carries: an IAM-gated peer gates its card too.
+    /// One `GET` of the card, with the version and the credential every
+    /// request carries: a gated peer gates its card too. On the same client
+    /// the SDK's calls go out on; the response's `Cache-Control` is read for
+    /// how long the card is kept.
     fn fetch_card(&self, deadline: Instant) -> Option<(PeerCard, Duration)> {
-        let timeout = request_timeout(deadline).min(CARD_TIMEOUT);
-        let owned = self.request_headers("GET", CARD_PATH, &[], &[]).ok()?;
-        let mut stream = self.connect(timeout).ok()?;
-        let mut headers: Vec<(&str, &str)> = vec![("Accept", "application/json")];
-        headers.extend(owned.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let resp = crate::net::http::send(
-            &mut *stream,
-            &self.ep.host_header,
-            "GET",
-            CARD_PATH,
-            &headers,
-            &[],
-        )
-        .ok()?;
-        if resp.status != 200 {
-            return None;
-        }
-        let card = PeerCard::parse(&resp.body)?;
+        let bound = request_timeout(deadline).min(CARD_TIMEOUT);
+        let rt = runtime().ok()?;
+        let (http, _) = self.http(None).ok()?;
+        let mut headers = vec![
+            ("A2A-Version".to_string(), A2A_PROTOCOL_VERSION.to_string()),
+            ("Accept".to_string(), "application/json".to_string()),
+        ];
+        headers.extend(self.request_headers(&[]));
+        let url = self.ep.card_url();
+        let (body, cache_control) = block(rt, async move {
+            let read = async move {
+                let mut req = http.get(url);
+                for (name, value) in &headers {
+                    req = req.header(name.as_str(), value.as_str());
+                }
+                let resp = req.send().await.ok()?;
+                if resp.status() != reqwest::StatusCode::OK {
+                    return None;
+                }
+                let cache_control = resp
+                    .headers()
+                    .get(reqwest::header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                let body = resp.bytes().await.ok()?;
+                Some((body, cache_control))
+            };
+            tokio::time::timeout(bound, read).await.ok().flatten()
+        })
+        .ok()
+        .flatten()?;
+        let card = PeerCard::parse(&body)?;
         Some((
             card,
-            card_ttl_for(self.ep.local(), resp.header("cache-control")),
+            card_ttl_for(self.ep.local(), cache_control.as_deref()),
         ))
     }
 
@@ -990,14 +1178,7 @@ impl HttpConn {
     /// for this kind of endpoint (its tenant is echoed from here on), and no
     /// required extension this client does not implement.
     fn adopt(&mut self, card: &PeerCard) -> Result<(), String> {
-        // The parent's card describes its own listener, unix or TCP; its
-        // channel speaks whichever it is.
-        let interface = if self.ep.channel {
-            card.select_interface(true, &self.ep.url)
-                .or_else(|_| card.select_interface(false, &self.ep.url))?
-        } else {
-            card.select_interface(self.ep.socket.is_some(), &self.ep.url)?
-        };
+        let interface = card.select_interface(self.ep.socket.is_some(), &self.ep.url)?;
         let mut implemented = CLIENT_EXTENSIONS.to_vec();
         implemented.extend(self.offered.iter().map(String::as_str));
         if let Some(uri) = card.requires_unknown_extension(&implemented) {
@@ -1014,244 +1195,190 @@ impl HttpConn {
         self.required = card.required_extensions().map(str::to_string).collect();
         Ok(())
     }
-}
 
-impl HttpConn {
-    /// One `SendStreamingMessage` round trip: POST with
-    /// `Accept: text/event-stream`, then consume the SSE frames — working →
-    /// (artifact) → final — to a terminal outcome. Returns `Recover(task_id)`
-    /// when the terminal state must instead be fetched over unary GetTask: the
-    /// peer answered `application/json` rather than a stream (that reply names
-    /// the task but its artifact rode a frame we never saw), or the stream broke
-    /// after the run had started. `Unsupported` is a peer that refused the
-    /// method (`-32004`) before any task existed. `Err` is returned ONLY when
-    /// nothing was started, so a caller surfacing it can never duplicate a
-    /// running task.
+    /// One `SendStreamingMessage` through the SDK, its frames — working →
+    /// (artifact) → final — followed to a terminal outcome. Returns
+    /// `Recover(task_id)` when the terminal state must instead be fetched over
+    /// unary GetTask: the stream broke, went quiet past [`STREAM_QUIET`] or
+    /// ran into the deadline after the run had started, or the task stopped at
+    /// a gate. `Unsupported` is a peer that refused the method (`-32004`)
+    /// before any task existed. `Err` is a stream that never opened or ended
+    /// before naming a task.
     fn call_streaming(
         &mut self,
         objective: &Objective,
         deadline: Instant,
     ) -> Result<StreamOutcome, String> {
-        let id = self.next_id;
-        self.next_id += 1;
         let params = objective.params(self.tenant.as_deref(), false);
         let marked = a2a::extensions_of(&params);
-        let req = Request::new(Id::Num(id), "SendStreamingMessage", Some(params));
-        let body =
-            serde_json::to_vec(&req).map_err(|e| format!("a2a: encode streaming send: {e}"))?;
-        // The read timeout must span the QUIET stretches of a long run; the
-        // server writes a keep-alive comment every ~15s, so 45s means three
-        // missed beats before the stream is declared dead.
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let timeout = remaining
-            .min(Duration::from_secs(45))
+        let req: SendMessageRequest = from_wire(sdk_gaps::outbound(params))
+            .map_err(|e| format!("a2a: encode streaming send: {e}"))?;
+        let quiet = deadline
+            .saturating_duration_since(Instant::now())
+            .min(STREAM_QUIET)
             .max(Duration::from_millis(1));
-        let owned = self.request_headers("POST", &self.ep.path, &body, &marked)?;
-        let stream = self.connect(timeout)?;
-        let mut headers: Vec<(&str, &str)> = vec![
-            ("Content-Type", "application/json"),
-            ("Accept", "text/event-stream"),
-        ];
-        headers.extend(owned.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let resp = crate::net::http::send_streaming(
-            stream,
-            &self.ep.host_header,
-            "POST",
-            &self.ep.path,
-            &headers,
-            &body,
-        )
-        .map_err(|e| format!("a2a: streaming send: {e}"))?;
-        if resp.status != 200 {
-            return Err(format!("a2a: SendStreamingMessage HTTP {}", resp.status));
-        }
-        let sse = resp
-            .header("content-type")
-            .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
-        if !sse {
-            // A peer that does not stream: the whole body is ONE JSON-RPC
-            // response whose result is the final status frame. The run already
-            // happened, so recover its artifacts via GetTask rather than resend.
-            use std::io::Read as _;
-            let mut text = String::new();
-            let _ = resp.into_reader().take(1 << 20).read_to_string(&mut text);
-            let frame: ::mcp::rpc::Response = serde_json::from_str(text.trim())
-                .map_err(|e| format!("a2a: bad unary streaming reply: {e}"))?;
-            if let Some(err) = frame.error {
-                if err.code == crate::a2a::errors::UNSUPPORTED_OPERATION {
-                    return Ok(StreamOutcome::Unsupported);
-                }
-                return Err(format!(
-                    "a2a: streaming rpc error {}: {}",
-                    err.code, err.message
-                ));
-            }
-            let result = frame.result.unwrap_or(Value::Null);
-            // A message is a whole answer: the peer tracked no task.
-            if let Some(a2a::Reply::Message(_)) = a2a::reply_of(&result) {
-                return Ok(StreamOutcome::Done(DelegateOutcome::Distillate(
-                    a2a::reply_text_of(&result),
-                )));
-            }
-            // A Task-shaped reply that is already TERMINAL carries its artifacts —
-            // resolve it directly (no recovery round trip). Anything else that
-            // names a task (a working Task, a final statusUpdate frame whose
-            // artifact rode a discarded stream frame) is recovered via GetTask.
-            if let Some(outcome) = terminal_outcome(&result) {
-                return Ok(StreamOutcome::Done(outcome));
-            }
-            let task_id = result
-                .pointer("/statusUpdate/taskId")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some(a2a::task_id_of(&result)).filter(|s| !s.is_empty()));
-            return match task_id {
-                Some(tid) => Ok(StreamOutcome::Recover(tid)),
-                None => Err("a2a: unary streaming reply named no task".into()),
-            };
-        }
+        let rt = runtime()?;
+        let (sdk, unreached) = self.sdk(&marked, Some(quiet))?;
+        let origin = self.ep.origin();
+        let until = tokio::time::Instant::from_std(deadline);
+        block(rt, async move {
+            let events =
+                match tokio::time::timeout_at(until, sdk.send_streaming_message(&req)).await {
+                    Err(_) => return Err("a2a: deadline while streaming".to_string()),
+                    Ok(Ok(events)) => events,
+                    Ok(Err(e)) if e.code == error_code::UNSUPPORTED_OPERATION => {
+                        return Ok(StreamOutcome::Unsupported);
+                    }
+                    Ok(Err(e)) if unreached.load(Ordering::SeqCst) => {
+                        return Err(format!("a2a: cannot reach peer {origin}: {}", e.message));
+                    }
+                    Ok(Err(e)) => {
+                        return Err(format!(
+                            "a2a: streaming rpc error {}: {}",
+                            e.code, e.message
+                        ));
+                    }
+                };
+            follow_stream(events, until).await
+        })?
+    }
+}
 
-        // Consume the stream: statusUpdate frames carry the lifecycle (a
-        // terminal state ends it), a completed run's artifactUpdate frames
-        // carry the distillate before that — possibly in chunks, possibly as
-        // several artifacts, which read as one answer in order. The reads
-        // themselves stop at the deadline: a peer's keep-alive comments would
-        // otherwise hold a quiet stream open past it.
-        let mut events = crate::net::http::SseReader::new(std::io::BufReader::new(UntilDeadline {
-            inner: resp.into_reader(),
-            deadline,
-        }));
-        let mut task_id: Option<String> = None;
-        let mut artifacts: Vec<(String, String)> = Vec::new();
-        loop {
-            if Instant::now() >= deadline {
+/// Follow a stream's frames to a [`StreamOutcome`]: statusUpdate frames
+/// carry the lifecycle (a terminal state ends it), a completed run's
+/// artifactUpdate frames carry the distillate before that — possibly in
+/// chunks, possibly as several artifacts, which read as one answer in order.
+/// The reads stop at `until`: a peer's keep-alive comments would otherwise
+/// hold a quiet stream open past it.
+async fn follow_stream(
+    mut events: a2a_sdk_client::BoxStream<'static, Result<StreamResponse, A2AError>>,
+    until: tokio::time::Instant,
+) -> Result<StreamOutcome, String> {
+    let mut task_id: Option<String> = None;
+    let mut artifacts: Vec<(String, String)> = Vec::new();
+    loop {
+        let next = match tokio::time::timeout_at(until, events.next()).await {
+            Ok(next) => next,
+            Err(_) => {
                 return match task_id {
                     Some(tid) => Ok(StreamOutcome::Recover(tid)),
                     None => Err("a2a: deadline while streaming".into()),
                 };
             }
-            let ev = match events.next_event() {
-                Ok(Some(ev)) => ev,
-                // EOF / a broken stream: the run may well be alive server-side —
-                // recover over GetTask when we know which task it is.
-                Ok(None) => {
-                    return match task_id {
-                        Some(tid) => Ok(StreamOutcome::Recover(tid)),
-                        None => Err("a2a: stream ended before any frame".into()),
-                    };
-                }
-                Err(e) => {
-                    return match task_id {
-                        Some(tid) => Ok(StreamOutcome::Recover(tid)),
-                        None => Err(format!("a2a: stream read: {e}")),
-                    };
-                }
-            };
-            if ev.data.trim().is_empty() {
-                continue;
+        };
+        let result = match next {
+            Some(Ok(frame)) => sdk_gaps::whole_numbers(to_wire(&frame)),
+            // The end of the stream: the run may well be alive server-side —
+            // recover over GetTask when we know which task it is.
+            None => {
+                return match task_id {
+                    Some(tid) => Ok(StreamOutcome::Recover(tid)),
+                    None => Err("a2a: stream ended before any frame".into()),
+                };
             }
-            let Ok(frame) = serde_json::from_str::<::mcp::rpc::Response>(ev.data.trim()) else {
-                continue; // an unparseable frame is skipped, not fatal
-            };
-            if let Some(err) = frame.error {
-                if task_id.is_none() && err.code == crate::a2a::errors::UNSUPPORTED_OPERATION {
+            Some(Err(e)) => {
+                if task_id.is_none() && e.code == error_code::UNSUPPORTED_OPERATION {
                     return Ok(StreamOutcome::Unsupported);
+                }
+                // A read that broke or went quiet, or a frame the SDK could
+                // not read: the run exists, and GetTask says how it is.
+                if e.code == error_code::INTERNAL_ERROR
+                    && let Some(tid) = task_id
+                {
+                    return Ok(StreamOutcome::Recover(tid));
                 }
                 return Ok(StreamOutcome::Done(DelegateOutcome::Error(format!(
                     "a2a: streaming rpc error {}: {}",
-                    err.code, err.message
+                    e.code, e.message
                 ))));
             }
-            let result = frame.result.unwrap_or(Value::Null);
-            if let Some(update) = result.get("statusUpdate") {
-                if let Some(tid) = update.get("taskId").and_then(Value::as_str) {
-                    task_id = Some(tid.to_string());
-                }
-                let state = update
-                    .pointer("/status/state")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                // A task waiting on someone keeps its stream open (A2A 1.0
-                // closes a stream only at a terminal state), but nothing will
-                // arrive on it until that someone answers: the wait is the
-                // poll's, up to the deadline.
-                if waits_on_someone(state)
-                    && let Some(tid) = &task_id
-                {
-                    return Ok(StreamOutcome::Recover(tid.clone()));
-                }
-                // Terminate on a terminal task STATE: an A2A stream closes once
-                // the task is terminal. agentd emits no `final` flag of its own,
-                // and a conformant peer signals termination by the state plus
-                // closing the stream, so the state is the only signal to trust.
-                if a2a::is_terminal(
-                    &serde_json::from_value(json!(state)).unwrap_or(TaskState::Unspecified),
-                ) {
-                    let outcome = match state {
-                        "TASK_STATE_COMPLETED" if !artifacts.is_empty() => {
-                            DelegateOutcome::Distillate(
-                                artifacts
-                                    .iter()
-                                    .map(|(_, t)| t.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join("\n"),
-                            )
-                        }
-                        // Completed but no artifact frame reached us (some
-                        // peers order the final status first): the task is
-                        // real — recover the artifacts over unary GetTask
-                        // instead of calling a finished delegation an error.
-                        "TASK_STATE_COMPLETED" => {
-                            return Ok(match &task_id {
-                                Some(tid) => StreamOutcome::Recover(tid.clone()),
-                                None => StreamOutcome::Done(DelegateOutcome::Error(
-                                    "a2a: remote completed without a distillate artifact".into(),
-                                )),
-                            });
-                        }
-                        "TASK_STATE_REJECTED" => DelegateOutcome::Error(
-                            "a2a: remote agent rejected the objective".into(),
-                        ),
-                        "TASK_STATE_CANCELLED" | "TASK_STATE_CANCELED" => {
-                            DelegateOutcome::Error("a2a: remote task was canceled".into())
-                        }
-                        other => DelegateOutcome::Error(format!("a2a: remote task ended {other}")),
-                    };
-                    return Ok(StreamOutcome::Done(outcome));
-                }
-            } else if let Some(update) = result.get("artifactUpdate") {
-                if let Some((artifact_id, append, text)) = a2a::artifact_update_of(update) {
-                    match artifacts.iter_mut().find(|(a, _)| *a == artifact_id) {
-                        Some((_, so_far)) if append => so_far.push_str(&text),
-                        Some((_, so_far)) => *so_far = text,
-                        None => artifacts.push((artifact_id, text)),
-                    }
-                }
+        };
+        if let Some(update) = result.get("statusUpdate") {
+            if let Some(tid) = update.get("taskId").and_then(Value::as_str) {
+                task_id = Some(tid.to_string());
             }
-            // A stream that opens with a message is answered by it: the peer
-            // tracked no task, and the stream ends there.
-            else if let Some(a2a::Reply::Message(_)) =
-                a2a::reply_of(&result).filter(|_| task_id.is_none())
+            let state = update
+                .pointer("/status/state")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // A task waiting on someone keeps its stream open (A2A 1.0
+            // closes a stream only at a terminal state), but nothing will
+            // arrive on it until that someone answers: the wait is the
+            // poll's, up to the deadline.
+            if waits_on_someone(state)
+                && let Some(tid) = &task_id
             {
-                return Ok(StreamOutcome::Done(DelegateOutcome::Distillate(
-                    a2a::reply_text_of(&result),
-                )));
+                return Ok(StreamOutcome::Recover(tid.clone()));
             }
-            // A full-Task frame (some peers stream the initial Task) is benign:
-            // capture its id and keep reading — unless the task is already
-            // waiting on someone, which the poll waits out.
-            else if !a2a::task_id_of(&result).is_empty() {
-                let tid = a2a::task_id_of(&result);
-                let state = result
-                    .pointer("/task/status/state")
-                    .or_else(|| result.pointer("/status/state"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if waits_on_someone(state) {
-                    return Ok(StreamOutcome::Recover(tid));
+            // Terminate on a terminal task STATE: an A2A stream closes once
+            // the task is terminal. agentd emits no `final` flag of its own,
+            // and a conformant peer signals termination by the state plus
+            // closing the stream, so the state is the only signal to trust.
+            if a2a::is_terminal(
+                &serde_json::from_value(json!(state)).unwrap_or(TaskState::Unspecified),
+            ) {
+                let outcome = match state {
+                    "TASK_STATE_COMPLETED" if !artifacts.is_empty() => DelegateOutcome::Distillate(
+                        artifacts
+                            .iter()
+                            .map(|(_, t)| t.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    // Completed but no artifact frame reached us (some
+                    // peers order the final status first): the task is
+                    // real — recover the artifacts over unary GetTask
+                    // instead of calling a finished delegation an error.
+                    "TASK_STATE_COMPLETED" => {
+                        return Ok(match &task_id {
+                            Some(tid) => StreamOutcome::Recover(tid.clone()),
+                            None => StreamOutcome::Done(DelegateOutcome::Error(
+                                "a2a: remote completed without a distillate artifact".into(),
+                            )),
+                        });
+                    }
+                    "TASK_STATE_REJECTED" => {
+                        DelegateOutcome::Error("a2a: remote agent rejected the objective".into())
+                    }
+                    "TASK_STATE_CANCELLED" | "TASK_STATE_CANCELED" => {
+                        DelegateOutcome::Error("a2a: remote task was canceled".into())
+                    }
+                    other => DelegateOutcome::Error(format!("a2a: remote task ended {other}")),
+                };
+                return Ok(StreamOutcome::Done(outcome));
+            }
+        } else if let Some(update) = result.get("artifactUpdate") {
+            if let Some((artifact_id, append, text)) = a2a::artifact_update_of(update) {
+                match artifacts.iter_mut().find(|(a, _)| *a == artifact_id) {
+                    Some((_, so_far)) if append => so_far.push_str(&text),
+                    Some((_, so_far)) => *so_far = text,
+                    None => artifacts.push((artifact_id, text)),
                 }
-                task_id = Some(tid);
             }
+        }
+        // A stream that opens with a message is answered by it: the peer
+        // tracked no task, and the stream ends there.
+        else if let Some(a2a::Reply::Message(_)) =
+            a2a::reply_of(&result).filter(|_| task_id.is_none())
+        {
+            return Ok(StreamOutcome::Done(DelegateOutcome::Distillate(
+                a2a::reply_text_of(&result),
+            )));
+        }
+        // A full-Task frame (some peers stream the initial Task) is benign:
+        // capture its id and keep reading — unless the task is already
+        // waiting on someone, which the poll waits out.
+        else if !a2a::task_id_of(&result).is_empty() {
+            let tid = a2a::task_id_of(&result);
+            let state = result
+                .pointer("/task/status/state")
+                .or_else(|| result.pointer("/status/state"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if waits_on_someone(state) {
+                return Ok(StreamOutcome::Recover(tid));
+            }
+            task_id = Some(tid);
         }
     }
 }
@@ -1264,68 +1391,17 @@ fn waits_on_someone(state: &str) -> bool {
     )
 }
 
-/// A reader that will not read past `deadline`: what a quiet stream's
-/// keep-alive comments would otherwise hold open ends when the delegation's
-/// time is up, as a read error the stream's caller recovers from.
-struct UntilDeadline<R> {
-    inner: R,
-    deadline: Instant,
-}
-
-impl<R: std::io::Read> std::io::Read for UntilDeadline<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if Instant::now() >= self.deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the delegation's deadline passed",
-            ));
-        }
-        self.inner.read(buf)
-    }
-}
-
 impl Caller for HttpConn {
     fn call(&mut self, method: &str, params: Value, deadline: Instant) -> Result<Value, String> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let timeout = request_timeout(deadline);
-        // The header activates what the message is marked with, and nothing
-        // else of the message's own: the mark is the one source.
-        let marked = a2a::extensions_of(&params);
-        let req = Request::new(Id::Num(id), method, Some(params));
-        let body = serde_json::to_vec(&req).map_err(|e| format!("a2a: encode {method}: {e}"))?;
-        let owned = self.request_headers("POST", &self.ep.path, &body, &marked)?;
-        let mut stream = self.connect(timeout)?;
-        let mut headers: Vec<(&str, &str)> = vec![("Content-Type", "application/json")];
-        headers.extend(owned.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        let resp = crate::net::http::send(
-            &mut *stream,
-            &self.ep.host_header,
-            "POST",
-            &self.ep.path,
-            &headers,
-            &body,
-        )
-        .map_err(|e| transport_error(method, &e))?;
-        if !resp.is_success() {
-            return Err(format!("a2a: {method} HTTP {}", resp.status));
-        }
-        let response: ::mcp::rpc::Response = serde_json::from_slice(&resp.body)
-            .map_err(|e| format!("a2a: {method} bad reply: {e}"))?;
-        if let Some(err) = response.error {
-            return Err(format!(
-                "a2a: {method} rpc error {}: {}",
-                err.code, err.message
-            ));
-        }
-        Ok(response.result.unwrap_or(Value::Null))
+        self.exchange(method, params, deadline)
+            .map_err(|f| f.say(method))
     }
 }
 
 /// Mint a per-delegation `messageId` (the A2A `Message.messageId`). agentd has no
 /// ULID dependency; time-plus-counter is unique enough for one client's run.
 pub(crate) fn mint_message_id() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::AtomicU64;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let millis = std::time::SystemTime::now()
@@ -1335,24 +1411,9 @@ pub(crate) fn mint_message_id() -> String {
     format!("a2a-msg-{millis:x}-{n:x}")
 }
 
-/// The per-request socket timeout: capped by [`REQUEST_TIMEOUT`] but never longer
-/// than the time left to the delegation deadline (and never zero — a tiny floor
-/// so the connect/read can at least attempt).
-/// A read or write that stopped because the socket's timeout ran out is a
-/// timeout, whatever the platform calls it: Linux reports an expired
-/// `SO_RCVTIMEO` as `EAGAIN` (`WouldBlock`), not `TimedOut`. The socket timeout
-/// is the delegation deadline (or the per-request cap), so without this a
-/// deadline that runs out mid-call surfaced as "Resource temporarily
-/// unavailable" instead of the timeout it is.
-fn transport_error(method: &str, e: &std::io::Error) -> String {
-    match e.kind() {
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-            format!("a2a: {method}: timed out waiting for the peer")
-        }
-        _ => format!("a2a: {method}: {e}"),
-    }
-}
-
+/// The per-request bound: capped by [`REQUEST_TIMEOUT`] but never longer than
+/// the time left to the delegation deadline (and never zero — a tiny floor so
+/// the call can at least attempt).
 fn request_timeout(deadline: Instant) -> Duration {
     let remaining = deadline.saturating_duration_since(Instant::now());
     remaining.min(REQUEST_TIMEOUT).max(Duration::from_millis(1))
@@ -1569,18 +1630,61 @@ mod tests {
         req.method == "GET" && req.path == CARD_PATH
     }
 
-    /// A tiny loopback-TCP **HTTP** A2A server fixture with no card: answers
-    /// each `POST` with one JSON-RPC reply drawn from the canned queue
-    /// (the send first, then the GetTask replies), clamp-repeating the LAST so
-    /// a never-terminal task keeps the client polling until its deadline.
+    /// Where a fixture card points its interfaces: a port nothing listens
+    /// on. A delegation that succeeds against such a card dialled the URL
+    /// it was configured with, not the one the card named.
+    const ELSEWHERE: &str = "http://127.0.0.1:1/";
+
+    fn card_of(interfaces: Value, streaming: bool, extensions: Value) -> Value {
+        json!({
+            "name": "fixture",
+            "description": "a fixture peer",
+            "version": "1",
+            "supportedInterfaces": interfaces,
+            "capabilities": {"streaming": streaming, "extensions": extensions},
+            "defaultInputModes": ["text/plain"],
+            "defaultOutputModes": ["text/plain"],
+            "skills": [],
+        })
+    }
+
+    fn interface(binding: &str, version: &str, tenant: &str) -> Value {
+        json!({"url": ELSEWHERE, "protocolBinding": binding, "protocolVersion": version, "tenant": tenant})
+    }
+
+    /// A non-streaming JSON-RPC 1.0 card.
+    fn unary_card() -> Value {
+        card_of(json!([interface("JSONRPC", "1.0", "")]), false, json!([]))
+    }
+
+    /// The card, marked uncacheable so no test's card outlives it.
+    fn serve_card(card: &Value) -> Answer {
+        Answer::Http(
+            200,
+            vec![("Cache-Control", "no-store".to_string())],
+            card.to_string(),
+        )
+    }
+
+    /// A tiny loopback-TCP **HTTP** A2A server fixture whose card says it
+    /// does not stream: answers each `POST` with one JSON-RPC reply drawn
+    /// from the canned queue (the send first, then the GetTask replies),
+    /// clamp-repeating the LAST so a never-terminal task keeps the client
+    /// polling until its deadline. (A peer that answers the streaming method
+    /// with plain JSON is refused by the SDK, so a unary peer says so on its
+    /// card.) A task answers `SendMessage` as the spec's `{"task": …}` and
+    /// `GetTask` bare.
     fn serve_http_fixture(replies: Vec<Value>) -> String {
         let mut idx = 0usize;
         serve(move |req| {
             if is_card_get(req) {
-                return no_card();
+                return serve_card(&unary_card());
             }
-            let result = replies[idx.min(replies.len() - 1)].clone();
+            let mut result = replies[idx.min(replies.len() - 1)].clone();
             idx += 1;
+            if req.body["method"] == "SendMessage" {
+                result = json!({ "task": result });
+            }
             Answer::Rpc(json!({ "result": result }))
         })
         .0
@@ -1825,11 +1929,11 @@ mod tests {
         // on the send, since both go to the same configured origin.
         let (url, log) = serve(|req| {
             if is_card_get(req) {
-                return no_card();
+                return serve_card(&unary_card());
             }
             // Reply terminal immediately so the client stops after one call.
             let result = task("h-a", TaskState::Completed, Some("authed"));
-            Answer::Rpc(json!({ "result": result }))
+            Answer::Rpc(json!({ "result": { "task": result } }))
         });
         let ep = A2aEndpoint::parse(&url).unwrap();
         let auth = PeerAuth {
@@ -1927,18 +2031,19 @@ mod tests {
     #[test]
     fn a_deadline_that_runs_out_inside_a_call_is_a_timeout() {
         // SendMessage is answered at once; every later call (GetTask) is held
-        // past the deadline, so the deadline always expires mid-read — on
-        // Linux as EAGAIN, which must still read as a timeout. Without
-        // transport_error this reports "Resource temporarily unavailable".
+        // past the deadline, so the deadline always expires mid-read — which
+        // must read as a timeout, not as whatever the socket reports.
         let mut first = true;
         let url = serve(move |req| {
             if is_card_get(req) {
-                return no_card();
+                return serve_card(&unary_card());
             }
-            if !std::mem::take(&mut first) {
-                thread::sleep(Duration::from_millis(900));
+            let working = task("h-d", TaskState::Working, None);
+            if std::mem::take(&mut first) {
+                return Answer::Rpc(json!({ "result": { "task": working } }));
             }
-            Answer::Rpc(json!({ "result": task("h-d", TaskState::Working, None) }))
+            thread::sleep(Duration::from_millis(900));
+            Answer::Rpc(json!({ "result": working }))
         })
         .0;
         let ep = A2aEndpoint::parse(&url).unwrap();
@@ -1983,42 +2088,6 @@ mod tests {
     mod outbound_protocol {
         use super::*;
         use crate::runtime::surface::UNIX_BINDING;
-
-        /// Where a fixture card points its interfaces: a port nothing listens
-        /// on. A delegation that succeeds against such a card dialled the URL
-        /// it was configured with, not the one the card named.
-        const ELSEWHERE: &str = "http://127.0.0.1:1/";
-
-        fn card_of(interfaces: Value, streaming: bool, extensions: Value) -> Value {
-            json!({
-                "name": "fixture",
-                "description": "a fixture peer",
-                "version": "1",
-                "supportedInterfaces": interfaces,
-                "capabilities": {"streaming": streaming, "extensions": extensions},
-                "defaultInputModes": ["text/plain"],
-                "defaultOutputModes": ["text/plain"],
-                "skills": [],
-            })
-        }
-
-        fn interface(binding: &str, version: &str, tenant: &str) -> Value {
-            json!({"url": ELSEWHERE, "protocolBinding": binding, "protocolVersion": version, "tenant": tenant})
-        }
-
-        /// A non-streaming JSON-RPC 1.0 card.
-        fn unary_card() -> Value {
-            card_of(json!([interface("JSONRPC", "1.0", "")]), false, json!([]))
-        }
-
-        /// The card, marked uncacheable so no test's card outlives it.
-        fn serve_card(card: &Value) -> Answer {
-            Answer::Http(
-                200,
-                vec![("Cache-Control", "no-store".to_string())],
-                card.to_string(),
-            )
-        }
 
         fn result(v: Value) -> Answer {
             Answer::Rpc(json!({ "result": v }))
@@ -2171,9 +2240,17 @@ mod tests {
             let command = &sent[1].body["params"];
             assert_eq!(command["message"]["role"], "ROLE_USER");
             assert_eq!(command["message"]["extensions"], json!([COMMAND_EXTENSION]));
+            // The document travels as written, but for its whole numbers,
+            // which the released SDK writes as doubles (`7.0`) and agentd's
+            // listener reads back as integers (`sdk_gaps`; 90e2876 upstream).
             assert_eq!(
-                command["message"]["parts"], cmd,
+                sdk_gaps::whole_numbers(command["message"]["parts"].clone()),
+                cmd,
                 "the document travels as written"
+            );
+            assert_eq!(
+                command["message"]["parts"][0]["data"]["agentd"]["seq"],
+                json!(7.0)
             );
             assert_eq!(sent[1].header("a2a-extensions"), Some(COMMAND_EXTENSION));
         }
@@ -2551,10 +2628,28 @@ mod tests {
                 "a message names no task to poll"
             );
 
+            // A peer with no card is streamed to, and answers on its stream.
             let reply = message.clone();
-            let (url, log) = peer(None, move || result(reply.clone()));
+            let (url, log) = peer(None, move || {
+                Answer::Sse(vec![json!({ "result": reply.clone() })])
+            });
             assert_eq!(answer_of(delegated(&url)), "{\"runs\":[]}");
             assert!(requests(&log, "GetTask").is_empty());
+        }
+
+        /// A peer that answers the streaming method with a plain JSON result
+        /// is refused by the SDK: the answer is an error, not a poll of a
+        /// task the client cannot name.
+        #[test]
+        fn a_plain_json_answer_to_a_stream_is_refused() {
+            let (url, log) = peer(None, working);
+            let e = error_of(delegated(&url));
+            assert!(e.contains("expected streaming response"), "{e}");
+            assert_eq!(
+                calls(&log),
+                [format!("GET {CARD_PATH}"), "SendStreamingMessage".into()],
+                "nothing was sent again"
+            );
         }
 
         /// A unix peer is read by the binding a unix socket declares — and only

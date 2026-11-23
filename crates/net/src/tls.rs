@@ -573,6 +573,17 @@ pub fn peer_identity(stream: &ServerTlsStream) -> Option<crate::x509::PeerIdenti
     Some(crate::x509::parse(leaf.as_ref()))
 }
 
+/// The client config [`connect`] dials with — the bundled roots and the
+/// [`install_extra_ca`] anchors on the ring provider, plus `identity` as the
+/// mTLS client certificate when `Some` — for a caller that hands TLS to
+/// another HTTP client (the A2A SDK's reqwest) rather than dialling here.
+pub fn client_config_for(identity: Option<&ClientIdentity>) -> io::Result<Arc<ClientConfig>> {
+    match identity {
+        None => Ok(client_config()),
+        Some(id) => mtls_config(id),
+    }
+}
+
 /// Build a per-identity mTLS config (the same root store + ring provider, plus
 /// the client cert/key). Not cached — client identities vary per endpoint and
 /// connections are infrequent.

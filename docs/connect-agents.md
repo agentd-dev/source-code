@@ -528,7 +528,8 @@ Things to know about delegation:
 
 - **The dial always goes to the configured endpoint.** The peer's card
   decides the protocol and the tenant, never the host, so a card cannot
-  redirect a delegation or its credentials.
+  redirect a delegation or its credentials, and neither can an HTTP
+  redirect: one is not followed, and the step fails saying so.
 - **The peer must speak A2A 1.0 JSON-RPC.** A peer whose card offers no such
   interface, or that requires an extension agentd does not implement, is
   refused before anything is sent.

@@ -681,6 +681,8 @@ own headers to each request:
 | TLS | agentd's own rustls configuration on `ring`: the bundled roots, `security.tls_ca`, and the peer's `client_cert` and `client_key` as the mTLS identity |
 | `unix:///path` | the request goes over that socket |
 | proxies | none: a peer is dialled directly, whatever `HTTPS_PROXY` says |
+| redirects | none followed: a 3xx answer fails the step, naming its status and target origin; an `https://` peer is dialled over TLS only |
+| errors | the SDK's: a reply with no JSON-RPC body (a gateway's `401` or `502` page) reads as `-32603: failed to parse JSON-RPC response`, without its HTTP status |
 | connections | one per request, none kept |
 | bounds | 30 s per request (the step's time left, when less); a stream silent for 45 s, or past the step's timeout, is given up and its task polled |
 

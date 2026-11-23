@@ -95,7 +95,7 @@ secret reference adds nothing ([Security model](security.md#secrets)).
 | An output contract | `output_contract` prose, or `output_schema` folded into that prose as text |
 | A model | The template's `model`, else `subagents.defaults.model`, else the agent's turn model, resolved to a connection with a live credential |
 | Budgets | Steps, tokens and a deadline, plus optional memory and CPU limits and a priority |
-| The agent's identity | With `security.aauth`, the daemon's: the key file's path, the agent token the daemon holds and the tokens the tree holds for each server, so the child signs its MCP, model and A2A requests with the daemon's key and asks the Agent Provider for nothing until that token is due a refresh; a token the child earns from a server is handed back for the children after it ([AAuth agent identity](aauth.md#what-agentd-signs)) |
+| The agent's identity | With `security.aauth`, the daemon's: the key file's path, the agent token the daemon holds and the tokens the tree holds for each server, so the child signs its MCP and model requests with the daemon's key (no A2A request is signed) and asks the Agent Provider for nothing until that token is due a refresh; a token the child earns from a server is handed back for the children after it ([AAuth agent identity](aauth.md#what-agentd-signs)) |
 
 The tool grant can only narrow. A caller cannot forge or widen it through
 `context`, because the supervisor's mint replaces any grant already in the

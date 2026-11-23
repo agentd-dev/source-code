@@ -58,7 +58,7 @@ reader who meets a word another page assumes. Configuration keys are in the
 | **egress** | One of the three capability tags: the tool can move data out or change external state. Also `security.egress`, which with `closed` refuses any destination the operator's sections do not declare. See [Security model](security.md). |
 | **emit** | A workflow step that appends an event to a declared stream. See [Workflows: how runs work](workflows.md). |
 | **escalate** | Asking an unsure decision once more on the model's `escalate` model and taking that answer as final. See [Models, providers and roles](intelligence.md). |
-| **extension** | An A2A protocol extension agentd declares on its card, such as the events feed or the command extension. See [A2A extensions](a2a-extensions.md). |
+| **extension** | An A2A protocol extension agentd declares on its card, such as the events feed, the command extension or the operator extension. See [A2A extensions](a2a-extensions.md). |
 
 ## F – H
 

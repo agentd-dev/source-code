@@ -1344,8 +1344,8 @@ the rest are dropped.
 | `link` | The `traceparent` of a request from another trace that caused the action without starting it — the answer to a gate, a message continuing a task, any A2A call on a task of another trace — when there is one |
 
 The `action` of an A2A call is `a2a.<method>`, or `a2a.<method>:<op>` when
-the message carried a command: `a2a.SendMessage:admin.drain`,
-`a2a.SendMessage:workflow.run`. A reload is `config.reload` with outcome
+the message carried a command: `a2a.SendMessage:workflow.run`. An operator
+method names its op already: `a2a.agentd.operator/admin.drain`. A reload is `config.reload` with outcome
 `applied`, `invalid` or `restart_required`. MCP Events runtime subscriptions
 record `mcp.events.subscribed` and `mcp.events.unsubscribed`. Acting at
 Companies records `company.sign_in` and `company.sign_out` — each naming the

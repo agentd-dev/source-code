@@ -96,7 +96,8 @@ plain A2A client gets the whole core protocol:
 
 | Extension | What it adds |
 |---|---|
-| [command](https://agentd.dev/a2a/ext/command) | structured operations sent as a DataPart on `SendMessage`: run a workflow, read status, operator controls |
+| [command](https://agentd.dev/a2a/ext/command) | the workload sent as a DataPart on `SendMessage`: run or signal a workflow, talk to a subagent |
+| [operator](https://agentd.dev/a2a/ext/operator) | the reads and the operator controls, as JSON-RPC methods `agentd.operator/<op>` |
 | [events](https://agentd.dev/a2a/ext/events) | an instance-wide observation feed for display clients |
 | [task-annotations](https://agentd.dev/a2a/ext/task-annotations) | agentd's facts about a task, under the task's metadata |
 

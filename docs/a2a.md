@@ -32,7 +32,7 @@ workflow or feed a stream ([React to changes and events](react-to-events.md)).
 flowchart LR
     Peer["Parent or peer agent"] -- "delegates work" --> L
     UI["TUI and web UI"] -- "converse, watch, approve" --> L
-    Ops["Operator script"] -- "command ops" --> L
+    Ops["Operator script"] -- "operator methods" --> L
     subgraph inst["agentd instance"]
         L["A2A listener"] -- "admitted requests" --> R["Runtime"]
     end
@@ -56,8 +56,12 @@ follow them as a stream and register webhooks for them.
 Anything agentd offers beyond core A2A is a declared extension that a client
 activates per request:
 
-- structured commands, the operator's controls among them
+- structured commands — starting and signalling workflows, talking to
+  subagents — sent as a DataPart on `SendMessage`
   ([`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command));
+- the operator's controls and the reads, as JSON-RPC methods
+  `agentd.operator/<op>`
+  ([`https://agentd.dev/a2a/ext/operator`](https://agentd.dev/a2a/ext/operator));
 - an instance-wide observation feed
   ([`https://agentd.dev/a2a/ext/events`](https://agentd.dev/a2a/ext/events));
 - agentd's own facts about a task
@@ -187,7 +191,8 @@ A principal's **role** decides what it may do by default:
   for a delegating peer.
 - **anonymous** may do nothing. A rule with this role names nobody.
 
-**Grants** extend a role to further command ops, by name or pattern. Each op
+**Grants** extend a role to further ops — commands and operator methods
+alike, named by their op — by name or pattern. Each op
 also has a **floor**: the operator-only ops answer to the role alone, and no
 grant reaches them, not even `grants: ["*"]`. A peer that could drain the
 instance it delegates to would be an operator, and a peer is not one. A
@@ -609,6 +614,6 @@ else ([Subagents](subagents.md#how-an-instance-child-reaches-its-parent)).
 - [Connect agents over A2A](connect-agents.md): expose an agent, sign
   people in and delegate, with complete configurations.
 - [A2A API reference](a2a-reference.md): methods, the pipeline, errors,
-  limits and the command ops.
+  limits, the command ops and the operator methods.
 - [A2A extensions](a2a-extensions.md): what agentd adds on top of core A2A.
 - [Security model](security.md): the threat model the listener is part of.

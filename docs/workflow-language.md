@@ -293,18 +293,26 @@ workflow steps, and subagents.
   (`workflow.stored.shadowed`).
 
 Over A2A, the [command extension](https://agentd.dev/a2a/ext/command) serves
-these ops for workflows; the [A2A extensions](a2a-extensions.md) page has
-the full table:
+the ops that start or steer work, and the
+[operator extension](https://agentd.dev/a2a/ext/operator) the reads and the
+controls, each as its method `agentd.operator/<op>`; the
+[A2A extensions](a2a-extensions.md) page has the full tables:
 
-| Op | Who may call | Does |
-|---|---|---|
-| `workflow.run` | `user`, `agent`, or a grant | starts a workflow; the reply is the task it runs under |
-| `workflow.status` | `user`, `agent`, or a grant | one run's status, or every run the caller started |
-| `workflow.cancel` | `user`, or a grant | cancels one run |
-| `workflow.signal` | a grant | delivers a signal |
-| `run.get` | `user`, or a grant; needs `a2a.introspection.enabled` | one run with per-step status, timings, errors and output |
-| `admin.pause`, `admin.resume` | operator | holds or releases the instance or one run |
-| `admin.cancel` | operator | cancels any run |
+| Op | Extension | Who may call | Does |
+|---|---|---|---|
+| `workflow.run` | command | `user`, `agent`, or a grant | starts a workflow; the reply is the task it runs under |
+| `workflow.signal` | command | a grant | delivers a signal |
+| `status` | operator | any named caller | every run the caller may see, with its exact status |
+| `workflow.cancel` | operator | `user`, or a grant | cancels one run by id |
+| `run.get` | operator | `user`, or a grant; needs `a2a.introspection.enabled` | one run with per-step status, timings, errors and output |
+| `admin.pause`, `admin.resume` | operator | operator | holds or releases the instance or one run |
+| `admin.cancel` | operator | operator | cancels any run |
+
+A run `workflow.run` starts is tracked by its task: the core `GetTask`,
+`ListTasks` and `CancelTask` read and cancel it. The task's state is coarser
+than the run's status — `running`, `suspended`, `paused` and `pending` are all
+`TASK_STATE_WORKING`, `stalled` is `TASK_STATE_FAILED` — so read `status` for
+the run's own.
 
 A workflow whose `a2a` start declares a `command` adds that command as one
 more op.

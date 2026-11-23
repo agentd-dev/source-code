@@ -5,6 +5,14 @@
 **Date:** 2026-08-16
 **Part of:** the durable-agent design (`docs/design/01-durable-agent-plan.md` §3.9, §3.15, §4.2, §4.5); supersedes RFC 0005 §served tools (the MCP peer-tool surface) and refines RFC 0020 (A2A serving) and RFC 0015 §4 (operator control stays the `a2a.*` admin family).
 
+> **Note (2026-11-23).** The command DataPart now carries the workload only
+> (`workflow.run`, `workflow.signal`, `subagent.send`, `subagent.kill`, the
+> `_instance.*` reports). The control plane and the reads moved to the
+> operator extension's JSON-RPC methods, `agentd.operator/<op>`
+> (`docs/ext/operator.md`), and `workflow.status` was removed in favour of
+> `GetTask`/`ListTasks` and the `status` read. Ops keep their names and
+> floors.
+
 ---
 
 ## 1. Summary

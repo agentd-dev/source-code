@@ -369,9 +369,9 @@ code and waits, and an operator approves it with `/approve <code> <name>`
    curl -s https://helpdesk.example.com:8443/ \
      -H 'content-type: application/json' \
      -H 'A2A-Version: 1.0' \
-     -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' \
+     -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' \
      -H "Authorization: Bearer $AGENTD_OPERATOR_TOKEN" \
-     -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"m-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"auth.device.approve","user_code":"WJLG-DRVQ","as":"alice"}}}]}}}'
+     -d '{"jsonrpc":"2.0","id":1,"method":"agentd.operator/auth.device.approve","params":{"user_code":"WJLG-DRVQ","as":"alice"}}'
    ```
 
 3. The client's next poll returns its session token:
@@ -392,10 +392,10 @@ same principal and shares what that name owns, so choose one name per person
 and never reuse a name for someone else. The approval's `existing: true`
 tells you the name was approved before.
 
-To see and end sessions, send the `auth.sessions` and `auth.sessions.revoke`
-ops the same way as the approval, with `{"op": "auth.sessions"}` or
-`{"op": "auth.sessions.revoke", "sid": "ds_…"}` (or `"name": "alice"`, or
-`"all": true`) under the `agentd` key. Revocation closes the session's open
+To see and end sessions, call the `agentd.operator/auth.sessions` and
+`agentd.operator/auth.sessions.revoke` methods the same way as the approval,
+with `{}` or `{"sid": "ds_…"}` (or `{"name": "alice"}`, or `{"all": true}`) as
+their `params`. Revocation closes the session's open
 streams within 100 ms and never deletes what the person owns. A restart ends
 every session, and there are no refresh tokens.
 

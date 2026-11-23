@@ -103,8 +103,8 @@ subagent); the tiers are in the [reference section](#internal-tool-tiers).
 Callers from outside arrive over A2A as principals. A turn that a `user` or
 `agent` principal drives is held to that principal: tools that act on the
 whole instance are refused, and tools that name a run or a subagent act only
-on the principal's own. A principal's `grants` bound the command operations
-it may call; they do not bound what the model does in a conversation the
+on the principal's own. A principal's `grants` bound the operations — command
+ops and operator methods — it may call; they do not bound what the model does in a conversation the
 principal starts. A natural-language message from a `user` drives a turn with
 the root tool plan, so to restrict which tools that turn may call for a given
 caller, write a [policy](#policies-a-verdict-on-each-call) that matches the
@@ -684,11 +684,14 @@ Narrowing or deleting a rule narrows work already in flight. `a2a.bearer`,
 ### The operator floor
 
 Every named role may call every core A2A method, on its own tasks; `anonymous`
-may call nothing. Beyond that a role reaches command operations, and the op
-table, published as the [command extension](https://agentd.dev/a2a/ext/command)
-specification, is the one the listener enforces. Its floor: an operator
-operation (`admin.*`, `auth.*`, `config`, `debug.events` and the reserved ops)
-answers to the operator role alone, before any grant is read. A `user` with
+may call nothing. Beyond that a role reaches operations, and the op table,
+published as the [command](https://agentd.dev/a2a/ext/command) and
+[operator](https://agentd.dev/a2a/ext/operator) extension specifications, is
+the one the listener enforces. Its floor: an operator operation (`admin.*`,
+`auth.*`, `config`, `debug.events` and the reserved ops) answers to the
+operator role alone, before any grant is read. An operator method is its op:
+the floor and the grants that admit the op admit the method, and a request
+that does not activate the operator extension never reaches one. A `user` with
 `grants: ["*"]` reaches none of them, and a rule that grants an operator-only
 op to another role is refused at load.
 
@@ -2057,8 +2060,8 @@ class.
 
 `finish` is granted to root and subagents, not to workflows, which end with
 the `finish` step. `status` is granted to every caller. What an A2A `user` or
-`agent` principal may do is set by the command extension's op table, its
-grants and the ownership rules, not by this table.
+`agent` principal may do is set by the command and operator extensions' op
+table, its grants and the ownership rules, not by this table.
 
 ### Read-back paths
 

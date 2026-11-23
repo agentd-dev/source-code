@@ -945,8 +945,9 @@ in [Host the web UI](hosting-the-ui.md).
 | `/quit` | leave the client (TUI) | |
 | `/<workflow>` | run that workflow | `workflow.run` |
 
-The ops are the [command extension's](a2a-extensions.md); which of them a
-caller may run is the daemon's decision.
+The ops are the [command and operator extensions'](a2a-extensions.md): a
+workload op is sent as a command, every other as its operator method. Which of
+them a caller may run is the daemon's decision.
 
 ### TUI keys
 

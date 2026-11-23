@@ -546,7 +546,7 @@ in your logs and traces:
 | An A2A answer that names a task (`SendMessage`, `SendStreamingMessage`, `GetTask`, `SubscribeToTask`) | A `traceparent` response header: the span the task's work is done in |
 | A task's annotations (the task-annotations extension) | `traceId` and `spanId` of that span |
 | A webhook's `202`, its `respond: sync` answer, and a `duplicate` of a kept delivery | `run_id` and `trace_id` in the body, and a `traceparent` response header naming the run's span; an `into:` append names the event's trace. A `202`'s `run_id` is the run the delivery was queued as: `concurrency.on_overflow: drop` or the workflow's `inputs.schema` can still refuse it, and the `run.dropped` or `run.inputs.invalid` line names it as `run` |
-| `status`, `run.get`, `workflow.status`, and the `run`, `step` and `activity` events of the event feed | `trace_id` of each run, step and working unit; the operator's `status` names the process's trace too |
+| `status`, `run.get`, and the `run`, `step` and `activity` events of the event feed | `trace_id` of each run, step and working unit; the operator's `status` names the process's trace too |
 | The `audit` events of the event feed | `trace_id` of the record |
 | Events on the `_runtime` stream | `traceparent`: the span the line was in |
 | OTLP log records | `traceId` and `spanId` |
@@ -597,11 +597,13 @@ audit:
 | `stream` | An event on the named stream, which a workflow can consume |
 
 A record carries the principal, its role, the action, the target and the
-outcome. An A2A command's action names the method and the op, so
-`a2a.SendMessage:admin.drain` is a filterable action of its own:
+outcome. An A2A command's action names the method and the op
+(`a2a.SendMessage:workflow.run`), and an operator method's names the method,
+which names its op, so `a2a.agentd.operator/admin.drain` is a filterable
+action of its own:
 
 ```json
-{"action":"a2a.SendMessage:admin.drain","agent_id":"sup","agent_path":"0","comp":"supervisor","event":"audit","instance":"probe","level":"info","outcome":"ok","pid":1852065,"principal":"operator","request_id":"m-6","role":"operator","run_id":"01M4P42Z69EJ2J6XDTWTFHP0GR","span_id":"3e9b0c7d1a2f4865","target":{"task":"01a12c41-84e3-7d91-9007-9a171a6601d3"},"trace":"f0bebfa0b94d2427e39ac6c9903b3f86","trace_id":"f0bebfa0b94d2427e39ac6c9903b3f86","ts":1791743853799}
+{"action":"a2a.agentd.operator/admin.drain","agent_id":"sup","agent_path":"0","comp":"supervisor","event":"audit","instance":"probe","level":"info","outcome":"ok","pid":1852065,"principal":"operator","role":"operator","run_id":"01M4P42Z69EJ2J6XDTWTFHP0GR","span_id":"3e9b0c7d1a2f4865","target":{"task":"01a12c41-84e3-7d91-9007-9a171a6601d3"},"trace":"f0bebfa0b94d2427e39ac6c9903b3f86","trace_id":"f0bebfa0b94d2427e39ac6c9903b3f86","ts":1791743853799}
 ```
 
 On an `audit` line, `ts` is the record's own timestamp in milliseconds since
@@ -625,7 +627,7 @@ audit:
 ```
 
 ```json
-{"action":"a2a.SendMessage:status","instance":"probe","outcome":"ok","prev":"5b2c0f7e9d…","principal":"operator","request_id":"m-2","role":"operator","seq":2,"target":{},"trace":"f0bebfa0b94d2427e39ac6c9903b3f86","ts":1791743853799}
+{"action":"a2a.agentd.operator/status","instance":"probe","outcome":"ok","prev":"5b2c0f7e9d…","principal":"operator","role":"operator","seq":2,"target":{},"trace":"f0bebfa0b94d2427e39ac6c9903b3f86","ts":1791743853799}
 ```
 
 Every start verifies the whole chain, and the head the store keeps catches a

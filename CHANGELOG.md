@@ -7,6 +7,35 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+- **Breaking: the operator surface is a method extension, and the command
+  extension carries the workload.** A new extension,
+  `https://agentd.dev/a2a/ext/operator`, declares one JSON-RPC method per
+  operator op, `agentd.operator/<op>`, its params the op's arguments:
+  `status`, `config`, `workflow.cancel`, `subagent.status`, `subagent.log`,
+  `plan.get`, the introspection reads, `admin.*`, `auth.*`,
+  `payment.allowances`, `company.*` and `delegation.*`. A read's result is
+  its document; work's is the Task it created, at once. A method is answered
+  only while the request's `A2A-Extensions` names the operator URI — a peer
+  that activates the command extension alone never reaches one — and holds
+  the caller to the op's floor, grants and inbound-token scopes
+  (`command:<op>`) exactly as before; op names in grants and policies mean
+  the same op. The command extension keeps `workflow.run`,
+  `workflow.signal`, `subagent.send`, `subagent.kill` and the `_instance.*`
+  reports; an operator op sent as a command DataPart is `UNKNOWN_OP`, and a
+  workflow still may not declare any built-in op's name. `workflow.status`
+  is removed: read a run's task with `GetTask`/`ListTasks` (its state is
+  coarser — `running`, `suspended`, `paused` and `pending` are all
+  `TASK_STATE_WORKING`, `stalled` is `TASK_STATE_FAILED`), and every run,
+  with its exact status, in `agentd.operator/status`'s `runs`. A declared
+  command's task is now linked to the run its start fires, so `CancelTask`
+  on it cancels the run. The `--login company:`, `--logout company:` and
+  `--delegation-*` clients call the operator methods over the unix
+  listener; audit actions are `a2a.agentd.operator/<op>`; the TUI and web UI
+  read the operator extension's ops and `settable` from the card. The
+  schema bundle is at `https://agentd.dev/a2a/ext/operator/schema.json`
+  (`agentd --extension-schema operator`), and `--capabilities` adds
+  `operator_ops` and lists the served operator methods.
+
 - **Breaking: the A2A SDK owns the inbound protocol.** The listener keeps
   only the host's gates — origin, failure limit, `415`, who is calling, the
   rate quota, the extensions, and the method's and a command op's

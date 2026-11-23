@@ -14,14 +14,13 @@ the instance's A2A listener (`a2a.listen`). The listener is in the release
 binaries and image. An instance without one can still be drained with
 `SIGTERM` and reloaded with `SIGHUP`, but takes no commands.
 
-A command is an ordinary A2A `SendMessage` whose message carries a data part
-of the form `{"agentd": {"op": "<name>", …arguments}}`. agentd treats it as a
-command only when the request activates the
-[command extension](https://agentd.dev/a2a/ext/command) twice: the
-`A2A-Extensions` header names its URI, and `message.extensions` lists it.
-A request without the header is refused with `EXTENSION_NOT_ACTIVATED`, and
-one without the mark with `EXTENSION_NOT_MARKED`, so no client sends a
-command by accident.
+An operator control is a JSON-RPC method of the
+[operator extension](https://agentd.dev/a2a/ext/operator):
+`agentd.operator/<op>`, its `params` the op's arguments. agentd answers it only
+when the request's `A2A-Extensions` header names the extension's URI; without
+it the method is `-32601` with `EXTENSION_NOT_ACTIVATED`, before anything
+runs. A read answers with its document as the JSON-RPC `result`; work answers
+with the Task it created, completed when the op finishes at once.
 
 This daemon configuration serves the listener with a bearer token for the
 operator:
@@ -77,7 +76,8 @@ export A2A_OPERATOR_TOKEN=replace-with-the-operator-token
 > `http://127.0.0.1:<port>/`. Declaring any credential or principal rule
 > ends that.
 
-Every command is audited as `a2a.SendMessage:<op>` when an audit sink is on.
+Every operator call is audited as `a2a.agentd.operator/<op>` when an audit
+sink is on.
 
 ## Drain for a rolling update
 
@@ -90,7 +90,7 @@ both resume when the instance starts again. Work still running at
 restart.
 
 ```bash
-curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"drain-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.drain","reason":"rolling update"}}}]}}}'
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' -d '{"jsonrpc":"2.0","id":1,"method":"agentd.operator/admin.drain","params":{"reason":"rolling update"}}'
 ```
 
 The answer is a completed task whose `<task id>.result` artifact carries the
@@ -134,7 +134,7 @@ accepted; the work waits until `admin.resume`. Use it to debug a live
 instance, or to hold it still while you swap the model service underneath.
 
 ```bash
-curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":2,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"pause-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.pause","reason":"debugging"}}}]}}}'
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' -d '{"jsonrpc":"2.0","id":2,"method":"agentd.operator/admin.pause","params":{"reason":"debugging"}}'
 ```
 
 ```json
@@ -144,7 +144,7 @@ curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'conten
 Resume it:
 
 ```bash
-curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":3,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"resume-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.resume"}}}]}}}'
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' -d '{"jsonrpc":"2.0","id":3,"method":"agentd.operator/admin.resume","params":{}}'
 ```
 
 ```json
@@ -156,8 +156,8 @@ moving:
 
 | Request arguments | Answer | Refused when |
 |---|---|---|
-| `{"op":"admin.pause","run":"<run id>"}` | `{"ok":true,"paused":"<run id>"}` | the run is already terminal (`-32602`); no such run (`-32001`) |
-| `{"op":"admin.resume","run":"<run id>"}` | `{"ok":true,"resumed":"<run id>"}` | the run is not paused (`-32602`); no such run (`-32001`) |
+| `agentd.operator/admin.pause` `{"run":"<run id>"}` | `{"ok":true,"paused":"<run id>"}` | the run is already terminal (`-32602`); no such run (`-32001`) |
+| `agentd.operator/admin.resume` `{"run":"<run id>"}` | `{"ok":true,"resumed":"<run id>"}` | the run is not paused (`-32602`); no such run (`-32001`) |
 
 A pause is not a drain. Readiness does not change, the instance stays in
 the fleet, and an instance-wide pause keeps an idle instance from exiting.
@@ -172,7 +172,7 @@ of `run.start`.
 The instance keeps running.
 
 ```bash
-curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":4,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"cancel-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.cancel","run":"reconcile-01M4P42Z6MAKCJSMS0GEMM61CM","reason":"superseded"}}}]}}}'
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' -d '{"jsonrpc":"2.0","id":4,"method":"agentd.operator/admin.cancel","params":{"run":"reconcile-01M4P42Z6MAKCJSMS0GEMM61CM","reason":"superseded"}}'
 ```
 
 ```json
@@ -182,13 +182,15 @@ curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'conten
 `run` is required: without it the request is refused before anything runs,
 with `-32602` and reason `INVALID_COMMAND_ARGS`. A run id that does not exist
 is acknowledged the same way, so confirm the cancellation with `status` or
-the run's `run.done` line. To cancel a *task*, one
-conversation turn or one delegated unit of work, use the standard A2A
-`CancelTask` method, which any principal may call on its own tasks.
+the run's `run.done` line. `admin.cancel` reaches any run, a scheduled or
+webhook-started one included, whoever started it. To cancel a *task* — a
+conversation turn, a delegated unit of work, or a run started over A2A, whose
+task it is — use the standard A2A `CancelTask` method, which any principal may
+call on its own tasks and the operator on any.
 
 `admin.drain`, `admin.pause` and `admin.cancel` take an optional `reason`
 (default `operator request`) that goes into the log and the audit record.
-An argument an op does not declare is refused, never ignored.
+A param an op does not declare is refused, never ignored.
 
 ## Change a setting at runtime
 
@@ -201,7 +203,7 @@ without touching the file:
 | `a2a.introspection.enabled` | `true`, `false` | Open the content and internals reads (transcripts, run detail, the log ring) while you debug |
 
 ```bash
-curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":5,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"set-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"admin.set","path":"a2a.introspection.enabled","value":true}}}]}}}'
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' -d '{"jsonrpc":"2.0","id":5,"method":"agentd.operator/admin.set","params":{"path":"a2a.introspection.enabled","value":true}}'
 ```
 
 ```json
@@ -215,12 +217,11 @@ done: it exposes conversation content to operators.
 
 ## Read live state
 
-Reads use the same listener and the same request shape. A read answers with
-a message rather than a task, so polling leaves nothing behind in any task
-list.
+Reads are operator methods too. A read's `result` is its document rather
+than a task, so polling leaves nothing behind in any task list.
 
 ```bash
-curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":6,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"status-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' -d '{"jsonrpc":"2.0","id":6,"method":"agentd.operator/status","params":{}}'
 ```
 
 `status` answers with the instance view: `instance`, `version`, `run_id`,
@@ -232,7 +233,7 @@ curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'conten
 version, size; never the text), the active `model`, operator-published
 `values`, and recent `activity`. Each principal sees the parts it may.
 
-Every run in `status`, `run.get` and `workflow.status`, and every working
+Every run in `status` and `run.get`, and every working
 unit in `activity`, names the trace its work is in as `trace_id`, so you can
 go from a run to its trace in your collector, or grep its log lines:
 
@@ -242,14 +243,14 @@ jq -c 'select(.trace_id == "f281fdc06f4dd1374e53be619f96e1fe")' agentd.log
 
 | Read | Request | Who may |
 |---|---|---|
-| Instance status | `{"op":"status"}` | any named principal |
-| Effective configuration | `{"op":"config"}` | operator |
+| Instance status | `agentd.operator/status` | any named principal |
+| Effective configuration | `agentd.operator/config` | operator |
 | One task, all tasks, task updates | `GetTask`, `ListTasks`, `SubscribeToTask` | the task's owner; the operator sees all |
 | Identity | `GET /.well-known/agent-card.json` | anyone |
 | What this caller may run | `GetExtendedAgentCard` | an authenticated caller |
 | The live event feed | `agentd.events/SubscribeToEvents` | any named principal, with `a2a.events.enabled` |
-| Transcripts, run and subagent detail | `conversation.get`, `run.get`, `subagent.get` | the owner or the operator, with `a2a.introspection.enabled` |
-| The log ring | `{"op":"debug.events"}` | operator, with `a2a.introspection.enabled` |
+| Transcripts, run and subagent detail | `agentd.operator/conversation.get`, `…/run.get`, `…/subagent.get` | the owner or the operator, with `a2a.introspection.enabled` |
+| The log ring | `agentd.operator/debug.events` | operator, with `a2a.introspection.enabled` |
 
 `config` returns the merged configuration with `{{secret:…}}` references as
 written, never the resolved values. Use it to confirm what a reload changed.
@@ -260,7 +261,7 @@ and `prefix`, and answers with `events`, `oldest_seq`, `newest_seq` and
 `dropped`:
 
 ```bash
-curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command' -d '{"jsonrpc":"2.0","id":7,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"tail-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"debug.events","level":"warn","limit":50}}}]}}}'
+curl -sS "$DAEMON_URL" -H "Authorization: Bearer $A2A_OPERATOR_TOKEN" -H 'content-type: application/json' -H 'A2A-Version: 1.0' -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' -d '{"jsonrpc":"2.0","id":7,"method":"agentd.operator/debug.events","params":{"level":"warn","limit":50}}'
 ```
 
 The ring holds `observability.events_ring` lines (default 1024) and exists
@@ -413,16 +414,18 @@ shortened here):
 {
   "a2a": {
     "auth": { "bearer": true, "device": false, "implicit_operator": false, "mtls": false, "required": true },
-    "command_ops": ["status", "config", "workflow.run", "workflow.status", "…"],
+    "command_ops": ["workflow.run", "workflow.signal", "subagent.send", "subagent.kill"],
     "cors_origins": 0,
     "events": true,
     "extensions": [
       "https://agentd.dev/a2a/ext/command",
+      "https://agentd.dev/a2a/ext/operator",
       "https://agentd.dev/a2a/ext/events",
       "https://agentd.dev/a2a/ext/task-annotations"
     ],
     "introspection": false,
-    "methods": ["SendMessage", "SendStreamingMessage", "GetTask", "…"],
+    "methods": ["SendMessage", "SendStreamingMessage", "GetTask", "…", "agentd.operator/status", "…"],
+    "operator_ops": ["status", "config", "workflow.cancel", "…"],
     "url": "https://agent.internal:8443"
   },
   "agent": { "instruction": true, "name": "reconciler", "preflight": "auto" },
@@ -495,5 +498,5 @@ the work for you.
 
 - [Deploy](deployment.md): drain timing and ConfigMap reloads on Kubernetes.
 - [Monitor in production](observability.md): probes, metrics and alerts.
-- [A2A API reference](a2a-reference.md): every method and command op.
+- [A2A API reference](a2a-reference.md): every method, command op and operator method.
 - [Scale out](scaling.md): drain as the safe way to scale in.

@@ -19,7 +19,8 @@ only when the card declares them:
 | Discover the agent | `GET /.well-known/agent-card.json`, then `GetExtendedAgentCard` with a credential | core A2A |
 | Converse | `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask` | core A2A |
 | Know a task's link, owner and answer schema | task metadata under the task-annotations URI | [task-annotations](https://agentd.dev/a2a/ext/task-annotations) |
-| Run operations (status, workflows, steering, sign-in admin) | one DataPart `{"agentd": {"op": …}}` on `SendMessage` | [command](https://agentd.dev/a2a/ext/command) |
+| Run work (start and signal workflows, talk to subagents) | one DataPart `{"agentd": {"op": …}}` on `SendMessage` | [command](https://agentd.dev/a2a/ext/command) |
+| Read state and operate (status, reads, pause, sign-in admin) | the method `agentd.operator/<op>` | [operator](https://agentd.dev/a2a/ext/operator) |
 | Watch the whole instance live | `agentd.events/SubscribeToEvents` | [events](https://agentd.dev/a2a/ext/events) |
 | Sign in a person | the OAuth device grant at the listener's `/oauth2/*` | listener with `a2a.device_grant` |
 
@@ -92,7 +93,7 @@ so a client can keep it for a minute and then revalidate with
 `If-None-Match`. When `capabilities.extendedAgentCard` is true and the client
 holds a credential, `GetExtendedAgentCard` narrows each declaration to this
 caller: the command ops it may run, the workflow commands it may fire, the
-paths `admin.set` accepts, the event kinds its feed can carry, and a
+operator methods it may call, the paths `admin.set` accepts, the event kinds its feed can carry, and a
 `workflow:<name>` skill for each workflow it may start. The public card's op
 list is the vocabulary every agentd can answer, the same for every caller; it
 is not a promise about what this caller may do. A listener with no
@@ -202,49 +203,56 @@ the task also carries agentd's facts about it:
 - **List** with `ListTasks`. A caller sees its own tasks; an operator sees
   all of them.
 
-## Run commands
+## Run commands and operator methods
 
-Operations that are not conversation (the instance's status, starting a
-workflow, pausing a run, approving a device) go through the command
-extension. A command is an ordinary `SendMessage` whose single part is a
-DataPart under the key `agentd`, and it is activated twice: the
-`A2A-Extensions` header names the command URI, and the message lists it in
-`message.extensions`. Without both, the part is refused and never run.
+Work that is not conversation — starting or signalling a workflow, talking to
+or stopping a subagent — goes through the command extension. A command is an
+ordinary `SendMessage` whose single part is a DataPart under the key
+`agentd`, and it is activated twice: the `A2A-Extensions` header names the
+command URI, and the message lists it in `message.extensions`. Without both,
+the part is refused and never run. A command answers with a Task, and its
+result arrives as the task's `<taskId>.result` artifact.
+
+The instance's status, the other reads and the operator controls (pausing a
+run, approving a device) are methods of the operator extension:
+`agentd.operator/<op>`, the op's arguments its `params`, answered only while
+the header names the operator URI.
 
 ```sh
 curl -si http://127.0.0.1:8420/ \
   -H 'content-type: application/json' \
   -H 'A2A-Version: 1.0' \
-  -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command, https://example.com/not-ours' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"m-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
+  -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator, https://example.com/not-ours' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agentd.operator/status","params":{}}'
 ```
 
 ```
 HTTP/1.1 200 OK
 content-type: application/json
-a2a-extensions: https://agentd.dev/a2a/ext/command
+a2a-extensions: https://agentd.dev/a2a/ext/operator
 
-{"id":1,"jsonrpc":"2.0","result":{"message":{…,"parts":[{"data":{"activity":[],"budget":{…},…}}]}}}
+{"id":1,"jsonrpc":"2.0","result":{"activity":[],"budget":{…},…}}
 ```
 
 The response echoes exactly the extensions the request activated; the URI
-agentd does not know was dropped, not refused. An op answers in one of two
-ways, published per op on the card as `params.ops[].reply`:
+agentd does not know was dropped, not refused. An operator method answers in
+one of two ways, published per op on the card as `params.ops[].reply`:
 
-- **A read** (`status`, `config`, `workflow.status`, `plan.get`, …) answers
-  with a Message whose DataPart is the result. No task is created, so a client
-  that polls leaves nothing behind.
-- **Work** (`workflow.run`, `admin.pause`, `auth.device.approve`, …) answers
-  with a Task, and its result arrives as the task's `<taskId>.result`
+- **A read** (`status`, `config`, `plan.get`, …): the result is the document.
+  No task is created, so a client that polls leaves nothing behind.
+- **Work** (`admin.pause`, `auth.device.approve`, …): the result is the Task
+  the call created, and its result arrives as the task's `<taskId>.result`
   artifact.
 
-Arguments sit beside `op` and are validated against the op's schema; an
-argument the op does not take is refused, never ignored. Before sending, check
-that the op is in the extended card's `params.ops` for this caller: the
-operator-only ops (`admin.*`, `auth.*`, `config`, `debug.events`) are refused
-to anyone else, whatever their grants say. The full op table, the reply
-shapes and the error reasons are the
-[command specification](https://agentd.dev/a2a/ext/command).
+Arguments are validated against the op's schema; an argument the op does not
+take is refused, never ignored. Before calling, check that the op is in the
+extended card's `params.ops` for this caller: the operator-only ops
+(`admin.*`, `auth.*`, `config`, `debug.events`) are refused to anyone else,
+whatever their grants say. A run `workflow.run` started is followed, read and
+cancelled with the core task methods on the task it answered with. The full
+op tables, the reply shapes and the error reasons are the
+[command](https://agentd.dev/a2a/ext/command) and
+[operator](https://agentd.dev/a2a/ext/operator) specifications.
 
 ## Watch the instance
 
@@ -324,7 +332,7 @@ const session = await openSession(endpoint);
 const client = new AgentdClient(session.ep, session.caps);
 console.log('agent:', session.card.name, '· events:', session.caps.events !== null);
 
-// A read op (command extension): answered with a Message, no task created.
+// A read (an operator method): its result is the document, no task created.
 if (client.offers('status')) {
   const status = await client.status();
   console.log('instance:', status.instance);
@@ -409,7 +417,7 @@ const credential = await deviceLogin({
 const session = await openSession(endpoint, { credential });
 const client = new AgentdClient(session.ep, session.caps);
 console.log('signed in until', new Date(credential.expiresAt).toISOString());
-console.log('ops I may run:', [...session.caps.command.ops].join(', '));
+console.log('ops I may run:', [...session.caps.command.ops, ...session.caps.operator.ops].join(', '));
 ```
 
 Against a daemon with the device grant on, once an operator approves the code
@@ -418,7 +426,7 @@ as `alice`, it prints what a `user` principal may run:
 ```
 open http://127.0.0.1:8420/oauth2/device and enter RKQK-VBDP
 signed in until 2026-10-12T02:48:03.164Z
-ops I may run: status, workflow.run, workflow.status, workflow.cancel, subagent.send, subagent.status, plan.get
+ops I may run: workflow.run, subagent.send, status, workflow.cancel, subagent.status, plan.get
 ```
 
 > **Note.** `@agentd-dev/cli` is licensed AGPL-3.0-only, like agentd. Check

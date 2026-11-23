@@ -322,7 +322,7 @@ companies:
   only. With an HTTPS listener the User asks the agent to sign in: its
   `company.sign_in` tool opens the sign-in gate, which the User answers in
   the [terminal or web UI](interface.md). Or the User's own A2A client
-  sends the `company.sign_in` [command op](a2a-reference.md#command-ops).
+  sends the `company.sign_in` [operator method](a2a-reference.md#operator-methods).
   The terminal and web UI have no command that starts a company sign-in;
   their `/login` signs in to agentd's own listener.
 
@@ -352,8 +352,8 @@ Signed out of the account "default" at shop: its Account Token is revoked there 
 The operator's `company.user_id.reset` goes further: it revokes the token of
 every account the User holds there, forgets the User ID and drops the
 Sessions, so the company sees a new User from the next call on. It is an
-A2A [command op](a2a-reference.md#command-ops) with one argument, `company`,
-sent from an A2A client with the operator role; no tool and no command in
+A2A [operator method](a2a-reference.md#operator-methods) with one argument, `company`,
+called from an A2A client with the operator role; no tool and no command in
 the terminal or web UI sends it.
 
 ### Several accounts
@@ -367,7 +367,7 @@ identifiers are never labels: the draft gives agentd none.
 
 - **Signing in.** Name the label after a `/`, or as the `account` argument:
   `agentd --login company:shop/work`, `company.sign_in {company: shop,
-  account: work}`, or the `company.sign_in` command op. The gate names the
+  account: work}`, or the `company.sign_in` operator method. The gate names the
   label. A sign-in that names none signs in to the only account held, or to
   `default` while none is. A label held whose token covers the scopes signs
   in with no gate. A label not held yet signs in in a new Session of its own.
@@ -433,7 +433,7 @@ User owns, and, when the User is `operator` or an operator principal, in
 work nobody owns, such as a schedule or a stream. The `company.status` tool
 says where each company stands: verified or not, the accounts signed in, and
 its servers. The operator's `company.status`
-[command op](a2a-reference.md#command-ops) answers the same, with why each
+[operator method](a2a-reference.md#operator-methods) answers the same, with why each
 company that failed failed.
 
 ### Its MCP tools
@@ -854,13 +854,13 @@ gap.
 | `companies.shop.sign_in needs security.companies.seal_key` | a sign-in with nowhere sealed to keep its token | add a `seal_key` |
 | `company.identity.unpublished` (error) | the documents at `client.id` or the key set's URL are not what this configuration prints | print and publish them again; every company waits until they match |
 | `company.signer.unavailable` (warn, error) | the external signer that holds the seal key does not answer | start the signer; every company waits for it, and no User is started over |
-| `company.seal_key.mismatch` (error) | the seal key opens none of the store's records, or was removed, or the store was sealed under the other custody | restore the key, or the custody; or send the [`company.user_id.reset` command op](a2a-reference.md#command-ops) as the operator for each company, which starts the User over there |
+| `company.seal_key.mismatch` (error) | the seal key opens none of the store's records, or was removed, or the store was sealed under the other custody | restore the key, or the custody; or send the [`company.user_id.reset` operator method](a2a-reference.md#operator-methods) as the operator for each company, which starts the User over there |
 | `company.refused` with a `reason` | the company's documents do not verify: `issuer`, `domains`, `es256`, `endpoint`, `https` and others | tell the company; agentd tries again with backoff |
 | `company.endpoint.refused` | a URL the company names is off the entry's hosts | add the host to `hosts` if it belongs to the company |
 | `company.clock_skew` (warn) | the host clock is over 30 s from the company's | fix the clock; assertions and proofs live about a minute |
 | `company.rate_limited` | the company asked for a wait | nothing: requests resume at `until` |
 | a tool answers `outcome unknown` | the call may have run | check at the company before you ask again |
-| `--login company:shop` exits `2` | no unix A2A listener, the User is not `operator`, or the label after `/` is not one | ask the agent to sign in (its `company.sign_in` tool opens the gate, which the User answers in the terminal or web UI), or send the [`company.sign_in` command op](a2a-reference.md#command-ops) from the User's own A2A client |
+| `--login company:shop` exits `2` | no unix A2A listener, the User is not `operator`, or the label after `/` is not one | ask the agent to sign in (its `company.sign_in` tool opens the gate, which the User answers in the terminal or web UI), or call the [`company.sign_in` operator method](a2a-reference.md#operator-methods) from the User's own A2A client |
 | `company.sign_in.failed` | `cancelled`, `denied`, `expired`, `account_mismatch`, `interrupted` or `failed` | start the sign-in again; after `account_mismatch`, the User signed in to another account than the label's: ask with `new_account: true` to replace it, which suspends the standing permissions covering that label until a restart, or under another label to hold both |
 | a call answers `the User holds several accounts here (…)` | several accounts are held and the call names none | name one as `account`; a conversation or operation goes on in its own |
 | a sign-in answers `holds 8 accounts there already` | the most accounts agentd keeps at one company | sign out of one first |
@@ -917,9 +917,9 @@ lists every `company.*` event and the `agent_company_*` metrics.
 - [CLI](cli.md#asks) — `--login company:<name>[/<label>]`,
   `--logout company:<name>[/<label>]` and `--print-company-client`, with
   their exit codes.
-- [A2A API reference](a2a-reference.md#command-ops) — the `company.status`,
-  `company.user_id.reset`, `company.sign_in` and `company.sign_out` command
-  ops, who may send them and what they answer.
+- [A2A API reference](a2a-reference.md#operator-methods) — the
+  `company.status`, `company.user_id.reset`, `company.sign_in` and
+  `company.sign_out` operator methods, who may call them and what they answer.
 - [MCP support reference](mcp-reference.md#agentds-own-tools) — agentd's
   own tools, `company.status` among them, and
   [internal tool tiers](security.md#internal-tool-tiers), where each

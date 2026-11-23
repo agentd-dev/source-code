@@ -4,7 +4,7 @@ A2A 1.0 defines eleven JSON-RPC methods and a message model. Anything an agent
 speaks beyond them goes through the protocol's own mechanism,
 [extensions](https://github.com/a2aproject/A2A/blob/main/docs/topics/extensions.md):
 a URI, declared on the Agent Card, that a client activates per request. This
-page lists the three extensions and one protocol binding agentd declares, the
+page lists the four extensions and one protocol binding agentd declares, the
 activation rules, what the extended card adds, and the errors the extensions
 introduce. It is for integrators building a client or a peer; each URI is
 also the address of its normative specification.
@@ -13,7 +13,8 @@ also the address of its normative specification.
 
 | URI | Kind | Declared | Applies to | Adds |
 |---|---|---|---|---|
-| [`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command) | profile | always | `SendMessage`, `SendStreamingMessage` | command ops: structured operations sent as one DataPart |
+| [`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command) | profile | always | `SendMessage`, `SendStreamingMessage` | the workload ops — starting and signalling workflows, talking to and stopping subagents — sent as one DataPart |
+| [`https://agentd.dev/a2a/ext/operator`](https://agentd.dev/a2a/ext/operator) | method | always | its methods `agentd.operator/<op>` | the control plane and the reads, as JSON-RPC methods |
 | [`https://agentd.dev/a2a/ext/events`](https://agentd.dev/a2a/ext/events) | method | while `a2a.events.enabled` is on | `agentd.events/SubscribeToEvents` | the instance-wide observation feed |
 | [`https://agentd.dev/a2a/ext/task-annotations`](https://agentd.dev/a2a/ext/task-annotations) | profile | always | every answer that carries a Task | agentd's facts about a task, in `Task.metadata` |
 
@@ -26,9 +27,10 @@ activated:
 
 A2A groups extensions into four kinds: data-only (information on the card),
 profile (structure or narrower values on core messages), method (new RPC
-methods) and state machine (new task states). agentd's are profile and method
-extensions. None changes a core structure: custom data rides in a DataPart or
-under a URI in a `metadata` map, which is what those fields exist for.
+methods) and state machine (new task states). agentd's are profile
+and method extensions. None changes a core structure: custom data rides in a
+DataPart or under a URI in a `metadata` map, which is what those fields exist
+for, and a call on the instance is a method of its own.
 
 **None is required.** A client that sends no `A2A-Extensions` header gets the
 whole core protocol: it converses, reads, lists and cancels its tasks,
@@ -53,6 +55,7 @@ Each URI is both an identifier and an address.
 | Schema bundle | Validates |
 |---|---|
 | [`https://agentd.dev/a2a/ext/command/schema.json`](https://agentd.dev/a2a/ext/command/schema.json) | the `data` of a command DataPart, each op's arguments and result |
+| [`https://agentd.dev/a2a/ext/operator/schema.json`](https://agentd.dev/a2a/ext/operator/schema.json) | a call of an operator method, each method's params and result |
 | [`https://agentd.dev/a2a/ext/events/schema.json`](https://agentd.dev/a2a/ext/events/schema.json) | the method's params, each frame, each event kind's `data` |
 | [`https://agentd.dev/a2a/ext/task-annotations/schema.json`](https://agentd.dev/a2a/ext/task-annotations/schema.json) | the object under `metadata[<URI>]` |
 
@@ -64,8 +67,8 @@ agentd --extensions
 agentd --extension-schema command
 ```
 
-`--extension-schema` takes the last segment of a URI: `command`, `events` or
-`task-annotations`.
+`--extension-schema` takes the last segment of a URI: `command`, `operator`,
+`events` or `task-annotations`.
 
 To see what a running instance declares, read its card:
 
@@ -75,6 +78,7 @@ curl -s http://127.0.0.1:8420/.well-known/agent-card.json | jq -r '.capabilities
 
 ```text
 https://agentd.dev/a2a/ext/command
+https://agentd.dev/a2a/ext/operator
 https://agentd.dev/a2a/ext/events
 https://agentd.dev/a2a/ext/task-annotations
 ```
@@ -88,9 +92,10 @@ is activated for a request when it is all three of:
 - **requested:** named in the header, matched exactly;
 - **declared:** on this instance's card;
 - **applicable:** meaningful on the method called. The command extension
-  applies to the two sends, the events extension to its own method, and
-  task-annotations to every answer that carries a Task (the sends, `GetTask`,
-  `ListTasks`, `CancelTask`, `SubscribeToTask` and the feed's `task` events).
+  applies to the two sends, the operator and events extensions to their own
+  methods, and task-annotations to every answer that carries a Task (the
+  sends, `GetTask`, `ListTasks`, `CancelTask`, `SubscribeToTask`, the feed's
+  `task` events and an operator method that answers with a Task).
 
 The response echoes, in the same header, exactly the extensions the request
 activated. Three consequences follow:
@@ -108,27 +113,28 @@ command only when the header names the command URI *and* the message lists it
 in `message.extensions`. Without both it is refused and never run, so no
 client sends a command by accident.
 
-**A method is part of its extension.** `agentd.events/SubscribeToEvents` is
-answered only when the instance declares the events extension and the request
-activates it.
+**A method is part of its extension.** `agentd.events/SubscribeToEvents` and
+each `agentd.operator/<op>` are answered only when the instance declares the
+extension and the request activates it. A peer that activates the command
+extension alone never reaches an operator method, whatever its grants.
 
-This request sends the `status` command and names one URI agentd does not
+This request calls the `status` read and names one URI agentd does not
 implement:
 
 ```sh
 curl -si http://127.0.0.1:8420/ \
   -H 'content-type: application/json' \
   -H 'A2A-Version: 1.0' \
-  -H 'A2A-Extensions: https://agentd.dev/a2a/ext/command, https://example.com/not-ours' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"role":"ROLE_USER","messageId":"m-1","extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"agentd":{"op":"status"}}}]}}}'
+  -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator, https://example.com/not-ours' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"agentd.operator/status","params":{}}'
 ```
 
 ```text
 HTTP/1.1 200 OK
 content-type: application/json
-a2a-extensions: https://agentd.dev/a2a/ext/command
+a2a-extensions: https://agentd.dev/a2a/ext/operator
 
-{"id":1,"jsonrpc":"2.0","result":{"message":{"extensions":["https://agentd.dev/a2a/ext/command"],"parts":[{"data":{"instance":"reviewer","draining":false,…}}],…}}}
+{"id":1,"jsonrpc":"2.0","result":{"instance":"reviewer","draining":false,…}}
 ```
 
 That example runs against a loopback listener with no credential configured,
@@ -142,16 +148,17 @@ where a local caller is the operator. Anywhere else, add
 ## The extended card
 
 The public card is the same for every caller. It declares each extension with
-the params that do not depend on who asks: the command extension's public
-`ops` list is the vocabulary agentd can answer, identical on every instance,
-whatever it has switched on.
+the params that do not depend on who asks: the command and operator
+extensions' public `ops` lists are the vocabulary agentd can answer, identical
+on every instance, whatever it has switched on.
 
 `GetExtendedAgentCard` narrows each declaration to this instance and this
 caller:
 
 | Extension | The extended card adds |
 |---|---|
-| command | `ops`: the ops this instance serves and the caller may run. `commands`: the workflow-declared commands the caller may send, each with its workflow and argument schema. `settable`: the paths `admin.set` accepts, for a caller that may run it |
+| command | `ops`: the ops this instance serves and the caller may run. `commands`: the workflow-declared commands the caller may send, each with its workflow and argument schema |
+| operator | `ops`: the operator methods this instance serves and the caller may call. `settable`: the paths `admin.set` accepts, for a caller that may call it |
 | events | `ring`: how many events the feed keeps for a reconnecting subscriber. `kinds`: the event kinds this caller's feed can carry |
 
 It also adds a `workflow:<name>` skill for each workflow the caller may run.
@@ -176,9 +183,7 @@ workflow-declared command sees this command declaration:
     "dataPartKey": "agentd",
     "schema": "https://agentd.dev/a2a/ext/command/schema.json",
     "ops": [
-      {"op": "status", "reply": "message"},
-      {"op": "workflow.run", "reply": "task"},
-      {"op": "workflow.status", "reply": "message"}
+      {"op": "workflow.run", "reply": "task"}
     ],
     "commands": [
       {
@@ -197,46 +202,92 @@ workflow-declared command sees this command declaration:
 
 ## The command extension
 
-A2A has no tool-call primitive, and a method per operation would put agentd's
-surface out of reach of a stock client. So every operation is an ordinary
-`SendMessage` whose single DataPart holds the command:
-`{"agentd": {"op": "…", …arguments}}`. The arguments are validated against
-the op's published schema, and an argument the op does not take is refused,
-never ignored.
+The command extension carries agentd's **workload**: the ops that start work
+or act on work a task tracks. Each is an ordinary `SendMessage` whose single
+DataPart holds the command: `{"agentd": {"op": "…", …arguments}}`, so a peer
+agent and a stock A2A client reach it with the one method every agent answers.
+The arguments are validated against the op's published schema, and an
+argument the op does not take is refused, never ignored. Every command answers
+with a Task; a result it produces arrives as the task's `<taskId>.result`
+artifact.
 
-An op answers in one of two ways, published per op as `params.ops[].reply`:
-
-- **A read** (`message`) answers with a Message whose DataPart is the result
-  document. No task is created, so a client that polls leaves nothing behind.
-- **Work** (`task`) answers with a Task. A result it produces arrives as the
-  task's `<taskId>.result` artifact.
-
-| Family | Ops | Served |
-|---|---|---|
-| Status and configuration | `status`, `config` | always |
-| Workflows | `workflow.run`, `workflow.status`, `workflow.cancel`, `workflow.signal` | always |
-| Subagents and plans | `subagent.send`, `subagent.kill`, `subagent.status`, `plan.get` | always |
-| Introspection | `conversation.get`, `run.get`, `subagent.get`, `debug.events` | while `a2a.introspection.enabled` is on |
-| Operator controls | `admin.drain`, `admin.pause`, `admin.resume`, `admin.cancel`, `admin.set` | always |
-| Sign-in | `auth.device.pending`, `auth.device.approve`, `auth.device.deny` | while `a2a.device_grant.enabled` is on |
-| Sessions | `auth.sessions`, `auth.sessions.revoke` | on a TCP listener |
+| Ops | Served |
+|---|---|
+| `workflow.run`, `workflow.signal`, `subagent.send`, `subagent.kill` | always |
 
 Who may call each op, its arguments and its result are in the
-[command ops table](a2a-reference.md#command-ops). The `admin.*` and `auth.*`
-ops, `config` and `debug.events` are operator-only, and no grant reaches
-them.
+[ops table](a2a-reference.md#command-ops). The `_instance.*` ops are reserved:
+a child instance's reports to its parent.
 
 **Workflow-declared commands.** A workflow whose start step is `kind: a2a`
 with a `command:` declares one more op: sending that command starts the
 workflow, and its arguments are held to the start step's `schema`. A caller
 may send it when its grants name the op (an operator always may) and the
-start's `roles:` admit its role. The built-in op names are reserved: a
+start's `roles:` admit its role. The task the message is tracked by becomes the
+run's once the start fires: `GetTask` reads it and `CancelTask` on it cancels
+the run. Every built-in op name — the operator ops' included — is reserved: a
 workflow that declares one is refused at validation, so a workflow can never
 shadow an operator control.
 
 The normative specification, with the envelope, every op and the reserved
 names, is at
 [`https://agentd.dev/a2a/ext/command`](https://agentd.dev/a2a/ext/command).
+
+## The operator extension
+
+The control plane and the reads are calls on the instance, not messages to the
+agent, so they are JSON-RPC methods of their own: `agentd.operator/<op>`,
+namespaced under the extension so a method the specification defines later can
+never collide with one. The `params` are the op's arguments; an op keeps its
+name, so `admin.drain` in a principal's `grants` or an inbound token's
+`command:admin.drain` skill means the method `agentd.operator/admin.drain`.
+
+```sh
+curl -s http://127.0.0.1:8420/ \
+  -H 'content-type: application/json' \
+  -H 'A2A-Version: 1.0' \
+  -H 'A2A-Extensions: https://agentd.dev/a2a/ext/operator' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"agentd.operator/admin.pause","params":{"reason":"maintenance"}}'
+```
+
+A method answers in one of two ways, published per op as `params.ops[].reply`:
+
+- **A read** (`message`): the JSON-RPC `result` is the document. No task is
+  created, so a client that polls leaves nothing behind.
+- **Work** (`task`): the `result` is the Task the call created, as `GetTask`
+  answers it, at once. A result it produces arrives as the task's
+  `<taskId>.result` artifact; the caller follows the task with `GetTask` or
+  `SubscribeToTask`.
+
+| Family | Ops | Served |
+|---|---|---|
+| Status and configuration | `status`, `config` | always |
+| Runs | `workflow.cancel` | always |
+| Subagents and plans | `subagent.status`, `subagent.log`, `plan.get` | always |
+| Introspection | `conversation.get`, `run.get`, `subagent.get`, `debug.events` | while `a2a.introspection.enabled` is on |
+| Operator controls | `admin.drain`, `admin.pause`, `admin.resume`, `admin.cancel`, `admin.set` | always |
+| Sign-in | `auth.device.pending`, `auth.device.approve`, `auth.device.deny` | while `a2a.device_grant.enabled` is on |
+| Sessions | `auth.sessions`, `auth.sessions.revoke` | on a TCP listener |
+| Spending | `payment.allowances` | where an allowance is declared |
+| Companies | `company.status`, `company.user_id.reset`, `company.sign_in`, `company.sign_out` | where a Company is declared |
+| Delegation | `delegation.enrol`, `delegation.list`, `delegation.approve`, `delegation.deny`, `delegation.revoke`, `delegation.forget`, `delegation.audit` | where an IdP or a delegated server is declared |
+
+The `admin.*` and `auth.*` methods, `config`, `subagent.log`, `debug.events`
+and the Company methods are operator-only, and no grant reaches them.
+
+**A run's task, and every run.** A run started over A2A — by `workflow.run`
+or a workflow's declared command — is tracked by a task: `GetTask` and
+`ListTasks` read it and the core `CancelTask` cancels the run. A task's state
+is coarser than the run's status: a run `running`, `suspended`, `paused` or
+`pending` is a `TASK_STATE_WORKING` task, and a `stalled` one
+`TASK_STATE_FAILED`. The run's exact status and workflow, and every run the
+caller may see — a scheduled, webhook- or signal-started run has no task — are
+in `agentd.operator/status`'s `runs`. `workflow.cancel` (the owner's) and
+`admin.cancel` (the operator's, whoever started it) cancel a run by id, task
+or not.
+
+The normative specification, with every method, is at
+[`https://agentd.dev/a2a/ext/operator`](https://agentd.dev/a2a/ext/operator).
 
 ## The events extension
 
@@ -270,7 +321,7 @@ The answer is a server-sent event stream of three frame types:
 - **Reconnecting** resumes from the last `seq` read, passed as `fromSeq`.
 - **`resync: true`** means the cursor cannot be honoured: events past it
   left the ring, or the daemon restarted, since the feed lives in memory.
-  The client re-reads its state (the `status` command and `ListTasks`) rather
+  The client re-reads its state (`agentd.operator/status` and `ListTasks`) rather
   than applying the replay on top.
 - **Visibility is per event.** An operator receives every event; any other
   caller receives the events its principal owns and those addressed to every
@@ -305,7 +356,7 @@ that activated it:
 | `consentGate` | no | the person's consent gate the task waits on |
 | `signIn` | no | where the person signs in at their IdP for the enrolment the task is |
 | `mcpSignIn` | no | the MCP server sign-in the task's gate is: `{server, method, url, code?}` |
-| `command` | no | the command op that started the task |
+| `command` | no | the op that started the task: a command, or an operator method's op |
 | `traceId`, `spanId` | no | the W3C trace and span the task's work is done in |
 
 A webhook body never carries the annotations. The normative specification is
@@ -343,15 +394,16 @@ run, and no task is created.
 | Code | Reason | When |
 |---|---|---|
 | `-32601` | `EXTENSION_NOT_DECLARED` | `agentd.events/SubscribeToEvents` on an instance that does not declare the events extension |
-| `-32601` | `EXTENSION_NOT_ACTIVATED` | that method, and `A2A-Extensions` does not name the events URI |
+| `-32601` | `EXTENSION_NOT_ACTIVATED` | that method, or an `agentd.operator/<op>` method, and `A2A-Extensions` does not name its extension's URI |
 | `-32602` | `EXTENSION_NOT_ACTIVATED` | a DataPart under `agentd`, and the header does not name the command URI |
 | `-32602` | `EXTENSION_NOT_MARKED` | a command, and `message.extensions` does not list the command URI |
 | `-32602` | `COMMAND_ENVELOPE_AMBIGUOUS` | more than one part carries a command |
 | `-32602` | `COMMAND_TASK_ID` | a command message names a `taskId` |
-| `-32602` | `UNKNOWN_OP` | no op of that name is served here |
-| `-32602` | `INVALID_COMMAND_ARGS` | the arguments do not match the op's schema |
+| `-32602` | `UNKNOWN_OP` | no op of that name is served here as a command — an operator op's name included |
+| `-32602` | `INVALID_COMMAND_ARGS` | the arguments — a command's envelope, an operator method's `params` — do not match the op's schema |
+| `-32601` | none | an operator method whose switch is off on this instance |
 | `-32005` | `CONTENT_TYPE_NOT_SUPPORTED` | `acceptedOutputModes` excludes `application/json`, which every command answers with |
-| `-32004` | `INTROSPECTION_DISABLED` | an introspection op while `a2a.introspection.enabled` is off |
+| `-32004` | `INTROSPECTION_DISABLED` | an introspection read while `a2a.introspection.enabled` is off |
 | `-31403` | `PERMISSION_DENIED` | the caller's role and grants do not reach the op: HTTP 403 with agentd's own `ErrorInfo` from the listener's op gate, 200 when the runtime decides it (a workflow's start roles) |
 
 ## Clients
@@ -365,7 +417,9 @@ methods alone. [Use the terminal and web UI](interface.md) covers them, and
 
 agentd's own outbound client, which the `a2a.send` and `a2a.delegate`
 workflow steps use, activates the command extension when it sends a command,
-and dials a peer's unix socket through the binding.
+and dials a peer's unix socket through the binding. The thin clients of a
+running daemon (`agentd --login company:<name>`, `--delegation-*`) call its
+operator methods over its unix listener.
 
 ## How conformance is checked
 
@@ -398,7 +452,7 @@ true:
 ## Next steps
 
 - [A2A API reference](a2a-reference.md): the core methods, the pipeline,
-  errors and the full command ops table.
+  errors and the full ops table.
 - [The A2A channel](a2a.md): how identity, ownership and delegation work.
 - [Build a client](build-a-client.md): a client that uses the feed and the
   commands.

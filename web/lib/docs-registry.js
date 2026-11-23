@@ -646,7 +646,16 @@ export const DOCS = [
     "group": "reference",
     "section": "protocols",
     "href": "/a2a/ext/command/",
-    "blurb": "The typed command DataPart: how a client runs an operation agentd declares."
+    "blurb": "The workload ops as a typed DataPart on SendMessage: starting and signalling workflows, talking to subagents."
+  },
+  {
+    "slug": "ext-operator",
+    "file": null,
+    "title": "Operator extension",
+    "group": "reference",
+    "section": "protocols",
+    "href": "/a2a/ext/operator/",
+    "blurb": "The control plane and the reads as JSON-RPC methods, agentd.operator/<op>."
   },
   {
     "slug": "ext-events",

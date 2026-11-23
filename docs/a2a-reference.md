@@ -666,6 +666,54 @@ The grant is not declared on the card; the RFC 8414 metadata lists it while a
 launch is installed. [Use the terminal and web UI](interface.md#launcher)
 describes the launcher.
 
+## The outbound client
+
+agentd dials a peer (`a2a.delegate`, `a2a.send`, `subagent.send` to an
+instance child, a paid task's answer, `agentd --login company:<name>`)
+through the A2A project's own client, `a2a-client-lf`: its `A2AClient` over
+its JSON-RPC transport writes the envelope and the ProtoJSON, sends
+`A2A-Version: 1.0` on every request, parses the SSE stream and decodes every
+error. agentd builds the HTTP client that transport is handed, and adds its
+own headers to each request:
+
+| On the HTTP client | Rule |
+|---|---|
+| TLS | agentd's own rustls configuration on `ring`: the bundled roots, `security.tls_ca`, and the peer's `client_cert` and `client_key` as the mTLS identity |
+| `unix:///path` | the request goes over that socket |
+| proxies | none: a peer is dialled directly, whatever `HTTPS_PROXY` says |
+| connections | one per request, none kept |
+| bounds | 30 s per request (the step's time left, when less); a stream silent for 45 s, or past the step's timeout, is given up and its task polled |
+
+| Header added | Value |
+|---|---|
+| `A2A-Extensions` | what the peer's card requires, what the step offers (a2a-x402 on a step that may pay), and what the message is marked with |
+| `traceparent`, `tracestate` | the hop's span |
+| the peer credential | the peer's `headers` and its `auth` bearer |
+
+The card is read with a plain `GET` on the same client, with the same
+headers, because its `Cache-Control` decides how long it is kept. A peer
+whose card says it streams is sent `SendStreamingMessage`; one that does
+not, `SendMessage` with `returnImmediately`, then polled with `GetTask`; a
+peer with no card is streamed to first. A stream refused with `-32004` is
+sent once more, unary, as the same message. A peer that answers
+`SendStreamingMessage` with a plain JSON result instead of a stream is
+refused by the SDK, and the step fails with that error.
+
+Nothing is signed per request: the client's interceptor sees the headers,
+not the URL or body a signature covers. An `aws` peer `auth` is refused at
+load, and an AAuth identity signs no A2A request.
+
+An instance child's reports to its `parent` go through the channel it was
+handed at spawn, which has no path for the HTTP client to dial. That one
+request, a `SendMessage` carrying `_instance.result` or `_instance.emit`, is
+framed by agentd itself; the parent accepts nothing else from a child, and
+a delegation to `parent` is refused.
+
+The released SDK carries a DataPart's or a metadata's numbers as doubles:
+a whole number goes on the wire as `7.0` (agentd's listener reads it back
+as `7`), an integer past 2^53 is rounded, and a peer's reply that carries
+one past 2^53 is refused as a whole.
+
 ## Listener settings
 
 Every `a2a.*` key is operator-only except `a2a.peers`: an instruction
@@ -802,6 +850,7 @@ The load refuses these with exit code 2, before anything starts.
 | Peer card cache | the card's `max-age`, at most 5 min; 1 min when it names none; 5 s for a peer on this host |
 | Peer card fetch | 5 s |
 | Peer request | 30 s per round trip; `GetTask` polls 100 ms apart, bounded by the step's timeout |
+| Peer stream | given up after 45 s without a byte, or at the step's timeout; its task is then polled |
 | Peer task in `AUTH_REQUIRED` | polled once a second; followed `auth_timeout` (default 1 h) past the step's timeout |
 | Inbound token | 16 KiB; times checked with 60 s of skew |
 | An issuer's key set | kept an hour; read again when a token names a key it lacks, at most every 30 s |
@@ -809,7 +858,7 @@ The load refuses these with exit code 2, before anything starts.
 | A webhook's token | lives at most `max_lifetime` (5 min, at most 15 min); 65 536 `jti`s remembered until they expire |
 | Admission sign-ins | 3 per principal per 10 minutes; a start link opens once, within 60 s |
 
-A card read under a client certificate or a per-request signature is not
+A card read under a client certificate is not
 cached, and a delegation that fails drops the card it used.
 
 ## Log events

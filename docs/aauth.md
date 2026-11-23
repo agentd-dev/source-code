@@ -107,7 +107,7 @@ first agent token. The start is refused, exit 2:
 A provider that does not answer does not stop the start. `auth.unavailable`
 (target `aauth`) is logged, and every request that needs the identity fails
 without being sent: an MCP server's connect, which is dialed again in the
-background, a tool call, a model call, an A2A call. Each later request asks
+background, a tool call, a model call. Each later request asks
 the provider again, its metadata first, and the daemon asks it in the
 background every 30 seconds; `auth.recovered` is logged when it answers. A
 provider that answers but will not enroll the key or issue a token is
@@ -141,7 +141,7 @@ the daemon's agent token too:
 | Request | Signed |
 |---|---|
 | MCP requests: connecting, listing tools, resource reads and subscriptions, workflow `mcp.tool` steps, and the tool calls of turns and subagents | yes, unless the server has `auth:`, `oauth:` or `aauth: false` |
-| outbound A2A peer requests | yes, beside any peer credential, except between a parent and its instance child |
+| outbound A2A peer requests | no: agentd's A2A client is the A2A project's SDK, which has no per-request signing hook |
 | model calls: the agent's turns, subagents, the approval judge, the goal check | yes, beside the connection's own credential |
 
 A turn worker or a subagent is handed the identity with its spawn payload,
@@ -182,12 +182,12 @@ token is never written into a file, and keeps it fresh. Its enrollment
 token is written only when it is a `{{secret:…}}` reference. A restored
 instance child is composed the running daemon's identity again.
 
-The links between a parent and its instance child are not signed: the
-child's reports to its `parent` peer, and the parent's `subagent.send` and
-`a2a.send` to the child. agentd's A2A listener checks no AAuth signature,
-and on these links the caller is named by the unix socket's peer credential
-or the bearer the parent composed, so the tree's own links do not wait on
-the Agent Provider.
+No A2A request is signed, so neither are the links between a parent and
+its instance child: the child's reports to its `parent` peer, and the
+parent's `subagent.send` and `a2a.send` to the child. agentd's A2A listener
+checks no AAuth signature, and on these links the caller is named by the
+unix socket's peer credential or the bearer the parent composed, so the
+tree's own links do not wait on the Agent Provider.
 
 The daemon's key always has a file. An embedder that installs an
 `AAuthClient` whose key it holds only in memory hands turn workers and
@@ -280,16 +280,19 @@ person's behalf; it carries the token the Person Server hands back.
 ## Limits
 
 - **The agent token goes to every signed destination.** `Signature-Key`
-  carries the agent token to every MCP server agentd signs for, every A2A
-  peer, and every model endpoint. A2A peers and model calls have no
-  per-destination opt-out; MCP servers have `aauth: false`. Set it on
-  servers that do not need the identity.
+  carries the agent token to every MCP server agentd signs for and every
+  model endpoint. Model calls have no per-destination opt-out; MCP servers
+  have `aauth: false`. Set it on servers that do not need the identity.
+- **No A2A request carries the identity.** agentd's A2A client is the A2A
+  project's SDK, which leaves no hook to sign the URL and body of a request,
+  so an A2A peer that admits callers by AAuth signature does not admit
+  agentd; it takes a bearer or a client certificate instead.
 - **Every signed request needs the provider.** No request goes out without
   the identity it is configured to present, so while the Agent Provider does
-  not answer and no agent token is held, model calls and A2A calls fail with
-  the MCP requests, unsent. A model call that fails this way is not failed
-  over to another endpoint or model. The links between a parent and its
-  instance child are not signed, and do not fail this way.
+  not answer and no agent token is held, model calls fail with the MCP
+  requests, unsent. A model call that fails this way is not failed over to
+  another endpoint or model. A2A requests are not signed, and do not fail
+  this way.
 - **A token a child earns reaches only the children after it.** A Case B or
   Case C token a turn worker or subagent earns is handed up to the daemon,
   so the children spawned after it present it, but children already running

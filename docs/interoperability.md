@@ -264,10 +264,10 @@ connection cannot apply is refused when the configuration loads.
 | Static bearer token | yes | yes | yes |
 | Static custom header in an `auth:` block | — (use `headers`, below) | yes | yes |
 | OAuth 2.1: device code, authorization code with PKCE, RFC 9207 `iss` and an OpenID Connect `nonce`, client credentials; RFC 8414 then OIDC discovery with an exact `issuer`; RFC 8707 `resource` (by default on MCP servers only); `private_key_jwt` (RFC 7523) and `client_secret_basic`; RFC 7009 revocation on `--logout`; with no registration, a [Client ID Metadata Document](authentication.md#client-id-metadata-document) (draft -02) | yes | yes | yes |
-| AWS SigV4: environment, IAM Identity Center (SSO), EC2 instance role, EKS IRSA | yes, and required by `dialect: bedrock` | yes | yes |
+| AWS SigV4: environment, IAM Identity Center (SSO), EC2 instance role, EKS IRSA | yes, and required by `dialect: bedrock` | yes | — (refused at load: the A2A client signs no request) |
 | SPIFFE JWT-SVID as a bearer | yes | yes | yes |
 | SPIFFE X.509-SVID or a client certificate (mTLS) | — | yes | yes |
-| AAuth agent identity (a draft): Ed25519 key, RFC 9421 HTTP message signatures | yes, signed beside the bearer | yes | yes |
+| AAuth agent identity (a draft): Ed25519 key, RFC 9421 HTTP message signatures | yes, signed beside the bearer | yes | — |
 | An enrolled person's grant (`grant: id_jag`, the `xaa` preview): an ID-JAG (draft -04) from their IdP by RFC 8693 token exchange, redeemed by the JWT bearer grant (RFC 7523) for an access token — Enterprise-Managed Authorization | — | yes | — |
 
 A model connection that needs a custom credential header — an `api-key`

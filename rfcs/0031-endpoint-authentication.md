@@ -1,6 +1,14 @@
 # RFC 0031: Endpoint Authentication — Interactive & Workload Credential Providers
 
 **Status:** Implemented (behind the `oauth` / `tls` features)
+
+> **⚠ AMENDED (2026-11-23).** Outbound A2A SigV4 (`kind: aws` on a peer) and
+> AAuth signing of A2A dials were removed: agentd's A2A client is now the
+> official A2A SDK client (`a2a-client-lf`), whose interceptor has no hook
+> that sees the request's URL and body, so no per-request signature can be
+> made. An `aws` peer is refused at load; A2A peers take `static`, `oauth2`,
+> `spiffe` and mTLS. Intelligence and MCP signing are unchanged.
+
 **Author:** agentd
 **Date:** 2026-08-16
 **Part of:** extends RFC 0023 (AAuth workload identity) and RFC 0012 (no local execution / secret handling); builds on RFC 0030 (config schema v2), RFC 0025 (durable state), RFC 0026 (reactor lifecycle).

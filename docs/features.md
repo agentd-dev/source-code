@@ -79,7 +79,7 @@ Two features are never in a release binary:
 | Feature | Default | Release | Adds crates | Enables |
 |---|---|---|---|---|
 | `tls` | yes | yes | `rustls` (with the `ring` provider), `webpki-roots` | Direct `https://` to models, MCP servers and peers; an `https://` listener; mTLS client identities; `security.tls_ca`. The bundled roots mean a `scratch` image trusts public CAs with no system bundle. |
-| `a2a` | no | yes | the A2A project's official Rust SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`), `tokio`, `axum`, `hyper`, `hyper-util`, `tokio-rustls`, `tower`, `chrono`, `async-trait`, `tokio-stream`, `futures-util` | The A2A listener and everything served on it, outbound A2A peers, and the webhook listener. Implies `tls`. |
+| `a2a` | no | yes | the A2A project's official Rust SDK (`a2a-lf`, `a2a-pb`, `a2a-server-lf`, `a2a-client-lf`), `reqwest`, `tokio`, `axum`, `hyper`, `hyper-util`, `tokio-rustls`, `tower`, `chrono`, `async-trait`, `tokio-stream`, `futures-util` | The A2A listener and everything served on it, outbound A2A peers, and the webhook listener. Implies `tls`. |
 | `cron` | no | yes | none | Five-field UTC cron expressions on `schedule` start nodes. |
 | `oauth` | no | yes | none new (reuses `ring`) | OAuth 2.1 credentials (device, authorization code with PKCE, client credentials, refresh, RFC 8414 and OIDC discovery, `private_key_jwt`) for models, MCP servers and peers; `security.client`, agentd's Client ID Metadata Document, and `agentd --print-client-metadata`; `agentd --login`, and RFC 7009 revocation on `agentd --logout`. |
 | `metrics` | no | yes | none | `/metrics` (Prometheus text), `/healthz` and `/readyz` on `observability.metrics_addr`. |

@@ -497,7 +497,8 @@ a2a:
 ```
 
 [Outbound credentials](authentication.md) covers every `auth` kind;
-`kind: aws` is not accepted for peers. A credential a person logs in for, an
+`kind: aws` is not accepted for peers: the A2A client signs no request. A
+credential a person logs in for, an
 oauth2 `device` or `authorization_code` grant, is completed once with
 `agentd --login a2a:<peer>`. `rate` paces sends to the peer in each process,
 and `timeout` bounds each request to it. Under `security.egress: closed` a

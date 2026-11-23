@@ -1306,7 +1306,10 @@ other deferred items of RFC 0044 P4.
 ## AWS SigV4
 
 An endpoint behind AWS IAM, such as an API Gateway in front of an MCP server
-or Amazon Bedrock, takes a `kind: aws` block. Every request is signed over
+or Amazon Bedrock, takes a `kind: aws` block (a model connection, an MCP
+server or an HTTP endpoint; an A2A peer does not take one, see
+[Which kinds each endpoint accepts](#which-kinds-each-endpoint-accepts)).
+Every request is signed over
 its method, path and body; a session token is signed as
 `x-amz-security-token`.
 
@@ -1389,7 +1392,14 @@ for every outbound TLS dial, in the daemon and its child processes.
 | model connection or provider | yes | refused at load | yes | yes | yes | refused at load |
 | MCP server | yes | yes | yes | yes | yes | yes (mutual TLS) |
 | HTTP endpoint | yes | yes | yes | yes | yes | refused at load |
-| A2A peer | yes | yes | yes | yes | yes | use `client_cert` and `client_key` |
+| A2A peer | yes | yes | yes | refused at load | yes | use `client_cert` and `client_key` |
+
+An A2A peer's credential is a header or a client certificate, never a
+signature over the request: agentd's A2A client is the A2A project's SDK,
+whose requests leave no hook to sign the URL and body they carry. So an A2A
+peer takes no `kind: aws` (the load refuses it, naming the peer), and an
+AAuth identity signs no A2A request (see [AAuth agent identity](aauth.md)).
+A peer behind AWS IAM is reached through a gateway that takes a bearer.
 
 ## When a credential is missing or refused
 

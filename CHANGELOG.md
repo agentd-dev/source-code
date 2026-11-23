@@ -26,6 +26,25 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   unreleased fixes (a2a-rs 4ab9443, 90e2876, 1d12a9c) are bridged in one
   module, `a2a::sdk_gaps`, until they ship.
 
+- **Breaking: the A2A SDK owns the outbound protocol, and signed A2A peers
+  are removed.** Every A2A request agentd sends a peer (`SendMessage`,
+  `SendStreamingMessage`, `GetTask`) goes through `a2a-client-lf`'s
+  `A2AClient` over its JSON-RPC transport, which writes the envelope and
+  the ProtoJSON, states `A2A-Version`, parses the stream and decodes the
+  errors; agentd keeps the delegation policy (card cache, tenant, required
+  extensions, stream-then-unary, polling recovery, deadlines, x402) and
+  builds the HTTP client: its ring TLS with the mTLS identity, the unix
+  socket, no proxy. The SDK's client signs nothing per request, so an A2A
+  peer with `auth: {kind: aws}` is refused at load, naming the peer, and an
+  AAuth identity no longer signs A2A requests (MCP and model calls are
+  signed as before). On the wire: a peer that answers the streaming method
+  with a plain JSON result, or `SendMessage` with a bare task, is refused
+  rather than polled; a DataPart's whole numbers go out as doubles (`7.0`);
+  a payment whose answer is an HTTP 4xx without a JSON-RPC body reads as
+  unanswered, not refused. An instance child's reports to its parent still
+  go through its channel, framed by agentd; a delegation to `parent` is
+  refused.
+
 - **MCP Events follows the Beta specification** (SEP-3415, merged; the
   `ext-events` Beta text). The server's `heartbeatMs` grant on
   `notifications/events/active` sets a push stream's idle bound: three

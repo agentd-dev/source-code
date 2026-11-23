@@ -17,6 +17,7 @@
 //! | [`answer`]: the push-config page's empty fields, and `Delete…`'s `null` | no upstream fix yet (a2a-rs main, 2026-11-22) |
 //! | [`outbound`]: an integer past ±2^53 in a request the client sends | no upstream fix yet (a2a-rs main, 2026-11-22) |
 //! | [`whole_numbers`] on what the client reads back: an integer read as `1.0` | 90e2876 "fix(a2a-pb): decode integral Value numbers as integers" |
+//! | `mcp::a2a_client::framed`, used by `PaidPeer::send`: an x402 payment message sent byte for byte, its payload's whole numbers (`x402Version`) written by the SDK as doubles | 90e2876 — **delete when a2a-pb releases 90e2876**, and send the payment through the SDK |
 //!
 //! The client side (`mcp::a2a_client`) hands the SDK a typed request and
 //! takes a typed answer, so it cannot touch the bytes: a DataPart's or a

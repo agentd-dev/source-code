@@ -83,19 +83,25 @@
 //! socket by path only, and its connector cannot be handed a stream of
 //! agentd's (a connector layer must yield `reqwest`'s own `Conn`, which only
 //! `reqwest` constructs), so that link stays on agentd's own transport
-//! ([`parent`]): one `SendMessage` carrying an `_instance.result` or
+//! ([`framed`]): one `SendMessage` carrying an `_instance.result` or
 //! `_instance.emit` report, which is all the parent accepts from a child.
 //! Nothing else is dialled over it — no card, no stream, no poll.
 //!
 //! Paying: a task that asks to be paid (a2a-x402) will not go on by itself,
 //! so a send or a delegation that may not pay ends there, saying so; one
 //! that may ([`paying`]) hands the task back on the connection it asked on.
+//! The payment message itself goes through the same one-request sender
+//! ([`framed`]), byte for byte: the released `a2a-pb` writes its payload's
+//! whole numbers as doubles (`x402Version: 2` as `2.0`), which a verifier
+//! refuses. That bridge is deleted when `a2a-pb` releases 90e2876
+//! ([`crate::a2a::sdk_gaps`]); every other request goes through the SDK,
+//! whose command arguments go out as doubles until then.
 
 #[cfg(feature = "x402")]
 mod paying;
 #[cfg(feature = "x402")]
 pub use paying::{PaidAnswer, PaidPeer, Paying, Reached, delegate_paying, send_paying};
-mod parent;
+mod framed;
 
 use crate::a2a::peer::{self as a2a, PeerCard};
 use crate::a2a::sdk_gaps;
@@ -411,7 +417,7 @@ fn delegate_unary(
 /// half a delegation cannot express.
 ///
 /// To [`A2aEndpoint::Parent`] the send goes through the instance child's
-/// channel ([`parent`]); to any other peer, through the SDK.
+/// channel ([`framed`]); to any other peer, through the SDK.
 ///
 /// Errors on connect / write / read / RPC error. Accepting is not the same as
 /// succeeding: a peer that answers 200 and then fails internally is invisible
@@ -432,7 +438,7 @@ pub fn send(
         .unwrap_or_else(mint_message_id);
     let params = a2a::send_message_params_parts(parts, context, &message_id, None)?;
     if matches!(endpoint, A2aEndpoint::Parent) {
-        return parent::send(params, &auth, deadline);
+        return framed::to_parent(params, &auth, deadline);
     }
     let mut conn = HttpConn::new(HttpEp::of(endpoint)?, auth);
     conn.call("SendMessage", params, deadline)
@@ -669,6 +675,12 @@ struct HttpEp {
     /// interfaces are matched against, and where a TCP peer is dialled.
     url: String,
     host: String,
+    /// The TCP port and request path the payment request (`framed`) is
+    /// posted to; the SDK's transport takes `url` whole.
+    #[cfg_attr(not(feature = "x402"), allow(dead_code))]
+    port: u16,
+    #[cfg_attr(not(feature = "x402"), allow(dead_code))]
+    path: String,
     host_header: String,
     tls: bool,
     /// `unix:///path` peer: dial this socket instead of TCP — the co-located
@@ -701,6 +713,8 @@ impl HttpEp {
             return Ok(HttpEp {
                 url: url.to_string(),
                 host: String::new(),
+                port: 0,
+                path: "/".to_string(),
                 host_header: "localhost".to_string(),
                 tls: false,
                 socket: Some(path.to_string()),
@@ -708,8 +722,15 @@ impl HttpEp {
         }
         let u = crate::net::http::Url::parse(url)
             .map_err(|e| format!("a2a: bad peer url {url}: {e}"))?;
+        let path = if u.path.is_empty() {
+            "/".to_string()
+        } else {
+            u.path.clone()
+        };
         Ok(HttpEp {
             url: url.to_string(),
+            port: u.port,
+            path,
             host_header: u.host_header(),
             tls: u.is_tls(),
             host: u.host,

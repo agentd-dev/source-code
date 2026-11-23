@@ -13,14 +13,14 @@
 //! was refused, or left with no readable answer, and the receipt, if one
 //! came. [`PaidPeer::reject`] answers it with `payment-rejected` instead.
 
+use super::framed::{self, Failure};
 use super::{
-    DelegateOutcome, Failed, Follow, Followed, HttpConn, HttpEp, POLL_INTERVAL, PeerAuth,
-    delegate_with, mint_message_id, terminal_outcome,
+    DelegateOutcome, Follow, Followed, HttpConn, HttpEp, POLL_INTERVAL, PeerAuth, delegate_with,
+    mint_message_id, terminal_outcome,
 };
 use crate::a2a::peer as a2a;
 use crate::a2a::x402;
 use crate::config::A2aEndpoint;
-use a2a_types::error_code;
 use serde_json::Value;
 use std::time::Instant;
 
@@ -51,8 +51,8 @@ pub enum Reached {
     /// It never left: the peer could not be reached, or the request could
     /// not be built.
     Unsent(String),
-    /// The peer answered that it did not take it: a JSON-RPC error other
-    /// than an internal one, as the SDK decodes it.
+    /// The peer answered that it did not take it: an HTTP 4xx, or a JSON-RPC
+    /// error other than an internal one.
     Refused(String),
     /// It left and no readable answer came, or the peer failed inside: the
     /// peer may have acted on it.
@@ -260,26 +260,25 @@ impl PaidPeer {
         }
     }
 
-    /// The paying `SendMessage`, through the SDK: its result, or how far it
-    /// got. A connection that could not be made never left; a bound that ran
-    /// out, or a reply the SDK could not read or that reports an internal
-    /// error, may have been acted on; any other JSON-RPC error is the peer
-    /// refusing it.
+    /// The paying `SendMessage` — the payment, or its rejection — framed by
+    /// agentd and sent byte for byte ([`super::framed`]), not through the
+    /// SDK: the released `a2a-pb` writes the payload's whole numbers as
+    /// doubles (`x402Version: 2` as `2.0`), which a verifier refuses.
+    /// Delete this bridge when `a2a-pb` releases 90e2876 (`sdk_gaps`), and
+    /// send it with `self.conn.call` like the polls. Its result, or how far
+    /// it got: a connection that could not be made never left; a transport
+    /// failure, an HTTP 5xx, an unreadable reply or an internal error may
+    /// have been acted on; an HTTP 4xx or any other JSON-RPC error is the
+    /// peer refusing it.
     fn send(&mut self, params: Value, deadline: Instant) -> Result<Value, Reached> {
-        const METHOD: &str = "SendMessage";
-        self.conn
-            .exchange(METHOD, params, deadline)
-            .map_err(|failed| {
-                let why = failed.say(METHOD);
-                match failed {
-                    Failed::Unsent(_) => Reached::Unsent(why),
-                    Failed::TimedOut => Reached::Unanswered(why),
-                    Failed::Peer(e) if e.code == error_code::INTERNAL_ERROR => {
-                        Reached::Unanswered(why)
-                    }
-                    Failed::Peer(_) => Reached::Refused(why),
-                }
-            })
+        let headers = self.conn.request_headers(&a2a::extensions_of(&params));
+        framed::to_peer(&self.conn.ep, &self.conn.auth, &headers, params, deadline).map_err(
+            |failure| match failure {
+                Failure::Unsent(e) => Reached::Unsent(e),
+                Failure::Unanswered(e) => Reached::Unanswered(e),
+                Failure::Refused(e) => Reached::Refused(e),
+            },
+        )
     }
 }
 

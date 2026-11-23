@@ -39,11 +39,12 @@ runtime (developed in the `agentd-dev` org). The format is loosely
   AAuth identity no longer signs A2A requests (MCP and model calls are
   signed as before). On the wire: a peer that answers the streaming method
   with a plain JSON result, or `SendMessage` with a bare task, is refused
-  rather than polled; a DataPart's whole numbers go out as doubles (`7.0`);
-  a payment whose answer is an HTTP 4xx without a JSON-RPC body reads as
-  unanswered, not refused. An instance child's reports to its parent still
-  go through its channel, framed by agentd; a delegation to `parent` is
-  refused.
+  rather than polled; a DataPart's whole numbers go out as doubles (`7.0`)
+  until a2a-pb releases 90e2876. Two requests are still framed by agentd,
+  one request each: an instance child's reports to its parent, through its
+  channel (a delegation to `parent` is refused), and an x402 payment message
+  (or its rejection), sent byte for byte so its `x402Version` stays an
+  integer, until a2a-pb releases 90e2876.
 
 - **MCP Events follows the Beta specification** (SEP-3415, merged; the
   `ext-events` Beta text). The server's `heartbeatMs` grant on

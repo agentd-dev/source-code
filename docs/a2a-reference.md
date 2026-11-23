@@ -712,7 +712,11 @@ a delegation to `parent` is refused.
 The released SDK carries a DataPart's or a metadata's numbers as doubles:
 a whole number goes on the wire as `7.0` (agentd's listener reads it back
 as `7`), an integer past 2^53 is rounded, and a peer's reply that carries
-one past 2^53 is refused as a whole.
+one past 2^53 is refused as a whole. The one exception is an x402 payment
+message (and its rejection): agentd frames it itself, the way it frames a
+report to the parent, and sends it byte for byte, so the payload's
+`x402Version` stays an integer for the peer's verifier. It goes back to the
+SDK once a2a-pb releases its fix (90e2876).
 
 ## Listener settings
 

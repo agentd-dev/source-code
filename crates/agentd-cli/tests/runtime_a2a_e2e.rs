@@ -150,21 +150,10 @@ fn a_status_command_over_a2a_is_a_message_without_a_task_or_a_model_turn() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let (_daemon, addr, cfg) = spawn_bound(|port| a2a_config(&llm.uri, port, ""));
 
-    // A `status` command DataPart is answered deterministically, as the
-    // spec's immediate reply: an agent Message carrying the document, and no
-    // task to track.
-    let result = SendMessage::command("status", json!({})).result(&addr);
-    assert!(
-        result.get("task").is_none(),
-        "a read creates no task: {result}"
-    );
-    let message = &result["message"];
-    assert_eq!(message["role"], "ROLE_AGENT", "{result}");
-    assert_eq!(
-        message["extensions"][0],
-        agentd::runtime::surface::COMMAND_EXTENSION
-    );
-    let doc = &message["parts"][0]["data"];
+    // The `status` operator method is answered deterministically: its
+    // result is the document, and no task to track.
+    let doc = common::OperatorCall::new("status", json!({})).result(&addr);
+    assert!(!common::is_task(&doc), "a read creates no task: {doc}");
     assert!(
         doc["conversations"].is_array() && doc["runs"].is_array(),
         "status document: {doc}"
@@ -296,8 +285,8 @@ fn a2a_calls_are_audited_when_the_audit_log_sink_is_on() {
     let (daemon, addr, cfg) =
         spawn_bound(|port| a2a_config(&llm.uri, port, "  audit:\n    sink: [log]\n"));
 
-    // A deterministic `status` command drives one A2A call → one audit event.
-    let _ = SendMessage::command("status", json!({})).result(&addr);
+    // A deterministic `status` read drives one A2A call → one audit event.
+    let _ = common::OperatorCall::new("status", json!({})).result(&addr);
 
     // The audit line lands on the daemon's JSON-lines stderr.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -314,13 +303,9 @@ fn a2a_calls_are_audited_when_the_audit_log_sink_is_on() {
     }
     let a = audit.expect("an audit event was emitted for the A2A call");
     let action = a["action"].as_str().unwrap_or("");
-    assert!(
-        action.starts_with("a2a.SendMessage"),
-        "action names the method: {a}"
-    );
-    assert!(
-        action.contains("status"),
-        "action names the command op: {a}"
+    assert_eq!(
+        action, "a2a.agentd.operator/status",
+        "action names the method, which names the op: {a}"
     );
     assert_eq!(
         a["principal"], "operator",

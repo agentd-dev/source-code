@@ -37,12 +37,15 @@ import {
   LAUNCH_GRANT_TYPE,
   LaunchRefused,
   Mirror,
+  OPERATOR_EXTENSION,
+  OPERATOR_OPS,
   OPS,
   Observation,
   RpcError,
   TASK_ANNOTATIONS_EXTENSION,
   TASK_NOT_FOUND,
   VERSION_NOT_SUPPORTED,
+  operatorMethod,
   commandMessage,
   deviceLogin,
   itemValue,
@@ -157,16 +160,15 @@ function raw(url, { method = 'POST', headers = {}, body } = {}) {
 }
 
 /** A JSON-RPC SendMessage carrying one command op, as a raw request body. */
-function commandBody(op, args = {}) {
-  return JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'SendMessage', params: { message: commandMessage(op, args), configuration: { returnImmediately: false } } });
+/** The JSON-RPC body calling operator op `op` with `args`. */
+function operatorBody(op, args = {}) {
+  return JSON.stringify({ jsonrpc: '2.0', id: 1, method: operatorMethod(op), params: args });
 }
 
-/** A command reply's document: a read's first DataPart. */
-const dataOf = (result) => result?.message?.parts?.find((p) => p.data !== undefined)?.data;
-
-/** Validate `value` as the published result of `op`. */
+/** Validate `value` as the published result of `op`, on the extension that carries it. */
 function checkResult(op, value) {
-  check(validator(COMMAND_EXTENSION, `/$defs/ops/${op}/result`), value, `the ${op} reply`);
+  const uri = OPERATOR_OPS.has(op) ? OPERATOR_EXTENSION : COMMAND_EXTENSION;
+  check(validator(uri, `/$defs/ops/${op}/result`), value, `the ${op} reply`);
 }
 
 test('live: a launched client signs in, and two TS clients converge on one real daemon', { skip }, async () => {
@@ -250,7 +252,7 @@ test('live: a launched client signs in, and two TS clients converge on one real 
     const declared = (c) => (c?.capabilities?.extensions ?? []).map((e) => e.uri);
     const session = mirrorA.getState().session;
     const uris = declared(session.extended ?? session.card);
-    for (const uri of [COMMAND_EXTENSION, EVENTS_EXTENSION, TASK_ANNOTATIONS_EXTENSION]) {
+    for (const uri of [COMMAND_EXTENSION, OPERATOR_EXTENSION, EVENTS_EXTENSION, TASK_ANNOTATIONS_EXTENSION]) {
       assert.ok(uris.includes(uri), `the card declares ${uri}: ${uris}`);
     }
     assert.equal(session.caps.annotations, true);
@@ -514,19 +516,19 @@ test('live: agentd ui signs its tab in once, from the launched origin, as the op
         origin,
         'content-type': 'application/json',
         'a2a-version': A2A_VERSION,
-        'a2a-extensions': COMMAND_EXTENSION,
+        'a2a-extensions': OPERATOR_EXTENSION,
         ...(bearer ? { authorization: `Bearer ${bearer}` } : {}),
       },
-      body: commandBody(OPS.status),
+      body: operatorBody(OPS.status),
     });
   const read = await status(token);
   assert.equal(read.status, 200, read.text);
-  checkResult(OPS.status, dataOf(read.json.result));
+  checkResult(OPS.status, read.json.result);
   const listed = await raw(endpoint, {
-    headers: { origin, 'content-type': 'application/json', 'a2a-version': A2A_VERSION, 'a2a-extensions': COMMAND_EXTENSION, authorization: `Bearer ${token}` },
-    body: commandBody(OPS.authSessions),
+    headers: { origin, 'content-type': 'application/json', 'a2a-version': A2A_VERSION, 'a2a-extensions': OPERATOR_EXTENSION, authorization: `Bearer ${token}` },
+    body: operatorBody(OPS.authSessions),
   });
-  const sessions = dataOf(listed.json?.result);
+  const sessions = listed.json?.result;
   assert.ok(
     sessions?.sessions?.some((s) => s.kind === 'launch' && s.role === 'operator' && s.client_id === 'agentd-ui'),
     listed.text,

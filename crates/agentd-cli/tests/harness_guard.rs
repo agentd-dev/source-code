@@ -206,7 +206,17 @@ fn helpers_send_version_and_content_type() {
         ("send_text", Box::new(|a| drop(common::send_text(a, "hi")))),
         (
             "send_command",
-            Box::new(|a| drop(common::send_command(a, "status", json!({})))),
+            Box::new(|a| {
+                drop(common::send_command(
+                    a,
+                    "workflow.signal",
+                    json!({"name": "go"}),
+                ))
+            }),
+        ),
+        (
+            "operator",
+            Box::new(|a| drop(common::operator(a, "status", json!({})))),
         ),
         (
             "SendMessage::result",
@@ -216,7 +226,7 @@ fn helpers_send_version_and_content_type() {
             "SendMessage::try_post_raw (streaming)",
             Box::new(|a| {
                 drop(
-                    SendMessage::command("status", json!({}))
+                    SendMessage::command("workflow.signal", json!({"name": "go"}))
                         .streaming()
                         .try_post_raw(a)
                         .unwrap(),
@@ -270,7 +280,13 @@ fn helpers_send_version_and_content_type() {
 fn command_messages_are_marked() {
     let cap = Capture::start();
 
-    let req = cap.one(|a| drop(common::send_command(a, "status", json!({"run": "r-1"}))));
+    let req = cap.one(|a| {
+        drop(common::send_command(
+            a,
+            "workflow.signal",
+            json!({"name": "go", "run": "r-1"}),
+        ))
+    });
     let body = req.json();
     let message = &body["params"]["message"];
     assert_eq!(body["method"], "SendMessage", "{body}");
@@ -287,7 +303,7 @@ fn command_messages_are_marked() {
     );
     assert_eq!(
         message["parts"],
-        json!([{"data": {"agentd": {"op": "status", "run": "r-1"}}}]),
+        json!([{"data": {"agentd": {"op": "workflow.signal", "name": "go", "run": "r-1"}}}]),
         "the op and its args ride one DataPart: {body}"
     );
     assert_eq!(
@@ -315,6 +331,18 @@ fn command_messages_are_marked() {
     assert_eq!(
         body["params"]["configuration"]["returnImmediately"], false,
         "the default is stated, never left to the server: {body}"
+    );
+
+    // An operator op is its own method, its arguments the params, and the
+    // request activates the operator extension — and nothing else.
+    let req = cap.one(|a| drop(common::operator(a, "admin.pause", json!({"run": "r-1"}))));
+    let body = req.json();
+    assert_eq!(body["method"], "agentd.operator/admin.pause", "{body}");
+    assert_eq!(body["params"], json!({"run": "r-1"}), "{body}");
+    assert_eq!(
+        req.header("a2a-extensions"),
+        Some(agentd::runtime::surface::OPERATOR_EXTENSION),
+        "{req:?}"
     );
 
     // The knobs land where the spec puts them, and the bearer in its header.

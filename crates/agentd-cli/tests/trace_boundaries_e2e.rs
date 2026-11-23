@@ -21,7 +21,7 @@
 //!   trace;
 //! * the outputs name the trace: a webhook's answer (`run_id`, `trace_id`, a
 //!   `traceparent` header naming the run's span), an A2A task's annotations,
-//!   `run.get`, `workflow.status` and `status`.
+//!   `run.get` and `status`.
 #![cfg(all(unix, feature = "a2a"))]
 
 mod common;
@@ -997,7 +997,7 @@ fn a_webhook_reply_names_its_run_and_its_trace() {
 
 /// The outputs that describe a run name its trace: the A2A task's
 /// annotations (`traceId`, and `spanId` — the span the `traceparent` response
-/// header names), `run.get`, `workflow.status`, and the run summaries of
+/// header names), `run.get`, and the run summaries of
 /// `status`, whose operator document names the process's trace too.
 #[test]
 fn an_a2a_task_and_the_reads_of_its_run_name_the_trace() {
@@ -1032,20 +1032,11 @@ fn an_a2a_task_and_the_reads_of_its_run_name_the_trace() {
     );
     b.wait_line("run.done", |v| v["run"] == run.as_str());
 
-    // A read op's document: a Message's data part, or a task's result.
-    let read = |op: &str, args: Value| -> Value {
-        let r = common::SendMessage::command(op, args).result(&addr);
-        let data = &r["message"]["parts"][0]["data"];
-        if data.is_null() {
-            r["task"]["artifacts"][0]["parts"][0]["data"].clone()
-        } else {
-            data.clone()
-        }
-    };
+    // A read's document: its operator method's result.
+    let read =
+        |op: &str, args: Value| -> Value { common::OperatorCall::new(op, args).result(&addr) };
     let got = read("run.get", json!({"run": run}));
     assert_eq!(got["run"]["trace_id"], trace, "{got}");
-    let status = read("workflow.status", json!({"run": run}));
-    assert_eq!(status["runs"][0]["trace_id"], trace, "{status}");
     let doc = read("status", json!({}));
     let listed = doc["runs"]
         .as_array()

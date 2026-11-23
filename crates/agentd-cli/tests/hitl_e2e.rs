@@ -28,11 +28,11 @@ fn command(addr: &str, op: &str, args: Value) -> Value {
     SendMessage::command(op, args).result(addr)
 }
 
-/// A read op's document: its reply is a Message carrying it, and no task.
+/// A read's document: the operator method's result, and no task.
 fn read(addr: &str, op: &str, args: Value) -> Value {
-    let r = command(addr, op, args);
-    assert!(r.get("task").is_none(), "{op} created a task: {r}");
-    r["message"]["parts"][0]["data"].clone()
+    let r = common::OperatorCall::new(op, args).result(addr);
+    assert!(!common::is_task(&r), "{op} created a task: {r}");
+    r
 }
 
 /// Poll GetTask until `pred` holds (returns the task).
@@ -493,8 +493,8 @@ fn a_gate_opened_mid_request_never_takes_the_requests_task_id() {
     // The run is parked on the signal before it is sent.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let ws = read(&addr, "workflow.status", json!({}));
-        let run = ws["runs"][0]["run"]
+        let ws = read(&addr, "status", json!({}));
+        let run = ws["runs"][0]["id"]
             .as_str()
             .map(|id| read(&addr, "run.get", json!({"run": id})));
         if run
@@ -571,8 +571,8 @@ fn a_workflow_human_node_gates_the_run_task_and_the_reply_is_the_step_output() {
         "{done}"
     );
     // Per-step detail (debug read): the gate step is Done with the reply.
-    let ws = read(&addr, "workflow.status", json!({}));
-    let run_id = ws["runs"][0]["run"]
+    let ws = read(&addr, "status", json!({}));
+    let run_id = ws["runs"][0]["id"]
         .as_str()
         .map(str::to_string)
         .expect("run id");
@@ -915,8 +915,8 @@ fn a_gates_addressee_and_schema_are_durable() {
 
     // Read the run back: the suspended step's wait record must carry both, or
     // a restart would rebuild a weaker gate than the one that was declared.
-    let ws = read(&addr, "workflow.status", json!({}));
-    let run_id = ws["runs"][0]["run"]
+    let ws = read(&addr, "status", json!({}));
+    let run_id = ws["runs"][0]["id"]
         .as_str()
         .map(str::to_string)
         .expect("run id");
@@ -1057,7 +1057,7 @@ fn cancelling_a_gate_unblocks_the_asker_with_an_error() {
     );
     // The run resolved (the gate step failed / the run was cancelled) — it is
     // terminal, not stuck.
-    let ws = read(&addr, "workflow.status", json!({}));
+    let ws = read(&addr, "status", json!({}));
     let status = ws["runs"][0]["status"]
         .as_str()
         .map(str::to_string)

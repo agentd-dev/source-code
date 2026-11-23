@@ -8,7 +8,7 @@
 //! the next read.
 
 use super::commands::refusal;
-use super::{COMMAND_EXTENSION, FEED_RING, command_ops_of};
+use super::{COMMAND_EXTENSION, FEED_RING, OPERATOR_EXTENSION, command_ops_of, operator_ops_of};
 use crate::a2a::Principal;
 use crate::a2a::errors::{self, reason};
 use crate::config::settings::Settings;
@@ -312,9 +312,7 @@ fn narrow(
 ) {
     let uri = ext["uri"].as_str().unwrap_or_default();
     if uri == COMMAND_EXTENSION {
-        // What this instance serves AND this caller may run: an operator sees
-        // the admin family, a `user` does not, and neither sees an
-        // introspection op while introspection is off.
+        // What this instance serves AND this caller may run.
         let ops: Vec<&str> = command_ops_of(settings)
             .into_iter()
             .filter(|op| caller.may_command(op))
@@ -324,6 +322,15 @@ fn narrow(
         if !commands.is_empty() {
             ext["params"]["commands"] = json!(commands);
         }
+    } else if uri == OPERATOR_EXTENSION {
+        // What this instance serves AND this caller may call: an operator
+        // sees the admin family, a `user` does not, and neither sees an
+        // introspection read while introspection is off.
+        let ops: Vec<&str> = operator_ops_of(settings)
+            .into_iter()
+            .filter(|op| caller.may_command(op))
+            .collect();
+        ext["params"]["ops"] = json!(op_entries(&ops));
         if caller.may_command("admin.set") {
             ext["params"]["settable"] = json!(RUNTIME_SETTABLE);
         }
@@ -482,11 +489,31 @@ mod tests {
     }
 
     fn command_params(card: &Value) -> Value {
+        params_of(card, COMMAND_EXTENSION)
+    }
+
+    fn operator_params(card: &Value) -> Value {
+        params_of(card, OPERATOR_EXTENSION)
+    }
+
+    fn params_of(card: &Value, uri: &str) -> Value {
         card["capabilities"]["extensions"]
             .as_array()
-            .and_then(|a| a.iter().find(|e| e["uri"] == COMMAND_EXTENSION))
+            .and_then(|a| a.iter().find(|e| e["uri"] == uri))
             .map(|e| e["params"].clone())
             .unwrap_or(Value::Null)
+    }
+
+    /// The operator ops the card's operator extension lists.
+    fn methods_of(card: &Value) -> Vec<String> {
+        operator_params(card)["ops"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| o["op"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn skill_ids(card: &Value) -> Vec<String> {
@@ -851,8 +878,14 @@ mod tests {
             command_ops_of(&s),
             "the operator may run every served op"
         );
+        assert_eq!(
+            methods_of(&op),
+            operator_ops_of(&s),
+            "and call every served operator method"
+        );
+        assert_eq!(operator_params(&op)["settable"], json!(RUNTIME_SETTABLE));
         let params = command_params(&op);
-        assert_eq!(params["settable"], json!(RUNTIME_SETTABLE));
+        assert!(params.get("settable").is_none(), "{params}");
         assert_eq!(
             params["commands"],
             json!([{"op": "ops.go", "workflow": "ops-only"},
@@ -898,13 +931,20 @@ mod tests {
         );
         let ops = ops_of(&us);
         assert!(ops.contains(&"workflow.run".to_string()), "{ops:?}");
+        let methods = methods_of(&us);
+        assert!(methods.contains(&"status".to_string()), "{methods:?}");
+        assert!(methods.contains(&"plan.get".to_string()), "{methods:?}");
         for never in ["admin.drain", "admin.set", "config", "debug.events"] {
-            assert!(!ops.iter().any(|o| o == never), "{never} offered to a user");
+            assert!(
+                !methods.iter().any(|o| o == never),
+                "{never} offered to a user"
+            );
+            assert!(!ops.iter().any(|o| o == never), "{never} is no command");
         }
-        // Introspection is off, so no caller is offered an introspection op.
-        assert!(!ops_of(&op).iter().any(|o| o == "run.get"));
+        // Introspection is off, so no caller is offered an introspection read.
+        assert!(!methods_of(&op).iter().any(|o| o == "run.get"));
+        assert!(operator_params(&us).get("settable").is_none());
         let params = command_params(&us);
-        assert!(params.get("settable").is_none(), "{params}");
         assert_eq!(
             params["commands"],
             json!([{"op": "report.make", "workflow": "report", "schema": {"type": "object"}}])

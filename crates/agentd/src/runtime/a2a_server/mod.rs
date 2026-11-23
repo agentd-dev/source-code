@@ -9,7 +9,7 @@
 //! blocking on a per-request oneshot. The **binding** (`impl Runtime`) runs on
 //! the loop: it creates/advances durable [`Task`](crate::a2a::Task)s, routes natural-language
 //! messages to conversation turns and command DataParts to the registry, and
-//! answers `GetTask`/`ListTasks`/`CancelTask` and the operator admin family.
+//! answers `GetTask`/`ListTasks`/`CancelTask` and the operator methods.
 //! Reads that must not stall the loop — a blocking `SendMessage`, a stream —
 //! are served by the transport thread polling a **shared task-snapshot map**
 //! the loop keeps current.
@@ -52,7 +52,7 @@ pub(crate) use send::command_data;
 pub use send::command_op;
 
 use super::surface::{Active, Declaration, declared_when};
-pub use super::surface::{COMMAND_EXTENSION, command_ops_of};
+pub use super::surface::{COMMAND_EXTENSION, OPERATOR_EXTENSION, command_ops_of, operator_ops_of};
 
 /// The observation feed ring capacity: the replay window a reconnecting client
 /// can resume across without a full re-bootstrap.
@@ -215,6 +215,8 @@ pub(crate) enum Verb {
     PushConfigDelete,
     PublicCard,
     GetExtendedAgentCard,
+    /// An operator method, `agentd.operator/<op>`.
+    Operator,
 }
 
 impl Verb {
@@ -231,6 +233,7 @@ impl Verb {
         Verb::PushConfigDelete,
         Verb::PublicCard,
         Verb::GetExtendedAgentCard,
+        Verb::Operator,
     ];
 
     /// The verb `method` names, if the runtime answers it. Matched exactly:
@@ -247,6 +250,7 @@ impl Verb {
             "PushConfigDelete" => Verb::PushConfigDelete,
             "PublicCard" => Verb::PublicCard,
             "GetExtendedAgentCard" => Verb::GetExtendedAgentCard,
+            m if m.starts_with(super::surface::OPERATOR_METHOD_PREFIX) => Verb::Operator,
             _ => return None,
         })
     }
@@ -261,9 +265,14 @@ impl Verb {
             | Verb::PushConfigList
             | Verb::PublicCard
             | Verb::GetExtendedAgentCard => true,
-            Verb::SendMessage | Verb::CancelTask | Verb::PushConfigSet | Verb::PushConfigDelete => {
-                false
-            }
+            // An operator method reads or acts by its op, which classifies
+            // it ([`crate::runtime::surface::is_read_op`]); the verb alone
+            // is not a read.
+            Verb::SendMessage
+            | Verb::CancelTask
+            | Verb::PushConfigSet
+            | Verb::PushConfigDelete
+            | Verb::Operator => false,
         }
     }
 }
@@ -330,6 +339,7 @@ impl Runtime {
             Some(Verb::PushConfigDelete) => self.a2a_push_delete(&principal, &params),
             Some(Verb::PublicCard) => self.a2a_agent_card(),
             Some(Verb::GetExtendedAgentCard) => self.a2a_extended_card(&principal),
+            Some(Verb::Operator) => self.a2a_operator(&principal, &method, &params),
             None => err_obj(
                 UNSUPPORTED_OPERATION,
                 &format!("unsupported method: {method}"),
@@ -370,7 +380,10 @@ impl Runtime {
         // Audit every A2A call: who (principal + role), what (method + command
         // op), and the outcome. This is the record of who authorized what, so
         // it is emitted for refusals as well as successes.
-        let op = params.get("message").and_then(command_op);
+        let op = match super::surface::operator_op_of(&method) {
+            Some(spec) => Some(spec.name.to_string()),
+            None => params.get("message").and_then(command_op),
+        };
         let outcome = if out.get("_error").is_some() {
             "error"
         } else {

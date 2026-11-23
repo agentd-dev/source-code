@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The command ops, as ONE table.
+//! agentd's ops, as ONE table.
 //!
-//! Every property of an op — whether it answers with a Message or a Task, who
-//! may call it, what switch serves it and which handler runs it — is a column
-//! of [`OPS`], and everything else is derived from the table: the reserved
-//! names a workflow may not claim, the ops the card and `params.ops` list, the
-//! authorization floor, the audit mirror and the dispatch. One table because
-//! an op classified in one list and missing from another is an op the
-//! authorization floor and the dispatch disagree about. A new op is one row
-//! plus its handler.
+//! Every property of an op — which extension carries it, whether it answers
+//! with a Message or a Task, who may call it, what switch serves it and which
+//! handler runs it — is a column of [`OPS`], and everything else is derived
+//! from the table: the reserved names a workflow may not claim, the ops each
+//! extension's `params.ops` lists, the operator methods the route table
+//! serves, the authorization floor, the audit mirror and the dispatch. One
+//! table because an op classified in one list and missing from another is an
+//! op the authorization floor and the dispatch disagree about. A new op is
+//! one row plus its handler.
+//!
+//! Two extensions carry them ([`OpExt`]): the command extension, a DataPart
+//! on `SendMessage`, carries the workload — the ops that start or act on a
+//! task's work; the operator extension carries the control plane and the
+//! reads as JSON-RPC methods of their own, `agentd.operator/<op>`.
 
 use super::events::FeedKind;
 use crate::a2a::errors::{self, reason};
@@ -25,6 +31,24 @@ pub enum Reply {
     /// Work: a Task tracks it.
     Task,
 }
+
+/// The extension that carries an op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpExt {
+    /// The command extension: a DataPart on `SendMessage`. The workload —
+    /// an op that starts work or acts on work a task tracks — so a peer and
+    /// a stock A2A client reach it with the one method every agent answers.
+    Command,
+    /// The operator extension: the JSON-RPC method
+    /// `agentd.operator/<op>` ([`OPERATOR_METHOD_PREFIX`]). The control
+    /// plane and the reads, which are calls on the instance, not messages
+    /// to it.
+    Operator,
+}
+
+/// What every operator method's name starts with: the operator extension's
+/// namespace, read off its URI's last segment.
+pub const OPERATOR_METHOD_PREFIX: &str = "agentd.operator/";
 
 /// Who may call an op, before any grant is consulted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +119,7 @@ pub struct OpSpec {
     /// The op, or — ending in `.` — a prefix every op under it shares.
     pub name: &'static str,
     pub reply: Reply,
+    pub ext: OpExt,
     pub floor: Floor,
     /// The roles a [`Floor::Granted`] op is open to without a grant.
     pub defaults: &'static [Role],
@@ -137,6 +162,7 @@ const USER_AGENT: &[Role] = &[Role::User, Role::Agent];
 const fn op(
     name: &'static str,
     reply: Reply,
+    ext: OpExt,
     floor: Floor,
     defaults: &'static [Role],
     scope: Scope,
@@ -149,6 +175,7 @@ const fn op(
     OpSpec {
         name,
         reply,
+        ext,
         floor,
         defaults,
         scope,
@@ -163,12 +190,14 @@ const fn op(
 use Floor::{AnyNamed, Granted, Operator};
 use Reply::{Message, Task};
 
-/// Every command op any build can serve, and the names held back from
-/// workflows. Order is the order the card and `params.ops` list them in.
+/// Every op any build can serve, on either extension, and the names held
+/// back from workflows. Order is the order each extension's `params.ops`
+/// lists its own in.
 pub const OPS: &[OpSpec] = &[
     op(
         "status",
         Message,
+        OpExt::Operator,
         AnyNamed,
         &[],
         Scope::Caller,
@@ -181,6 +210,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "config",
         Message,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -193,6 +223,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "workflow.run",
         Task,
+        OpExt::Command,
         Granted,
         USER_AGENT,
         Scope::Workflow,
@@ -203,20 +234,9 @@ pub const OPS: &[OpSpec] = &[
         workflow_run_result,
     ),
     op(
-        "workflow.status",
-        Message,
-        Granted,
-        USER_AGENT,
-        Scope::Owner,
-        Gate::Always,
-        Handler::Workflow,
-        "The status of one run, or of every run the caller started",
-        workflow_status_args,
-        workflow_status_result,
-    ),
-    op(
         "workflow.cancel",
         Task,
+        OpExt::Operator,
         Granted,
         USER,
         Scope::Owner,
@@ -229,6 +249,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "workflow.signal",
         Task,
+        OpExt::Command,
         Granted,
         &[],
         Scope::Owner,
@@ -241,6 +262,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "subagent.send",
         Task,
+        OpExt::Command,
         Granted,
         USER,
         Scope::Owner,
@@ -253,6 +275,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "subagent.kill",
         Task,
+        OpExt::Command,
         Granted,
         &[],
         Scope::Owner,
@@ -265,6 +288,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "subagent.status",
         Message,
+        OpExt::Operator,
         Granted,
         USER,
         Scope::Owner,
@@ -277,6 +301,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "subagent.log",
         Message,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -289,6 +314,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "plan.get",
         Message,
+        OpExt::Operator,
         Granted,
         USER,
         Scope::Owner,
@@ -301,6 +327,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "conversation.get",
         Message,
+        OpExt::Operator,
         Granted,
         USER,
         Scope::Owner,
@@ -313,6 +340,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "run.get",
         Message,
+        OpExt::Operator,
         Granted,
         USER,
         Scope::Owner,
@@ -325,6 +353,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "subagent.get",
         Message,
+        OpExt::Operator,
         Granted,
         USER,
         Scope::Owner,
@@ -337,6 +366,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "debug.events",
         Message,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -349,6 +379,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "admin.drain",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -361,6 +392,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "admin.pause",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -373,6 +405,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "admin.resume",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -385,6 +418,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "admin.cancel",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -397,6 +431,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "admin.set",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -409,6 +444,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "auth.device.pending",
         Message,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -421,6 +457,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "auth.device.approve",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -433,6 +470,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "auth.device.deny",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -445,6 +483,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "auth.sessions",
         Message,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -457,6 +496,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "auth.sessions.revoke",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -469,6 +509,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "payment.allowances",
         Message,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -481,6 +522,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "company.status",
         Message,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -493,6 +535,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "company.user_id.reset",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -505,6 +548,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "company.sign_in",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -517,6 +561,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "company.sign_out",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -529,6 +574,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "delegation.enrol",
         Task,
+        OpExt::Operator,
         AnyNamed,
         &[],
         Scope::Instance,
@@ -541,6 +587,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "delegation.list",
         Message,
+        OpExt::Operator,
         AnyNamed,
         &[],
         Scope::Instance,
@@ -553,6 +600,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "delegation.approve",
         Task,
+        OpExt::Operator,
         AnyNamed,
         &[],
         Scope::Instance,
@@ -565,6 +613,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "delegation.deny",
         Task,
+        OpExt::Operator,
         AnyNamed,
         &[],
         Scope::Instance,
@@ -577,6 +626,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "delegation.revoke",
         Task,
+        OpExt::Operator,
         AnyNamed,
         &[],
         Scope::Instance,
@@ -589,6 +639,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "delegation.forget",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -601,6 +652,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "delegation.audit",
         Task,
+        OpExt::Operator,
         Operator,
         &[],
         Scope::Instance,
@@ -613,6 +665,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "_instance.",
         Task,
+        OpExt::Command,
         Operator,
         &[],
         Scope::Instance,
@@ -625,6 +678,7 @@ pub const OPS: &[OpSpec] = &[
     op(
         "ask_human",
         Task,
+        OpExt::Command,
         Operator,
         &[],
         Scope::Instance,
@@ -680,8 +734,12 @@ pub fn op_spec(op: &str) -> Option<&'static OpSpec> {
         .or_else(|| OPS.iter().find(|s| s.is_prefix() && s.matches(op)))
 }
 
-/// Is `op` one of the built-in command ops — a row of [`OPS`], served or
-/// merely reserved, the `_instance.` family included?
+/// Is `op` one of the built-in ops — a row of [`OPS`] on either extension,
+/// served or merely reserved, the `_instance.` family included?
+///
+/// An operator op is reserved too, though no `SendMessage` reaches it: a
+/// workflow command named `admin.drain` would read, in every grant, policy
+/// and audit line, as the operator's drain.
 ///
 /// The built-in surface is RESERVED: a workflow's `a2a` start node may not
 /// declare a command that collides with one, and the listener dispatches a
@@ -741,22 +799,54 @@ fn listable() -> impl Iterator<Item = &'static OpSpec> {
         .filter(|s| !s.is_prefix() && s.handler != Handler::Reserved)
 }
 
-/// The command ops an instance serves, in ONE place: the agent card renders
-/// them as skills, the command extension declares them, and `--capabilities`
-/// reports them. Three views, one list — they cannot disagree (they did: the
-/// manifest listed ops the card never mentioned).
+/// The listable rows `ext` carries.
+fn listable_on(ext: OpExt) -> impl Iterator<Item = &'static OpSpec> {
+    listable().filter(move |s| s.ext == ext)
+}
+
+/// The command ops an instance serves, in ONE place: the command extension
+/// declares them and `--capabilities` reports them. Two views, one list —
+/// they cannot disagree (they did: the manifest listed ops the card never
+/// mentioned).
 pub fn command_ops_of(s: &Settings) -> Vec<&'static str> {
-    listable()
+    listable_on(OpExt::Command)
         .filter(|spec| gate_open(spec, s))
         .map(|spec| spec.name)
         .collect()
 }
 
-/// Every op any instance can serve, whatever its switches — the vocabulary a
-/// client may learn without authenticating, since it says what agentd CAN
-/// answer and nothing about what this instance does.
+/// The operator ops an instance serves: what the operator extension declares
+/// and `--capabilities` reports, by the same rule as [`command_ops_of`].
+pub fn operator_ops_of(s: &Settings) -> Vec<&'static str> {
+    listable_on(OpExt::Operator)
+        .filter(|spec| gate_open(spec, s))
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// Every command op any instance can serve, whatever its switches — the
+/// vocabulary a client may learn without authenticating, since it says what
+/// agentd CAN answer and nothing about what this instance does.
 pub fn static_vocabulary() -> Vec<&'static str> {
-    listable().map(|spec| spec.name).collect()
+    listable_on(OpExt::Command).map(|spec| spec.name).collect()
+}
+
+/// Every operator op any instance can serve, whatever its switches: the
+/// operator extension's public vocabulary.
+pub fn operator_vocabulary() -> Vec<&'static str> {
+    listable_on(OpExt::Operator).map(|spec| spec.name).collect()
+}
+
+/// The method that calls operator op `op`.
+pub fn operator_method(op: &str) -> String {
+    format!("{OPERATOR_METHOD_PREFIX}{op}")
+}
+
+/// The operator op a method name calls, if it names one any build serves:
+/// `agentd.operator/<op>`, matched exactly.
+pub fn operator_op_of(method: &str) -> Option<&'static OpSpec> {
+    let op = method.strip_prefix(OPERATOR_METHOD_PREFIX)?;
+    listable_on(OpExt::Operator).find(|s| s.name == op)
 }
 
 // ── The reserved `_instance.` family ─────────────────────────────────────────
@@ -962,30 +1052,6 @@ fn workflow_run_args() -> Value {
 
 fn workflow_run_result() -> Value {
     json!({"description": "the run's output, once the run finishes"})
-}
-
-fn workflow_status_args() -> Value {
-    closed(
-        &[],
-        json!({"run": named("One run; without it, every run the caller may see")}),
-    )
-}
-
-fn workflow_status_result() -> Value {
-    closed(
-        &["runs"],
-        json!({"runs": list_of(closed(
-            &["run", "workflow", "status", "output", "error", "trace_id"],
-            json!({
-                "run": {"type": "string"},
-                "workflow": {"type": "string"},
-                "status": {"type": "string"},
-                "output": true,
-                "error": string_or_null(),
-                "trace_id": {"type": ["string", "null"], "description": "the W3C trace id the run's work is in, 32 lowercase hex digits"},
-            }),
-        ))}),
-    )
 }
 
 fn workflow_signal_args() -> Value {
@@ -1554,6 +1620,9 @@ pub fn result_schema_of(op: &str) -> Option<Value> {
 /// what [`check_command`] validates against and what the bundle publishes,
 /// built once, here, so the two are the same value.
 pub fn command_envelope(op: &str) -> Option<Value> {
+    if op_spec(op)?.ext != OpExt::Command {
+        return None;
+    }
     let mut schema = args_schema_of(op)?;
     let obj = schema.as_object_mut()?;
     obj.entry("properties")
@@ -1830,6 +1899,132 @@ pub fn check_command(
     }))
 }
 
+// ── The operator methods ─────────────────────────────────────────────────────
+
+/// The params of a call to operator op `spec`, held to the op's published
+/// argument schema — the one [`operator_schema_bundle`] publishes under the
+/// method — or the JSON-RPC error object refusing them (`-32602`,
+/// `INVALID_COMMAND_ARGS`, each miss named as `params.<field>`). Absent
+/// params are no arguments.
+///
+/// Returns the op's whole argument object with `op` beside it: the envelope
+/// its handler reads, the same object a command DataPart carries.
+pub fn check_operator(spec: &OpSpec, params: &Value) -> Result<Value, Value> {
+    let op = spec.name;
+    let args = if params.is_null() {
+        json!({})
+    } else {
+        params.clone()
+    };
+    let schema = (spec.args_schema)();
+    let mut errs = crate::jsonschema::validate(&schema, &args)
+        .err()
+        .unwrap_or_default();
+    errs.extend(regex_violations(&schema, &args));
+    if !errs.is_empty() {
+        let violations: Vec<(String, String)> = errs
+            .iter()
+            .map(|e| {
+                let (pointer, what) = e.split_once(": ").unwrap_or(("/", e.as_str()));
+                let path = pointer.trim_start_matches('/').replace('/', ".");
+                let field = if path.is_empty() {
+                    "params".to_string()
+                } else {
+                    format!("params.{path}")
+                };
+                (field, what.to_string())
+            })
+            .collect();
+        let pairs: Vec<(&str, &str)> = violations
+            .iter()
+            .map(|(f, w)| (f.as_str(), w.as_str()))
+            .collect();
+        let method = operator_method(op);
+        return Err(json!({
+            "code": errors::INVALID_PARAMS,
+            "message": format!("{method} params do not match its schema: {}", errs.join("; ")),
+            "data": [
+                errors::bad_request(&pairs),
+                errors::error_info(errors::AGENTD_DOMAIN, reason::INVALID_COMMAND_ARGS, &[("op", op)]),
+            ],
+        }));
+    }
+    let mut envelope = json!({"op": op});
+    if let (Some(e), Some(a)) = (envelope.as_object_mut(), args.as_object()) {
+        for (k, v) in a {
+            e.insert(k.clone(), v.clone());
+        }
+        // `op` is the method's, whatever the params say: the schema is
+        // closed, so a param named `op` never got this far.
+        e.insert("op".into(), json!(op));
+    }
+    Ok(envelope)
+}
+
+/// The operator extension's schema bundle, published next to its URI.
+///
+/// The root is a call: the JSON-RPC request naming one of the methods, its
+/// `params` held to that method's. `$defs.ops.<op>` is each op's `method`,
+/// reply kind (`message`: the result is the document; `task`: the result is
+/// the Task the call created), description, `params` — the schema
+/// [`check_operator`] holds a call to — and `result`: for a task method, the
+/// data of the result artifact its task completes with (`false`: none).
+pub fn operator_schema_bundle() -> Value {
+    let vocabulary = operator_vocabulary();
+    let ops: serde_json::Map<String, Value> = vocabulary
+        .iter()
+        .filter_map(|op| {
+            let spec = op_spec(op)?;
+            let reply = match spec.reply {
+                Reply::Message => "message",
+                Reply::Task => "task",
+            };
+            Some((
+                op.to_string(),
+                json!({
+                    "method": operator_method(op),
+                    "reply": reply,
+                    "description": spec.description,
+                    "params": (spec.args_schema)(),
+                    "result": (spec.result_schema)(),
+                }),
+            ))
+        })
+        .collect();
+    let per_method: Vec<Value> = vocabulary
+        .iter()
+        .map(|op| {
+            json!({
+                "if": {"required": ["method"], "properties": {"method": {"const": operator_method(op)}}},
+                "then": {"properties": {"params": {"$ref": format!("#/$defs/ops/{op}/params")}}},
+            })
+        })
+        .collect();
+    let methods: Vec<String> = vocabulary.iter().map(|op| operator_method(op)).collect();
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": super::schema_of(super::OPERATOR_EXTENSION),
+        "title": "agentd operator",
+        "description": "A call of one of the operator extension's methods, agentd.operator/<op>: \
+                        the JSON-RPC request, its params held to the method's. $defs/ops/<op> \
+                        gives each op's method, its reply kind — message: the JSON-RPC result \
+                        is the document; task: the result is the A2A Task the call created, as \
+                        GetTask answers — its params and its result: for a message method the \
+                        document, for a task method the data of the result artifact its task \
+                        completes with (false: none).",
+        "type": "object",
+        "required": ["jsonrpc", "method"],
+        "properties": {
+            "jsonrpc": {"const": "2.0"},
+            "id": {"type": ["string", "integer"]},
+            "method": {"enum": methods},
+            "params": {"type": "object"},
+        },
+        "allOf": per_method,
+        "$defs": {"ops": ops},
+    })
+}
+
 /// The command extension's schema bundle, published next to the extension's URI.
 ///
 /// The root is the object a command DataPart carries (`{"agentd": {…}}`);
@@ -1943,7 +2138,8 @@ mod tests {
         let spec = op_spec("subagent.log").expect("a row");
         assert_eq!(spec.floor, Floor::Operator);
         assert_eq!(spec.reply, Reply::Message);
-        assert!(command_ops_of(&Settings::default()).contains(&"subagent.log"));
+        assert!(operator_ops_of(&Settings::default()).contains(&"subagent.log"));
+        assert!(!command_ops_of(&Settings::default()).contains(&"subagent.log"));
         let who = |role, grants: &[&str]| Principal {
             role,
             grants: grants.iter().map(|g| (*g).to_string()).collect(),
@@ -1968,7 +2164,7 @@ mod tests {
             let mut s = Settings::default();
             s.a2a.listen = listen.map(str::to_string);
             s.a2a.device_grant.enabled = device;
-            command_ops_of(&s)
+            operator_ops_of(&s)
                 .into_iter()
                 .filter(|o| o.starts_with("auth."))
                 .collect::<Vec<_>>()
@@ -2044,7 +2240,6 @@ mod tests {
     fn sample(op: &str) -> Value {
         let args = match op {
             "workflow.run" => json!({"workflow": "greet", "inputs": {"who": "ada"}}),
-            "workflow.status" => json!({"run": "greet-1"}),
             "workflow.cancel" | "run.get" | "admin.cancel" => json!({"run": "greet-1"}),
             "workflow.signal" => json!({"name": "go", "payload": {"n": 1}, "run": "greet-1"}),
             "subagent.send" => json!({"handle": "sub-1", "message": "left"}),
@@ -2099,7 +2294,7 @@ mod tests {
     #[test]
     fn command_check_refusals() {
         let check = |params: &Value| check_command(params, None, true);
-        let status = json!({"op": "status"});
+        let status = json!({"op": "subagent.kill", "handle": "sub-1"});
 
         // Not a command at all: no envelope, whatever else the message holds.
         assert!(
@@ -2185,9 +2380,15 @@ mod tests {
         picky["configuration"]["acceptedOutputModes"] = json!([]);
         assert!(check(&picky).is_ok(), "an empty list names no preference");
 
-        // Ops nothing serves: held in reserve, a name under a prefix that is
-        // no member.
-        for op in ["ask_human", "_instance.nope", "_instance."] {
+        // Ops nothing serves as a command: held in reserve, a name under a
+        // prefix that is no member, and every operator op — the operator
+        // extension's methods, which no DataPart reaches.
+        let operator = operator_vocabulary();
+        assert!(operator.contains(&"admin.drain") && operator.contains(&"status"));
+        for op in ["ask_human", "_instance.nope", "_instance."]
+            .into_iter()
+            .chain(operator)
+        {
             let e = check(&command(json!({"op": op}))).unwrap_err();
             assert_eq!(
                 refused(&e),
@@ -2217,7 +2418,7 @@ mod tests {
         // Arguments off the schema, each miss named as the field it is.
         for (envelope, field) in [
             (
-                json!({"op": "status", "verbose": true}),
+                json!({"op": "subagent.kill", "handle": "s", "verbose": true}),
                 "message.parts[1].data.agentd",
             ),
             (
@@ -2229,27 +2430,7 @@ mod tests {
                 "message.parts[1].data.agentd.workflow",
             ),
             (
-                json!({"op": "admin.set", "path": "agent.model", "value": "x"}),
-                "message.parts[1].data.agentd.path",
-            ),
-            (
-                json!({"op": "auth.device.deny", "user_code": "A", "all": true}),
-                "message.parts[1].data.agentd",
-            ),
-            (
-                json!({"op": "auth.sessions.revoke", "sid": "s", "name": "n"}),
-                "message.parts[1].data.agentd",
-            ),
-            (
-                json!({"op": "auth.device.approve", "user_code": "A", "as": "Alice"}),
-                "message.parts[1].data.agentd.as",
-            ),
-            (
-                json!({"op": "auth.device.approve", "user_code": "A", "as": "operator"}),
-                "message.parts[1].data.agentd.as",
-            ),
-            (
-                json!({"op": "auth.device.approve", "user_code": "A"}),
+                json!({"op": "workflow.signal"}),
                 "message.parts[1].data.agentd",
             ),
             (
@@ -2273,13 +2454,13 @@ mod tests {
         // Admitted: the op, its part and its row. A number a DataPart
         // carried as a double is still the integer it was.
         let ok = check(&command(
-            json!({"op": "conversation.get", "id": "c", "limit": 20.0}),
+            json!({"op": "workflow.signal", "name": "go", "payload": {"n": 20.0}}),
         ))
         .unwrap()
         .unwrap();
-        assert_eq!((ok.op.as_str(), ok.index), ("conversation.get", 0));
-        assert_eq!(ok.spec.map(|s| s.name), Some("conversation.get"));
-        assert_eq!(ok.envelope["id"], "c");
+        assert_eq!((ok.op.as_str(), ok.index), ("workflow.signal", 0));
+        assert_eq!(ok.spec.map(|s| s.name), Some("workflow.signal"));
+        assert_eq!(ok.envelope["name"], "go");
     }
 
     /// The schema a caller reads is the schema its call is held to: each
@@ -2368,6 +2549,87 @@ mod tests {
                 assert_eq!(enforced, i == 0, "{op} {v}: only the sample is valid");
             }
         }
+        // The operator methods, by the same agreement: each method's params
+        // in the operator bundle ARE the schema `check_operator` holds a call
+        // to, and on every op's sample — as sent, with a param it does not
+        // take, without each it requires — the two agree.
+        let ops_bundle = operator_schema_bundle();
+        assert_eq!(
+            ops_bundle["$id"],
+            format!("{}/schema.json", super::super::OPERATOR_EXTENSION)
+        );
+        let methods = ops_bundle["$defs"]["ops"].as_object().unwrap();
+        assert_eq!(methods.len(), operator_vocabulary().len(), "one per op");
+        for op in operator_vocabulary() {
+            let spec = op_spec(op).unwrap();
+            let entry = &methods[op];
+            let params = (spec.args_schema)();
+            assert_eq!(entry["method"], operator_method(op));
+            assert_eq!(entry["params"], params, "{op}");
+            assert_eq!(entry["result"], (spec.result_schema)(), "{op}");
+            assert_eq!(
+                entry["reply"],
+                if spec.reply == Reply::Message {
+                    "message"
+                } else {
+                    "task"
+                },
+                "{op}"
+            );
+            assert_eq!(params["additionalProperties"], false, "{op}");
+            let mut good = sample(op);
+            good.as_object_mut().unwrap().remove("op");
+            let mut variants = vec![good.clone()];
+            let mut extra = good.clone();
+            extra["bogus"] = json!(true);
+            variants.push(extra);
+            for req in params["required"].as_array().into_iter().flatten() {
+                let mut without = good.clone();
+                without
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(req.as_str().unwrap());
+                variants.push(without);
+            }
+            for (i, v) in variants.iter().enumerate() {
+                let published = crate::jsonschema::validate(&params, v).is_ok()
+                    && regex_violations(&params, v).is_empty();
+                let enforced = check_operator(spec, v);
+                assert_eq!(published, enforced.is_ok(), "{op} {v}");
+                // The root agrees: the whole call, as the bundle publishes it.
+                let call =
+                    json!({"jsonrpc": "2.0", "id": 1, "method": operator_method(op), "params": v});
+                assert_eq!(
+                    crate::jsonschema::validate(&ops_bundle, &call).is_ok()
+                        && regex_violations(&params, v).is_empty(),
+                    enforced.is_ok(),
+                    "{op} {call}"
+                );
+                assert_eq!(
+                    enforced.is_ok(),
+                    i == 0,
+                    "{op} {v}: only the sample is valid"
+                );
+                if let Ok(envelope) = enforced {
+                    assert_eq!(envelope["op"], op, "the envelope is the op's");
+                }
+            }
+            // Absent params are no arguments.
+            let none = check_operator(spec, &Value::Null);
+            assert_eq!(
+                none.is_ok(),
+                params["required"].as_array().is_none_or(Vec::is_empty)
+                    && params.get("oneOf").is_none(),
+                "{op}"
+            );
+        }
+        // A refusal names each miss as the param it is.
+        let set = op_spec("admin.set").unwrap();
+        let e = check_operator(set, &json!({"path": "agent.model", "value": "x"})).unwrap_err();
+        assert_eq!(e["code"], errors::INVALID_PARAMS);
+        assert_eq!(e["data"][0]["fieldViolations"][0]["field"], "params.path");
+        assert_eq!(e["data"][1]["reason"], reason::INVALID_COMMAND_ARGS);
+        assert_eq!(e["data"][1]["metadata"]["op"], "admin.set");
         // A regex the validator skips is still refused, and the published
         // schema of the approval carries the handler's own rule and list.
         let approve = args_schema_of("auth.device.approve").unwrap();
@@ -2380,16 +2642,19 @@ mod tests {
             json!(RESERVED_APPROVAL_NAMES)
         );
         assert_eq!(approve["required"], json!(["user_code", "as"]));
+        let approve_spec = op_spec("auth.device.approve").unwrap();
         for name in ["Alice", "a:b", "-x", ""] {
-            let v = json!({"op": "auth.device.approve", "user_code": "A", "as": name});
-            assert!(check_command(&command(v), None, true).is_err(), "{name:?}");
+            let v = json!({"user_code": "A", "as": name});
+            let e = check_operator(approve_spec, &v).unwrap_err();
+            assert_eq!(
+                e["data"][0]["fieldViolations"][0]["field"], "params.as",
+                "{name:?}"
+            );
         }
         for name in RESERVED_APPROVAL_NAMES {
-            let v = json!({"op": "auth.device.approve", "user_code": "A", "as": name});
-            assert!(
-                crate::jsonschema::validate(&bundle, &json!({"agentd": v})).is_err(),
-                "{name}"
-            );
+            let v = json!({"user_code": "A", "as": name});
+            assert!(crate::jsonschema::validate(&approve, &v).is_err(), "{name}");
+            assert!(check_operator(approve_spec, &v).is_err(), "{name}");
         }
         // The root lets an op no row holds through, to its workflow's schema.
         assert!(

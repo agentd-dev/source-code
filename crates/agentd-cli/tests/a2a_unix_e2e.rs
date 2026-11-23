@@ -271,7 +271,7 @@ fn a_same_uid_unix_caller_is_operator_even_with_principals() {
     }
 
     // `config` is an operator-floor op: no grant reaches it, only the role.
-    let command = common::SendMessage::command("config", json!({}));
+    let command = common::OperatorCall::new("config", json!({}));
     let headers = command.headers();
     let extra: Vec<(&str, &str)> = headers
         .iter()

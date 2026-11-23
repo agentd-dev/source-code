@@ -207,9 +207,13 @@ impl Runtime {
         trace: Option<&crate::obs::trace::TraceContext>,
         link: Option<&crate::obs::trace::TraceContext>,
     ) {
+        // A command is the method that carried it, then its op; an operator
+        // method names its op already (`a2a.agentd.operator/admin.drain`).
         let action = match op {
-            Some(o) => format!("a2a.{method}:{o}"),
-            None => format!("a2a.{method}"),
+            Some(o) if !method.starts_with(crate::runtime::surface::OPERATOR_METHOD_PREFIX) => {
+                format!("a2a.{method}:{o}")
+            }
+            _ => format!("a2a.{method}"),
         };
         let role = format!("{:?}", principal.role).to_lowercase();
         self.audit_to(
@@ -262,20 +266,21 @@ mod tests {
     #[test]
     fn reads_are_not_mirrored_but_refusals_and_mutations_are() {
         // Successful reads: a read op, a read method.
-        for op in [
-            "status",
-            "debug.events",
-            "conversation.get",
-            "workflow.status",
-        ] {
-            assert!(!mirror_to_feed("SendMessage", Some(op), "ok"), "{op}");
+        for op in ["status", "debug.events", "conversation.get"] {
+            assert!(
+                !mirror_to_feed(&format!("agentd.operator/{op}"), Some(op), "ok"),
+                "{op}"
+            );
         }
         // Every verb the runtime answers, by the name it is audited under: a
         // read is not mirrored, anything else is. The push-config reads are
         // the ones a list of spec names missed.
         use crate::runtime::a2a_server::Verb;
         for v in Verb::ALL {
-            let name = format!("{v:?}");
+            let name = match v {
+                Verb::Operator => "agentd.operator/admin.drain".to_string(),
+                _ => format!("{v:?}"),
+            };
             assert_eq!(Verb::of(&name), Some(*v), "{name} is dispatched");
             assert_eq!(mirror_to_feed(&name, None, "ok"), !v.reads(), "{name}");
         }
@@ -283,11 +288,21 @@ mod tests {
             assert!(!mirror_to_feed(m, None, "ok"), "{m}");
         }
         // The same reads, refused, are mirrored.
-        assert!(mirror_to_feed("SendMessage", Some("debug.events"), "error"));
+        assert!(mirror_to_feed(
+            "agentd.operator/debug.events",
+            Some("debug.events"),
+            "error"
+        ));
         assert!(mirror_to_feed("GetTask", None, "rate_limited"));
         // Mutations are mirrored.
-        for op in ["workflow.run", "admin.set", "admin.drain", "subagent.kill"] {
+        for op in ["workflow.run", "subagent.kill"] {
             assert!(mirror_to_feed("SendMessage", Some(op), "ok"), "{op}");
+        }
+        for op in ["admin.set", "admin.drain"] {
+            assert!(
+                mirror_to_feed(&format!("agentd.operator/{op}"), Some(op), "ok"),
+                "{op}"
+            );
         }
         assert!(mirror_to_feed("SendMessage", None, "ok"));
         assert!(mirror_to_feed("CancelTask", None, "ok"));

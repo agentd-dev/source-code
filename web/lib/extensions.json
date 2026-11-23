@@ -9,6 +9,14 @@
   },
   {
     "kind": "extension",
+    "path": "a2a/ext/operator",
+    "required": false,
+    "schema": "https://agentd.dev/a2a/ext/operator/schema.json",
+    "spec": "docs/ext/operator.md",
+    "uri": "https://agentd.dev/a2a/ext/operator"
+  },
+  {
+    "kind": "extension",
     "path": "a2a/ext/events",
     "required": false,
     "schema": "https://agentd.dev/a2a/ext/events/schema.json",

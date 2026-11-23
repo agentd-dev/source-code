@@ -364,20 +364,23 @@ fn a_message_wait_wakes_only_for_its_sender() {
     };
     let log = || std::fs::read_to_string(&errf).unwrap_or_default();
     let as_ = |bearer: &str, op: &str, args: Value| {
+        if common::is_operator_op(op) {
+            return common::operator_as(&addr, bearer, op, args);
+        }
         SendMessage::command(op, args)
             .bearer(bearer)
             .return_immediately()
             .post(&addr)
     };
-    let doc = |v: &Value| v["result"]["message"]["parts"][0]["data"].clone();
+    let doc = |v: &Value| common::answer_of(v);
 
     // Alice's run parks on its wait.
     let started = as_(ALICE, "workflow.run", json!({"workflow": "listener"}));
     assert!(started.get("error").is_none(), "Alice starts: {started}");
     let deadline = Instant::now() + Duration::from_secs(15);
     let run = loop {
-        let v = as_(ALICE, "workflow.status", json!({}));
-        if let Some(r) = doc(&v)["runs"][0]["run"].as_str() {
+        let v = as_(ALICE, "status", json!({}));
+        if let Some(r) = doc(&v)["runs"][0]["id"].as_str() {
             let got = as_(ALICE, "run.get", json!({"run": r}));
             if doc(&got)["run"]["steps"]["w"]["status"] == "suspended" {
                 break r.to_string();

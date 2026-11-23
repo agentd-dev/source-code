@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 /**
- * agentd's extension vocabulary, in one place: every extension URI, the one
- * extension method, the command envelope key and the op names the client
+ * agentd's extension vocabulary, in one place: every extension URI, the
+ * extension methods, the command envelope key and the op names the client
  * reaches for. This is their only home — a source scan in client.test.mjs
  * fails the build when another file under src/ spells one.
  *
@@ -14,11 +14,28 @@
  */
 
 /**
- * command — structured operations sent as one DataPart on SendMessage.
- * A profile extension: it adds no method, and a client that ignores it can
- * still converse. Spec: https://agentd.dev/a2a/ext/command
+ * command — the workload ops (start or signal a workflow, talk to or stop a
+ * subagent), sent as one DataPart on SendMessage. A profile extension: it
+ * adds no method, and a client that ignores it can still converse.
+ * Spec: https://agentd.dev/a2a/ext/command
  */
 export const COMMAND_EXTENSION = 'https://agentd.dev/a2a/ext/command';
+
+/**
+ * operator — the control plane and the reads, as JSON-RPC methods of their
+ * own: `agentd.operator/<op>` ({@link operatorMethod}). A method extension:
+ * a method is answered only while the request activates it.
+ * Spec: https://agentd.dev/a2a/ext/operator
+ */
+export const OPERATOR_EXTENSION = 'https://agentd.dev/a2a/ext/operator';
+
+/** What every operator method's name starts with. */
+export const OPERATOR_METHOD_PREFIX = 'agentd.operator/';
+
+/** The method that calls operator op `op`. */
+export function operatorMethod(op: string): string {
+  return `${OPERATOR_METHOD_PREFIX}${op}`;
+}
 
 /**
  * events — the instance-wide observation feed, a method extension
@@ -42,6 +59,7 @@ export const TASK_ANNOTATIONS_EXTENSION = 'https://agentd.dev/a2a/ext/task-annot
  */
 export const CLIENT_EXTENSIONS: ReadonlySet<string> = new Set([
   COMMAND_EXTENSION,
+  OPERATOR_EXTENSION,
   EVENTS_EXTENSION,
   TASK_ANNOTATIONS_EXTENSION,
 ]);
@@ -54,9 +72,9 @@ export const CLIENT_EXTENSIONS: ReadonlySet<string> = new Set([
 export const UNIX_BINDING = 'https://agentd.dev/a2a/binding/jsonrpc-unix';
 
 /**
- * The one method outside A2A core the client may call, declared by
- * {@link EVENTS_EXTENSION}. Namespaced so it can never collide with a method
- * the specification defines later.
+ * The feed's method, declared by {@link EVENTS_EXTENSION}. Namespaced so it
+ * can never collide with a method the specification defines later — as the
+ * operator methods are ({@link operatorMethod}).
  */
 export const EVENTS_METHOD = 'agentd.events/SubscribeToEvents';
 
@@ -64,15 +82,15 @@ export const EVENTS_METHOD = 'agentd.events/SubscribeToEvents';
 export const COMMAND_DATA_KEY = 'agentd';
 
 /**
- * Every command op the client sends, keyed by the `AgentdClient` method
- * that sends it. Whether an agent SERVES one is its card's business
+ * Every op the client sends, keyed by the `AgentdClient` method that sends
+ * it — a command op as a DataPart, an operator op ({@link OPERATOR_OPS}) as
+ * its method. Whether an agent SERVES one is its card's business
  * (`params.ops`); this is only the spelling.
  */
 export const OPS = Object.freeze({
   status: 'status',
   config: 'config',
   workflowRun: 'workflow.run',
-  workflowStatus: 'workflow.status',
   workflowCancel: 'workflow.cancel',
   workflowSignal: 'workflow.signal',
   subagentSend: 'subagent.send',
@@ -108,8 +126,24 @@ export const OPS = Object.freeze({
   paymentAllowances: 'payment.allowances',
 } as const);
 
+/** The ops the command extension carries: the workload. */
+export const COMMAND_OPS: ReadonlySet<string> = new Set([
+  OPS.workflowRun,
+  OPS.workflowSignal,
+  OPS.subagentSend,
+  OPS.subagentKill,
+]);
+
 /**
- * The slash commands that are command ops, keyed by the word a person
+ * The ops the operator extension carries, each as its method: every op of
+ * {@link OPS} that is no command op.
+ */
+export const OPERATOR_OPS: ReadonlySet<string> = new Set(
+  Object.values(OPS).filter((op) => !COMMAND_OPS.has(op)),
+);
+
+/**
+ * The slash commands that are ops, keyed by the word a person
  * types. A slash command is offered only while the card lists its op.
  */
 export const SLASH_OPS: Readonly<Record<string, string>> = Object.freeze({

@@ -5,8 +5,8 @@
 //! checks its envelope and its `A2A-Version`, decodes its params, dispatches
 //! it to agentd's handler ([`ports::RuntimePorts`]) and writes the answer,
 //! errors included. What runs here is the host's: who the caller is, how
-//! fast it may ask, what it may ask for — and agentd's own extension method,
-//! which the SDK does not know.
+//! fast it may ask, what it may ask for — and agentd's own extension
+//! methods (the feed, the operator methods), which the SDK does not know.
 
 use std::sync::Arc;
 
@@ -87,12 +87,12 @@ fn echoed(mut resp: Response, active: Active) -> Response {
 ///    method, and the refusal of an extension method whose extension it does
 ///    not;
 /// 6. the method's authorization, the extended card's credential, and — of a
-///    send — the reach of the caller (an instance child's channel, an inbound
-///    token's scopes, the command op's floor and grants) to the op its
-///    command DataPart names;
+///    send or an operator method — the reach of the caller (an instance
+///    child's channel, an inbound token's scopes, the op's floor and grants)
+///    to the op its command DataPart or its method names;
 /// 7. the answer: the SDK's router over agentd's handler — or, for agentd's
-///    own extension method, the feed — echoing the extensions it was given
-///    under.
+///    own extension methods, the feed or the operator method's op —
+///    echoing the extensions it was given under.
 ///
 /// The order is the point. Nothing that costs the runtime anything runs before
 /// the caller is known, and a method that is no route is the SDK's `-32601`
@@ -351,10 +351,23 @@ async fn dispatch(
             SpecMethod::SendMessage | SpecMethod::SendStreamingMessage
         ))
     );
-    // The op a send's command DataPart names — what the command gates below
-    // authorize. The envelope itself (its extension, its marking, its
-    // arguments) is the runtime's to hold to the command extension.
-    let op = send.then(|| peeked.op()).flatten();
+    // The operator op an operator method calls: the method IS the op, so
+    // the gates below hold it to everything a command naming the op was
+    // held to — the op's floor and the caller's grants, an inbound token's
+    // scopes.
+    let operator = match route {
+        Some(Route::Extension { ext_method }) => surface::operator_op_of(ext_method),
+        _ => None,
+    };
+    // The op a send's command DataPart names, or an operator method's —
+    // what the command gates below authorize. A command's envelope itself
+    // (its extension, its marking, its arguments) is the runtime's to hold
+    // to the command extension; an operator method's params, to the op's
+    // argument schema.
+    let op = match operator {
+        Some(spec) => Some(spec.name.to_string()),
+        None => send.then(|| peeked.op()).flatten(),
+    };
     // An op the table names but nothing serves is unknown to every caller
     // alike, which the runtime says (`UNKNOWN_OP`): no grant could reach it,
     // so the op gate does not answer "not permitted" for it first.
@@ -412,15 +425,19 @@ async fn dispatch(
         }
 
         // An instance child's channel carries its reports and nothing else:
-        // a request that is not one is refused, whatever it says.
-        if principal.instance_handle().is_some() && op.is_none() {
+        // a request that is not one is refused, whatever it says — an op
+        // that is no report included, whether a command serves it or not.
+        let report = op
+            .as_deref()
+            .is_some_and(|o| surface::INSTANCE_OPS.iter().any(|m| m.name == o));
+        if principal.instance_handle().is_some() && !report {
             denied(
                 &app,
                 unvouched,
                 Some(&principal),
                 None,
                 Some(name),
-                None,
+                op.as_deref(),
                 "not_permitted",
                 403,
             );
@@ -442,8 +459,7 @@ async fn dispatch(
         // already admitted, and one that becomes a turn needs `conversation`
         // there.
         #[cfg(feature = "oauth")]
-        if send
-            && (op.is_some() || !peeked.names_a_task())
+        if (operator.is_some() || (send && (op.is_some() || !peeked.names_a_task())))
             && let (Some(v), Some(inbound)) = (&verified, &app.auth.inbound)
         {
             let skill = skill_of(op.as_deref(), &peeked.message);
@@ -511,7 +527,7 @@ async fn dispatch(
     // answer — echoes what the request activated.
     let resp = match route {
         Some(Route::Extension { ext_method }) => {
-            extension_method(&app, ext_method, &headers, &body, principal, active)
+            extension_method(&app, ext_method, &headers, &body, principal, active, trace).await
         }
         _ => {
             let scope = ports::RequestScope::new(principal, via, active).in_trace(trace);
@@ -576,23 +592,23 @@ impl Peek {
     }
 }
 
-/// agentd's own extension method, which the SDK correctly does not know.
-/// Negotiation has already refused it wherever the listener holds no feed to
-/// serve it from. Served only as the events extension's own: a method some
-/// other extension declares is not the feed, and until it has a handler of
-/// its own it is a method nobody answers.
+/// agentd's own extension methods, which the SDK correctly does not know:
+/// the feed, and the operator methods. Negotiation has already refused each
+/// wherever its extension is not declared or not activated, and the gates
+/// have held an operator method to its op's floor and the caller's grants.
 ///
 /// The request is read with the SDK's own `JsonRpcRequest`, and the
 /// `A2A-Version` it states held to the rule the SDK's router holds every
 /// other method to: the major version this listener speaks, a missing
 /// header read as 0.3.
-fn extension_method(
+async fn extension_method(
     app: &Arc<App>,
     ext_method: &'static str,
     headers: &HeaderMap,
     body: &[u8],
     principal: Principal,
     active: Active,
+    trace: Option<TraceContext>,
 ) -> Response {
     let req = match serde_json::from_slice::<a2a_types::JsonRpcRequest>(body) {
         Ok(req) if req.jsonrpc == "2.0" => req,
@@ -616,6 +632,11 @@ fn extension_method(
     if !accepts_version(version) {
         return refusal(req.id, &a2a_types::A2AError::version_not_supported(version));
     }
+    if owner_of(ext_method) == Some(Ext::Operator) {
+        let id = serde_json::to_value(&req.id).unwrap_or_default();
+        let params = req.params.unwrap_or(Value::Null);
+        return operator_method(app, ext_method, id, params, principal, active, trace).await;
+    }
     let feed = app
         .bridge
         .feed()
@@ -634,6 +655,39 @@ fn extension_method(
         alive,
         active,
     )
+}
+
+/// An operator method, answered by the runtime on its loop: the op's
+/// params held to its schema, the caller to the op's reach, then the op's
+/// handler. A read's result is its document; work's is the Task it created,
+/// as `GetTask` would answer — never waited on: the caller follows it with
+/// `GetTask` or `SubscribeToTask`. A refusal is the runtime's error object,
+/// a `-31401`/`-31403` at its HTTP status, as every other refusal is.
+async fn operator_method(
+    app: &Arc<App>,
+    method: &'static str,
+    id: Value,
+    params: Value,
+    principal: Principal,
+    active: Active,
+    trace: Option<TraceContext>,
+) -> Response {
+    let bridge = Arc::clone(&app.bridge);
+    let out =
+        tokio::task::spawn_blocking(move || bridge.call(method, params, principal, active, trace))
+            .await
+            .unwrap_or_else(|e| {
+                json!({"_error": {"code": errors::INTERNAL_ERROR,
+                                  "message": format!("the runtime call did not complete: {e}")}})
+            });
+    if let Some(e) = out.get("_error") {
+        let status = e["code"].as_i64().map_or(200, errors::http_status_of);
+        return json_with(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+            &errors::response(id, e),
+        );
+    }
+    json_response(json!({"jsonrpc": "2.0", "id": id, "result": out}))
 }
 
 /// The SDK's answer to a request every gate has passed: its router parses

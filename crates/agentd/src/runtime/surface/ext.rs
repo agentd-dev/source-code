@@ -6,7 +6,10 @@
 use serde_json::{Value, json};
 
 use super::methods::{Route, SpecMethod};
-use super::ops::{Floor, Reply, op_spec, static_vocabulary};
+use super::ops::{
+    Floor, OPERATOR_METHOD_PREFIX, Reply, op_spec, operator_method, operator_vocabulary,
+    static_vocabulary,
+};
 use crate::a2a::errors::{self, reason};
 use crate::config::settings::Settings;
 
@@ -24,10 +27,17 @@ use crate::config::settings::Settings;
 // hosted at its URI, so agentd.dev serves each one's spec page there and its
 // schema bundle at `<uri>/schema.json` ([`registry`] lists them).
 
-/// Structured operations invoked as a DataPart on `SendMessage`. A profile
-/// extension: it adds no method and changes no core structure, so it is never
-/// `required` and a client that ignores it can still converse.
+/// The workload ops — starting a workflow, signalling one, talking to and
+/// stopping a subagent, a child's reports home — invoked as a DataPart on
+/// `SendMessage`. A profile extension: it adds no method and changes no
+/// core structure, so it is never `required`, a client that ignores it can
+/// still converse, and a stock A2A client sends it with the one method every
+/// agent answers.
 pub const COMMAND_EXTENSION: &str = "https://agentd.dev/a2a/ext/command";
+/// The operator surface — the control plane and the reads — as A2A methods
+/// of their own, `agentd.operator/<op>` ([`OPERATOR_METHOD_PREFIX`]): a call
+/// on the instance is RPC, not a message to the agent.
+pub const OPERATOR_EXTENSION: &str = "https://agentd.dev/a2a/ext/operator";
 /// The observation feed, as an A2A method extension.
 pub const EVENTS_EXTENSION: &str = "https://agentd.dev/a2a/ext/events";
 /// The method [`EVENTS_EXTENSION`] declares, namespaced so it can never collide
@@ -41,7 +51,7 @@ pub const TASK_ANNOTATIONS_EXTENSION: &str = "https://agentd.dev/a2a/ext/task-an
 pub const UNIX_BINDING: &str = "https://agentd.dev/a2a/binding/jsonrpc-unix";
 
 /// The most `A2A-Extensions` tokens one request has considered. agentd
-/// declares three; a header naming more than this is not a client asking for
+/// declares four; a header naming more than this is not a client asking for
 /// what it speaks, and the listener does not spend a lookup on each.
 pub const MAX_EXTENSION_TOKENS: usize = 32;
 /// The longest token considered. A URI is an identifier, not a payload.
@@ -54,6 +64,7 @@ pub const MAX_EXTENSION_TOKEN_BYTES: usize = 512;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ext {
     Command,
+    Operator,
     Events,
     TaskAnnotations,
 }
@@ -61,13 +72,19 @@ pub enum Ext {
 impl Ext {
     /// Every extension, in registry order — the order the card declares them
     /// in and the echo lists them in.
-    pub const ALL: &[Ext] = &[Ext::Command, Ext::Events, Ext::TaskAnnotations];
+    pub const ALL: &[Ext] = &[
+        Ext::Command,
+        Ext::Operator,
+        Ext::Events,
+        Ext::TaskAnnotations,
+    ];
 
     /// The extension's URI. One exhaustive match, so a variant cannot be
     /// added without one.
     pub fn uri(self) -> &'static str {
         match self {
             Ext::Command => COMMAND_EXTENSION,
+            Ext::Operator => OPERATOR_EXTENSION,
             Ext::Events => EVENTS_EXTENSION,
             Ext::TaskAnnotations => TASK_ANNOTATIONS_EXTENSION,
         }
@@ -88,25 +105,25 @@ impl Ext {
                 route,
                 Route::Spec(SpecMethod::SendMessage | SpecMethod::SendStreamingMessage)
             ),
-            Ext::Events => false,
+            Ext::Operator | Ext::Events => false,
             // Every answer that carries a Task: the sends, the task reads and
-            // the cancel, a task stream, and the feed's `task` events.
-            Ext::TaskAnnotations => {
-                matches!(
-                    route,
-                    Route::Spec(
-                        SpecMethod::SendMessage
-                            | SpecMethod::SendStreamingMessage
-                            | SpecMethod::GetTask
-                            | SpecMethod::ListTasks
-                            | SpecMethod::CancelTask
-                            | SpecMethod::SubscribeToTask
-                    )
-                ) || route
-                    == Route::Extension {
-                        ext_method: EVENTS_METHOD,
-                    }
-            }
+            // the cancel, a task stream, the feed's `task` events and the
+            // Task an operator method that does work answers with.
+            Ext::TaskAnnotations => match route {
+                Route::Spec(m) => matches!(
+                    m,
+                    SpecMethod::SendMessage
+                        | SpecMethod::SendStreamingMessage
+                        | SpecMethod::GetTask
+                        | SpecMethod::ListTasks
+                        | SpecMethod::CancelTask
+                        | SpecMethod::SubscribeToTask
+                ),
+                Route::Extension { ext_method } => {
+                    ext_method == EVENTS_METHOD
+                        || super::operator_op_of(ext_method).is_some_and(|s| s.reply == Reply::Task)
+                }
+            },
         }
     }
 
@@ -121,13 +138,27 @@ impl Ext {
             // drain.
             Ext::Command => json!({
                 "uri": uri,
-                "description": "Structured operations invoked as a DataPart on SendMessage: \
+                "description": "The workload ops — start or signal a workflow, talk to or stop a \
+                                subagent — invoked as a DataPart on SendMessage: \
                                 {\"data\": {\"agentd\": {\"op\": \"…\", …}}}. \
                                 The ops this caller may run are on the extended card.",
                 "params": {
                     "dataPartKey": "agentd",
                     "schema": schema_of(uri),
                     "ops": op_entries(&static_vocabulary()),
+                },
+            }),
+            Ext::Operator => json!({
+                "uri": uri,
+                "description": "The operator surface — the control plane and the reads — as \
+                                JSON-RPC methods agentd.operator/<op>, whose params are the op's \
+                                arguments. A read answers with its document, work with the Task \
+                                it created. The methods this caller may call are on the extended \
+                                card.",
+                "params": {
+                    "methodPrefix": OPERATOR_METHOD_PREFIX,
+                    "schema": schema_of(uri),
+                    "ops": op_entries(&operator_vocabulary()),
                 },
             }),
             Ext::Events => json!({
@@ -157,12 +188,30 @@ impl Ext {
 /// its extension is declared AND activated, and the authorization matrix
 /// admits each caller by the row's floor — a row has to say who may call its
 /// method, so adding one cannot open it to every named caller by default.
-pub const EXTENSION_METHODS: &[(&str, Ext, Floor)] =
-    &[(EVENTS_METHOD, Ext::Events, Floor::AnyNamed)];
+///
+/// The feed's method, then one `agentd.operator/<op>` per operator op of
+/// [`super::OPS`], whose floor is the op's: an operator method is that op,
+/// and whoever may run the op — its floor, its role defaults, a grant naming
+/// it — may call the method, and nobody else.
+pub fn extension_methods() -> &'static [(&'static str, Ext, Floor)] {
+    static METHODS: std::sync::LazyLock<Vec<(&'static str, Ext, Floor)>> =
+        std::sync::LazyLock::new(|| {
+            let mut v = vec![(EVENTS_METHOD, Ext::Events, Floor::AnyNamed)];
+            for op in operator_vocabulary() {
+                let Some(spec) = op_spec(op) else { continue };
+                // Built once per process, for a fixed table: the names live
+                // as long as the route table that hands them out.
+                let name: &'static str = Box::leak(operator_method(op).into_boxed_str());
+                v.push((name, Ext::Operator, spec.floor));
+            }
+            v
+        });
+    &METHODS
+}
 
 /// The extension that declares `method`, if one does.
 pub fn owner_of(method: &str) -> Option<Ext> {
-    EXTENSION_METHODS
+    extension_methods()
         .iter()
         .find(|(name, ..)| *name == method)
         .map(|(_, ext, _)| *ext)
@@ -170,7 +219,7 @@ pub fn owner_of(method: &str) -> Option<Ext> {
 
 /// Who may call extension method `method`, if it is one.
 pub fn extension_floor(method: &str) -> Option<Floor> {
-    EXTENSION_METHODS
+    extension_methods()
         .iter()
         .find(|(name, ..)| *name == method)
         .map(|(.., floor)| *floor)
@@ -187,8 +236,8 @@ pub struct Declaration {
 }
 
 /// What an instance declares, from the one switch that varies it:
-/// the command and task-annotations extensions always, events while the feed
-/// is on.
+/// the command, operator and task-annotations extensions always, events
+/// while the feed is on.
 ///
 /// Takes the switch rather than the settings because the listener asks with
 /// what it SERVES: the feed is armed at spawn and `a2a.events` is
@@ -281,6 +330,7 @@ impl Ext {
     pub fn schema_bundle(self) -> Value {
         match self {
             Ext::Command => super::ops::schema_bundle(),
+            Ext::Operator => super::ops::operator_schema_bundle(),
             Ext::Events => super::events::schema_bundle(),
             Ext::TaskAnnotations => task_annotations_bundle(),
         }
@@ -631,7 +681,7 @@ mod tests {
         let methods: Vec<&str> = SpecMethod::ALL
             .iter()
             .map(|m| m.name())
-            .chain(EXTENSION_METHODS.iter().map(|(m, ..)| *m))
+            .chain(extension_methods().iter().map(|(m, ..)| *m))
             .collect();
         for events in [false, true] {
             let declared = declared_when(events);
@@ -685,6 +735,34 @@ mod tests {
         let card = negotiate(&all, &on, route("GetExtendedAgentCard")).unwrap();
         assert_eq!(card, Active::NONE, "nothing applies to the card");
         assert_eq!(card.echo(), None, "and nothing is echoed");
+        // A peer that activates the command extension alone never reaches
+        // an operator method: it is refused before any authorization runs.
+        let command_only = uris(&[COMMAND_EXTENSION, TASK_ANNOTATIONS_EXTENSION]);
+        let operator_methods: Vec<&str> = extension_methods()
+            .iter()
+            .filter(|(_, e, _)| *e == Ext::Operator)
+            .map(|(m, ..)| *m)
+            .collect();
+        assert!(operator_methods.contains(&"agentd.operator/admin.drain"));
+        for m in &operator_methods {
+            let e = negotiate(&command_only, &on, route(m)).unwrap_err();
+            assert_eq!(e["code"], errors::METHOD_NOT_FOUND, "{m}");
+        }
+        // Activated, a method that does work echoes task-annotations with
+        // the operator extension — its answer is a Task — and a read does
+        // not: its answer is a document.
+        let operator = uris(&[OPERATOR_EXTENSION, TASK_ANNOTATIONS_EXTENSION]);
+        let drain = negotiate(&operator, &on, route("agentd.operator/admin.drain")).unwrap();
+        assert_eq!(
+            drain.echo().unwrap(),
+            format!("{OPERATOR_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}")
+        );
+        let status = negotiate(&operator, &on, route("agentd.operator/status")).unwrap();
+        assert_eq!(status.echo().as_deref(), Some(OPERATOR_EXTENSION));
+        // And the operator extension applies to no core method: a send
+        // that names it does not activate it.
+        let send = negotiate(&operator, &on, route("SendMessage")).unwrap();
+        assert!(!send.contains(Ext::Operator));
         // Declared matters: the feed's URI on a feed-off instance activates
         // nothing on a method it would otherwise apply to.
         let only_events = uris(&[EVENTS_EXTENSION]);
@@ -785,11 +863,13 @@ mod tests {
     /// the request named.
     #[test]
     fn an_extension_method_needs_its_extension() {
-        for (method, owner, _) in EXTENSION_METHODS {
+        for (method, owner, _) in extension_methods() {
             let r = route(method);
             let uri = owner.uri();
             let on = declared_when(true);
-            let off = declared_when(false);
+            // An instance that does not declare this method's extension —
+            // which only the feed's can be — stood in for by leaving it out.
+            let off: Vec<Declaration> = on.iter().filter(|d| d.ext != *owner).copied().collect();
             let asked = uris(&[uri]);
             for (declared, requested, want) in [
                 (&on, &[][..], reason::EXTENSION_NOT_ACTIVATED),
@@ -842,7 +922,7 @@ mod tests {
             assert!(!seen.contains(&uri), "{uri} twice");
             seen.push(uri);
         }
-        for (method, owner, _) in EXTENSION_METHODS {
+        for (method, owner, _) in extension_methods() {
             let (ns, _) = method.split_once('/').expect("a namespaced method");
             let name = owner.uri().rsplit('/').next().unwrap();
             assert_eq!(ns, format!("agentd.{name}"), "{method}");
@@ -1005,6 +1085,7 @@ mod tests {
             .expect("card.rs has fn narrow");
         let consts = [
             ("COMMAND_EXTENSION", COMMAND_EXTENSION),
+            ("OPERATOR_EXTENSION", OPERATOR_EXTENSION),
             ("EVENTS_EXTENSION", EVENTS_EXTENSION),
             ("TASK_ANNOTATIONS_EXTENSION", TASK_ANNOTATIONS_EXTENSION),
         ];
@@ -1036,10 +1117,11 @@ mod tests {
     /// Each spec states the vocabulary it publishes, and the code is the
     /// authority on it:
     ///
-    /// * the command spec's op table is [`OPS`] — every listed op, then the
-    ///   reserved `_instance.*` members and the names served by nothing — with
-    ///   each op's reply, who may call it, when it is served and its
-    ///   description, in table order;
+    /// * the command spec's op table is the command rows of [`OPS`] — every
+    ///   listed op, then the reserved `_instance.*` members and the names
+    ///   served by nothing — and the operator spec's method table is its
+    ///   operator rows, each method by its name; each with its reply, who may
+    ///   call it, when it is served and its description, in table order;
     /// * the events spec's kinds table is [`FeedKind::ALL`], each with its
     ///   audience;
     /// * each spec's params table is exactly the keys its declaration
@@ -1048,11 +1130,12 @@ mod tests {
     #[test]
     fn extension_specs_document_the_whole_vocabulary() {
         use super::super::events::{Audience, FeedKind};
-        use super::super::ops::{INSTANCE_OPS, OPS, Reply};
+        use super::super::ops::{INSTANCE_OPS, OPS, OpExt, Reply};
 
         let command = read_repo(&spec_doc(COMMAND_EXTENSION));
         let rows = table_under(&command, "## Ops");
         let mut want: Vec<[String; 5]> = Vec::new();
+        let mut want_methods: Vec<[String; 5]> = Vec::new();
         for spec in OPS {
             let reply = match spec.reply {
                 Reply::Message => "message",
@@ -1067,7 +1150,9 @@ mod tests {
                     description.to_string(),
                 ]
             };
-            if spec.name.ends_with('.') {
+            if spec.ext == OpExt::Operator {
+                want_methods.push(row(&operator_method(spec.name), spec.description));
+            } else if spec.name.ends_with('.') {
                 for m in INSTANCE_OPS
                     .iter()
                     .filter(|m| m.name.starts_with(spec.name))
@@ -1078,20 +1163,31 @@ mod tests {
                 want.push(row(spec.name, spec.description));
             }
         }
-        let got: Vec<[String; 5]> = rows
-            .iter()
-            .map(|r| {
-                assert_eq!(r.len(), 5, "an op row has five cells: {r:?}");
-                [
-                    ident(&r[0]).to_string(),
-                    r[1].clone(),
-                    r[2].clone(),
-                    r[3].clone(),
-                    r[4].clone(),
-                ]
-            })
-            .collect();
-        assert_eq!(got, want, "docs/ext/command.md's op table is not OPS");
+        let cells = |rows: &[Vec<String>]| -> Vec<[String; 5]> {
+            rows.iter()
+                .map(|r| {
+                    assert_eq!(r.len(), 5, "an op row has five cells: {r:?}");
+                    [
+                        ident(&r[0]).to_string(),
+                        r[1].clone(),
+                        r[2].clone(),
+                        r[3].clone(),
+                        r[4].clone(),
+                    ]
+                })
+                .collect()
+        };
+        assert_eq!(
+            cells(&rows),
+            want,
+            "docs/ext/command.md's op table is not the command rows of OPS"
+        );
+        let operator = read_repo(&spec_doc(OPERATOR_EXTENSION));
+        assert_eq!(
+            cells(&table_under(&operator, "## Methods")),
+            want_methods,
+            "docs/ext/operator.md's method table is not the operator rows of OPS"
+        );
 
         let events = read_repo(&spec_doc(EVENTS_EXTENSION));
         let got: Vec<(String, String)> = table_under(&events, "## Kinds")
@@ -1221,13 +1317,14 @@ mod tests {
         out
     }
 
-    /// The command spec's error table is what the command path refuses with:
+    /// The two op specs' error tables are what the op paths refuse with:
     /// each row names a reason `errors::reason` defines, with the code every
     /// site that emits it answers, and every agentd reason the command path
-    /// emits has its row. A renamed reason or a changed code would otherwise
-    /// publish a normative contract the listener does not keep.
+    /// or an operator method emits has its row in one of the two. A renamed
+    /// reason or a changed code would otherwise publish a normative contract
+    /// the listener does not keep.
     #[test]
-    fn the_command_spec_error_table_is_what_the_command_path_refuses_with() {
+    fn the_op_specs_error_tables_are_what_the_op_paths_refuse_with() {
         let codes = error_codes();
         let errors_src = read_repo("crates/agentd/src/a2a/errors.rs");
         let reasons: Vec<&str> = errors_src
@@ -1250,31 +1347,32 @@ mod tests {
         }
         assert!(!emitted.is_empty(), "the scan found no refusal");
 
-        let command = read_repo(&spec_doc(COMMAND_EXTENSION));
-        let rows = table_under(&command, "## Errors");
         let mut documented = Vec::new();
-        for r in &rows {
-            assert_eq!(r.len(), 3, "an error row has three cells: {r:?}");
-            let code: i64 = ident(&r[0])
-                .parse()
-                .unwrap_or_else(|_| panic!("the code cell {:?} is not a number", r[0]));
-            let reason = ident(&r[1]);
-            assert!(
-                reasons.contains(&reason),
-                "docs/ext/command.md names {reason}, which errors::reason does not define"
-            );
-            for (_, got) in emitted.iter().filter(|(e, _)| e == reason) {
-                assert_eq!(
-                    *got, code,
-                    "docs/ext/command.md gives {reason} the code {code}; the command path answers {got}"
+        for uri in [COMMAND_EXTENSION, OPERATOR_EXTENSION] {
+            let doc = spec_doc(uri);
+            for r in &table_under(&read_repo(&doc), "## Errors") {
+                assert_eq!(r.len(), 3, "an error row has three cells: {r:?}");
+                let code: i64 = ident(&r[0])
+                    .parse()
+                    .unwrap_or_else(|_| panic!("the code cell {:?} is not a number", r[0]));
+                let reason = ident(&r[1]).to_string();
+                assert!(
+                    reasons.contains(&reason.as_str()),
+                    "{doc} names {reason}, which errors::reason does not define"
                 );
+                for (_, got) in emitted.iter().filter(|(e, _)| *e == reason) {
+                    assert_eq!(
+                        *got, code,
+                        "{doc} gives {reason} the code {code}; the op paths answer {got}"
+                    );
+                }
+                documented.push(reason);
             }
-            documented.push(reason);
         }
         for (reason, code) in &emitted {
             assert!(
-                documented.contains(&reason.as_str()),
-                "the command path refuses with {reason} ({code}), which docs/ext/command.md does not list"
+                documented.contains(reason),
+                "the op paths refuse with {reason} ({code}), which neither docs/ext/command.md nor docs/ext/operator.md lists"
             );
         }
     }

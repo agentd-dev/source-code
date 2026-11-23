@@ -536,7 +536,10 @@ pub(super) fn a_callers_tasks_are_theirs_alone(h: &Harness) -> Outcome {
         "SendMessage",
         util::text_params("hello", None, true),
     );
-    let Some(id) = r["result"]["task"]["id"].as_str().map(str::to_string) else {
+    let Some(id) = crate::checks::util::task_of(&r)["id"]
+        .as_str()
+        .map(str::to_string)
+    else {
         return Outcome::fail(format!("no task: {r}"));
     };
     let (_, _, mine) = s.call_as(&alice, "GetTask", json!({"id": id}));
@@ -583,7 +586,7 @@ pub(super) fn admission_waits_on_the_callers_sign_in(h: &Harness) -> Outcome {
     s.xaa.control(json!({"sub": ALICE}));
     let alice = s.token(ALICE, &["agent.read", "agent.run"]);
     let (status, _, r) = s.run_with(&alice, "who");
-    let task = r["result"]["task"].clone();
+    let task = crate::checks::util::task_of(&r).clone();
     let id = task["id"].as_str().unwrap_or_default().to_string();
     let link = task["metadata"][util::ANNOTATIONS]["signIn"]["start_uri"]
         .as_str()
@@ -682,7 +685,7 @@ pub(super) fn admission_waits_on_the_callers_sign_in(h: &Harness) -> Outcome {
         .and(|| {
             Outcome::require(
                 again == 200
-                    && second["result"]["task"]["status"]["state"] != "TASK_STATE_AUTH_REQUIRED",
+                    && crate::checks::util::task_of(&second)["status"]["state"] != "TASK_STATE_AUTH_REQUIRED",
                 format!("held a grant now, the next run asks nothing: {second}"),
             )
         })
@@ -698,7 +701,7 @@ pub(super) fn a_cancelled_admission_starts_nothing(h: &Harness) -> Outcome {
     s.xaa.control(json!({"sub": ALICE}));
     let alice = s.token(ALICE, &["agent.read", "agent.run"]);
     let (_, _, r) = s.run_with(&alice, "who");
-    let task = &r["result"]["task"];
+    let task = &crate::checks::util::task_of(&r);
     let id = task["id"].as_str().unwrap_or_default().to_string();
     let link = task["metadata"][util::ANNOTATIONS]["signIn"]["start_uri"]
         .as_str()
@@ -755,7 +758,10 @@ pub(super) fn a_workflow_token_answers_its_own_runs_question(h: &Harness) -> Out
     let _d = s.daemon(h);
     let runner = s.token(ALICE, &["agent.run"]);
     let (_, _, r) = s.run_with(&runner, "ask-me");
-    let Some(id) = r["result"]["task"]["id"].as_str().map(str::to_string) else {
+    let Some(id) = crate::checks::util::task_of(&r)["id"]
+        .as_str()
+        .map(str::to_string)
+    else {
         return Outcome::fail(format!("no task: {r}"));
     };
     tryo!(until(
@@ -912,7 +918,10 @@ pub(super) fn a_question_beside_a_peers_sign_in_is_answered(h: &Harness) -> Outc
     s.xaa.control(json!({"peer_auth": true}));
     let _d = s.daemon(h);
     let r = s.op_as(&s.ops, "workflow.run", json!({"workflow": "both"}));
-    let Some(id) = r["result"]["task"]["id"].as_str().map(str::to_string) else {
+    let Some(id) = crate::checks::util::task_of(&r)["id"]
+        .as_str()
+        .map(str::to_string)
+    else {
         return Outcome::fail(format!("no task: {r}"));
     };
     tryo!(until(
@@ -971,7 +980,7 @@ pub(super) fn a_step_up_waits_in_auth_required_for_one_call(h: &Harness) -> Outc
     std::thread::sleep(Duration::from_secs(3));
     let gated = |s: &Fed| -> Result<(String, String), String> {
         let (_, _, r) = s.run_with(&alice, "who");
-        let id = r["result"]["task"]["id"]
+        let id = crate::checks::util::task_of(&r)["id"]
             .as_str()
             .ok_or(format!("no task: {r}"))?
             .to_string();

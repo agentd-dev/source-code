@@ -99,32 +99,59 @@ fn command_requires_activation(h: &Harness) -> Outcome {
     let booted = boot(h, false);
     let addr = booted.addr.as_str();
 
-    // `admin.pause` is the probe because it would CHANGE something observable:
-    // a refusal that still ran it would leave the instance paused.
+    // `workflow.signal` is the probe because it would CHANGE something
+    // observable: a refusal that still ran it would leave a task behind.
     for (activate, mark, want) in [
         (false, true, "EXTENSION_NOT_ACTIVATED"),
         (true, false, "EXTENSION_NOT_MARKED"),
     ] {
-        let env = send_command_dressed(addr, 1, "admin.pause", activate, mark);
+        let env = send_command_dressed(addr, 1, "workflow.signal", activate, mark);
         if env["error"]["code"] != -32602 || reason(&env) != Some(want) {
             return Outcome::fail(format!(
                 "a command (activated: {activate}, marked: {mark}) should be -32602 {want}: {env}"
             ));
         }
     }
-    let bare = send_command_dressed(addr, 2, "admin.pause", false, false);
+    let bare = send_command_dressed(addr, 2, "workflow.signal", false, false);
     if bare["error"]["code"] != -32602 {
         return Outcome::fail(format!(
             "a command neither activated nor marked should be -32602: {bare}"
         ));
     }
 
+    // An operator method is answered only when its extension is activated —
+    // the command extension alone does not reach it — and is refused as no
+    // method, before anything runs.
+    for activation in ["", crate::checks::util::COMMAND] {
+        let headers: &[(&str, &str)] = if activation.is_empty() {
+            &[]
+        } else {
+            &[("A2A-Extensions", activation)]
+        };
+        let env: Value = serde_json::from_str(&post(
+            addr,
+            &rpc_body(
+                4,
+                &crate::checks::util::operator_method("admin.pause"),
+                json!({}),
+            ),
+            headers,
+        ))
+        .unwrap_or(Value::Null);
+        if env["error"]["code"] != -32601
+            || env["error"]["data"][0]["metadata"]["agentdReason"] != "EXTENSION_NOT_ACTIVATED"
+        {
+            return Outcome::fail(format!(
+                "an operator method activated with {activation:?} should be -32601 EXTENSION_NOT_ACTIVATED: {env}"
+            ));
+        }
+    }
+
     // Nothing ran: the instance is not paused, and no task was made.
-    let status = send_command(addr, 3, "status");
-    let doc = &status["result"]["message"]["parts"][0]["data"];
+    let status = crate::checks::util::call_operator(addr, 3, "status", &json!({}));
     Outcome::require(
-        doc["paused"] == false,
-        format!("a refused command must not run — the instance is paused: {status}"),
+        status["result"]["paused"] == false,
+        format!("a refused call must not run — the instance is paused: {status}"),
     )
     .and(|| {
         Outcome::require(
@@ -236,21 +263,17 @@ fn frames_are_stream_responses(what: &str, frames: &[Frame]) -> Result<(), Strin
 fn results_are_spec_shaped(h: &Harness) -> Outcome {
     let booted = boot(h, false);
     let addr = booted.addr.as_str();
-    let uri = command_uri(&get_card(addr));
 
-    // Unary: a conversation turn and a task command are a task; a read is a
-    // message — the reply the command extension marks as its own.
+    // Unary: a conversation turn and a task command are a task.
     let turn = post(
         addr,
         &rpc_body(1, "SendMessage", text_params("hi", None, false)),
         &[],
     );
     let turn: Value = serde_json::from_str(&turn).unwrap_or(Value::Null);
-    let read = send_command(addr, 2, "status");
-    let task_op = send_command(addr, 3, "admin.resume");
+    let task_op = send_command(addr, 3, "workflow.signal");
     for (what, env, want) in [
         ("a conversation turn", &turn, "task"),
-        ("a read command", &read, "message"),
         ("a task command", &task_op, "task"),
     ] {
         if keys(&env["result"]) != [want] {
@@ -259,25 +282,30 @@ fn results_are_spec_shaped(h: &Harness) -> Outcome {
             ));
         }
     }
-    if read["result"]["message"]["extensions"] != json!([uri]) {
+    // An operator read's result is its document; operator work's, the Task
+    // it created.
+    let read = crate::checks::util::call_operator(addr, 2, "status", &json!({}));
+    let work = crate::checks::util::call_operator(addr, 7, "admin.resume", &json!({}));
+    if !(read["result"]["runs"].is_array() && !crate::checks::util::is_task(&read["result"])) {
         return Outcome::fail(format!(
-            "a read's Message should list the command extension: {read}"
+            "an operator read should answer with its document: {read}"
         ));
+    }
+    if !crate::checks::util::is_task(&work["result"]) {
+        return Outcome::fail(format!("operator work should answer with its Task: {work}"));
     }
 
     // Streaming: every frame is one StreamResponse member. A turn and a task
-    // command open with their task; a read is its one message, and no more.
+    // command open with their task.
     let (_, _, turn_frames) = stream(
         addr,
         &rpc_body(4, "SendStreamingMessage", text_params("hi", None, false)),
         &[],
     );
-    let (_, _, op_frames) = stream_command(addr, 5, "admin.resume");
-    let (_, _, read_frames) = stream_command(addr, 6, "status");
+    let (_, _, op_frames) = stream_command(addr, 5, "workflow.signal");
     for (what, frames) in [
         ("a streamed turn", &turn_frames),
         ("a streamed task command", &op_frames),
-        ("a streamed read", &read_frames),
     ] {
         if let Err(e) = frames_are_stream_responses(what, frames) {
             return Outcome::fail(e);
@@ -294,14 +322,7 @@ fn results_are_spec_shaped(h: &Harness) -> Outcome {
             ));
         }
     }
-    Outcome::require(
-        read_frames.len() == 1
-            && read_frames[0].data["result"].get("message").is_some()
-            && read_frames[0].data["id"] == 6,
-        format!(
-            "a streamed read should be exactly one message frame, carrying the request id: {read_frames:?}"
-        ),
-    )
+    Outcome::pass()
 }
 
 /// Every key of every `metadata` object anywhere in `v`.
@@ -383,7 +404,7 @@ fn no_bare_metadata(h: &Harness) -> Outcome {
         } else {
             uri.as_str()
         };
-        let op = send_command_activating(addr, 5, "admin.resume", activation);
+        let op = send_command_activating(addr, 5, "workflow.signal", activation);
         let mut out = vec![
             ("SendMessage".to_string(), sent),
             ("GetTask".to_string(), got),

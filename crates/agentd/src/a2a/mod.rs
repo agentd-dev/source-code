@@ -32,9 +32,6 @@ pub mod principals;
 /// Push notifications: telling a caller instead of making it watch.
 #[cfg(feature = "a2a")]
 pub mod push;
-/// Message replies to the read ops.
-#[cfg(feature = "a2a")]
-pub mod reply;
 /// The listener: identity in, protocol out.
 #[cfg(feature = "a2a")]
 pub mod sdk_gaps;

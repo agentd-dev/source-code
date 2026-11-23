@@ -88,11 +88,13 @@ fn events(log: &str, name: &str) -> Vec<Value> {
         .collect()
 }
 
-/// A read op's document, as `bearer`.
+/// A read's document — its operator method's result — as `bearer`.
 fn read(addr: &str, bearer: &str, op: &str, args: Value) -> Value {
-    let r = SendMessage::command(op, args).bearer(bearer).result(addr);
-    assert!(r.get("task").is_none(), "{op} created a task: {r}");
-    r["message"]["parts"][0]["data"].clone()
+    let r = common::OperatorCall::new(op, args)
+        .bearer(bearer)
+        .result(addr);
+    assert!(!common::is_task(&r), "{op} created a task: {r}");
+    r
 }
 
 fn wait_for<T>(what: &str, d: &Daemon, mut f: impl FnMut() -> Option<T>) -> T {
@@ -191,13 +193,14 @@ fn the_operator_reads_an_instance_childs_log_and_messages_it() {
 
     // A handle that does not exist is not found; anyone but the operator is
     // refused, whatever their grants say.
-    let unknown = SendMessage::command("subagent.log", json!({"handle": "inst-nope"}))
-        .bearer(OPERATOR)
-        .post(&addr);
+    let unknown = common::operator_as(
+        &addr,
+        OPERATOR,
+        "subagent.log",
+        json!({"handle": "inst-nope"}),
+    );
     assert_eq!(unknown["error"]["code"], -32001, "{unknown}");
-    let user = SendMessage::command("subagent.log", json!({"handle": handle}))
-        .bearer(USER)
-        .post(&addr);
+    let user = common::operator_as(&addr, USER, "subagent.log", json!({"handle": handle}));
     assert_eq!(user["error"]["code"], -31403, "{user}");
     assert_eq!(
         user["error"]["data"][0]["reason"], "PERMISSION_DENIED",
@@ -332,9 +335,7 @@ fn the_parent_reads_only_the_log_it_opened_and_follows_sends_in_order() {
     let log_op = |addr: &str, handle: &str| {
         let (addr, handle) = (addr.to_string(), handle.to_string());
         within(10, "subagent.log", move || {
-            SendMessage::command("subagent.log", json!({"handle": handle}))
-                .bearer(OPERATOR)
-                .post(&addr)
+            common::operator_as(&addr, OPERATOR, "subagent.log", json!({"handle": handle}))
         })
     };
     let refused = |r: &Value, what: &str| {

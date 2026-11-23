@@ -23,8 +23,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::SendMessage;
-
 const TOKEN_OP: &str = "status-values-operator-token";
 const TOKEN_USER: &str = "status-values-user-token";
 
@@ -50,10 +48,8 @@ impl Drop for Daemon {
 
 /// The `status` document as `bearer` reads it.
 fn status_as(addr: &str, bearer: &str) -> Value {
-    let v = SendMessage::command("status", json!({}))
-        .bearer(bearer)
-        .post(addr);
-    let doc = v["result"]["message"]["parts"][0]["data"].clone();
+    let v = common::operator_as(addr, bearer, "status", json!({}));
+    let doc = v["result"].clone();
     assert!(doc.is_object(), "status as {bearer}: {v}");
     doc
 }

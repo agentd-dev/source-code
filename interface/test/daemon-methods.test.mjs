@@ -5,8 +5,9 @@
 //
 // CORE_METHODS (a2a.ts) is the client's list of the A2A 1.0 methods. The
 // daemon's is `SpecMethod::ALL`, spelled by the one exhaustive match in
-// `SpecMethod::name()`; its extension methods (EXTENSION_METHODS) are routed
-// beside that table, never in it. Checking the client's list only against
+// `SpecMethod::name()`; its extension methods (`extension_methods()`: the
+// feed's, and `agentd.operator/<op>` for each operator op) are routed beside
+// that table, never in it. Checking the client's list only against
 // itself proves nothing, so it is checked against the daemon's here: a method
 // either side adds, drops or misspells fails.
 import test from 'node:test';
@@ -46,20 +47,20 @@ function specMethods(src) {
 
 test('CORE_METHODS is what the daemon routes as core, and no extension method', () => {
   const core = specMethods(readFileSync(join(surface, 'methods.rs'), 'utf8'));
-  // `(method, extension, floor)` rows: the method is each row's first
-  // element, a string literal or a `&str` constant of the same file.
-  const extSrc = readFileSync(join(surface, 'ext.rs'), 'utf8');
-  const extBody = constBody(extSrc, 'EXTENSION_METHODS');
-  const extension = [...extBody.matchAll(/\(\s*("([^"\\]*)"|[A-Z_][A-Z0-9_]*)/g)].map((m) => {
-    if (m[2] !== undefined) return m[2];
-    const c = new RegExp(`pub const ${m[1]}: &str = "([^"\\\\]*)";`).exec(extSrc);
-    assert.ok(c, `const ${m[1]} not found in ext.rs`);
+  // The feed's method, and the namespace every operator method is under.
+  const strConst = (file, name) => {
+    const src = readFileSync(join(surface, file), 'utf8');
+    const c = new RegExp(`pub const ${name}: &str = "([^"\\\\]*)";`).exec(src);
+    assert.ok(c, `const ${name} not found in ${file}`);
     return c[1];
-  });
-  assert.ok(core.length > 0 && extension.length > 0, 'the daemon lists were read');
-  for (const m of extension) {
-    assert.ok(!core.includes(m), `extension method ${m} is never a core one`);
-    assert.ok(!CORE_METHODS.includes(m), `CORE_METHODS does not list extension method ${m}`);
+  };
+  const events = strConst('ext.rs', 'EVENTS_METHOD');
+  const operator = strConst('ops.rs', 'OPERATOR_METHOD_PREFIX');
+  assert.ok(core.length > 0 && events && operator, 'the daemon lists were read');
+  assert.ok(!core.includes(events), `extension method ${events} is never a core one`);
+  assert.ok(!CORE_METHODS.includes(events), `CORE_METHODS does not list extension method ${events}`);
+  for (const m of [...core, ...CORE_METHODS]) {
+    assert.ok(!m.startsWith(operator), `${m} is an operator method, never a core one`);
   }
   assert.deepEqual([...CORE_METHODS].sort(), [...core].sort());
 });

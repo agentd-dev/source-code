@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{HttpReply, SendMessage, free_port};
+use common::{HttpReply, free_port};
 use serde_json::{Value, json};
 
 /// The ports every launch here listens on are none the kernel hands out by
@@ -683,20 +683,17 @@ fn operator_token(r: &HttpReply) -> String {
 
 /// The document a command answered with.
 fn answer(v: &Value) -> Value {
-    if let Some(doc) = v["message"]["parts"][0].get("data") {
-        return doc.clone();
-    }
-    v["task"]["artifacts"][0]["parts"][0]["data"].clone()
+    common::answer_of(&json!({"result": v}))
 }
 
 /// `token` is an operator's session: it reads status, and the operator-only
 /// session list names it as a launch.
 fn assert_operator_session(addr: &str, token: &str) {
-    SendMessage::command("status", json!({}))
+    common::OperatorCall::new("status", json!({}))
         .bearer(token)
         .result(addr);
     let listed = answer(
-        &SendMessage::command("auth.sessions", json!({}))
+        &common::OperatorCall::new("auth.sessions", json!({}))
             .bearer(token)
             .result(addr),
     );
@@ -1608,7 +1605,7 @@ fn launcher_fds_never_reach_daemon_children() {
         }
 
         // A model turn that runs a long command through the exec tool.
-        SendMessage::text("sleep, please")
+        common::SendMessage::text("sleep, please")
             .return_immediately()
             .result(&addr);
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -1704,7 +1701,7 @@ fn a_daemon_hands_no_inherited_fd_to_its_children() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    SendMessage::text("sleep, please")
+    common::SendMessage::text("sleep, please")
         .return_immediately()
         .result(&addr);
     let sleeper = loop {

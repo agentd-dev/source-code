@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The JSON-RPC methods the listener answers: the specification's eleven, and
-//! the extension methods [`super::EXTENSION_METHODS`] declares.
+//! the extension methods [`super::extension_methods`] declares.
 //!
 //! Lives here rather than beside the dispatch because the `--capabilities`
 //! manifest is always compiled and the listener is `a2a`-gated: a manifest that
@@ -13,7 +13,7 @@
 //! before anything reaches the runtime, and every method that is answered went
 //! through the version gate a spec client is held to.
 
-use super::EXTENSION_METHODS;
+use super::extension_methods;
 
 /// The A2A protocol version, as the `A2A-Version` header and a card
 /// interface's `protocolVersion` spell it.
@@ -96,7 +96,7 @@ pub fn route_of(method: &str) -> Option<Route> {
     if let Some(m) = SpecMethod::ALL.iter().find(|m| m.name() == method) {
         return Some(Route::Spec(*m));
     }
-    EXTENSION_METHODS
+    extension_methods()
         .iter()
         .find(|(name, ..)| *name == method)
         .map(|(name, ..)| Route::Extension { ext_method: name })
@@ -163,7 +163,7 @@ mod tests {
             assert_eq!(route_of(m.name()), Some(Route::Spec(*m)), "{m:?}");
             assert_eq!(Route::Spec(*m).name(), m.name());
         }
-        for (name, uri, _) in EXTENSION_METHODS {
+        for (name, uri, _) in extension_methods() {
             assert_eq!(
                 route_of(name),
                 Some(Route::Extension { ext_method: name }),

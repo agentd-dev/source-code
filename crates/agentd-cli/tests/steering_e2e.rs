@@ -14,49 +14,70 @@ use serde_json::{Value, json};
 
 use common::{SendMessage, free_port, rpc_result as rpc};
 
+/// `op` with `args`, which must succeed: an operator op's method's result,
+/// or a command's — non-blocking: command tasks complete inline anyway, and
+/// workflow.run must NOT be polled to terminal — the tests steer runs
+/// mid-flight.
 fn command(addr: &str, op: &str, args: Value) -> Value {
-    // Non-blocking: command tasks complete inline anyway, and workflow.run
-    // must NOT be polled to terminal — the tests steer runs mid-flight.
+    if common::is_operator_op(op) {
+        return common::OperatorCall::new(op, args).result(addr);
+    }
     SendMessage::command(op, args)
         .return_immediately()
         .result(addr)
 }
 
-/// A command's document: a read's Message data, or a task's JSON DataPart artifact.
+/// An op's document: a read's, or a task's JSON DataPart artifact.
 fn artifact_json(v: &Value) -> Value {
     if let Some(doc) = v["message"]["parts"][0].get("data") {
         assert!(v.get("task").is_none(), "a read creates no task: {v}");
         return doc.clone();
     }
-    v["task"]["artifacts"][0]["parts"][0]["data"].clone()
+    if common::is_task(v) {
+        return v["artifacts"][0]["parts"][0]["data"].clone();
+    }
+    if v["task"].is_object() {
+        return v["task"]["artifacts"][0]["parts"][0]["data"].clone();
+    }
+    v.clone()
 }
 
-/// Poll `workflow.status` for one run until `pred` holds; returns the view.
+/// One run as `status` lists it, if it is listed.
+fn run_view(addr: &str, run: &str) -> Option<Value> {
+    let st = command(addr, "status", json!({}));
+    st["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|r| r["id"] == run)
+        .cloned()
+}
+
 /// The newest run's id, polled until the supervisor has registered it.
 ///
-/// `workflow.run` returns as soon as the request is accepted, so a
-/// `workflow.status` issued immediately after can still see an empty list —
-/// rare locally, reliably reproducible under CI load.
+/// `workflow.run` returns as soon as the request is accepted, so a `status`
+/// read issued immediately after can still list no run — rare locally,
+/// reliably reproducible under CI load.
 fn wait_run_id(addr: &str, secs: u64) -> String {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let ws = command(addr, "workflow.status", json!({}));
-        if let Some(id) = artifact_json(&ws)["runs"][0]["run"].as_str() {
+        let st = command(addr, "status", json!({}));
+        if let Some(id) = st["runs"][0]["id"].as_str() {
             return id.to_string();
         }
         assert!(
             Instant::now() < deadline,
-            "timeout: no run appeared in workflow.status"
+            "timeout: no run appeared in status"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
+/// Poll `status` for one run until `pred` holds; returns the view.
 fn wait_run<F: Fn(&Value) -> bool>(addr: &str, run: &str, secs: u64, what: &str, pred: F) -> Value {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        let ws = command(addr, "workflow.status", json!({"run": run}));
-        let view = artifact_json(&ws)["runs"][0].clone();
+        let view = run_view(addr, run).unwrap_or(Value::Null);
         if pred(&view) {
             return view;
         }
@@ -215,8 +236,7 @@ fn a_single_run_pauses_and_resumes() {
     let paused = artifact_json(&command(&addr, "admin.pause", json!({"run": run_id})));
     assert_eq!(paused["paused"], run_id, "{paused}");
     std::thread::sleep(Duration::from_millis(1600)); // past the sleep deadline
-    let view = artifact_json(&command(&addr, "workflow.status", json!({"run": run_id})))["runs"][0]
-        .clone();
+    let view = run_view(&addr, &run_id).expect("the run is listed").clone();
     assert_ne!(
         view["status"], "completed",
         "paused runs don't advance: {view}"

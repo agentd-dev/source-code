@@ -971,6 +971,173 @@ impl SendMessage {
     }
 }
 
+/// A call of an operator method — `agentd.operator/<op>`, its params the
+/// op's arguments — in the shape the operator extension gives it: the
+/// request activates the extension with the `A2A-Extensions` header, which
+/// is what a client that read the card would send. A read's `result` is its
+/// document; work's is the Task it created.
+#[derive(Debug, Clone)]
+pub struct OperatorCall {
+    op: String,
+    args: Value,
+    bearer: Option<String>,
+    /// The extensions the request activates: the operator extension unless
+    /// a test says otherwise.
+    extensions: Vec<String>,
+    extra: Vec<(String, String)>,
+}
+
+#[allow(dead_code)]
+impl OperatorCall {
+    pub fn new(op: &str, args: Value) -> Self {
+        Self {
+            op: op.to_string(),
+            args,
+            bearer: None,
+            extensions: vec![agentd::runtime::surface::OPERATOR_EXTENSION.to_string()],
+            extra: Vec::new(),
+        }
+    }
+
+    /// Present `bearer` as the caller's credential.
+    pub fn bearer(mut self, bearer: &str) -> Self {
+        self.bearer = Some(bearer.to_string());
+        self
+    }
+
+    /// Activate `extensions` instead of the operator extension alone.
+    pub fn activating(mut self, extensions: &[&str]) -> Self {
+        self.extensions = extensions.iter().map(|e| (*e).to_string()).collect();
+        self
+    }
+
+    /// Send the header `name: value` too.
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.extra.push((name.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn method(&self) -> String {
+        agentd::runtime::surface::operator_method(&self.op)
+    }
+
+    pub fn body(&self, id: i64) -> String {
+        rpc_body(id, &self.method(), self.args.clone())
+    }
+
+    pub fn headers(&self) -> Vec<(String, String)> {
+        let mut h = Vec::new();
+        if !self.extensions.is_empty() {
+            h.push(("A2A-Extensions".to_string(), self.extensions.join(", ")));
+        }
+        if let Some(b) = &self.bearer {
+            h.push(("Authorization".to_string(), format!("Bearer {b}")));
+        }
+        h.extend(self.extra.iter().cloned());
+        h
+    }
+
+    pub fn post_raw(&self, addr: &str) -> HttpReply {
+        let headers = self.headers();
+        let extra: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        try_a2a_post(addr, &self.body(1), &extra)
+            .unwrap_or_else(|e| panic!("{} to {addr}: {e}", self.method()))
+    }
+
+    /// Call, returning the JSON-RPC envelope — result or error.
+    pub fn post(&self, addr: &str) -> Value {
+        self.post_raw(addr).json()
+    }
+
+    /// [`Self::post`] to a listener served over TLS at `origin`.
+    #[cfg(feature = "oauth")]
+    pub fn post_tls(&self, origin: &str) -> Value {
+        let headers = self.headers();
+        let extra: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        a2a_post_tls(origin, &self.body(1), &extra)
+    }
+
+    /// Call a method that must succeed; returns its `result`.
+    pub fn result(&self, addr: &str) -> Value {
+        let v = self.post(addr);
+        assert!(v.get("error").is_none(), "{} error: {v}", self.method());
+        v["result"].clone()
+    }
+}
+
+/// Whether `op` is an operator op: one the operator extension carries as its
+/// method, rather than a command DataPart.
+#[allow(dead_code)]
+pub fn is_operator_op(op: &str) -> bool {
+    agentd::runtime::surface::operator_op_of(&agentd::runtime::surface::operator_method(op))
+        .is_some()
+}
+
+/// Whether `v` is an A2A `Task`: an id, a contextId and a status whose state
+/// is a TaskState — which no op's document is.
+#[allow(dead_code)]
+pub fn is_task(v: &Value) -> bool {
+    v["id"].is_string()
+        && v["contextId"].is_string()
+        && v["status"]["state"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("TASK_STATE_"))
+}
+
+/// The Task an op's answer carries: an operator method's `result`, or a
+/// command's `{task}`.
+#[allow(dead_code)]
+pub fn task_of(v: &Value) -> Value {
+    let r = &v["result"];
+    if is_task(r) {
+        r.clone()
+    } else {
+        r["task"].clone()
+    }
+}
+
+/// The document an op answered with, however its extension carries it: an
+/// operator read's `result`, a command read's Message DataPart, or the data
+/// of the result artifact of the Task work completed.
+#[allow(dead_code)]
+pub fn answer_of(v: &Value) -> Value {
+    let r = &v["result"];
+    if let Some(doc) = r["message"]["parts"][0].get("data") {
+        return doc.clone();
+    }
+    let task = if is_task(r) { r } else { &r["task"] };
+    if task.is_object() {
+        let want = format!("{}.result", task["id"].as_str().unwrap_or_default());
+        return task["artifacts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| a["artifactId"] == want.as_str())
+            .or_else(|| task["artifacts"].get(0))
+            .map(|a| a["parts"][0]["data"].clone())
+            .unwrap_or(Value::Null);
+    }
+    r.clone()
+}
+
+/// Call operator op `op` with `args`; returns the envelope.
+#[allow(dead_code)]
+pub fn operator(addr: &str, op: &str, args: Value) -> Value {
+    OperatorCall::new(op, args).post(addr)
+}
+
+/// [`operator`] presenting `bearer`.
+#[allow(dead_code)]
+pub fn operator_as(addr: &str, bearer: &str, op: &str, args: Value) -> Value {
+    OperatorCall::new(op, args).bearer(bearer).post(addr)
+}
+
 /// Send `text` and wait for the task to settle; returns the envelope.
 pub fn send_text(addr: &str, text: &str) -> Value {
     SendMessage::text(text).post(addr)

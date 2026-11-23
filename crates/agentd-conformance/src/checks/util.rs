@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 /// a link into agentd, so naming them keeps the suite a black box; a check
 /// still confirms a card declares one before it relies on it.
 pub const COMMAND: &str = "https://agentd.dev/a2a/ext/command";
+pub const OPERATOR: &str = "https://agentd.dev/a2a/ext/operator";
 pub const EVENTS: &str = "https://agentd.dev/a2a/ext/events";
 pub const ANNOTATIONS: &str = "https://agentd.dev/a2a/ext/task-annotations";
 
@@ -319,6 +320,122 @@ pub fn command_send_params(op: &str, args: &Value) -> Value {
         },
         "configuration": {"returnImmediately": true},
     })
+}
+
+/// The ops agentd's operator extension carries as methods of their own,
+/// `agentd.operator/<op>`: its control plane and its reads. Every other op —
+/// the workload, and a command a workflow declares — is a command DataPart.
+pub const OPERATOR_OPS: &[&str] = &[
+    "status",
+    "config",
+    "workflow.cancel",
+    "subagent.status",
+    "subagent.log",
+    "plan.get",
+    "conversation.get",
+    "run.get",
+    "subagent.get",
+    "debug.events",
+    "admin.drain",
+    "admin.pause",
+    "admin.resume",
+    "admin.cancel",
+    "admin.set",
+    "auth.device.pending",
+    "auth.device.approve",
+    "auth.device.deny",
+    "auth.sessions",
+    "auth.sessions.revoke",
+    "payment.allowances",
+    "company.status",
+    "company.user_id.reset",
+    "company.sign_in",
+    "company.sign_out",
+    "delegation.enrol",
+    "delegation.list",
+    "delegation.approve",
+    "delegation.deny",
+    "delegation.revoke",
+    "delegation.forget",
+    "delegation.audit",
+];
+
+/// The method that calls operator op `op`.
+pub fn operator_method(op: &str) -> String {
+    format!("agentd.operator/{op}")
+}
+
+/// The JSON-RPC request that runs `op` with `args`, as a client that read the
+/// card sends it: an operator op as its method, with `args` its params; any
+/// other as a `SendMessage` command, answered at once. The method and params.
+pub fn op_request(op: &str, args: &Value) -> (String, Value) {
+    if OPERATOR_OPS.contains(&op) {
+        let params = if args.is_null() {
+            json!({})
+        } else {
+            args.clone()
+        };
+        (operator_method(op), params)
+    } else {
+        ("SendMessage".to_string(), command_send_params(op, args))
+    }
+}
+
+/// Whether `v` is an A2A `Task`: an id, a contextId and a status whose state
+/// is a TaskState.
+pub fn is_task(v: &Value) -> bool {
+    v["id"].is_string()
+        && v["contextId"].is_string()
+        && v["status"]["state"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("TASK_STATE_"))
+}
+
+/// The Task an answer carries: an operator method's `result`, or a send's
+/// `{task}` (`null` when there is none).
+pub fn task_of(v: &Value) -> Value {
+    let r = &v["result"];
+    if is_task(r) {
+        r.clone()
+    } else {
+        r["task"].clone()
+    }
+}
+
+/// The document an op answered with: an operator read's `result`, a Message's
+/// DataPart, or the data of the result artifact of the Task work completed.
+pub fn doc_of(v: &Value) -> Value {
+    let r = &v["result"];
+    if let Some(d) = r["message"]["parts"][0].get("data") {
+        return d.clone();
+    }
+    let task = task_of(v);
+    if task.is_object() {
+        return task["artifacts"][0]["parts"][0]["data"].clone();
+    }
+    r.clone()
+}
+
+/// Call the operator op `op` with `args` the way a client that read the card
+/// would: the operator extension's URI looked up on the card and activated.
+/// Returns the envelope.
+pub fn call_operator(addr: &str, id: i64, op: &str, args: &Value) -> Value {
+    let card = get_card(addr);
+    let uri = card["capabilities"]["extensions"]
+        .as_array()
+        .and_then(|exts| {
+            exts.iter()
+                .filter_map(|e| e["uri"].as_str())
+                .find(|u| *u == OPERATOR)
+        })
+        .unwrap_or_else(|| panic!("the card declares no operator extension: {card}"))
+        .to_string();
+    let resp = post(
+        addr,
+        &rpc_body(id, &operator_method(op), args.clone()),
+        &[("A2A-Extensions", &uri)],
+    );
+    serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
 }
 
 /// `SendMessage` params for the command `op`, marked with the extension `uri`.

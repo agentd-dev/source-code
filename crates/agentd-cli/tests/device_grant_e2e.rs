@@ -266,19 +266,19 @@ fn poll(addr: &str, device_code: &str, client: &str) -> HttpReply {
     )
 }
 
-/// The document a command answered with: a read's Message data, or the JSON
+/// The document an op answered with: a read's document, or the JSON
 /// DataPart artifact of the task the work completed as.
 fn answer(v: &Value) -> Value {
-    let r = &v["result"];
-    if let Some(doc) = r["message"]["parts"][0].get("data") {
-        return doc.clone();
-    }
-    r["task"]["artifacts"][0]["parts"][0]["data"].clone()
+    common::answer_of(v)
 }
 
-/// Run `op` as `bearer`, answered as soon as its task exists: a command that
-/// starts work that waits (a parked run) must not hold the call open.
+/// Run `op` as `bearer` — an operator op as its method — answered as soon as
+/// its task exists: a command that starts work that waits (a parked run)
+/// must not hold the call open.
 fn command_as(addr: &str, bearer: &str, op: &str, args: Value) -> Value {
+    if common::is_operator_op(op) {
+        return common::operator_as(addr, bearer, op, args);
+    }
     SendMessage::command(op, args)
         .bearer(bearer)
         .return_immediately()
@@ -409,7 +409,7 @@ fn device_grant_end_to_end() {
         (400, json!("authorization_pending"))
     );
     // 3. A user holding every grant may not approve anything.
-    let r = SendMessage::command("auth.device.approve", json!({"user_code": uc, "as": "ci"}))
+    let r = common::OperatorCall::new("auth.device.approve", json!({"user_code": uc, "as": "ci"}))
         .bearer(CI_TOKEN)
         .post_raw(&addr);
     assert_eq!(r.status, 403, "{r:?}");
@@ -455,7 +455,7 @@ fn device_grant_end_to_end() {
     assert!(!line.contains(&token), "a token reached the log: {line}");
     // A refusal of the session is logged with its sid too: siblings share
     // the principal id, and only the sid says which of them was refused.
-    let refused = SendMessage::command("config", json!({}))
+    let refused = common::OperatorCall::new("config", json!({}))
         .bearer(&token)
         .post_raw(&addr);
     assert_eq!(refused.status, 403, "{refused:?}");
@@ -492,7 +492,7 @@ fn device_grant_end_to_end() {
     assert_eq!(goodbye.expect("a goodbye")["reason"], "revoked");
     daemon.wait_log(&["\"auth.session.revoked\"", &sid]);
     // 9. The token is dead.
-    let r = SendMessage::command("status", json!({}))
+    let r = common::OperatorCall::new("status", json!({}))
         .bearer(&token)
         .post_raw(&addr);
     assert_revoked(&r);
@@ -566,9 +566,9 @@ fn revoking_one_session_leaves_its_siblings() {
         ),
         Ok(n) => assert!(n > 0, "the sibling's stream ended with the revoked one"),
     }
-    let v = command_as(&addr, &two, "workflow.status", json!({}));
+    let v = command_as(&addr, &two, "status", json!({}));
     assert!(v.get("error").is_none(), "the sibling still works: {v}");
-    let r = SendMessage::command("status", json!({}))
+    let r = common::OperatorCall::new("status", json!({}))
         .bearer(&one)
         .post_raw(&addr);
     assert_revoked(&r);
@@ -584,12 +584,16 @@ fn ownership_survives_re_login() {
     let (first, first_sid) = session(&addr, "alice");
     let run = command_as(&addr, &first, "workflow.run", json!({"workflow": "waiter"}));
     assert!(run.get("error").is_none(), "{run}");
+    let run_task = run["result"]["task"]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the run's task: {run}"))
+        .to_string();
     // workflow.run answers once the start is accepted; the run itself
     // begins on the loop's next pass.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let run_id = loop {
-        let runs = command_as(&addr, &first, "workflow.status", json!({}));
-        if let Some(id) = answer(&runs)["runs"][0]["run"].as_str() {
+        let runs = command_as(&addr, &first, "status", json!({}));
+        if let Some(id) = answer(&runs)["runs"][0]["id"].as_str() {
             break id.to_string();
         }
         assert!(std::time::Instant::now() < deadline, "alice's run: {runs}");
@@ -600,8 +604,11 @@ fn ownership_survives_re_login() {
     assert_eq!(revoke(&addr, json!({"sid": first_sid})), 1);
 
     let (again, _) = session(&addr, "alice");
-    let status = command_as(&addr, &again, "workflow.status", json!({"run": run_id}));
-    assert_eq!(answer(&status)["runs"][0]["run"], run_id, "{status}");
+    // Alice's run is hers again: its task reads back, and `status` lists it.
+    let task = common::rpc_as(&addr, &again, 3, "GetTask", json!({"id": run_task}));
+    assert_eq!(task["result"]["id"], run_task.as_str(), "{task}");
+    let status = command_as(&addr, &again, "status", json!({}));
+    assert_eq!(answer(&status)["runs"][0]["id"], run_id, "{status}");
     let plan = command_as(&addr, &again, "plan.get", json!({"id": ctx}));
     assert!(
         plan.get("error").is_none(),
@@ -615,8 +622,13 @@ fn ownership_survives_re_login() {
     assert_eq!(continued["task"]["status"]["state"], "TASK_STATE_COMPLETED");
 
     let (bob, _) = session(&addr, "bob");
-    let v = command_as(&addr, &bob, "workflow.status", json!({"run": run_id}));
+    let v = common::rpc_as(&addr, &bob, 4, "GetTask", json!({"id": run_task}));
     assert_eq!(v["error"]["code"], -32001, "{v}");
+    let v = command_as(&addr, &bob, "status", json!({}));
+    assert!(
+        answer(&v)["runs"].as_array().is_some_and(Vec::is_empty),
+        "bob is told of no run: {v}"
+    );
     let v = command_as(&addr, &bob, "plan.get", json!({"id": ctx}));
     assert_eq!(v["error"]["code"], -32001, "{v}");
     assert!(daemon.alive(), "{}", daemon.stderr());
@@ -779,7 +791,7 @@ fn wildcard_listener_has_no_loopback_operator() {
     );
     let code: Value = serde_json::from_slice(&r.body).unwrap();
     assert_eq!(code["verification_uri"], format!("{origin}/oauth2/device"));
-    let approval = SendMessage::command(
+    let approval = common::OperatorCall::new(
         "auth.device.approve",
         json!({"user_code": code["user_code"], "as": "alice"}),
     )

@@ -606,7 +606,7 @@ fn a_slow_registry_report_holds_up_no_read() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let asked = Instant::now();
-    let status = common::SendMessage::command("status", json!({})).result(&addr);
+    let status = common::OperatorCall::new("status", json!({})).result(&addr);
     let took = asked.elapsed();
     assert!(
         !mock.log().contains("MOCK_BINDINGS_ANSWERED"),

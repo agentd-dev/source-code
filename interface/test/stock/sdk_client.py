@@ -325,18 +325,22 @@ async def run(url: str) -> list[httpx.Request]:
         extended = await unary.get_extended_agent_card(GetExtendedAgentCardRequest())
         expect(extended.name == card.name, f'the extended card: {extended.name}')
 
-        # A command, activated the way A2A activates any extension.
-        command = new_message(parts=[new_data_part({'agentd': {'op': 'status'}})], role=Role.ROLE_USER)
+        # A command, activated the way A2A activates any extension: a signal
+        # nothing waits on, whose task completes at once with its result.
+        command = new_message(
+            parts=[new_data_part({'agentd': {'op': 'workflow.signal', 'name': 'nobody-waits'}})],
+            role=Role.ROLE_USER,
+        )
         command.extensions.append(COMMAND_EXTENSION)
         ctx = ClientCallContext(
             service_parameters=ServiceParametersFactory.create([with_a2a_extensions([COMMAND_EXTENSION])])
         )
         replies = [r async for r in unary.send_message(SendMessageRequest(message=command), context=ctx)]
-        expect(len(replies) == 1 and replies[0].HasField('message'), f'a read op answers a Message: {replies}')
-        answer: Message = replies[0].message
+        expect(len(replies) == 1 and replies[0].HasField('task'), f'a command answers a Task: {replies}')
+        signalled = replies[0].task
         expect(
-            any(p.HasField('data') for p in answer.parts),
-            f'the status document is a DataPart: {answer}',
+            signalled.status.state == TaskState.TASK_STATE_COMPLETED,
+            f'the signal task completed: {signalled.status}',
         )
 
         # The webhook was told, with the credential it was given.

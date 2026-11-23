@@ -5,6 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   COMMAND_EXTENSION,
+  OPERATOR_EXTENSION,
   Mirror,
   OPS,
   SLASH_OPS,
@@ -31,9 +32,25 @@ import {
  */
 const ALL_OPS = Object.values(OPS).map((op) => ({ op, reply: 'task' }));
 
-/** A card declaring the command extension with `params`. */
+/**
+ * A card declaring the command and operator extensions with `params`: the
+ * ops on each (the composer reads only the names), the settable paths on the
+ * operator extension, which carries `admin.set`.
+ */
 function cardWith(params, extra = {}) {
-  return { name: 'beacon', version: '1.17.0', capabilities: { extensions: [{ uri: COMMAND_EXTENSION, params }] }, ...extra };
+  const { settable, ...command } = params;
+  const operator = settable === undefined ? { ...command } : { ...command, settable };
+  return {
+    name: 'beacon',
+    version: '1.17.0',
+    capabilities: {
+      extensions: [
+        { uri: COMMAND_EXTENSION, params: command },
+        { uri: OPERATOR_EXTENSION, params: operator },
+      ],
+    },
+    ...extra,
+  };
 }
 
 /** What discovery settles: a public card, and the extended card when one was read. */

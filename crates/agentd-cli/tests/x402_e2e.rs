@@ -1568,18 +1568,14 @@ fn above_the_allowances_approve_above_its_approver_is_asked() {
         .unwrap();
     assert_eq!(authorized["target"]["approved_by"], "user:alice");
     assert_eq!(authorized["target"]["tier"], "approved");
-    let left = common::SendMessage::command("payment.allowances", json!({}))
-        .bearer("ops-bearer-x402")
-        .post(&addr);
+    let left = common::operator_as(&addr, "ops-bearer-x402", "payment.allowances", json!({}));
     let shown = left.to_string();
     assert!(
         shown.contains("\"spent\":\"0.03\"") || shown.contains("\\\"spent\\\":\\\"0.03\\\""),
         "{left}"
     );
     // Nobody but an operator reads it.
-    let alice = common::SendMessage::command("payment.allowances", json!({}))
-        .bearer("alice-bearer-x402")
-        .post(&addr);
+    let alice = common::operator_as(&addr, "alice-bearer-x402", "payment.allowances", json!({}));
     assert!(alice.get("error").is_some(), "{alice}");
 }
 

@@ -37,7 +37,7 @@ import {
 } from '../dist/client/auth.js';
 import { AgentdClient } from '../dist/client/index.js';
 import { capabilitiesOf } from '../dist/client/discovery.js';
-import { COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD } from '../dist/client/ext.js';
+import { COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD, OPERATOR_EXTENSION } from '../dist/client/ext.js';
 
 const EP = { url: 'http://agent.test/' };
 // What a card declaring the feed, streaming and the `status` op grants: the
@@ -47,7 +47,8 @@ const CAPS = capabilitiesOf(
     capabilities: {
       streaming: true,
       extensions: [
-        { uri: COMMAND_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } },
+        { uri: COMMAND_EXTENSION, params: { ops: [{ op: 'workflow.run', reply: 'task' }] } },
+        { uri: OPERATOR_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } },
         { uri: EVENTS_EXTENSION },
       ],
     },

@@ -743,7 +743,7 @@ mod tests {
             (e["_error"]["code"].as_i64().unwrap_or_default(), reason)
         };
         let on = surface::Active::of(&[Ext::Command]);
-        let status = send(json!({"op": "status"}));
+        let status = send(json!({"op": "workflow.signal", "name": "go"}));
 
         // Not activated: refused, for the operator too.
         let e = admitted_command(&status, &who(Role::Operator), surface::Active::NONE).unwrap_err();
@@ -756,7 +756,7 @@ mod tests {
             "{e}"
         );
         let c = admitted_command(&status, &who(Role::Operator), on).unwrap();
-        assert_eq!(c.map(|c| c.op).as_deref(), Some("status"));
+        assert_eq!(c.map(|c| c.op).as_deref(), Some("workflow.signal"));
 
         // A child's report is the operator's alone, `*` grants or not.
         let report = send(

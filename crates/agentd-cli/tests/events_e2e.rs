@@ -22,16 +22,20 @@ use serde_json::{Value, json};
 
 use common::{SendMessage, error_of, free_port, get_card, rpc_result as rpc};
 
+/// `op` with `args`, which must succeed: an operator op's method's result
+/// (a read's document, or the Task work created), or a command's.
 fn command(addr: &str, op: &str, args: Value) -> Value {
+    if common::is_operator_op(op) {
+        return common::OperatorCall::new(op, args).result(addr);
+    }
     SendMessage::command(op, args).result(addr)
 }
 
-/// A read op: its reply is a Message carrying the document, and no task.
+/// A read: an operator method whose result is its document, and no task.
 fn read(addr: &str, op: &str, args: Value) -> Value {
     let r = command(addr, op, args);
-    assert!(r.get("task").is_none(), "{op} created a task: {r}");
-    assert_eq!(r["message"]["role"], "ROLE_AGENT", "{op}: {r}");
-    r["message"]["parts"][0]["data"].clone()
+    assert!(!common::is_task(&r), "{op} created a task: {r}");
+    r
 }
 
 struct MockLlm {
@@ -234,8 +238,8 @@ fn the_introspection_reads_work_over_a2a() {
     while Instant::now() < deadline {
         let got = rpc(&addr, 9, "GetTask", json!({"id": run_task_id}));
         if got["status"]["state"] == "TASK_STATE_COMPLETED" {
-            let ws = read(&addr, "workflow.status", json!({}));
-            run_id = ws["runs"][0]["run"]
+            let ws = read(&addr, "status", json!({}));
+            run_id = ws["runs"][0]["id"]
                 .as_str()
                 .map(str::to_string)
                 .unwrap_or_default();
@@ -243,7 +247,7 @@ fn the_introspection_reads_work_over_a2a() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(!run_id.is_empty(), "workflow.status yielded the run id");
+    assert!(!run_id.is_empty(), "status yielded the run id");
     let run = read(&addr, "run.get", json!({"run": run_id}));
     assert_eq!(run["run"]["status"], "completed", "{run}");
     let steps = run["run"]["steps"].as_object().unwrap();
@@ -525,7 +529,7 @@ fn the_feed_is_gated_off_by_default() {
     });
 
     // Introspection reads refuse, naming their own switch…
-    let (code, msg) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
+    let (code, msg) = error_of(&common::operator(&addr, "debug.events", json!({})));
     assert_eq!(code, -32004);
     assert!(msg.contains("a2a.introspection.enabled"), "{msg}");
     // …the feed is a method this instance does not offer: plain JSON, never
@@ -962,7 +966,7 @@ fn admin_set_toggles_introspection_live() {
     // Introspection starts OFF.
     let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
 
-    let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
+    let (code, _) = error_of(&common::operator(&addr, "debug.events", json!({})));
     assert_eq!(code, -32004);
 
     // `admin.set a2a.introspection.enabled true` flips it at runtime…
@@ -971,10 +975,7 @@ fn admin_set_toggles_introspection_live() {
         "admin.set",
         json!({"path": "a2a.introspection.enabled", "value": true}),
     );
-    assert_eq!(
-        set["task"]["status"]["state"], "TASK_STATE_COMPLETED",
-        "{set}"
-    );
+    assert_eq!(set["status"]["state"], "TASK_STATE_COMPLETED", "{set}");
     // …and the introspection reads work — including the log ring, installed on
     // toggle.
     let ev = read(&addr, "debug.events", json!({"limit": 10}));
@@ -982,11 +983,11 @@ fn admin_set_toggles_introspection_live() {
 
     // A path that is not runtime-settable: the op's published schema refuses
     // it, and the error names what is.
-    let v = SendMessage::command(
+    let v = common::operator(
+        &addr,
         "admin.set",
         json!({"path": "intelligence.model", "value": "x"}),
-    )
-    .post(&addr);
+    );
     let (code, msg) = error_of(&v);
     assert_eq!(code, -32602, "{v}");
     assert_eq!(
@@ -1017,8 +1018,11 @@ fn a_live_subagent_is_observable_and_drillable() {
     let (_daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, true, ""));
 
     // Missing handle → non-disclosing not-found.
-    let (code, _) =
-        error_of(&SendMessage::command("subagent.get", json!({"handle": "nope"})).post(&addr));
+    let (code, _) = error_of(&common::operator(
+        &addr,
+        "subagent.get",
+        json!({"handle": "nope"}),
+    ));
     assert_eq!(code, -32001);
 
     // Drive the delegating turn (blocking → returns when the tree settles).
@@ -1295,7 +1299,7 @@ fn a_reload_revokes_a_web_origin_and_the_grant_stops() {
 fn a_reload_that_turns_introspection_on_arms_the_ring() {
     let llm = spawn_mock_llm(&json!({"turns": [{"content": "unused"}]}));
     let (daemon, addr, cfg) = spawn_bound(|port| iface_config(&llm.uri, port, false, ""));
-    let (code, _) = error_of(&SendMessage::command("debug.events", json!({})).post(&addr));
+    let (code, _) = error_of(&common::operator(&addr, "debug.events", json!({})));
     assert_eq!(code, -32004, "introspection starts off");
 
     // A client watching the feed is told what the reload moved.

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::checks::util::{
     EVENTS, declared_extensions, feed_activation, feed_method, free_port, get_card, mock_llm, open,
-    post, rpc_body, rpc_value, send_command, text_params, wait_ready, write_file,
+    post, rpc_body, rpc_value, text_params, wait_ready, write_file,
 };
 use crate::{Category, Check, Harness, Outcome};
 
@@ -83,13 +83,12 @@ fn default_off(h: &Harness) -> Outcome {
         )
     })
     .and(|| {
-        // …and the core surface is untouched: status still answers, as a
-        // Message carrying the document.
-        let st = send_command(&addr, 3, "status");
+        // …and the rest of the surface is untouched: the status read still
+        // answers, its result the document.
+        let st = crate::checks::util::call_operator(&addr, 3, "status", &json!({}));
         Outcome::require(
-            st["result"]["message"]["parts"][0]["data"]["runs"].is_array()
-                && st["result"].get("task").is_none(),
-            format!("the core status command should still answer with a Message: {st}"),
+            st["result"]["runs"].is_array() && !crate::checks::util::is_task(&st["result"]),
+            format!("the status read should still answer with its document: {st}"),
         )
     })
 }

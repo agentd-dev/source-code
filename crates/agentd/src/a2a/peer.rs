@@ -656,7 +656,10 @@ mod tests {
     fn command_replies_are_read_as_task_or_message() {
         let doc =
             json!({"runs": [{"run": "r1", "status": "running"}], "seq": 9_007_199_254_740_993u64});
-        let as_message = crate::a2a::reply::read_reply("ctx", doc.clone());
+        let as_message = json!({"message": {
+            "role": "ROLE_AGENT", "messageId": "msg-1", "contextId": "ctx",
+            "parts": [{"data": doc.clone(), "mediaType": "application/json"}],
+        }});
         assert!(matches!(reply_of(&as_message), Some(Reply::Message(_))));
         assert!(task_of(&as_message).is_none(), "a message is not a task");
         assert_eq!(task_id_of(&as_message), "");

@@ -4,7 +4,7 @@
 |---|---|
 | URI | `https://agentd.dev/a2a/ext/command` |
 | Schema | [`https://agentd.dev/a2a/ext/command/schema.json`](https://agentd.dev/a2a/ext/command/schema.json) (JSON Schema draft 2020-12) |
-| Kind | A2A profile extension: no new method, no change to a core structure |
+| Kind | A2A profile extension: a structure on the messages it marks (one command DataPart); no new method, no change to a core structure |
 | Required | never |
 | Applies to | `SendMessage`, `SendStreamingMessage` |
 
@@ -17,12 +17,22 @@ a second name for the same thing. An incompatible change takes a new URI with a
 new name, never a `/vN` suffix: §4.6.3 and §5.8 say a URI's meaning MUST NOT
 change under a peer that already speaks it.
 
-A2A has no tool-call primitive. The protocol's own answer is a message that
-carries structured input, so every operation agentd offers over A2A is an
-ordinary `SendMessage` whose message carries one `DataPart` under the `agentd`
-key. A client that never activates this extension can still converse, list
-tasks and subscribe to them. The extension adds reach, and is never a
-precondition.
+This extension carries agentd's **workload**: the ops that start work or act
+on work a task tracks — starting a workflow, signalling one, talking to and
+stopping a subagent, and a child instance's reports home. Each is an ordinary
+`SendMessage` whose message carries one `DataPart` under the `agentd` key, so
+a peer agent and a stock A2A client reach it with the one method every agent
+answers, and the work it starts is a task like any other. A client that never
+activates this extension can still converse, list tasks and subscribe to them.
+The extension adds reach, and is never a precondition.
+
+The operator surface — the control plane (drain, pause, sign-ins, sessions,
+Companies, delegation) and the reads (`status`, `run.get`, …) — is not here.
+Those are calls on the instance, not messages to the agent, so they are
+JSON-RPC methods of their own, `agentd.operator/<op>`, under the
+[operator extension](operator.md). An operator op sent as a command is
+refused as an unknown op. Cancelling a run's task is the core `CancelTask`;
+reading it, `GetTask` and `ListTasks`.
 
 ## Params
 
@@ -37,7 +47,6 @@ and this caller may run.
 | `schema` | string | public | the URL of this extension's schema bundle |
 | `ops` | `[{op, reply}]` | public | the ops, each with its reply kind (`message` or `task`). On the public card, every op any build serves; on the extended card, the ops this instance serves and the caller may run |
 | `commands` | `[{op, workflow, schema?}]` | extended | the commands loaded workflows declare that the caller may fire, each with the workflow it starts and the schema its arguments are held to |
-| `settable` | string[] | extended | the paths `admin.set` accepts, on an extended card whose caller may run it |
 
 ## Activation
 
@@ -82,75 +91,36 @@ A command message:
 
 ## Replies
 
-An op answers in one of two ways, given by its `reply` column below and by
-`params.ops[].reply` on the card.
+Every op is work, and answers with a `Task` (its `reply` column below, and
+`params.ops[].reply` on the card, is `task`). When it completes with a result,
+the task carries one artifact, `<taskId>.result`, whose `DataPart` holds the
+result and whose `extensions` lists this URI. An op whose result schema is
+`false` completes with no result artifact. A read is no command: the reads are
+the [operator extension](operator.md)'s methods, which answer with their
+document and create no task.
 
-- **`message`, a read.** The answer is a `Message` (`ROLE_AGENT`) with
-  one `DataPart`, media type `application/json`, whose `data` is the op's
-  result document. Its `extensions` lists this URI. No task is created, so
-  a client that polls a read leaves nothing behind in any task list.
-- **`task`, work.** The answer is a `Task`. When it completes with a result, the
-  task carries one artifact, `<taskId>.result`, whose `DataPart` holds the
-  result and whose `extensions` lists this URI. An op whose result schema is
-  `false` completes with no result artifact.
-
-Each op's result schema is `$defs/ops/<op>/result` in the bundle. For a
-`message` op it is the document in the reply. For a `task` op it is the data of
+Each op's result schema is `$defs/ops/<op>/result` in the bundle: the data of
 the result artifact.
 
 ## Ops
 
-Every op agentd serves, in the order the card lists them, followed by the
-reserved names. The reserved names are never listed in `params.ops`, and no
-workflow may declare them as a command.
+Every op this extension serves, in the order the card lists them, followed by
+the reserved names. The reserved names are never listed in `params.ops`. No
+workflow may declare any of them as a command — nor an
+[operator op](operator.md#methods)'s name.
 
 - **who may call** is the op's floor. `operator` means the operator role alone,
   and no grant reaches it. `any named caller` means every authenticated
   principal. The remaining rows are open to the roles named and to any principal
   whose `grants` name the op.
-- **served** is the switch that serves the op. An op behind a closed switch is
-  answered as an unknown op, except the introspection ops, which say that
-  introspection is off.
+- **served** is the switch that serves the op.
 
 | op | reply | who may call | served | description |
 |---|---|---|---|---|
-| `status` | message | any named caller | always | Liveness and a snapshot of this instance, as the caller may see it: its runs, conversations and activity; an operator sees everything |
-| `config` | message | operator | always | The effective configuration, credentials redacted |
 | `workflow.run` | task | `user`, `agent` or a grant | always | Start a workflow; the reply is the task it runs under |
-| `workflow.status` | message | `user`, `agent` or a grant | always | The status of one run, or of every run the caller started |
-| `workflow.cancel` | task | `user` or a grant | always | Cancel one run by id |
 | `workflow.signal` | task | a grant | always | Deliver a signal a workflow is waiting on |
 | `subagent.send` | task | `user` or a grant | always | Send a message to a warm subagent |
 | `subagent.kill` | task | a grant | always | Stop a subagent |
-| `subagent.status` | message | `user` or a grant | always | The status of one subagent, and its result once it has one |
-| `subagent.log` | message | operator | always | The last lines of one subagent's log {handle, lines?, after?} and a cursor to tail it with: an instance child's own log file, a flat worker's lines from this instance's log ring. Read-only |
-| `plan.get` | message | `user` or a grant | always | One conversation's current plan and its progress |
-| `conversation.get` | message | `user` or a grant | `a2a.introspection.enabled` | One conversation's transcript, message bodies included |
-| `run.get` | message | `user` or a grant | `a2a.introspection.enabled` | One run with per-step status, timings, errors and output |
-| `subagent.get` | message | `user` or a grant | `a2a.introspection.enabled` | One subagent's instruction, attempts, result and error |
-| `debug.events` | message | operator | `a2a.introspection.enabled` | A cursor read of the live log ring, across every principal |
-| `admin.drain` | task | operator | always | Begin a graceful drain, then exit 0 |
-| `admin.pause` | task | operator | always | Hold the instance, or one run, at a safe boundary |
-| `admin.resume` | task | operator | always | Clear a prior pause |
-| `admin.cancel` | task | operator | always | Cancel one run by id, whoever started it |
-| `admin.set` | task | operator | always | Set a runtime-settable path (agent.approval, a2a.introspection.enabled) until the next reload |
-| `auth.device.pending` | message | operator | `a2a.device_grant.enabled` | Device sign-ins waiting for an operator's decision |
-| `auth.device.approve` | task | operator | `a2a.device_grant.enabled` | Approve a device sign-in {user_code, as, scope?}; every session approved as one name is one principal |
-| `auth.device.deny` | task | operator | `a2a.device_grant.enabled` | Refuse a pending device sign-in {user_code}, or all of them {all: true} |
-| `auth.sessions` | message | operator | a TCP listener | The signed-in sessions: kind, name, principal and expiry |
-| `auth.sessions.revoke` | task | operator | a TCP listener | End one session {sid}, every session of a name {name}, or all {all: true} |
-| `payment.allowances` | message | operator | an allowance (`security.payments.allowances`) | What each spending allowance has left: its currency, its period and when the current one started, its budget, what was spent in it and how many payments were made. Read-only |
-| `company.status` | message | operator | a `companies` entry | Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, the User's accounts there by label and whether the Session its MCP servers act with is signed in, until when it asked for no requests, and its MCP servers |
-| `company.user_id.reset` | task | operator | a `companies` entry | Forget the User ID one Company knows the User by {company}, with its Session and MCP connections: the Company sees a new User from the next call on |
-| `company.sign_in` | task | operator | a `companies` entry | Ask the User to sign in at a Company {company, account?, scopes?, new_account?} — to the account `account` labels, the only one held, else `default`: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone |
-| `company.sign_out` | task | operator | a `companies` entry | Sign the User out of one account at a Company {company, account?} — the one `account` labels, or the only one held: its Account Token is revoked there and forgotten here, and every other account stays signed in. The configured User's alone |
-| `delegation.enrol` | task | any named caller | an identity provider or a `grant: id_jag` server | Sign the caller in at an identity provider {idp, grant?} and keep their delegation grant — a per-person operator, an a2a.login session, or a device session whose name a pin or the first binding makes eligible: the task says where to sign in (a display session's start link is its signIn annotation), and how it ended. The caller's own enrolment alone |
-| `delegation.list` | message | any named caller | an identity provider or a `grant: id_jag` server | The delegation grants and the open consent gates — every one to an operator, the caller's own to anyone else; never a secret — each gate with its nonce and argument hash for the person who answers it |
-| `delegation.approve` | task | any named caller | an identity provider or a `grant: id_jag` server | Approve one consent gate {gate, nonce, args_hash}, or several of one shape {gates: [...]}: the calls they hold run. Each bound to its gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers |
-| `delegation.deny` | task | any named caller | an identity provider or a `grant: id_jag` server | Deny one consent gate {gate, nonce}, or several of one shape {gates: [...]}: the calls they hold are refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says |
-| `delegation.revoke` | task | any named caller | an identity provider or a `grant: id_jag` server | Revoke the grants {target?} names — a principal, or idp:<name>#<sub> for every grant of that subject; the caller's own when absent: RFC 7009 at the IdP, then the tombstone, the record and every token. An operator revokes anyone's; anyone else their own alone |
-| `delegation.forget` | task | operator | an identity provider or a `grant: id_jag` server | Erase a person {principal}: their grants revoked as delegation.revoke does, then their personal key destroyed — what it sealed in the audit chain, the arguments their consent gates showed, is unreadable from then on, and the chain still verifies |
-| `delegation.audit` | task | operator | an identity provider or a `grant: id_jag` server | A person's consent records {principal?} from the audit chain, the latest first, as the task's result — each with what the gate showed opened under their personal key, or `unreadable` once they were forgotten; read off the loop. The per-person operator reads their own; any other operator names a principal |
 | `_instance.result` | task | operator | always | reserved: a `mode: sync` child's first result, recorded on the parent's handle; sent by the child over its channel, or by an operator |
 | `_instance.emit` | task | operator | always | reserved: one event of a child's `mirror_streams` stream, appended to the parent's stream of the same name; sent by the child over its channel, or by an operator |
 | `ask_human` | task | operator | never | reserved: the model's tool for asking a person; not served over A2A |
@@ -184,16 +154,15 @@ command. Nothing refused is run.
 | `-32602` | `COMMAND_ENVELOPE_AMBIGUOUS` | more than one part carries a command |
 | `-32602` | `COMMAND_TASK_ID` | a command message names a `taskId` |
 | `-32005` | `CONTENT_TYPE_NOT_SUPPORTED` | `acceptedOutputModes` is given and excludes `application/json` |
-| `-32602` | `UNKNOWN_OP` | the op is empty, or nothing serves it: no row, and no loaded workflow declares it |
+| `-32602` | `UNKNOWN_OP` | the op is empty, or nothing serves it as a command: no row of this extension (an operator op included), and no loaded workflow declares it |
 | `-32602` | `INVALID_COMMAND_ARGS` | the envelope does not match the op's schema; `BadRequest` names each miss |
 | `-31403` | `PERMISSION_DENIED` | the caller's role and grants do not reach the op (HTTP 403) |
-| `-32004` | `INTROSPECTION_DISABLED` | an introspection op while `a2a.introspection.enabled` is off |
+| `-32603` | `DRAINING` | the agent is draining and takes no new work |
 
 ## Security
 
 - **The floor is the table's.** A `user` holding `grants: ["*"]` still reaches
-  no `operator` op. An op that drains the instance, relaxes its approval policy
-  or reads every principal's log lines is an operator's, whatever a grant says.
+  no `operator` op.
 - **Ownership is enforced at the object.** An op that names a run, a
   subagent or a conversation acts only on one the caller started. An operator
   acts on any. A caller who may not run a workflow is told it may not, never
@@ -222,8 +191,9 @@ beside it under
 
 ## Related
 
+- [operator.md](operator.md): the control plane and the reads, as methods.
 - [events.md](events.md): the observation feed, which a display client
-  bootstraps with the `status` read.
+  bootstraps with the `agentd.operator/status` read.
 - [task-annotations.md](task-annotations.md): the `command` annotation names the
   op that started a task.
 - [../a2a.md](../a2a.md): the listener, its pipeline and its core methods.

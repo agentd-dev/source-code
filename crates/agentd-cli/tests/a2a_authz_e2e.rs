@@ -633,19 +633,28 @@ fn credentials_are_challenged_with_401_and_roles_refused_with_403() {
     );
     assert_eq!(reply.status, 200, "an unknown method: {reply:?}");
     assert_eq!(reply.json()["error"]["code"], -32601, "{reply:?}");
-    // A command the role is not granted: `plan.get` is a user op, not an
-    // agent one. Blocking and streaming both answer with the JSON 403.
-    let command = SendMessage::command("plan.get", json!({})).bearer(TOKEN_B);
-    let headers = command.headers();
+    // An operator method the role is not granted: `plan.get` is a user op,
+    // not an agent one. The JSON 403.
+    let method = common::OperatorCall::new("plan.get", json!({})).bearer(TOKEN_B);
+    let headers = method.headers();
     let extra: Vec<(&str, &str)> = headers
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
     forbidden(
-        a2a_post(&addr, &command.body(7), &extra),
+        a2a_post(&addr, &method.body(7), &extra),
         7,
-        "an ungranted command",
+        "an ungranted operator method",
     );
+    // A command the role is not granted — `subagent.send` is a user op —
+    // blocking and streaming alike.
+    let command = SendMessage::command("subagent.send", json!({"handle": "h", "message": "m"}))
+        .bearer(TOKEN_B);
+    let headers = command.headers();
+    let extra: Vec<(&str, &str)> = headers
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
     let streamed = command.clone().streaming();
     forbidden(
         a2a_post(&addr, &streamed.body(8), &extra),
@@ -720,7 +729,7 @@ fn extended_card_needs_a_declared_scheme_credential() {
     );
     // …as `user:pub`, the rule's principal — never the operator: an
     // operator-only op is refused, naming who asked.
-    let config = SendMessage::command("config", json!({})).post(&addr);
+    let config = common::operator(&addr, "config", json!({}));
     assert_eq!(config["error"]["code"], -31403, "{config}");
     assert!(
         config["error"]["message"]
@@ -820,11 +829,7 @@ fn a_reload_demotes_a_principal_and_the_revocation_takes_effect() {
     let (mut daemon, cfg) = spawn_daemon(|port| cfg_for("user", port));
     let addr = daemon.addr.clone();
 
-    let plan_get = || {
-        SendMessage::command("plan.get", json!({}))
-            .bearer(TOKEN_A)
-            .post(&addr)
-    };
+    let plan_get = || common::operator_as(&addr, TOKEN_A, "plan.get", json!({}));
 
     // As a user, the command is not refused for want of a grant.
     let before = plan_get();
@@ -908,17 +913,18 @@ fn owners_config_on(llm: &str, port: u16, b_grants: &str, store: &str) -> String
     )
 }
 
-/// The document a command answered with: a read's Message data, or the JSON
+/// The document an op answered with: a read's document, or the JSON
 /// DataPart artifact of the task a piece of work completed.
 fn answer(v: &Value) -> Value {
-    let r = &v["result"];
-    if let Some(doc) = r["message"]["parts"][0].get("data") {
-        return doc.clone();
-    }
-    r["task"]["artifacts"][0]["parts"][0]["data"].clone()
+    common::answer_of(v)
 }
 
+/// `op` with `args` as `bearer`: an operator op as its method, a command op
+/// as a DataPart.
 fn command_as(addr: &str, bearer: &str, op: &str, args: Value) -> Value {
+    if common::is_operator_op(op) {
+        return common::operator_as(addr, bearer, op, args);
+    }
     SendMessage::command(op, args)
         .bearer(bearer)
         .return_immediately()
@@ -956,8 +962,8 @@ fn a_owns_a_run_and_a_subagent(addr: &str, daemon: &Daemon) -> Owned {
     assert!(started.get("error").is_none(), "A starts a run: {started}");
     let deadline = Instant::now() + Duration::from_secs(10);
     let run = loop {
-        let v = command_as(addr, TOKEN_A, "workflow.status", json!({}));
-        if let Some(r) = answer(&v)["runs"][0]["run"].as_str()
+        let v = command_as(addr, TOKEN_A, "status", json!({}));
+        if let Some(r) = answer(&v)["runs"][0]["id"].as_str()
             && parked(addr, r)
         {
             break r.to_string();
@@ -1032,7 +1038,6 @@ fn every_command_op_that_names_an_object_is_owner_scoped() {
         e
     };
     let cases = [
-        ("workflow.status", json!({"run": a.run}), "no such run"),
         ("workflow.cancel", json!({"run": a.run}), "no such run"),
         (
             "workflow.signal",
@@ -1255,7 +1260,7 @@ fn a_narrowed_principal_cannot_run_a_workflow_through_the_model() {
     // Every run B started is B's, so B's own listing is all of them.
     let deadline = Instant::now() + Duration::from_secs(10);
     let runs = loop {
-        let v = command_as(&addr, TOKEN_B, "workflow.status", json!({}));
+        let v = command_as(&addr, TOKEN_B, "status", json!({}));
         let runs = answer(&v)["runs"].clone();
         if runs.as_array().is_some_and(|a| !a.is_empty()) {
             break runs;
@@ -1280,7 +1285,7 @@ fn a_narrowed_principal_cannot_run_a_workflow_through_the_model() {
     assert!(v.get("error").is_none(), "{v}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let v = command_as(&addr, TOKEN_B, "workflow.status", json!({}));
+        let v = command_as(&addr, TOKEN_B, "status", json!({}));
         let mine: Vec<String> = answer(&v)["runs"]
             .as_array()
             .map(|a| {
@@ -2169,8 +2174,8 @@ fn a_commands_conversation_is_its_callers_own() {
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     let run = loop {
-        let v = command_as(&addr, TOKEN_B, "workflow.status", json!({}));
-        if let Some(r) = answer(&v)["runs"][0]["run"].as_str()
+        let v = command_as(&addr, TOKEN_B, "status", json!({}));
+        if let Some(r) = answer(&v)["runs"][0]["id"].as_str()
             && wait_of(r).1 == "suspended"
         {
             break r.to_string();
@@ -2402,7 +2407,7 @@ fn an_operator_joins_a_conversation_by_its_key_and_is_answered_in_it() {
 /// **Polling binds nothing.**
 ///
 /// A caller's `contextId` is bound to a conversation of its own when it
-/// starts work there. An op that answers with a Message — `workflow.status`,
+/// starts work there. An op that answers with a document — `status`,
 /// `subagent.status` — starts nothing, and a task op the handler refused made
 /// nothing; a poll carrying no `contextId` gets a fresh one each time, so a
 /// binding per request would be memory any named caller could grow for as
@@ -2428,8 +2433,8 @@ fn a_poll_or_a_refused_command_binds_no_conversation() {
 
     for i in 0..4 {
         for (bearer, op, args) in [
-            (TOKEN_A, "workflow.status", json!({})),
-            (TOKEN_B, "workflow.status", json!({})),
+            (TOKEN_A, "status", json!({})),
+            (TOKEN_B, "status", json!({})),
             (
                 TOKEN_A,
                 "subagent.status",
@@ -2442,11 +2447,13 @@ fn a_poll_or_a_refused_command_binds_no_conversation() {
             ),
         ] {
             let _ = command_as(&addr, bearer, op, args.clone());
-            let _ = SendMessage::command(op, args)
-                .bearer(bearer)
-                .context(&format!("fresh-{i}"))
-                .return_immediately()
-                .post(&addr);
+            if !common::is_operator_op(op) {
+                let _ = SendMessage::command(op, args)
+                    .bearer(bearer)
+                    .context(&format!("fresh-{i}"))
+                    .return_immediately()
+                    .post(&addr);
+            }
         }
     }
     assert_eq!(bindings(), start, "polls and refusals bound conversations");

@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The built-in command ops, reached as a command DataPart on `SendMessage`.
+//! The built-in ops: the command extension's, reached as a command DataPart
+//! on `SendMessage`, and the operator extension's, reached as the method
+//! `agentd.operator/<op>` — one dispatch for both, so an op answers the same
+//! whichever way its extension carries it.
 //!
 //! One table ([`surface::OPS`]) says what each op is; this file routes an op
 //! to its handler with ONE match on the row's [`Handler`], and turns what the
@@ -33,7 +36,6 @@ pub(super) fn refusal(code: i64, why: &str, msg: &str, meta: &[(&str, &str)]) ->
 }
 
 /// The answer to an op that is no row of the table, or a row nothing serves.
-/// A removed op is named with what replaced it.
 ///
 /// Where the dispatch holds the command, [`unknown_command`] names the part
 /// it came in; this is for a handler that has only the op.
@@ -60,7 +62,6 @@ enum ReadOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkflowOp {
     Run,
-    Status,
     Cancel,
     Signal,
 }
@@ -109,7 +110,6 @@ fn route(op: &str) -> Option<(&'static surface::OpSpec, Route)> {
         .map(Route::Read),
         Handler::Workflow => match op {
             "workflow.run" => Some(WorkflowOp::Run),
-            "workflow.status" => Some(WorkflowOp::Status),
             "workflow.cancel" => Some(WorkflowOp::Cancel),
             "workflow.signal" => Some(WorkflowOp::Signal),
             _ => None,
@@ -150,6 +150,95 @@ enum Answer {
 }
 
 impl Runtime {
+    /// An operator method, `agentd.operator/<op>`: the op's params held to
+    /// its published schema, the caller to the op's reach — the same
+    /// [`Principal::authorize_command`] a command meets — the draining
+    /// refusal every command meets, the switch that serves the op, then its
+    /// handler, the very one a command DataPart reached.
+    ///
+    /// The answer is the method's `result`: a read's document, or the Task
+    /// work created, as it stands now — a method does not wait for it.
+    ///
+    /// The listener has already held the caller to the op's floor; this is
+    /// the runtime's own lock, so a path into the loop that skipped the
+    /// listener cannot skip it.
+    pub(super) fn a2a_operator(
+        &mut self,
+        principal: &Principal,
+        method: &str,
+        params: &Value,
+    ) -> Value {
+        let Some(spec) = surface::operator_op_of(method) else {
+            return err_obj(
+                errors::METHOD_NOT_FOUND,
+                &format!("method not found: {method}"),
+            );
+        };
+        let op = spec.name;
+        let envelope = match surface::check_operator(spec, params) {
+            Ok(envelope) => envelope,
+            Err(e) => return json!({"_error": e}),
+        };
+        if let Err(why) = principal.authorize_command(op, &envelope) {
+            return refusal(
+                errors::PERMISSION_DENIED,
+                reason::PERMISSION_DENIED,
+                &why,
+                &[("op", op)],
+            );
+        }
+        if self.draining {
+            return refusal(
+                errors::INTERNAL_ERROR,
+                reason::DRAINING,
+                "the agent is draining",
+                &[],
+            );
+        }
+        // The switch, asked before the handler as a command's is. A closed
+        // one is a method this instance does not serve — the extended card
+        // does not list it — except introspection, which says why, since
+        // `admin.set` can open it.
+        if !surface::gate_open(spec, &self.settings) {
+            return match spec.gate {
+                Gate::Introspection => refusal(
+                    UNSUPPORTED_OPERATION,
+                    reason::INTROSPECTION_DISABLED,
+                    "introspection is disabled (set a2a.introspection.enabled: true, or admin.set it)",
+                    &[("op", op)],
+                ),
+                _ => err_obj(
+                    errors::METHOD_NOT_FOUND,
+                    &format!("{method} is not served by this instance"),
+                ),
+            };
+        }
+        // The call as a task's history records it: what was asked, by the
+        // method's extension. A fresh conversation, as a command that names
+        // none starts in.
+        let message = json!({
+            "role": "ROLE_USER",
+            "messageId": format!("op-{}", crate::state::ulid::new()),
+            "parts": [{"data": {"agentd": envelope}, "mediaType": "application/json"}],
+            "extensions": [surface::OPERATOR_EXTENSION],
+        });
+        let command = Command {
+            op: op.to_string(),
+            index: 0,
+            envelope,
+            spec: Some(spec),
+        };
+        let out = self.a2a_command(principal, &command, &message);
+        if out.get("_error").is_some() {
+            return out;
+        }
+        match (out.get("document"), out.get("task")) {
+            (Some(doc), _) => doc.clone(),
+            (None, Some(t)) => t.clone(),
+            (None, None) => out,
+        }
+    }
+
     /// A command addressed to a built-in op — or to no op at all: whatever
     /// no workflow declares comes here to be refused. The command is already
     /// held to its envelope and the caller's reach (`a2a_send`); what is left
@@ -184,7 +273,7 @@ impl Runtime {
         // The same namespace a conversational message is held to: a command
         // runs in a conversation its caller may address, claimed before any
         // work is done. An op that answers with a Message starts nothing in
-        // any conversation — `status`, `workflow.status`, `subagent.status`,
+        // any conversation — `status`, `subagent.status`,
         // the sign-in listings — so it binds nothing: asked of the row, not of
         // the handler family, because a poll with no `contextId` gets a fresh
         // one every time, and each would otherwise be a binding kept for good.
@@ -259,9 +348,11 @@ impl Runtime {
         // message in its history, and its `task` frame is what a display
         // client sees.
         match answer {
+            // A read's document, which its operator method answers with
+            // as its result (`a2a_operator`): no read is a command.
             Answer::Doc(doc) => {
                 debug_assert_eq!(spec.reply, Reply::Message, "{op} answered a document");
-                crate::a2a::reply::read_reply(&wire, doc)
+                json!({"document": doc})
             }
             Answer::Done { link, text, result } => {
                 debug_assert_eq!(spec.reply, Reply::Task, "{op} answered a task");
@@ -331,8 +422,7 @@ impl Runtime {
         }
     }
 
-    /// `workflow.run`, `workflow.status`, `workflow.cancel` and
-    /// `workflow.signal`.
+    /// `workflow.run`, `workflow.cancel` and `workflow.signal`.
     fn workflow_op(
         &mut self,
         principal: &Principal,
@@ -343,21 +433,6 @@ impl Runtime {
     ) -> Answer {
         match op {
             WorkflowOp::Run => Answer::Reply(self.workflow_run(principal, data, ctx, message)),
-            WorkflowOp::Status => {
-                let view: Vec<Value> = match data["run"].as_str() {
-                    Some(id) => match self.owned_run(principal, id) {
-                        Some(r) => vec![run_view(id, r)],
-                        None => return no_such_run(),
-                    },
-                    None => self
-                        .runs
-                        .iter()
-                        .filter(|(_, r)| may_act_on(principal, r.principal.as_deref()))
-                        .map(|(id, r)| run_view(id, r))
-                        .collect(),
-                };
-                Answer::Doc(json!({"runs": view}))
-            }
             WorkflowOp::Cancel => match data["run"].as_str() {
                 Some(id) if self.owned_run(principal, id).is_some() => {
                     self.cancel_run(id, "cancelled over A2A");
@@ -679,12 +754,6 @@ fn declared_schema<'a>(
 /// told apart for nobody.
 fn no_such_run() -> Answer {
     Answer::Reply(err_obj(TASK_NOT_FOUND, "no such run"))
-}
-
-/// A compact run view for `workflow.status`, naming the trace the run is in.
-fn run_view(id: &str, r: &crate::engine::RunState) -> Value {
-    json!({"run": id, "workflow": r.workflow, "status": r.status.as_str(), "output": r.output, "error": r.error,
-           "trace_id": r.trace.as_ref().map(|t| &t.trace_id)})
 }
 
 #[cfg(test)]

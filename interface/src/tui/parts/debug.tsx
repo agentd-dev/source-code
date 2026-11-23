@@ -155,8 +155,8 @@ function LogTail({ lines }: { lines: Json[] }): React.JSX.Element {
 
 /** The card offers this caller `admin.set` on `path`. */
 export function settable(s: MirrorState, path: string): boolean {
-  const cmd = s.session?.caps.command;
-  return cmd !== null && cmd !== undefined && cmd.ops.has(OPS.adminSet) && cmd.settable.includes(path);
+  const op = s.session?.caps.operator;
+  return op !== null && op !== undefined && op.ops.has(OPS.adminSet) && op.settable.includes(path);
 }
 
 export function DebugScreen({

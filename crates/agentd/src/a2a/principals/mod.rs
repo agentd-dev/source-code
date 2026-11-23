@@ -111,6 +111,13 @@ impl Principal {
         match self.role {
             Role::Anonymous => false,
             Role::Operator => true,
+            // An operator method IS its op: callable by exactly whoever may
+            // run the op — its floor, its role's defaults, a grant naming it
+            // — so a grant reaches an operator method as it reached the op
+            // when the op rode a command DataPart, and no further.
+            _ if let Some(spec) = surface::operator_op_of(method) => {
+                op.is_none() && self.may_command(spec.name)
+            }
             // An extension method is callable by whoever its registry row's
             // floor admits — the feed's is any named caller, since it shows a
             // subscriber only what it may see. Read from the registry, so a
@@ -445,18 +452,39 @@ mod tests {
         assert_eq!(workflow_name_of(&serde_json::json!({"name": "b"})), None);
     }
 
-    /// Every extension method the registry declares is callable by any named
-    /// caller and by no anonymous one — under its registered name only: the
-    /// feed's bare pre-namespace name is no method anybody may call.
+    /// Every extension method the registry declares is callable by exactly
+    /// whom its floor admits, and by no anonymous caller — under its
+    /// registered name only: the feed's bare pre-namespace name is no method
+    /// anybody may call. An operator method is its op: whoever may run the
+    /// op, with or without a grant, may call it, and nobody else.
     #[test]
-    fn extension_methods_are_any_named_callers_by_their_registered_name() {
-        for (method, _, floor) in surface::EXTENSION_METHODS {
+    fn extension_methods_are_callable_by_their_floor_under_their_registered_name() {
+        for (method, _, floor) in surface::extension_methods() {
+            let op = surface::operator_op_of(method);
             for role in [Role::User, Role::Agent, Role::Operator] {
-                assert_eq!(
-                    with(role, &[]).may(method, None),
-                    role == Role::Operator || *floor == Floor::AnyNamed,
-                    "{role:?} {method}"
-                );
+                for grants in [&[][..], &["*"][..]] {
+                    let p = with(role, grants);
+                    let want = match op {
+                        Some(spec) => p.may_command(spec.name),
+                        None => role == Role::Operator || *floor == Floor::AnyNamed,
+                    };
+                    assert_eq!(p.may(method, None), want, "{role:?} {grants:?} {method}");
+                }
+            }
+            // An operator-floor op's method is the operator's even against a
+            // `*` grant; a granted one's is reached by a grant naming it.
+            if let Some(spec) = op {
+                assert_eq!(spec.floor, *floor, "{method}");
+                if spec.floor == Floor::Operator {
+                    assert!(!with(Role::User, &["*"]).may(method, None), "{method}");
+                }
+                if spec.floor == Floor::Granted && !spec.defaults.contains(&Role::Agent) {
+                    assert!(!with(Role::Agent, &[]).may(method, None), "{method}");
+                    assert!(
+                        with(Role::Agent, &[spec.name]).may(method, None),
+                        "{method}"
+                    );
+                }
             }
             assert!(!Principal::anonymous().may(method, None), "{method}");
             // An extension method carries no command op.

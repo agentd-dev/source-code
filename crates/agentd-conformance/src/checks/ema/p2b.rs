@@ -247,7 +247,7 @@ pub(super) fn consent_is_the_persons_alone(h: &Harness) -> Outcome {
         let _d = s.daemon(h);
         tryo!(s.login(h));
         let started = s.op("workflow.run", json!({"workflow": "write"}));
-        let task = started["result"]["task"]["id"]
+        let task = crate::checks::util::task_of(&started)["id"]
             .as_str()
             .unwrap_or_default()
             .to_string();

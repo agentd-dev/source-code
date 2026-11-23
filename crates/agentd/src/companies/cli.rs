@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! `agentd --login company:<name>` and `--logout company:<name>` (RFC 0047
-//! §5.3): thin clients of the running daemon. Each sends the operator op
-//! `company.sign_in` or `company.sign_out` over the daemon's unix A2A
+//! §5.3): thin clients of the running daemon. Each calls the operator method
+//! `agentd.operator/company.sign_in` or `…/company.sign_out` over the daemon's unix A2A
 //! listener — whose peer the kernel holds to the daemon's own uid, or root —
 //! prints what the daemon says, and waits for the end. The sign-in itself
 //! happens in the daemon, where every secret it involves stays: this
@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 use crate::config::A2aEndpoint;
 use crate::config::settings::{Settings, companies::OPERATOR};
 use crate::mcp::a2a_client::{self, PeerAuth};
+use crate::runtime::surface::{OPERATOR_EXTENSION, operator_method};
 
 /// Why a login or logout did not end as asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,8 +69,9 @@ fn daemon(settings: &Settings, name: &str, what: &str) -> Result<A2aEndpoint, St
     Ok(A2aEndpoint::Https(format!("unix://{path}")))
 }
 
-/// Send the op `op` with `args`, and follow its task to its end, writing each
-/// thing it says to `out`: the last thing it said, or why it failed.
+/// Call the operator method of `op` with `args`, and follow the task it
+/// answers with to its end, writing each thing it says to `out`: the last
+/// thing it said, or why it failed.
 fn follow(
     endpoint: &A2aEndpoint,
     op: &str,
@@ -77,32 +79,18 @@ fn follow(
     out: &mut dyn Write,
 ) -> Result<String, String> {
     let deadline = Instant::now() + FOLLOW_FOR;
-    let mut command = json!({"op": op});
-    if let (Value::Object(c), Value::Object(a)) = (&mut command, args) {
-        c.extend(a);
-    }
-    let id = crate::sec::random::b64url_token(16)
-        .map_err(|e| format!("no OS randomness for a message id: {e}"))?;
-    let params = crate::a2a::peer::send_message_params_cmd(
-        "",
-        Some(&command),
-        None,
-        &format!("login-{id}"),
-        None,
-        true,
-    );
-    let sent = a2a_client::call(
+    let mut task = a2a_client::call_extension(
         endpoint,
         PeerAuth::default(),
-        "SendMessage",
-        params,
+        OPERATOR_EXTENSION,
+        &operator_method(op),
+        args,
         deadline,
     )
-    .map_err(|e| format!("no daemon answered on its A2A listener ({e})"))?;
-    let mut task = sent["task"].clone();
+    .map_err(|e| format!("the daemon did not answer {op} on its A2A listener ({e})"))?;
     let id = task["id"].as_str().unwrap_or_default().to_string();
     if id.is_empty() {
-        return Err(format!("the daemon answered no task: {sent}"));
+        return Err(format!("the daemon answered no task: {task}"));
     }
     let mut said = String::new();
     loop {

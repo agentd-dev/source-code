@@ -226,12 +226,8 @@ fn a_listening_daemon_runs_nothing_until_a_message_arrives() {
         "one model call, the message's: nothing else ran"
     );
     // …and no run is left in status.
-    let status = SendMessage::command("status", json!({})).result(&addr);
-    assert_eq!(
-        status["message"]["parts"][0]["data"]["runs"],
-        json!([]),
-        "{status}"
-    );
+    let status = common::OperatorCall::new("status", json!({})).result(&addr);
+    assert_eq!(status["runs"], json!([]), "{status}");
 
     assert_eq!(daemon.drain(), Some(0), "{}", daemon.log());
     let log = daemon.log();

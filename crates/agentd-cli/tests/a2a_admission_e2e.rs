@@ -386,9 +386,7 @@ fn adding_a_principal_ends_the_implicit_operator() {
     );
     // …as the principal it declares: an operator-only op is refused, and the
     // refusal names who asked.
-    let config = SendMessage::command("config", json!({}))
-        .bearer(CI_TOKEN)
-        .post(&addr);
+    let config = common::operator_as(&addr, CI_TOKEN, "config", json!({}));
     assert_eq!(config["error"]["code"], -31403, "{config}");
     assert!(
         config["error"]["message"]

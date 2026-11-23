@@ -36,6 +36,7 @@ import {
   COMMAND_EXTENSION,
   EVENTS_EXTENSION,
   INTROSPECTION_OPS,
+  OPERATOR_EXTENSION,
   TASK_ANNOTATIONS_EXTENSION,
   UNIX_BINDING,
 } from './ext.js';
@@ -459,6 +460,14 @@ export interface Capabilities {
     ops: ReadonlySet<string>;
     /** Commands a workflow declares, with the workflow that answers each. */
     commands: { op: string; workflow: string; schema?: Json }[];
+  } | null;
+  /**
+   * operator, when declared: the ops whose methods (`agentd.operator/<op>`)
+   * this caller may call — read from the extended card; from the public card,
+   * every operator op an agentd can serve.
+   */
+  operator: {
+    ops: ReadonlySet<string>;
     /** The paths `admin.set` accepts from this caller. */
     settable: string[];
   } | null;
@@ -466,7 +475,7 @@ export interface Capabilities {
   annotations: boolean;
   /**
    * The introspection reads are offered to this caller: `true` or `false` when
-   * the extended card said so, or when no command vocabulary is declared at
+   * the extended card said so, or when no operator vocabulary is declared at
    * all; `null` when the cards cannot tell. The public vocabulary names the
    * reads whether or not this agent has introspection on, and an agent with
    * no listener auth serves no extended card — so `null` is the common case
@@ -505,16 +514,21 @@ export function capabilitiesOf(pub: AgentCard, ext: AgentCard | null, o: { noExt
     if (typeof ev.params.ring === 'number') events.ring = ev.params.ring;
   }
 
-  let command: Capabilities['command'] = null;
-  const cmd = find(COMMAND_EXTENSION);
-  if (cmd) {
+  // Each `params.ops` entry is `{op, reply}`: the reply kind is part of what
+  // the op promises, so an entry without that shape names no op.
+  const opsOf = (params: Obj): Set<string> => {
     const ops = new Set<string>();
-    for (const raw of Array.isArray(cmd.params.ops) ? cmd.params.ops : []) {
-      // Each entry is `{op, reply}`: the reply kind is part of what the op
-      // promises, so an entry without that shape names no op.
+    for (const raw of Array.isArray(params.ops) ? params.ops : []) {
       const op = str(obj(raw)?.op);
       if (op !== undefined) ops.add(op);
     }
+    return ops;
+  };
+
+  let command: Capabilities['command'] = null;
+  const cmd = find(COMMAND_EXTENSION);
+  if (cmd) {
+    const ops = opsOf(cmd.params);
     const commands: { op: string; workflow: string; schema?: Json }[] = [];
     for (const raw of Array.isArray(cmd.params.commands) ? cmd.params.commands : []) {
       const c = obj(raw);
@@ -523,8 +537,12 @@ export function capabilitiesOf(pub: AgentCard, ext: AgentCard | null, o: { noExt
       if (!c || op === undefined || workflow === undefined) continue;
       commands.push(c.schema !== undefined ? { op, workflow, schema: c.schema } : { op, workflow });
     }
-    command = { ops, commands, settable: strings(cmd.params.settable) };
+    command = { ops, commands };
   }
+
+  let operator: Capabilities['operator'] = null;
+  const opx = find(OPERATOR_EXTENSION);
+  if (opx) operator = { ops: opsOf(opx.params), settable: strings(opx.params.settable) };
 
   const workflows: string[] = [];
   if (ext) {
@@ -543,8 +561,10 @@ export function capabilitiesOf(pub: AgentCard, ext: AgentCard | null, o: { noExt
     extendedCard: ext !== null,
     events,
     command,
+    operator,
     annotations: find(TASK_ANNOTATIONS_EXTENSION) !== undefined,
-    introspection: command === null ? false : ext === null ? null : INTROSPECTION_OPS.some((op) => command.ops.has(op)),
+    introspection:
+      operator === null ? false : ext === null ? null : INTROSPECTION_OPS.some((op) => operator.ops.has(op)),
     workflows,
     login,
     authRequired: !login.some((l) => l.method === 'none'),

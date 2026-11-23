@@ -146,13 +146,6 @@ fn caller_output(log: &str) -> Value {
     done[0]["output"].clone()
 }
 
-/// A rendered value that may have come back as its JSON text.
-fn value(v: &Value) -> Value {
-    v.as_str()
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_else(|| v.clone())
-}
-
 /// The directory the child `instance.spawn` names lives in: its socket's.
 fn child_dir(spawn: &Value) -> PathBuf {
     Path::new(spawn["socket"].as_str().expect("socket"))
@@ -290,8 +283,8 @@ fn a_memory_parent_does_not_adopt_an_earlier_parents_child() {
         "\x20     s:     { kind: once }\n\
          \x20     spawn: { kind: subagent, template: room, params: { id: second }, depends_on: [s] }\n\
          \x20     ping:  { kind: a2a.delegate, depends_on: [spawn], peer: \"{{steps.spawn.output.peer}}\", command: room.ping, args: {}, timeout: 10s, retry: { max: 6, backoff: 1s } }\n\
-         \x20     st:    { kind: a2a.delegate, depends_on: [ping], peer: \"{{steps.spawn.output.peer}}\", command: status, args: {}, timeout: 10s }\n\
-         \x20     f:     { kind: finish, depends_on: [st], status: completed, output: { pong: \"{{steps.ping.output}}\", runs: \"{{steps.st.output.runs}}\", pending: \"{{steps.st.output.inbox_pending}}\" } }\n",
+         \x20     lg:    { kind: tool, depends_on: [ping], name: subagent.log, args: { handle: \"{{steps.spawn.output.handle}}\", lines: 1000 } }\n\
+         \x20     f:     { kind: finish, depends_on: [lg], status: completed, output: { pong: \"{{steps.ping.output}}\", log: \"{{steps.lg.output.lines}}\" } }\n",
     );
     let (code, log) = dirs.run("second", &second);
     assert_eq!(code, Some(0), "{log}");
@@ -300,13 +293,37 @@ fn a_memory_parent_does_not_adopt_an_earlier_parents_child() {
     assert_eq!(spawned[0]["handle"], "inst-1", "{log}");
     let out = caller_output(&log);
     assert_eq!(out["pong"], "pong second", "{log}");
-    let runs = value(&out["runs"]);
-    let runs = runs.as_array().unwrap_or_else(|| panic!("{out}\n{log}"));
+    // The second child, as its own log tells its parent (`subagent.log`): it
+    // came up with no run and nothing pending, and never started the first
+    // parent's held command.
+    let pid = spawned[0]["pid"].clone();
+    let lines = match &out["log"] {
+        Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or(Value::Null),
+        v => v.clone(),
+    };
+    let lines: Vec<Value> = lines
+        .as_array()
+        .unwrap_or_else(|| panic!("the child's log lines: {out}\n{log}"))
+        .iter()
+        .map(|l| match l {
+            Value::String(s) => serde_json::from_str(s).unwrap_or(Value::Null),
+            v => v.clone(),
+        })
+        .filter(|l| l["pid"] == pid)
+        .collect();
+    let ready: Vec<&Value> = lines
+        .iter()
+        .filter(|e| e["event"] == "proc.ready")
+        .collect();
+    assert_eq!(ready.len(), 1, "the second child's own start: {lines:?}");
+    assert_eq!(ready[0]["runs"], 0, "{lines:?}");
+    assert_eq!(ready[0]["inbox_pending"], 0, "{lines:?}");
     assert!(
-        runs.iter().all(|r| r["workflow"] != "on-hold"),
-        "the child resumed the first parent's command: {runs:?}"
+        lines
+            .iter()
+            .all(|e| e["event"] != "run.start" || e["workflow"] != "on-hold"),
+        "the child resumed the first parent's command: {lines:?}"
     );
-    assert_eq!(value(&out["pending"]), 0, "{out}");
 }
 
 /// Two memory-store parents running at once, under one state directory and

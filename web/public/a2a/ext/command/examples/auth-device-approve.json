@@ -1,8 +1,0 @@
-{
-  "agentd": {
-    "op": "auth.device.approve",
-    "user_code": "WDJB-MJHT",
-    "as": "alice.laptop",
-    "scope": "user"
-  }
-}

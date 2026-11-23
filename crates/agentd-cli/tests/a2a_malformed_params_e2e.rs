@@ -195,12 +195,13 @@ fn malformed_send_params_are_refused_and_the_daemon_keeps_serving() {
 
     // The half that actually distinguishes a contained error from a dead
     // listener: a well-formed request over a NEW connection is still answered.
-    let v = common::SendMessage::command("status", json!({}))
+    let v = common::SendMessage::text("hello")
+        .return_immediately()
         .try_post_raw(&addr)
         .and_then(parse)
         .unwrap_or_else(|e| panic!("the listener stopped answering after malformed input: {e}"));
-    assert_eq!(
-        v["result"]["message"]["role"], "ROLE_AGENT",
+    assert!(
+        v["result"]["task"]["id"].is_string(),
         "a good request after the bad ones: {v}"
     );
     assert!(daemon.alive(), "the daemon survived the whole sequence");

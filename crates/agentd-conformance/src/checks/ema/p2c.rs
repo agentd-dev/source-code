@@ -210,11 +210,7 @@ pub(super) fn sign_in_at(uri: &str) -> Result<(u16, String), String> {
 /// The document a command answered with: a read's message data, or the data
 /// of the task it completed as.
 pub(super) fn doc(v: &Value) -> Value {
-    let r = &v["result"];
-    if let Some(d) = r["message"]["parts"][0].get("data") {
-        return d.clone();
-    }
-    r["task"]["artifacts"][0]["parts"][0]["data"].clone()
+    util::doc_of(v)
 }
 
 impl Fed {
@@ -312,7 +308,12 @@ impl Fed {
     /// `method` as `bearer`: the envelope.
     pub(super) fn rpc_as(&self, bearer: &str, method: &str, params: Value) -> Value {
         let auth = format!("Bearer {bearer}");
-        let exts = format!("{}, {}", util::COMMAND, util::ANNOTATIONS);
+        let exts = format!(
+            "{}, {}, {}",
+            util::COMMAND,
+            util::OPERATOR,
+            util::ANNOTATIONS
+        );
         let mut headers = vec![("A2A-Extensions", exts.as_str())];
         if !bearer.is_empty() {
             headers.push(("Authorization", &auth));
@@ -322,12 +323,14 @@ impl Fed {
         serde_json::from_str(&body).unwrap_or(json!({"unparsed": body}))
     }
 
-    /// Command `op` as `bearer`: the envelope.
+    /// `op` as `bearer` — an operator op as its method, any other as a
+    /// command: the envelope.
     pub(super) fn op_as(&self, bearer: &str, op: &str, args: Value) -> Value {
-        self.rpc_as(bearer, "SendMessage", util::command_send_params(op, &args))
+        let (method, params) = util::op_request(op, &args);
+        self.rpc_as(bearer, &method, params)
     }
 
-    /// Command `op` as the operator.
+    /// `op` as the operator.
     pub(super) fn operator(&self, op: &str, args: Value) -> Value {
         self.op_as(&self.ops, op, args)
     }
@@ -447,7 +450,7 @@ impl Fed {
     ) -> Result<(String, String), String> {
         self.xaa.control(json!({"sub": sub}));
         let r = self.op_as(bearer, "delegation.enrol", json!({"idp": "okta"}));
-        let task = &r["result"]["task"];
+        let task = &crate::checks::util::task_of(&r);
         let Some(id) = task["id"].as_str() else {
             return Err(format!("delegation.enrol: {r}"));
         };
@@ -471,7 +474,8 @@ impl Fed {
             "delegation.enrol",
             json!({"idp": "okta", "grant": "device"}),
         );
-        let Some(id) = r["result"]["task"]["id"].as_str() else {
+        let task = crate::checks::util::task_of(&r);
+        let Some(id) = task["id"].as_str() else {
             return Err(format!("delegation.enrol: {r}"));
         };
         self.task_end(bearer, id)
@@ -721,7 +725,7 @@ pub(super) fn tools_are_offered_only_with_a_grant(h: &Harness) -> Outcome {
         "delegation.revoke",
         json!({"target": format!("idp:okta#{BOB}")}),
     );
-    if let Some(id) = r["result"]["task"]["id"].as_str() {
+    if let Some(id) = crate::checks::util::task_of(&r)["id"].as_str() {
         tryo!(s.task_end(&s.ops, id));
     }
     // What each person's turn is handed, from the frames sent to its worker.
@@ -1239,12 +1243,8 @@ pub(super) fn the_login_listener_rules(h: &Harness) -> Outcome {
     let schemes = card["securitySchemes"].clone();
     let (anon, _, _) = util::post_full(
         &s.addr(),
-        &util::rpc_body(
-            1,
-            "SendMessage",
-            util::command_send_params("status", &json!({})),
-        ),
-        &[("A2A-Extensions", util::COMMAND)],
+        &util::rpc_body(1, &util::operator_method("status"), json!({})),
+        &[("A2A-Extensions", util::OPERATOR)],
     );
     let (_, _, meta) = util::exchange(
         &s.addr(),

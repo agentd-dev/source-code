@@ -31,6 +31,7 @@ use crate::harness::TempDir;
 use crate::{Category, Check, Harness, Outcome};
 
 const COMMAND: &str = "https://agentd.dev/a2a/ext/command";
+const OPERATOR: &str = crate::checks::util::OPERATOR;
 const EMA: &str = "io.modelcontextprotocol/enterprise-managed-authorization";
 const ID_JAG: &str = "urn:ietf:params:oauth:token-type:id-jag";
 const EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
@@ -1204,7 +1205,7 @@ impl Setup {
             if fired.get("error").is_some() {
                 return Err(format!("signal {name}: {fired}"));
             }
-            let delivered = fired["result"]["task"]["artifacts"]
+            let delivered = crate::checks::util::task_of(&fired)["artifacts"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -1300,10 +1301,11 @@ impl Setup {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
-    /// Send `op` over the unix listener.
+    /// Send `op` over the unix listener: an operator op as its method, any
+    /// other as a command.
     fn op(&self, op: &str, args: Value) -> Value {
-        let params = crate::checks::util::command_send_params(op, &args);
-        unix_rpc(&self.sock, "SendMessage", params)
+        let (method, params) = crate::checks::util::op_request(op, &args);
+        unix_rpc(&self.sock, &method, params)
     }
 
     /// Start workflow `name`; how many runs of it had ended before.
@@ -1363,7 +1365,7 @@ fn unix_rpc(sock: &Path, method: &str, params: Value) -> Value {
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
     let _ = write!(
         s,
-        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nA2A-Extensions: {COMMAND}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nA2A-Extensions: {COMMAND}, {OPERATOR}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut r = BufReader::new(s);
@@ -2718,7 +2720,7 @@ fn another_principal(h: &Harness) -> Outcome {
             json!({"message": {"role": "ROLE_USER", "messageId": b64url(&rand16()), "parts": [{"text": "hello"}]},
                    "configuration": {"returnImmediately": true}}),
         );
-        ctx = r["result"]["task"]["contextId"]
+        ctx = crate::checks::util::task_of(&r)["contextId"]
             .as_str()
             .unwrap_or_default()
             .to_string();

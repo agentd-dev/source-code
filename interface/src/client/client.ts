@@ -3,9 +3,10 @@
  * `AgentdClient` — agentd's declared extensions on top of the core A2A client.
  *
  * {@link A2aClient} speaks what any A2A 1.0 agent understands. This class adds
- * command (structured ops as a DataPart), events (the observation feed)
- * and task-annotations (agentd's facts about a task) — each only when the
- * card this session was opened from DECLARES it. A call the card does not
+ * command (the workload ops, as a DataPart), operator (the control plane and
+ * the reads, as methods `agentd.operator/<op>`), events (the observation
+ * feed) and task-annotations (agentd's facts about a task) — each only when
+ * the card this session was opened from DECLARES it. A call the card does not
  * back is refused here, before anything reaches the wire: a command DataPart
  * sent to an agent that never promised to read one as a command is just a
  * message, and a model on the other end may act on it.
@@ -27,10 +28,19 @@ import {
   TaskState,
   TaskView,
 } from './types.js';
-import { CallOptions, rpcStream } from './wire.js';
+import { call, CallOptions, rpcStream } from './wire.js';
 import { A2aClient, commandMessage, ListQuery, userMessage } from './a2a.js';
 import type { Capabilities } from './discovery.js';
-import { COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD, OPS, TASK_ANNOTATIONS_EXTENSION } from './ext.js';
+import {
+  COMMAND_EXTENSION,
+  EVENTS_EXTENSION,
+  EVENTS_METHOD,
+  OPERATOR_EXTENSION,
+  OPERATOR_OPS,
+  operatorMethod,
+  OPS,
+  TASK_ANNOTATIONS_EXTENSION,
+} from './ext.js';
 import { requireSecureUrl } from './auth.js';
 
 type Obj = { [k: string]: Json };
@@ -184,7 +194,11 @@ export function normalizeTask(t: Json, o: NormalizeOptions = {}): TaskView | nul
   return ann ? { ...view, ...annotationsOf(ann) } : view;
 }
 
-/** A command's reply: a read answers with a Message, work with a Task. */
+/**
+ * An op's reply: a read answers with its document (`message`: over the
+ * command extension the Message carrying it; over the operator extension
+ * `message` is null and `data` is the method's result), work with a Task.
+ */
 export type CommandReply =
   | { kind: 'message'; message: Json; data: Json | undefined }
   | { kind: 'task'; task: TaskView; data: Json | undefined };
@@ -250,10 +264,14 @@ export class AgentdClient {
     this.a2a = new A2aClient(ep);
   }
 
-  /** The card offers `op` to this caller (a built-in op or a workflow command). */
+  /**
+   * The card offers `op` to this caller: a command op or a workflow's
+   * command on the command extension, or an operator op's method.
+   */
   offers(op: string): boolean {
     const c = this.caps.command;
-    return c !== null && (c.ops.has(op) || c.commands.some((x) => x.op === op));
+    const o = this.caps.operator;
+    return (c !== null && (c.ops.has(op) || c.commands.some((x) => x.op === op))) || (o !== null && o.ops.has(op));
   }
 
   /**
@@ -306,6 +324,7 @@ export class AgentdClient {
     args: Obj = {},
     o: { contextId?: string; returnImmediately?: boolean; signal?: AbortSignal } = {},
   ): Promise<CommandReply> {
+    if (OPERATOR_OPS.has(op)) return this.operator(op, args, o);
     if (this.caps.command === null) {
       throw new ClientError('extension-not-declared', `${op}: this agent does not declare ${COMMAND_EXTENSION}`);
     }
@@ -321,7 +340,54 @@ export class AgentdClient {
     return commandReply(r.task ? { task: r.task } : { message: r.message ?? null }, this.annotationsIn(r.echo));
   }
 
-  /** A command's structured answer: the reply's DataPart, or null. */
+  /**
+   * Call one operator op as its method, `agentd.operator/<op>`. Refused
+   * locally — no request is made — when the card declares no operator
+   * extension or does not offer `op`. The call activates the extension and
+   * REQUIRES it in a present echo. A read's result is its document; work's
+   * is the Task it created, followed with GetTask until it stops working
+   * unless `returnImmediately`.
+   */
+  async operator(
+    op: string,
+    args: Obj = {},
+    o: { returnImmediately?: boolean; signal?: AbortSignal } = {},
+  ): Promise<CommandReply> {
+    const caps = this.caps.operator;
+    if (caps === null) {
+      throw new ClientError('extension-not-declared', `${op}: this agent does not declare ${OPERATOR_EXTENSION}`);
+    }
+    if (!caps.ops.has(op)) {
+      throw new ClientError('op-not-offered', `${op} is not offered by this agent (its card does not list the op)`);
+    }
+    const r = await call(this.ep, operatorMethod(op), args, {
+      exts: [OPERATOR_EXTENSION, ...this.annotated()],
+      require: [OPERATOR_EXTENSION],
+      signal: o.signal,
+    });
+    const annotations = this.annotationsIn(r.echo);
+    // A task method answers with a Task — an id, a contextId, a status
+    // whose state is a TaskState — and a read with its document, which is
+    // none of those.
+    const res = obj(r.result);
+    const state = str(obj(res?.status)?.state);
+    const isTask = str(res?.id) !== undefined && typeof res?.contextId === 'string' && state?.startsWith('TASK_STATE_');
+    let task = isTask ? normalizeTask(r.result, annotations) : null;
+    if (task === null) return { kind: 'message', message: null, data: r.result };
+    let raw: Json = r.result;
+    while (!o.returnImmediately && (task.state === 'TASK_STATE_WORKING' || task.state === 'TASK_STATE_SUBMITTED')) {
+      await new Promise((res) => setTimeout(res, 250));
+      if (o.signal?.aborted) break;
+      const g = await this.a2a.getTask(task.id, undefined, this.core(o.signal));
+      const next = normalizeTask(g.result, this.annotationsIn(g.echo));
+      if (next === null) break;
+      raw = g.result;
+      task = next;
+    }
+    return commandReply({ task: raw }, annotations);
+  }
+
+  /** An op's structured answer: a read's document, work's result, or null. */
   private async data(op: string, args: Obj = {}): Promise<Json> {
     return (await this.command(op, args)).data ?? null;
   }
@@ -361,10 +427,6 @@ export class AgentdClient {
   /** The effective config (operator). */
   async config(): Promise<Json> {
     return this.data(OPS.config);
-  }
-
-  async workflowStatus(run?: string): Promise<Json> {
-    return this.data(OPS.workflowStatus, run ? { run } : {});
   }
 
   /** A subagent's status (served without introspection, unlike `.get`). */
@@ -476,7 +538,7 @@ export class AgentdClient {
     return this.data(OPS.adminResume, run ? { run } : {});
   }
 
-  /** Cancel one run by id. */
+  /** Cancel one run by id, whoever started it — a run with no task included. */
   async cancelRun(run: string, reason?: string): Promise<Json> {
     return this.data(OPS.adminCancel, reason ? { run, reason } : { run });
   }

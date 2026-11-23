@@ -6,6 +6,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   COMMAND_EXTENSION,
+  OPERATOR_EXTENSION,
+  operatorMethod,
   EVENTS_EXTENSION,
   EVENTS_METHOD,
   Mirror,
@@ -414,12 +416,12 @@ test('feed events that arrive during a resync re-bootstrap are applied after it'
     return { stream: [hello(2, 0, true), event(1, 'run', { id: 'r-new', status: 'running' })], hold: sleep(2000) };
   });
   // The status snapshot is slow, and older than the run event.
-  fake.card.capabilities.extensions.push({ uri: COMMAND_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } });
+  fake.card.capabilities.extensions.push({ uri: OPERATOR_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } });
   let statusReads = 0;
-  fake.handle('SendMessage', async () => {
+  fake.handle(operatorMethod('status'), async () => {
     statusReads++;
     if (statusReads > 1) await slow;
-    return { message: { role: 'ROLE_AGENT', messageId: `s${statusReads}`, parts: [{ data: { runs: [] }, mediaType: 'application/json' }] } };
+    return { runs: [] };
   });
   const mirror = new Mirror();
   const obs = new Observation({ configured: fake.url, backoffCapMs: 20 }, mirror);

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The one-request sender: a `SendMessage` agentd frames itself, for the two
-//! requests the SDK's client cannot carry.
+//! The one-request sender: a JSON-RPC request agentd frames itself, for the
+//! three requests the SDK's client cannot carry.
 //!
 //! * **The parent link** ([`to_parent`]) — an instance child's
 //!   `_instance.result` / `_instance.emit` report, through the channel it was
@@ -16,12 +16,19 @@
 //!   byte for byte as built. **Delete this use when `a2a-pb` releases
 //!   90e2876** (see [`crate::a2a::sdk_gaps`]) and send the payment through
 //!   the SDK like every other request.
+//! * **An agentd extension method** ([`to_peer`], from
+//!   [`super::call_extension`]) — `agentd.operator/<op>` on an agentd's own
+//!   listener, as `agentd --login company:<name>` and the `--delegation-*`
+//!   clients call it. The SDK's client sends the core methods it knows and
+//!   has no call for a method an extension declares (A2A §4.6.2), so a
+//!   method agentd declares is sent here: a JSON-RPC request and its
+//!   response, and nothing of the protocol beside them. Not an SDK defect —
+//!   this use stays when the payment's goes.
 //!
 //! One request per connection: the version and the caller's headers stated,
 //! the JSON-RPC envelope written, its `result` read back — no card, no
 //! stream, no poll.
 
-#[cfg(feature = "x402")]
 use super::HttpEp;
 use super::{PeerAuth, request_timeout};
 use crate::runtime::surface::A2A_PROTOCOL_VERSION;
@@ -67,7 +74,8 @@ pub(super) fn to_parent(
         headers.extend(auth.headers.iter().cloned());
         let stream = crate::a2a::channel::connect(request_timeout(deadline))
             .map_err(|e| format!("a2a: cannot reach the parent through its channel: {e}"))?;
-        send_message(stream, "localhost", "/", &headers, params).map_err(Failure::into_message)
+        send_request(stream, "localhost", "/", &headers, "SendMessage", params)
+            .map_err(Failure::into_message)
     }
     #[cfg(not(unix))]
     {
@@ -76,13 +84,14 @@ pub(super) fn to_parent(
     }
 }
 
-/// `params` to the peer at `ep`, presenting `headers` (the connection's
-/// extensions, trace and credential) and `auth`'s mTLS identity.
-#[cfg(feature = "x402")]
+/// `method` with `params` to the peer at `ep`, presenting `headers` (the
+/// connection's extensions, trace and credential) and `auth`'s mTLS
+/// identity.
 pub(super) fn to_peer(
     ep: &HttpEp,
     auth: &PeerAuth,
     headers: &[(String, String)],
+    method: &str,
     params: Value,
     deadline: Instant,
 ) -> Result<Value, Failure> {
@@ -105,22 +114,22 @@ pub(super) fn to_peer(
             Box::new(tcp)
         }
     };
-    send_message(stream, &ep.host_header, &ep.path, headers, params)
+    send_request(stream, &ep.host_header, &ep.path, headers, method, params)
 }
 
-/// One `SendMessage` with `params` on `stream`.
-fn send_message<S: std::io::Read + std::io::Write>(
+/// One JSON-RPC `method` call with `params` on `stream`.
+fn send_request<S: std::io::Read + std::io::Write>(
     mut stream: S,
     host_header: &str,
     path: &str,
     headers: &[(String, String)],
+    method: &str,
     params: Value,
 ) -> Result<Value, Failure> {
     use ::mcp::rpc::{INTERNAL_ERROR, Id, Request, Response};
-    const METHOD: &str = "SendMessage";
-    let req = Request::new(Id::Num(1), METHOD, Some(params));
+    let req = Request::new(Id::Num(1), method, Some(params));
     let body = serde_json::to_vec(&req)
-        .map_err(|e| Failure::Unsent(format!("a2a: encode {METHOD}: {e}")))?;
+        .map_err(|e| Failure::Unsent(format!("a2a: encode {method}: {e}")))?;
     let mut all: Vec<(&str, &str)> = vec![
         ("Content-Type", "application/json"),
         ("A2A-Version", A2A_PROTOCOL_VERSION),
@@ -131,12 +140,12 @@ fn send_message<S: std::io::Read + std::io::Write>(
             Failure::Unanswered(match e.kind() {
                 // Linux reports an expired SO_RCVTIMEO as EAGAIN, not TimedOut.
                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
-                    format!("a2a: {METHOD}: timed out waiting for the peer")
+                    format!("a2a: {method}: timed out waiting for the peer")
                 }
-                _ => format!("a2a: {METHOD}: {e}"),
+                _ => format!("a2a: {method}: {e}"),
             })
         })?;
-    let status = format!("a2a: {METHOD} HTTP {}", resp.status);
+    let status = format!("a2a: {method} HTTP {}", resp.status);
     if resp.status >= 500 {
         return Err(Failure::Unanswered(status));
     }
@@ -144,9 +153,9 @@ fn send_message<S: std::io::Read + std::io::Write>(
         return Err(Failure::Refused(status));
     }
     let response: Response = serde_json::from_slice(&resp.body)
-        .map_err(|e| Failure::Unanswered(format!("a2a: {METHOD} bad reply: {e}")))?;
+        .map_err(|e| Failure::Unanswered(format!("a2a: {method} bad reply: {e}")))?;
     if let Some(err) = response.error {
-        let why = format!("a2a: {METHOD} rpc error {}: {}", err.code, err.message);
+        let why = format!("a2a: {method} rpc error {}: {}", err.code, err.message);
         return Err(if err.code == INTERNAL_ERROR {
             Failure::Unanswered(why)
         } else {

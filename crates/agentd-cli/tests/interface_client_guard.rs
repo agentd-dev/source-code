@@ -115,6 +115,8 @@ fn the_clients_extension_vocabulary_is_the_daemons() {
         ),
         ("UNIX_BINDING", daemon::UNIX_BINDING),
         ("EVENTS_METHOD", daemon::EVENTS_METHOD),
+        ("OPERATOR_EXTENSION", daemon::OPERATOR_EXTENSION),
+        ("OPERATOR_METHOD_PREFIX", daemon::OPERATOR_METHOD_PREFIX),
     ] {
         assert_eq!(
             ts_const(&ext, name).as_deref(),
@@ -130,6 +132,61 @@ fn the_clients_extension_vocabulary_is_the_daemons() {
             "interface/src/client/ext.ts OPS sends `{op}`, which is no op the daemon serves"
         );
     }
+    // The client sends an op on the extension the daemon serves it on: the
+    // ops of `COMMAND_OPS` as a command DataPart, every other as its
+    // operator method.
+    let keys = ts_ops_keys(&ext);
+    let start = ext
+        .find("export const COMMAND_OPS")
+        .expect("ext.ts declares COMMAND_OPS");
+    let block = &ext[start..];
+    let block = &block[..block.find("]);").expect("COMMAND_OPS closes")];
+    let commands: Vec<&str> = block
+        .split("OPS.")
+        .skip(1)
+        .filter_map(|k| k.split(|c: char| !c.is_ascii_alphanumeric()).next())
+        .filter_map(|k| {
+            keys.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, op)| op.as_str())
+        })
+        .collect();
+    assert!(commands.contains(&"workflow.run"), "{commands:?}");
+    for (_, op) in &keys {
+        let ext = daemon::op_spec(op).map(|s| s.ext);
+        let want = if commands.contains(&op.as_str()) {
+            daemon::OpExt::Command
+        } else {
+            daemon::OpExt::Operator
+        };
+        assert_eq!(
+            ext,
+            Some(want),
+            "interface/src/client/ext.ts sends `{op}` on the {want:?} extension; the daemon serves it on {ext:?}"
+        );
+    }
+}
+
+/// The `key: 'op'` pairs of ext.ts's `OPS` table.
+fn ts_ops_keys(src: &str) -> Vec<(String, String)> {
+    let start = src
+        .find("export const OPS = Object.freeze({")
+        .expect("ext.ts declares OPS");
+    let body = &src[start..];
+    let body = &body[..body.find("\n}").expect("OPS closes")];
+    body.lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| {
+            (
+                k.trim().to_string(),
+                v.trim()
+                    .trim_end_matches(',')
+                    .trim_matches(['\'', '"'])
+                    .to_string(),
+            )
+        })
+        .collect()
 }
 
 /// The values of ext.ts's `OPS` table (`key: 'op',` lines).

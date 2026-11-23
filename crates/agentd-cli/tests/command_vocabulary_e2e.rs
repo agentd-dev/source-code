@@ -161,12 +161,37 @@ fn spawn(yaml_for: impl Fn(u16) -> String) -> Daemon {
     panic!("the daemon never bound an A2A listener (5 attempts)");
 }
 
-/// A command's document: a read's Message data, or a task's JSON DataPart artifact.
+/// An op's document: a read's, or a task's JSON DataPart artifact.
 fn doc_of(result: &Value) -> Value {
     if let Some(doc) = result["message"]["parts"][0].get("data") {
         return doc.clone();
     }
-    result["task"]["artifacts"][0]["parts"][0]["data"].clone()
+    if common::is_task(result) {
+        return result["artifacts"][0]["parts"][0]["data"].clone();
+    }
+    if result["task"].is_object() {
+        return result["task"]["artifacts"][0]["parts"][0]["data"].clone();
+    }
+    result.clone()
+}
+
+/// `op` with `args`, as `bearer` when given: an operator op as its method, a
+/// command op as a DataPart. The envelope, result or error.
+fn call(addr: &str, bearer: Option<&str>, op: &str, args: Value) -> Value {
+    if common::is_operator_op(op) {
+        let c = common::OperatorCall::new(op, args);
+        return match bearer {
+            Some(b) => c.bearer(b),
+            None => c,
+        }
+        .post(addr);
+    }
+    let c = SendMessage::command(op, args);
+    match bearer {
+        Some(b) => c.bearer(b),
+        None => c,
+    }
+    .post(addr)
 }
 
 /// Who owns the task a `task` feed event carries: its task-annotations
@@ -275,7 +300,8 @@ fn read_commands_create_no_task_and_push_no_task_event() {
     let feed = watch_feed(&d.addr);
 
     // Every read the table declares — answered or refused (an unknown object
-    // is still a read), none leaves a task behind.
+    // is still a read), none leaves a task behind. Each is an operator
+    // method, whose result is its document.
     let reads: Vec<&str> = OPS
         .iter()
         .filter(|s| s.reply == Reply::Message)
@@ -283,38 +309,23 @@ fn read_commands_create_no_task_and_push_no_task_event() {
         .collect();
     assert!(reads.contains(&"status") && reads.contains(&"debug.events"));
     for op in &reads {
-        let v = SendMessage::command(op, json!({})).post(&d.addr);
+        assert!(
+            common::is_operator_op(op),
+            "the read {op} is an operator method"
+        );
+        let v = common::operator(&d.addr, op, json!({}));
         if v.get("error").is_some() {
             continue;
         }
         let r = &v["result"];
-        assert!(r.get("task").is_none(), "{op} created a task: {v}");
-        assert_eq!(r["message"]["role"], "ROLE_AGENT", "{op}: {v}");
-        assert_eq!(
-            r["message"]["parts"][0]["mediaType"], "application/json",
-            "{op}: {v}"
-        );
+        assert!(r.is_object(), "{op} answered no document: {v}");
+        assert!(!common::is_task(r), "{op} created a task: {v}");
     }
     // `status` and `config` answer an operator whatever else exists.
     for op in ["status", "config"] {
-        let v = SendMessage::command(op, json!({})).result(&d.addr);
+        let v = common::OperatorCall::new(op, json!({})).result(&d.addr);
         assert!(doc_of(&v).is_object(), "{op}: {v}");
     }
-    // Streamed, a read is one Message frame, not a task stream.
-    let raw = SendMessage::command("status", json!({}))
-        .streaming()
-        .post_raw(&d.addr)
-        .body;
-    let frames: Vec<Value> = raw
-        .lines()
-        .filter_map(|l| l.strip_prefix("data:"))
-        .filter_map(|d| serde_json::from_str(d.trim()).ok())
-        .collect();
-    assert_eq!(frames.len(), 1, "one frame: {raw}");
-    assert!(
-        frames[0]["result"]["message"].is_object() && frames[0]["result"].get("task").is_none(),
-        "{raw}"
-    );
 
     assert_eq!(task_count(&d.addr), 0, "reads are taskless");
     std::thread::sleep(Duration::from_millis(600));
@@ -389,8 +400,7 @@ fn admin_set_parses_like_the_config_file() {
     ];
     let mut accepted = 0;
     for (path, value) in cases {
-        let v =
-            SendMessage::command("admin.set", json!({"path": path, "value": value})).post(&d.addr);
+        let v = common::operator(&d.addr, "admin.set", json!({"path": path, "value": value}));
         let set_ok = v.get("error").is_none();
         assert_eq!(
             set_ok,
@@ -400,7 +410,7 @@ fn admin_set_parses_like_the_config_file() {
         if set_ok {
             accepted += 1;
             assert_eq!(
-                v["result"]["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+                v["result"]["status"]["state"], "TASK_STATE_COMPLETED",
                 "{v}"
             );
             assert_eq!(doc_of(&v["result"])["path"], *path, "{v}");
@@ -458,7 +468,7 @@ fn introspection_works_without_the_feed_and_follows_admin_set() {
         "{v}"
     );
 
-    let refused = SendMessage::command("debug.events", json!({})).post(&d.addr);
+    let refused = common::operator(&d.addr, "debug.events", json!({}));
     assert_eq!(refused["error"]["code"], -32004, "{refused}");
     assert_eq!(
         refused["error"]["data"][0]["metadata"]["agentdReason"], "INTROSPECTION_DISABLED",
@@ -466,23 +476,23 @@ fn introspection_works_without_the_feed_and_follows_admin_set() {
     );
 
     let set = |on: bool| {
-        SendMessage::command(
+        common::OperatorCall::new(
             "admin.set",
             json!({"path": "a2a.introspection.enabled", "value": on}),
         )
         .result(&d.addr)
     };
     set(true);
-    let ev = SendMessage::command("debug.events", json!({"limit": 5})).result(&d.addr);
+    let ev = common::OperatorCall::new("debug.events", json!({"limit": 5})).result(&d.addr);
     assert!(doc_of(&ev)["events"].is_array(), "{ev}");
-    let conv = SendMessage::command("conversation.get", json!({"id": "nope"})).post(&d.addr);
+    let conv = common::operator(&d.addr, "conversation.get", json!({"id": "nope"}));
     assert_eq!(
         conv["error"]["code"], -32001,
         "the read runs, and finds nothing: {conv}"
     );
 
     set(false);
-    let again = SendMessage::command("debug.events", json!({})).post(&d.addr);
+    let again = common::operator(&d.addr, "debug.events", json!({}));
     assert_eq!(again["error"]["code"], -32004, "{again}");
 }
 
@@ -533,9 +543,7 @@ fn a_user_with_every_grant_cannot_reach_operator_controls() {
             "_instance.emit" => json!({"handle": "c1", "stream": "s", "event": {}}),
             _ => json!({}),
         };
-        let v = SendMessage::command(op, args)
-            .bearer(USER_TOKEN)
-            .post(&d.addr);
+        let v = call(&d.addr, Some(USER_TOKEN), op, args);
         let (code, _) = error_of(&v);
         assert!(
             code == -32003 || code == agentd::a2a::errors::PERMISSION_DENIED,
@@ -552,7 +560,7 @@ fn a_user_with_every_grant_cannot_reach_operator_controls() {
     );
 
     // Nothing moved: the instance is not draining or paused.
-    let st = SendMessage::command("status", json!({}))
+    let st = common::OperatorCall::new("status", json!({}))
         .bearer(USER_TOKEN)
         .result(&d.addr);
     let st = doc_of(&st);
@@ -723,10 +731,10 @@ fn reads_are_audited_but_not_mirrored_onto_the_feed() {
 
     // A display client's polling: reads by op and by method, a few times.
     for _ in 0..3 {
-        SendMessage::command("status", json!({}))
+        common::OperatorCall::new("status", json!({}))
             .bearer(OPS_TOKEN)
             .result(&d.addr);
-        SendMessage::command("debug.events", json!({"limit": 1}))
+        common::OperatorCall::new("debug.events", json!({"limit": 1}))
             .bearer(OPS_TOKEN)
             .result(&d.addr);
         assert!(rpc_as(&d.addr, OPS_TOKEN, 7, "ListTasks", json!({}))["result"].is_object());
@@ -780,8 +788,8 @@ fn reads_are_audited_but_not_mirrored_onto_the_feed() {
         "the mutation is mirrored: {actions:?}"
     );
     for read in [
-        "a2a.SendMessage:status ok",
-        "a2a.SendMessage:debug.events ok",
+        "a2a.agentd.operator/status ok",
+        "a2a.agentd.operator/debug.events ok",
         "a2a.ListTasks ok",
         "a2a.GetTask ok",
         "a2a.GetExtendedAgentCard ok",
@@ -819,7 +827,7 @@ fn subagent_get_answers_the_owner_and_the_operator_only() {
         "{sent}"
     );
     let st = doc_of(
-        &SendMessage::command("status", json!({}))
+        &common::OperatorCall::new("status", json!({}))
             .bearer(OPS_TOKEN)
             .result(&d.addr),
     );
@@ -828,21 +836,27 @@ fn subagent_get_answers_the_owner_and_the_operator_only() {
         .expect("a subagent exists")
         .to_string();
 
-    let theirs = SendMessage::command("subagent.get", json!({"handle": handle}))
-        .bearer(USER_TOKEN)
-        .post(&d.addr);
+    let theirs = common::operator_as(
+        &d.addr,
+        USER_TOKEN,
+        "subagent.get",
+        json!({"handle": handle}),
+    );
     assert_eq!(
         theirs["error"]["code"], -32001,
         "another principal's subagent: {theirs}"
     );
-    let nope = SendMessage::command("subagent.get", json!({"handle": "nope"}))
-        .bearer(USER_TOKEN)
-        .post(&d.addr);
+    let nope = common::operator_as(
+        &d.addr,
+        USER_TOKEN,
+        "subagent.get",
+        json!({"handle": "nope"}),
+    );
     assert_eq!(
         theirs["error"]["message"], nope["error"]["message"],
         "not told it exists"
     );
-    let mine = SendMessage::command("subagent.get", json!({"handle": handle}))
+    let mine = common::OperatorCall::new("subagent.get", json!({"handle": handle}))
         .bearer(OPS_TOKEN)
         .result(&d.addr);
     assert!(
@@ -872,7 +886,8 @@ fn a_reload_announces_what_it_put_back_after_admin_set() {
             "a2a.introspection.enabled" => json!(true),
             other => panic!("no fixture for {other}: give it a value the file does not"),
         };
-        SendMessage::command("admin.set", json!({"path": path, "value": value})).result(&d.addr);
+        common::OperatorCall::new("admin.set", json!({"path": path, "value": value}))
+            .result(&d.addr);
     }
     // The file did not change; the reload puts every one of them back.
     unsafe { libc::kill(d.child.id() as i32, libc::SIGHUP) };

@@ -272,13 +272,19 @@ impl PaidPeer {
     /// peer refusing it.
     fn send(&mut self, params: Value, deadline: Instant) -> Result<Value, Reached> {
         let headers = self.conn.request_headers(&a2a::extensions_of(&params));
-        framed::to_peer(&self.conn.ep, &self.conn.auth, &headers, params, deadline).map_err(
-            |failure| match failure {
-                Failure::Unsent(e) => Reached::Unsent(e),
-                Failure::Unanswered(e) => Reached::Unanswered(e),
-                Failure::Refused(e) => Reached::Refused(e),
-            },
+        framed::to_peer(
+            &self.conn.ep,
+            &self.conn.auth,
+            &headers,
+            "SendMessage",
+            params,
+            deadline,
         )
+        .map_err(|failure| match failure {
+            Failure::Unsent(e) => Reached::Unsent(e),
+            Failure::Unanswered(e) => Reached::Unanswered(e),
+            Failure::Refused(e) => Reached::Refused(e),
+        })
     }
 }
 

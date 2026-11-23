@@ -28,11 +28,15 @@ import {
   COMMAND_DATA_KEY,
   COMMAND_EXTENSION,
   EVENTS_EXTENSION,
+  COMMAND_OPS,
   Mirror,
+  OPERATOR_EXTENSION,
+  OPERATOR_OPS,
   OPS,
   TASK_ANNOTATIONS_EXTENSION,
   capabilitiesOf,
   commandReply,
+  operatorMethod,
 } from '../dist/client/index.js';
 import { REGISTRY, bundleOf, check, examplesOf, readRepoJson, readRepoText, validator } from './schemas.mjs';
 
@@ -56,8 +60,14 @@ test('the bundles refuse what they do not describe', () => {
   const command = validator(COMMAND_EXTENSION);
   // (An op outside the vocabulary is not refused by the bundle: a workflow's
   // `kind: a2a` trigger declares a command of its own name.)
-  assert.equal(command({ [COMMAND_DATA_KEY]: { op: OPS.status, extra: 1 } }), false, 'an argument the op does not take');
-  assert.equal(command({ [COMMAND_DATA_KEY]: { op: OPS.runGet } }), false, 'a missing required argument');
+  assert.equal(command({ [COMMAND_DATA_KEY]: { op: OPS.workflowRun, workflow: 'w', extra: 1 } }), false, 'an argument the op does not take');
+  assert.equal(command({ [COMMAND_DATA_KEY]: { op: OPS.workflowSignal } }), false, 'a missing required argument');
+  const operator = validator(OPERATOR_EXTENSION);
+  const callOf = (op, params) => ({ jsonrpc: '2.0', id: 1, method: operatorMethod(op), params });
+  assert.equal(operator(callOf(OPS.status, { extra: 1 })), false, 'a param the method does not take');
+  assert.equal(operator(callOf(OPS.runGet, {})), false, 'a missing required param');
+  assert.equal(operator(callOf('workflow.status', {})), false, 'no such method');
+  assert.equal(operator(callOf(OPS.runGet, { run: 'r1' })), true, 'and a call it describes');
   const events = validator(EVENTS_EXTENSION);
   assert.equal(events({ hello: { seq: 1 }, goodbye: { seq: 1, reason: 'deadline' } }), false, 'two frames in one');
   const ann = validator(TASK_ANNOTATIONS_EXTENSION);
@@ -75,7 +85,7 @@ function rustConst(src, name) {
 
 test("the client's extension identifiers are the daemon's, and none carries a version", () => {
   const src = readRepoText('crates', 'agentd', 'src', 'runtime', 'surface', 'ext.rs');
-  const names = ['COMMAND_EXTENSION', 'EVENTS_EXTENSION', 'TASK_ANNOTATIONS_EXTENSION', 'UNIX_BINDING', 'EVENTS_METHOD'];
+  const names = ['COMMAND_EXTENSION', 'OPERATOR_EXTENSION', 'EVENTS_EXTENSION', 'TASK_ANNOTATIONS_EXTENSION', 'UNIX_BINDING', 'EVENTS_METHOD'];
   for (const name of names) {
     assert.equal(typeof ext[name], 'string', `dist/client/ext.js exports ${name}`);
     assert.equal(ext[name], rustConst(src, name), `${name}: the client and the daemon disagree`);
@@ -100,7 +110,6 @@ const SEND = {
   [OPS.status]: (c) => c.status(),
   [OPS.config]: (c) => c.config(),
   [OPS.workflowRun]: (c, e) => c.workflowRun(e.workflow, e.inputs),
-  [OPS.workflowStatus]: (c, e) => c.workflowStatus(e.run),
   [OPS.workflowCancel]: (c, e) => c.workflowCancel(e.run),
   [OPS.workflowSignal]: (c, e) => c.signal(e.name, e.payload, e.run),
   [OPS.subagentSend]: (c, e) => c.subagentSend(e.handle, e.message),
@@ -143,8 +152,6 @@ const SEND = {
 const MORE = [
   { op: OPS.config },
   { op: OPS.workflowRun, workflow: 'greet' },
-  { op: OPS.workflowStatus },
-  { op: OPS.workflowStatus, run: 'greet-01' },
   { op: OPS.workflowCancel, run: 'greet-01' },
   { op: OPS.workflowSignal, name: 'go' },
   { op: OPS.workflowSignal, name: 'go', payload: { ok: true }, run: 'greet-01' },
@@ -222,15 +229,20 @@ function fullClient() {
   const ops = Object.values(OPS).map((op) => ({ op, reply: 'task' }));
   const extensions = [
     { uri: COMMAND_EXTENSION, params: { ops } },
+    { uri: OPERATOR_EXTENSION, params: { ops } },
     { uri: EVENTS_EXTENSION, params: {} },
     { uri: TASK_ANNOTATIONS_EXTENSION, params: {} },
   ];
   return new AgentdClient({ url: 'http://127.0.0.1:9/' }, capabilitiesOf({ capabilities: { streaming: true, extensions } }, null));
 }
 
-test('the client speaks the published command vocabulary, and nothing outside it', () => {
+test('the client speaks the published vocabularies, each on its extension, and nothing outside them', () => {
   const bundle = bundleOf(COMMAND_EXTENSION);
-  const published = Object.keys(bundle.$defs.ops).sort();
+  const commands = Object.keys(bundle.$defs.ops).sort();
+  const operators = Object.keys(bundleOf(OPERATOR_EXTENSION).$defs.ops).sort();
+  assert.deepEqual([...COMMAND_OPS].sort(), commands, 'COMMAND_OPS is the command extension\'s op list');
+  assert.deepEqual([...OPERATOR_OPS].sort(), operators, 'OPERATOR_OPS is the operator extension\'s op list');
+  const published = [...commands, ...operators].sort();
   assert.deepEqual(Object.values(OPS).sort(), published, 'OPS is the published op list');
   for (const op of Object.keys(bundle.$defs.reserved)) {
     assert.ok(!Object.values(OPS).includes(op), `${op} is reserved: no client sends it`);
@@ -238,15 +250,25 @@ test('the client speaks the published command vocabulary, and nothing outside it
   assert.deepEqual(Object.keys(SEND).sort(), published, 'every op has a way to send it');
 });
 
-test('every envelope the client sends validates, and a golden example is sent exactly', async (t) => {
+test('every call the client sends validates, and a golden example is sent exactly', async (t) => {
   const validate = validator(COMMAND_EXTENSION);
+  const validateCall = validator(OPERATOR_EXTENSION);
+  const task = { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_COMPLETED' } };
   const calls = stubFetch(
     t,
-    () => ({ result: { task: { id: 't1', contextId: 'c1', status: { state: 'TASK_STATE_COMPLETED' } } } }),
-    [COMMAND_EXTENSION, TASK_ANNOTATIONS_EXTENSION],
+    (body) => ({ result: body.method === 'SendMessage' ? { task } : task }),
+    [COMMAND_EXTENSION, OPERATOR_EXTENSION, TASK_ANNOTATIONS_EXTENSION],
   );
   const c = fullClient();
-  const golden = examplesOf(COMMAND_EXTENSION).map(([f, doc]) => [`examples/${f}`, doc[COMMAND_DATA_KEY]]);
+  // An operator example is a call; the op it names, with its params, is the
+  // envelope the wrapper is given.
+  const golden = [
+    ...examplesOf(COMMAND_EXTENSION).map(([f, doc]) => [`command/examples/${f}`, doc[COMMAND_DATA_KEY]]),
+    ...examplesOf(OPERATOR_EXTENSION).map(([f, doc]) => [
+      `operator/examples/${f}`,
+      { op: doc.method.slice('agentd.operator/'.length), ...doc.params },
+    ]),
+  ];
   const all = [...golden, ...MORE.map((e, i) => [`MORE[${i}]`, e])];
   const sentOps = new Set();
   for (const [what, envelope] of all) {
@@ -255,6 +277,14 @@ test('every envelope the client sends validates, and a golden example is sent ex
     calls.length = 0;
     await send(c, envelope);
     assert.equal(calls.length, 1, what);
+    if (OPERATOR_OPS.has(envelope.op)) {
+      const { op, ...params } = envelope;
+      assert.equal(calls[0].method, operatorMethod(op), `${what}: the op's own method`);
+      check(validateCall, calls[0], `${what} as sent`);
+      assert.deepEqual(calls[0].params, params, `${what}: the client sent other params`);
+      sentOps.add(op);
+      continue;
+    }
     const { message } = calls[0].params;
     assert.deepEqual(message.extensions, [COMMAND_EXTENSION], `${what}: the message is marked as a command`);
     assert.equal(message.parts.length, 1, `${what}: one DataPart`);
@@ -329,16 +359,16 @@ test('the feed frames, through the client’s frame reader, land in the Mirror a
 test("a command's reply is read from where the extension puts it", () => {
   const annotations = validator(TASK_ANNOTATIONS_EXTENSION);
 
-  // A read answers with a Message: its first DataPart is the answer.
+  // A Message reply: its first DataPart is the answer.
   const read = commandReply({ message: { messageId: 'm1', role: 'ROLE_AGENT', parts: [{ text: 'status' }, { data: { runs: [] } }] } });
   assert.equal(read.kind, 'message');
   assert.deepEqual(read.data, { runs: [] });
 
   // Work answers with a Task: the result is its `<id>.result` artifact and
   // nothing else, and agentd's facts come from the annotations.
-  const [, set] = examplesOf(COMMAND_EXTENSION).find(([f]) => f === 'admin-set.json');
-  const result = { path: set[COMMAND_DATA_KEY].path, value: set[COMMAND_DATA_KEY].value };
-  check(validator(COMMAND_EXTENSION, `/$defs/ops/${OPS.adminSet}/result`), result, 'the admin.set result');
+  const [, set] = examplesOf(OPERATOR_EXTENSION).find(([f]) => f === 'admin-set.json');
+  const result = { path: set.params.path, value: set.params.value };
+  check(validator(OPERATOR_EXTENSION, `/$defs/ops/${OPS.adminSet}/result`), result, 'the admin.set result');
   // Every optional member is carried by some example, so none of them is
   // read (or dropped) untested.
   assert.ok(

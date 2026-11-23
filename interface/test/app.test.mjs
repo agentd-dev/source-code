@@ -7,7 +7,7 @@ import React from 'react';
 import { render } from 'ink-testing-library';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { COMMAND_EXTENSION, Mirror, capabilitiesOf } from '../dist/client/index.js';
+import { COMMAND_EXTENSION, Mirror, OPERATOR_EXTENSION, capabilitiesOf } from '../dist/client/index.js';
 import { App, LAUNCH_SESSION_ENDED, terminalBanner } from '../dist/tui/app.js';
 import { startFakeA2a } from './fake-a2a.mjs';
 
@@ -17,10 +17,21 @@ const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 const at = (s) => new Date(Date.UTC(2026, 8, 1, 0, 0, s)).toISOString();
 
 /**
- * What discovery settles for a public card declaring the command vocabulary:
- * whether introspection is on is not something that card can tell.
+ * What discovery settles for a public card declaring the command and
+ * operator vocabularies: whether introspection is on is not something that
+ * card can tell.
  */
-function session(card = { name: 'agentd', capabilities: { extensions: [{ uri: COMMAND_EXTENSION, params: { ops: [] } }] } }) {
+function session(
+  card = {
+    name: 'agentd',
+    capabilities: {
+      extensions: [
+        { uri: COMMAND_EXTENSION, params: { ops: [] } },
+        { uri: OPERATOR_EXTENSION, params: { ops: [] } },
+      ],
+    },
+  },
+) {
   return { cardUrl: 'http://127.0.0.1:1/.well-known/agent-card.json', card, extended: null, ep: { url: 'http://127.0.0.1:1/' }, caps: capabilitiesOf(card, null), warnings: [] };
 }
 
@@ -171,9 +182,17 @@ test('draining and input-required surface prominently', async () => {
   }
 });
 
-/** A card declaring the command vocabulary with exactly `ops`. */
+/** A card declaring exactly `ops`, on whichever extension carries each. */
 function opsSession(ops, settable = []) {
-  return session({ name: 'agentd', capabilities: { extensions: [{ uri: COMMAND_EXTENSION, params: { ops, settable } }] } });
+  return session({
+    name: 'agentd',
+    capabilities: {
+      extensions: [
+        { uri: COMMAND_EXTENSION, params: { ops } },
+        { uri: OPERATOR_EXTENSION, params: { ops, settable } },
+      ],
+    },
+  });
 }
 
 test("a reply answers only this conversation's gate, and a Message answer is shown", async () => {

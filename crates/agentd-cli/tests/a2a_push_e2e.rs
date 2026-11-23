@@ -561,7 +561,7 @@ fn inline_push_config() {
 
     // A command that finishes inside the send it came with has settled before
     // its webhook is attached — and is still told, once, where it ended.
-    let resume = SendMessage::command("admin.resume", json!({}));
+    let resume = SendMessage::command("workflow.signal", json!({"name": "nobody-waits"}));
     let headers = resume.headers();
     let extra: Vec<(&str, &str)> = headers
         .iter()

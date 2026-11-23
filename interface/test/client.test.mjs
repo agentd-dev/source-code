@@ -17,9 +17,11 @@ import {
   EVENTS_EXTENSION,
   EVENTS_METHOD,
   Mirror,
+  OPERATOR_EXTENSION,
   OPS,
   TASK_ANNOTATIONS_EXTENSION,
   capabilitiesOf,
+  operatorMethod,
   commandReply,
   normalizeTask,
   sseParser,
@@ -39,7 +41,8 @@ function capsOf(exts = {}, { streaming = true, noExtensions = false } = {}) {
 
 const ALL_OPS = Object.values(OPS).map((op) => ({ op, reply: 'task' }));
 /** Every agentd extension declared, every op offered. */
-const FULL = () => capsOf({ [COMMAND_EXTENSION]: { ops: ALL_OPS }, [EVENTS_EXTENSION]: {}, [ANN]: {} });
+const FULL = () =>
+  capsOf({ [COMMAND_EXTENSION]: { ops: ALL_OPS }, [OPERATOR_EXTENSION]: { ops: ALL_OPS }, [EVENTS_EXTENSION]: {}, [ANN]: {} });
 
 /**
  * Replace fetch for one test. `reply(req)` gets {url, body, headers} and
@@ -103,13 +106,21 @@ test('messages carry ROLE_USER and a taskId is never paired with a contextId', a
   // A command: one DataPart, marked with the extension, never a taskId, and
   // `op` wins over an arg that happens to be named `op`.
   calls.length = 0;
-  await c.command(OPS.adminPause, { run: 'r1', op: 'admin.drain' }, { contextId: 'c1' });
+  await c.command(OPS.subagentKill, { handle: 'h1', op: 'admin.drain' }, { contextId: 'c1' });
   const cmd = calls[0].body.params;
   assert.equal(cmd.message.role, 'ROLE_USER');
   assert.deepEqual(cmd.message.extensions, [COMMAND_EXTENSION]);
   assert.ok(!('taskId' in cmd.message));
-  assert.deepEqual(cmd.message.parts, [{ data: { agentd: { run: 'r1', op: OPS.adminPause } }, mediaType: 'application/json' }]);
+  assert.deepEqual(cmd.message.parts, [{ data: { agentd: { handle: 'h1', op: OPS.subagentKill } }, mediaType: 'application/json' }]);
   assert.equal(cmd.configuration.returnImmediately, false);
+
+  // An operator op is its own method, its arguments the params — and no
+  // `op` among them, which the method already names.
+  calls.length = 0;
+  await c.command(OPS.adminPause, { run: 'r1' });
+  assert.equal(calls[0].body.method, operatorMethod(OPS.adminPause));
+  assert.equal(calls[0].body.method, 'agentd.operator/admin.pause');
+  assert.deepEqual(calls[0].body.params, { run: 'r1' });
 
   // The typed wrappers speak the canonical argument names.
   calls.length = 0;
@@ -122,21 +133,23 @@ test('messages carry ROLE_USER and a taskId is never paired with a contextId', a
   await c.authSessionsRevoke({ sid: 'ds_1' });
   await c.authSessionsRevoke({ name: 'alice' });
   await c.authSessionsRevoke({ all: true });
-  const sent = calls.map((r) => r.body.params.message.parts[0].data.agentd);
+  const sent = calls.map((r) =>
+    r.body.method === 'SendMessage' ? r.body.params.message.parts[0].data.agentd : { [r.body.method]: r.body.params },
+  );
+  const m = operatorMethod;
   assert.deepEqual(sent, [
     { workflow: 'deploy', inputs: { env: 'prod' }, op: OPS.workflowRun },
-    { path: 'agent.approval', value: 'ask', op: OPS.adminSet },
-    { user_code: 'ABCD-EFGH', as: 'alice', op: OPS.authDeviceApprove },
-    { user_code: 'ABCD-EFGH', as: 'bob', scope: 'operator', op: OPS.authDeviceApprove },
-    { user_code: 'WXYZ-BCDF', op: OPS.authDeviceDeny },
-    { all: true, op: OPS.authDeviceDeny },
-    { sid: 'ds_1', op: OPS.authSessionsRevoke },
-    { name: 'alice', op: OPS.authSessionsRevoke },
-    { all: true, op: OPS.authSessionsRevoke },
+    { [m(OPS.adminSet)]: { path: 'agent.approval', value: 'ask' } },
+    { [m(OPS.authDeviceApprove)]: { user_code: 'ABCD-EFGH', as: 'alice' } },
+    { [m(OPS.authDeviceApprove)]: { user_code: 'ABCD-EFGH', as: 'bob', scope: 'operator' } },
+    { [m(OPS.authDeviceDeny)]: { user_code: 'WXYZ-BCDF' } },
+    { [m(OPS.authDeviceDeny)]: { all: true } },
+    { [m(OPS.authSessionsRevoke)]: { sid: 'ds_1' } },
+    { [m(OPS.authSessionsRevoke)]: { name: 'alice' } },
+    { [m(OPS.authSessionsRevoke)]: { all: true } },
   ]);
-  // A workflow run hands back the WORKING task; a mutation waits for its result.
+  // A workflow run hands back the WORKING task.
   assert.equal(calls[0].body.params.configuration.returnImmediately, true);
-  assert.equal(calls[1].body.params.configuration.returnImmediately, false);
   for (const r of calls) assert.equal(JSON.stringify(r.body).includes('blocking'), false);
 });
 
@@ -153,14 +166,18 @@ test('extensions are refused locally when undeclared', async (t) => {
   assert.equal(bare.offers(OPS.status), false);
 
   // agentd's extensions declared, but this card offers only `status`.
-  const narrow = new AgentdClient(EP, capsOf({ [COMMAND_EXTENSION]: { ops: [{ op: OPS.status, reply: 'message' }] } }));
+  const narrow = new AgentdClient(EP, capsOf({ [OPERATOR_EXTENSION]: { ops: [{ op: OPS.status, reply: 'message' }] } }));
+  await rejects(narrow.subagentKill('h1'), 'extension-not-declared');
   await rejects(narrow.pause(), 'op-not-offered');
   await rejects(narrow.adminSet('agent.approval', 'ask'), 'op-not-offered');
   await rejects(narrow.debugEvents(), 'op-not-offered');
   await rejects(narrow.subscribeEvents(0, () => {}, () => {}), 'extension-not-declared');
 
   // `--no-extensions`: a card declaring everything still gets core only.
-  const off = new AgentdClient(EP, capsOf({ [COMMAND_EXTENSION]: { ops: ALL_OPS }, [EVENTS_EXTENSION]: {} }, { noExtensions: true }));
+  const off = new AgentdClient(
+    EP,
+    capsOf({ [COMMAND_EXTENSION]: { ops: ALL_OPS }, [OPERATOR_EXTENSION]: { ops: ALL_OPS }, [EVENTS_EXTENSION]: {} }, { noExtensions: true }),
+  );
   await rejects(off.status(), 'extension-not-declared');
   await rejects(off.subscribeEvents(0, () => {}, () => {}), 'extension-not-declared');
 
@@ -183,7 +200,8 @@ test('activation headers and echo verification', async (t) => {
   });
   const header = (i) => calls[i].headers['a2a-extensions'];
 
-  // Declared: a command activates the command extension (+ annotations), the
+  // Declared: an operator method activates the operator extension
+  // (+ annotations), a command the command extension (+ annotations), the
   // feed the events extension (+ annotations), a core task call the
   // annotations alone.
   const c = new AgentdClient(EP, FULL());
@@ -192,7 +210,10 @@ test('activation headers and echo verification', async (t) => {
   await c.send('hi');
   await c.getTask('t1');
   await c.listTasks();
-  assert.equal(header(0), `${COMMAND_EXTENSION}, ${ANN}`);
+  await c.subagentKill('h1');
+  assert.equal(header(0), `${OPERATOR_EXTENSION}, ${ANN}`);
+  assert.equal(calls[0].body.method, operatorMethod(OPS.status));
+  assert.equal(header(5), `${COMMAND_EXTENSION}, ${ANN}`);
   assert.equal(header(1), `${EVENTS_EXTENSION}, ${ANN}`);
   assert.equal(calls[1].body.method, EVENTS_METHOD);
   assert.deepEqual(calls[1].body.params, { fromSeq: 3 });
@@ -201,11 +222,13 @@ test('activation headers and echo verification', async (t) => {
 
   // Not declared: nothing is claimed that is not used.
   calls.length = 0;
-  const plain = new AgentdClient(EP, capsOf({ [COMMAND_EXTENSION]: { ops: ALL_OPS } }));
+  const plain = new AgentdClient(EP, capsOf({ [COMMAND_EXTENSION]: { ops: ALL_OPS }, [OPERATOR_EXTENSION]: { ops: ALL_OPS } }));
   await plain.status();
   await plain.send('hi');
-  assert.equal(header(0), COMMAND_EXTENSION);
+  await plain.subagentKill('h1');
+  assert.equal(header(0), OPERATOR_EXTENSION);
   assert.equal(header(1), undefined);
+  assert.equal(header(2), COMMAND_EXTENSION);
   // A card without task-annotations gets no annotations read, whatever
   // the reply carries under that key.
   assert.equal((await plain.send('hi')).task.principal, undefined);
@@ -214,11 +237,11 @@ test('activation headers and echo verification', async (t) => {
   assert.equal((await c.send('hi')).task.principal, 'user:alice');
   // An echo that lists the annotations: read.
   echo = `${COMMAND_EXTENSION}, ${ANN}`;
-  assert.equal((await c.command(OPS.adminPause)).task.principal, 'user:alice');
+  assert.equal((await c.command(OPS.subagentKill, { handle: 'h1' })).task.principal, 'user:alice');
   // An echo WITHOUT the annotations: the key was not written under the
   // extension's contract, so the task is read without it.
   echo = COMMAND_EXTENSION;
-  assert.equal((await c.command(OPS.adminPause)).task.principal, undefined);
+  assert.equal((await c.command(OPS.subagentKill, { handle: 'h1' })).task.principal, undefined);
   // The same rule on every core task call, not only on sends: the echo of
   // GetTask, ListTasks and CancelTask governs the task that call returned.
   echo = 'urn:x:other';
@@ -230,9 +253,10 @@ test('activation headers and echo verification', async (t) => {
   assert.equal((await c.listTasks()).tasks[0].principal, 'user:alice', 'ListTasks');
   assert.equal((await c.cancelTask('t1')).principal, 'user:alice', 'CancelTask');
   // An echo without the command extension: the agent did not run this as a
-  // command (a model may have read it as prose), so the answer is refused.
+  // command (a model may have read it as prose), so the answer is refused —
+  // and an operator method's answer without the operator extension, too.
   echo = ANN;
-  await rejects(c.command(OPS.adminPause), 'extension-not-activated');
+  await rejects(c.command(OPS.subagentKill, { handle: 'h1' }), 'extension-not-activated');
   await rejects(c.status(), 'extension-not-activated');
   // …and a feed opened without the events extension is refused before a
   // frame lands.

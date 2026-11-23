@@ -320,38 +320,11 @@ fn content_type() {
     assert!(reply.json().get("error").is_none(), "{reply:?}");
 }
 
-/// A read op streamed is exactly one frame — the Message, under the
-/// request's own id, with no SSE `id:` — and then the stream ends. Work is
-/// the task's stream: the task first, then its transitions to a terminal
-/// state. A refusal before the first frame is JSON, never a frame.
+/// Work is the task's stream: the task first, then its transitions to a
+/// terminal state. A refusal before the first frame is JSON, never a frame.
 #[test]
 fn stream_shapes() {
     let d = boot();
-
-    let status = SendMessage::command("status", json!({}))
-        .streaming()
-        .bearer(OPERATOR);
-    let headers = status.headers();
-    let extra: Vec<(&str, &str)> = headers
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let reply = a2a_post(&d.addr, &status.body(31), &extra);
-    assert!(
-        reply
-            .header("content-type")
-            .is_some_and(|t| t.starts_with("text/event-stream")),
-        "{reply:?}"
-    );
-    let got = frames(&reply.body);
-    assert_eq!(got.len(), 1, "exactly one frame: {}", reply.body);
-    assert_eq!(got[0]["id"], 31, "the request's own id: {}", got[0]);
-    assert_eq!(
-        got[0]["result"]["message"]["role"], "ROLE_AGENT",
-        "{}",
-        got[0]
-    );
-    assert!(got[0]["result"].get("task").is_none(), "{}", got[0]);
 
     let reply = SendMessage::text("hello")
         .streaming()
@@ -534,11 +507,11 @@ fn task_id_rules() {
         assert!(is_uuid_v7(fresh_id) && fresh_id != id, "{none:?}: {fresh}");
     }
     // A command with a blank id names no task either.
-    let status = SendMessage::command("status", json!({}))
+    let signal = SendMessage::command("workflow.signal", json!({"name": "nobody"}))
         .task("  ")
         .bearer(OPERATOR)
         .post(&d.addr);
-    assert!(status.get("error").is_none(), "{status}");
+    assert!(signal.get("error").is_none(), "{signal}");
 
     let before_a = task_count(&d, USER_A);
     let before_b = task_count(&d, AGENT_B);
@@ -584,7 +557,7 @@ fn task_id_rules() {
     // before anything reads the task it names, so the answer is the same for
     // a task that exists and one that does not.
     for (op, task) in [
-        ("status", id.as_str()),
+        ("workflow.signal", id.as_str()),
         ("workflow.run", id.as_str()),
         ("workflow.run", "my-own-id"),
     ] {
@@ -737,7 +710,7 @@ fn draining_is_identical_on_both_paths() {
          \x20     s: {kind: manual}\n\
          \x20     f: {kind: finish, depends_on: [s]}\n",
     );
-    SendMessage::command("admin.drain", json!({"reason": "the test"}))
+    common::OperatorCall::new("admin.drain", json!({"reason": "the test"}))
         .bearer(OPERATOR)
         .result(&d.addr);
 
@@ -755,9 +728,7 @@ fn draining_is_identical_on_both_paths() {
         .bearer(OPERATOR)
         .post(&d.addr);
     assert_eq!(expected(&run, "workflow.run"), one, "{run}");
-    let read = SendMessage::command("status", json!({}))
-        .bearer(OPERATOR)
-        .post(&d.addr);
+    let read = common::operator_as(&d.addr, OPERATOR, "status", json!({}));
     assert_eq!(expected(&read, "a read"), one, "{read}");
 
     let streamed = SendMessage::text("hello")

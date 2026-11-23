@@ -93,9 +93,13 @@ export const SYSTEM_COMMANDS: ReadonlyArray<SystemCommand> = Object.freeze(
   ),
 );
 
-/** The ops the card offers this caller; empty before a session or without the command extension. */
+/**
+ * The ops the card offers this caller, command and operator alike; empty
+ * before a session or without either extension.
+ */
 function offeredOps(s: MirrorState): ReadonlySet<string> {
-  return s.session?.caps.command?.ops ?? new Set();
+  const caps = s.session?.caps;
+  return new Set([...(caps?.command?.ops ?? []), ...(caps?.operator?.ops ?? [])]);
 }
 
 /** Whether the card offers this caller the op `op` — what a control for it is shown by. */
@@ -266,7 +270,7 @@ export function suggest(input: string, s: MirrorState, max = 6): Suggestion[] {
     if (!set || !offeredOps(s).has(SLASH_OPS.set)) return [];
     // Only the paths the card says THIS caller may set: the daemon refuses
     // every other one, so offering it would be offering a refusal.
-    return (s.session?.caps.command?.settable ?? [])
+    return (s.session?.caps.operator?.settable ?? [])
       .filter((p) => p.startsWith(set.query))
       .map((p) => ({ label: p, insert: `${p} `, hint: 'settable' }))
       .slice(0, max);

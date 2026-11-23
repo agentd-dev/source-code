@@ -10,10 +10,11 @@ use crate::config::settings::Settings;
 use serde_json::{Value, json};
 
 use super::auth::{configured_url, listener_auth_of};
-use super::{EXTENSION_METHODS, SpecMethod, declared_for, extensions_of};
+use super::{SpecMethod, declared_for, extension_methods, extensions_of};
 
 /// Every JSON-RPC method this instance answers: the specification's eleven,
-/// then the methods of the extensions it declares.
+/// then the methods of the extensions it declares — an operator method only
+/// while the switch that serves its op is on, as its op is listed.
 ///
 /// Derived from the route table and the declaration list, which are the same
 /// two lists the listener routes by and the card declares from, so the
@@ -24,9 +25,12 @@ pub fn methods_of(s: &Settings) -> Vec<&'static str> {
         .iter()
         .map(|m| m.name())
         .chain(
-            EXTENSION_METHODS
+            extension_methods()
                 .iter()
-                .filter(|(_, ext, _)| declared.iter().any(|d| d.ext == *ext))
+                .filter(|(name, ext, _)| {
+                    declared.iter().any(|d| d.ext == *ext)
+                        && super::operator_op_of(name).is_none_or(|op| super::gate_open(op, s))
+                })
                 .map(|(name, ..)| *name),
         )
         .collect()
@@ -55,6 +59,8 @@ pub fn a2a_section(s: &Settings) -> Value {
         // advertise a surface the card denies (they disagreed once: the
         // manifest listed ops the card never mentioned).
         "command_ops": super::command_ops_of(s),
+        // The operator ops, from the list the operator extension declares.
+        "operator_ops": super::operator_ops_of(s),
         "extensions": extensions_of(s),
         "url": configured_url(s),
         "auth": {
@@ -107,11 +113,13 @@ mod tests {
                 assert!(reported.contains(&m.name()), "{m:?} is not reported");
             }
             let declared = extensions_of(s);
-            for (name, ext, _) in EXTENSION_METHODS {
+            for (name, ext, _) in extension_methods() {
+                let served = crate::runtime::surface::operator_op_of(name)
+                    .is_none_or(|op| crate::runtime::surface::gate_open(op, s));
                 assert_eq!(
                     reported.contains(name),
-                    declared.contains(&ext.uri()),
-                    "{name} is reported iff {ext:?} is declared"
+                    declared.contains(&ext.uri()) && served,
+                    "{name} is reported iff {ext:?} is declared and its op served"
                 );
                 assert!(matches!(route_of(name), Some(Route::Extension { .. })));
             }
@@ -143,7 +151,7 @@ mod tests {
         }));
         assert_eq!(
             a2a_section(&s).to_string(),
-            r#"{"auth":{"bearer":true,"device":false,"implicit_operator":false,"mtls":true,"required":true},"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","subagent.log","plan.get","conversation.get","run.get","subagent.get","debug.events","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set","auth.sessions","auth.sessions.revoke"],"cors_origins":2,"events":true,"extensions":["https://agentd.dev/a2a/ext/command","https://agentd.dev/a2a/ext/events","https://agentd.dev/a2a/ext/task-annotations"],"introspection":true,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard","agentd.events/SubscribeToEvents"],"url":"https://agent.example.com"}"#
+            r#"{"auth":{"bearer":true,"device":false,"implicit_operator":false,"mtls":true,"required":true},"command_ops":["workflow.run","workflow.signal","subagent.send","subagent.kill"],"cors_origins":2,"events":true,"extensions":["https://agentd.dev/a2a/ext/command","https://agentd.dev/a2a/ext/operator","https://agentd.dev/a2a/ext/events","https://agentd.dev/a2a/ext/task-annotations"],"introspection":true,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard","agentd.events/SubscribeToEvents","agentd.operator/status","agentd.operator/config","agentd.operator/workflow.cancel","agentd.operator/subagent.status","agentd.operator/subagent.log","agentd.operator/plan.get","agentd.operator/conversation.get","agentd.operator/run.get","agentd.operator/subagent.get","agentd.operator/debug.events","agentd.operator/admin.drain","agentd.operator/admin.pause","agentd.operator/admin.resume","agentd.operator/admin.cancel","agentd.operator/admin.set","agentd.operator/auth.sessions","agentd.operator/auth.sessions.revoke"],"operator_ops":["status","config","workflow.cancel","subagent.status","subagent.log","plan.get","conversation.get","run.get","subagent.get","debug.events","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set","auth.sessions","auth.sessions.revoke"],"url":"https://agent.example.com"}"#
         );
 
         // A unix socket: the kernel authenticates, the caller is the operator,
@@ -151,7 +159,7 @@ mod tests {
         let t = settings(json!({"listen": "unix:/run/agentd.sock"}));
         assert_eq!(
             a2a_section(&t).to_string(),
-            r#"{"auth":{"bearer":false,"device":false,"implicit_operator":true,"mtls":false,"required":false},"command_ops":["status","config","workflow.run","workflow.status","workflow.cancel","workflow.signal","subagent.send","subagent.kill","subagent.status","subagent.log","plan.get","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set"],"cors_origins":0,"events":false,"extensions":["https://agentd.dev/a2a/ext/command","https://agentd.dev/a2a/ext/task-annotations"],"introspection":false,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard"],"url":null}"#
+            r#"{"auth":{"bearer":false,"device":false,"implicit_operator":true,"mtls":false,"required":false},"command_ops":["workflow.run","workflow.signal","subagent.send","subagent.kill"],"cors_origins":0,"events":false,"extensions":["https://agentd.dev/a2a/ext/command","https://agentd.dev/a2a/ext/operator","https://agentd.dev/a2a/ext/task-annotations"],"introspection":false,"methods":["SendMessage","SendStreamingMessage","GetTask","ListTasks","CancelTask","SubscribeToTask","CreateTaskPushNotificationConfig","GetTaskPushNotificationConfig","ListTaskPushNotificationConfigs","DeleteTaskPushNotificationConfig","GetExtendedAgentCard","agentd.operator/status","agentd.operator/config","agentd.operator/workflow.cancel","agentd.operator/subagent.status","agentd.operator/subagent.log","agentd.operator/plan.get","agentd.operator/admin.drain","agentd.operator/admin.pause","agentd.operator/admin.resume","agentd.operator/admin.cancel","agentd.operator/admin.set"],"operator_ops":["status","config","workflow.cancel","subagent.status","subagent.log","plan.get","admin.drain","admin.pause","admin.resume","admin.cancel","admin.set"],"url":null}"#
         );
 
         assert_eq!(

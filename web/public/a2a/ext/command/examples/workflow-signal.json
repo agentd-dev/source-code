@@ -1,0 +1,7 @@
+{
+  "agentd": {
+    "op": "workflow.signal",
+    "name": "approved",
+    "payload": {"by": "ada"}
+  }
+}

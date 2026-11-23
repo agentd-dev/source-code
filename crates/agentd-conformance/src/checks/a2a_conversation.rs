@@ -19,8 +19,7 @@ use serde_json::{Value, json};
 
 use crate::checks::util::{
     Headers, command_uri, declared_extensions, free_port, get_card, header, mock_llm, post_stating,
-    rpc, rpc_body, rpc_value as rpc_raw, send_command, send_text, stream, stream_command,
-    text_params, wait_ready, write_file,
+    rpc, rpc_body, rpc_value as rpc_raw, send_text, stream, text_params, wait_ready, write_file,
 };
 use crate::{Category, Check, Harness, Outcome};
 
@@ -177,9 +176,11 @@ fn version_and_vocabulary(h: &Harness) -> Outcome {
     )
 }
 
-/// A read is the spec's immediate reply: a Message, and no task to track. The
-/// card says which commands are reads; each is sent bare, and is either
-/// answered as one or refused (one that needs arguments) — never run as a task.
+/// A read is an operator method answered with its document, and no task to
+/// track. The card says which operator ops are reads; each is called bare,
+/// and is either answered or refused (one that needs arguments) — never run
+/// as a task. No command the command extension lists is a read: a command is
+/// work.
 fn read_commands(h: &Harness) -> Outcome {
     let tmp = h.tempdir();
     let llm = mock_llm(h, &tmp, &json!({"turns": [{"content": "unused"}]}));
@@ -191,12 +192,20 @@ fn read_commands(h: &Harness) -> Outcome {
 
     let card = get_card(&addr);
     let uri = command_uri(&card);
-    let reads: Vec<String> = card["capabilities"]["extensions"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|e| e["uri"] == uri.as_str())
-        .flat_map(|e| e["params"]["ops"].as_array().cloned().unwrap_or_default())
+    let ops_of = |ext: &str| -> Vec<Value> {
+        card["capabilities"]["extensions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["uri"] == ext)
+            .flat_map(|e| e["params"]["ops"].as_array().cloned().unwrap_or_default())
+            .collect()
+    };
+    if let Some(read) = ops_of(&uri).iter().find(|o| o["reply"] == "message") {
+        return Outcome::fail(format!("a command is work, and {read} is a read: {card}"));
+    }
+    let reads: Vec<String> = ops_of(crate::checks::util::OPERATOR)
+        .iter()
         .filter(|o| o["reply"] == "message")
         .filter_map(|o| o["op"].as_str().map(str::to_string))
         .collect();
@@ -205,28 +214,23 @@ fn read_commands(h: &Harness) -> Outcome {
     }
 
     for (n, op) in reads.iter().enumerate() {
-        let sent = send_command(&addr, 10 + n as i64, op);
-        let answered = sent["result"]["message"]["role"] == "ROLE_AGENT";
-        if sent["result"].get("task").is_some() || !(answered || sent.get("error").is_some()) {
+        let sent = crate::checks::util::call_operator(&addr, 10 + n as i64, op, &json!({}));
+        let answered = sent["result"].is_object();
+        if crate::checks::util::is_task(&sent["result"])
+            || !(answered || sent.get("error").is_some())
+        {
             return Outcome::fail(format!(
-                "the read `{op}` should be answered with an agent Message or refused, never a task: {sent}"
+                "the read `{op}` should be answered with its document or refused, never a task: {sent}"
             ));
         }
         if op == "status" {
-            let doc = &sent["result"]["message"]["parts"][0]["data"];
-            if !(answered && doc["conversations"].is_array() && doc["runs"].is_array()) {
+            let doc = &sent["result"];
+            if !(doc["conversations"].is_array() && doc["runs"].is_array()) {
                 return Outcome::fail(format!(
                     "`status` should answer with the document listing conversations + runs: {sent}"
                 ));
             }
         }
-    }
-
-    let (status, _, frames) = stream_command(&addr, 5, "status");
-    if !(status == 200 && frames.len() == 1 && frames[0].data["result"].get("message").is_some()) {
-        return Outcome::fail(format!(
-            "a streamed read should be exactly one message frame: {status} {frames:?}"
-        ));
     }
     Outcome::require(
         task_count(&addr) == 0,

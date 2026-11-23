@@ -344,11 +344,9 @@ fn run_fetch(addr: &str) -> String {
 
 /// The step `call` of the only run, as `run.get` reads it.
 fn call_step(addr: &str) -> Value {
-    let read = |op: &str, args: Value| {
-        SendMessage::command(op, args).result(addr)["message"]["parts"][0]["data"].clone()
-    };
-    let ws = read("workflow.status", json!({}));
-    let run = ws["runs"][0]["run"].as_str().expect("a run").to_string();
+    let read = |op: &str, args: Value| common::OperatorCall::new(op, args).result(addr);
+    let st = read("status", json!({}));
+    let run = st["runs"][0]["id"].as_str().expect("a run").to_string();
     read("run.get", json!({"run": run}))["run"]["steps"]["call"].clone()
 }
 

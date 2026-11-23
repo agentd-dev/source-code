@@ -556,7 +556,7 @@ pub(super) fn a_documents_workflow_asks_unless_listed(h: &Harness) -> Outcome {
             return o;
         }
         let list = s.op("status", json!({}));
-        let wf = list["result"]["message"]["parts"][0]["data"]["workflows"]
+        let wf = crate::checks::util::doc_of(&list)["workflows"]
             .as_array()
             .into_iter()
             .flatten()
@@ -954,7 +954,7 @@ pub(super) fn a_person_revokes_their_own_grant(h: &Harness) -> Outcome {
         }
         let before = s.listed(&s.ops);
         let by_other = s.op_as(&other, "delegation.revoke", json!({}));
-        let (ostate, otext) = match by_other["result"]["task"]["id"].as_str() {
+        let (ostate, otext) = match crate::checks::util::task_of(&by_other)["id"].as_str() {
             Some(id) => tryo!(s.task_end(&other, id)),
             None => return Outcome::fail(format!("delegation.revoke: {by_other}")),
         };
@@ -991,14 +991,14 @@ pub(super) fn a_person_revokes_their_own_grant(h: &Harness) -> Outcome {
     let bob_id = format!("user:oidc:{}#{BOB}", s.xaa.idp);
     let not_his = s.op_as(&bob, "delegation.revoke", json!({"target": alice_id}));
     let own = s.op_as(&alice, "delegation.revoke", json!({}));
-    let (state, text) = match own["result"]["task"]["id"].as_str() {
+    let (state, text) = match crate::checks::util::task_of(&own)["id"].as_str() {
         Some(id) => tryo!(s.task_end(&alice, id)),
         None => return Outcome::fail(format!("delegation.revoke: {own}")),
     };
     let hers = tryo!(s.run_as(&alice, "who"));
     let his = tryo!(s.run_as(&bob, "who"));
     let by_op = s.operator("delegation.revoke", json!({"target": bob_id}));
-    if let Some(id) = by_op["result"]["task"]["id"].as_str() {
+    if let Some(id) = crate::checks::util::task_of(&by_op)["id"].as_str() {
         tryo!(s.task_end(&s.ops, id));
     }
     let his_after = tryo!(s.run_as(&bob, "who"));
@@ -1079,8 +1079,9 @@ fn mtls_rpc(addr: &str, cert: &Path, key: &Path, method: &str, params: Value) ->
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
     let _ = write!(
         tls,
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nA2A-Extensions: {COMMAND}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
+        "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nA2A-Version: 1.0\r\nA2A-Extensions: {COMMAND}, {operator}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len(),
+        operator = crate::checks::util::OPERATOR,
     );
     let mut out = Vec::new();
     let _ = tls.read_to_end(&mut out);
@@ -1137,19 +1138,17 @@ pub(super) fn a_certificate_principal_delegates(h: &Harness) -> Outcome {
     let _ = std::fs::remove_file(&s.log);
     let _ = std::os::unix::fs::symlink(&log, &s.log);
     let op = |op: &str, args: Value| {
-        mtls_rpc(
-            &addr,
-            &cert,
-            &key,
-            "SendMessage",
-            crate::checks::util::command_send_params(op, &args),
-        )
+        let (method, params) = crate::checks::util::op_request(op, &args);
+        mtls_rpc(&addr, &cert, &key, &method, params)
     };
     let enrol = op(
         "delegation.enrol",
         json!({"idp": "okta", "grant": "device"}),
     );
-    let Some(task) = enrol["result"]["task"]["id"].as_str().map(str::to_string) else {
+    let Some(task) = crate::checks::util::task_of(&enrol)["id"]
+        .as_str()
+        .map(str::to_string)
+    else {
         return Outcome::fail(format!("delegation.enrol: {enrol}"));
     };
     let deadline = Instant::now() + Duration::from_secs(30);

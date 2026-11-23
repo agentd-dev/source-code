@@ -14,8 +14,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use common::SendMessage;
-
 struct Daemon {
     child: Child,
     stderr_path: String,
@@ -113,7 +111,7 @@ fn a2a_calls_are_chained_and_a_tampered_chain_refuses_the_start() {
     let chain = format!("{dir}/audit/audit.log");
     let (d, addr) = start(&dir);
     for _ in 0..2 {
-        let _ = SendMessage::command("status", json!({})).result(&addr);
+        let _ = common::OperatorCall::new("status", json!({})).result(&addr);
     }
     d.stop();
 
@@ -140,14 +138,14 @@ fn a2a_calls_are_chained_and_a_tampered_chain_refuses_the_start() {
         .filter(|r| {
             r["action"]
                 .as_str()
-                .is_some_and(|a| a.starts_with("a2a.SendMessage") && a.contains("status"))
+                .is_some_and(|a| a == "a2a.agentd.operator/status")
         })
         .count();
     assert!(calls >= 2, "each status call is a record:\n{text}");
 
     // A restart verifies it and goes on with it.
     let (d, addr) = start(&dir);
-    let _ = SendMessage::command("status", json!({})).result(&addr);
+    let _ = common::OperatorCall::new("status", json!({})).result(&addr);
     let log = std::fs::read_to_string(&d.stderr_path).unwrap_or_default();
     assert!(log.contains("\"event\":\"audit.chain.open\""), "{log}");
     d.stop();

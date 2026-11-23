@@ -33,10 +33,10 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use agentd::runtime::surface::{
-    COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD, TASK_ANNOTATIONS_EXTENSION,
-    static_vocabulary,
+    COMMAND_EXTENSION, EVENTS_EXTENSION, EVENTS_METHOD, OPERATOR_EXTENSION,
+    TASK_ANNOTATIONS_EXTENSION, static_vocabulary,
 };
-use common::{SendMessage, a2a_post, get_card, rpc_as, rpc_body};
+use common::{OperatorCall, SendMessage, a2a_post, get_card, rpc_as, rpc_body};
 
 const OPERATOR: &str = "ext-e2e-operator-token";
 const USER: &str = "ext-e2e-user-token";
@@ -158,7 +158,16 @@ fn extension<'c>(card: &'c Value, uri: &str) -> &'c Value {
 }
 
 fn ops(card: &Value) -> Vec<String> {
-    extension(card, COMMAND_EXTENSION)["params"]["ops"]
+    ops_of(card, COMMAND_EXTENSION)
+}
+
+/// The operator ops `card`'s operator extension lists.
+fn methods(card: &Value) -> Vec<String> {
+    ops_of(card, OPERATOR_EXTENSION)
+}
+
+fn ops_of(card: &Value, uri: &str) -> Vec<String> {
+    extension(card, uri)["params"]["ops"]
         .as_array()
         .map(|a| {
             a.iter()
@@ -216,6 +225,14 @@ fn the_public_card_reveals_no_posture_and_the_extended_card_adds_per_caller() {
     assert_eq!(params["dataPartKey"], "agentd", "{params}");
     assert_eq!(ops(&public), static_vocabulary(), "the static vocabulary");
     assert!(params.get("commands").is_none() && params.get("settable").is_none());
+    let operator = &extension(&public, OPERATOR_EXTENSION)["params"];
+    assert_eq!(operator["methodPrefix"], "agentd.operator/", "{operator}");
+    assert_eq!(
+        methods(&public),
+        agentd::runtime::surface::operator_vocabulary(),
+        "the operator vocabulary"
+    );
+    assert!(operator.get("settable").is_none(), "{operator}");
 
     assert_eq!(skill_ids(&public), vec!["conversation"], "{public}");
     let text = public.to_string();
@@ -246,14 +263,14 @@ fn the_public_card_reveals_no_posture_and_the_extended_card_adds_per_caller() {
         ]
     );
     let op_ops = ops(&op);
-    for want in [
-        "status",
-        "workflow.run",
-        "admin.drain",
-        "admin.set",
-        "config",
-    ] {
-        assert!(op_ops.iter().any(|o| o == want), "{want}: {op_ops:?}");
+    assert!(op_ops.iter().any(|o| o == "workflow.run"), "{op_ops:?}");
+    let op_methods = methods(&op);
+    for want in ["status", "admin.drain", "admin.set", "config"] {
+        assert!(
+            op_methods.iter().any(|o| o == want),
+            "{want}: {op_methods:?}"
+        );
+        assert!(!op_ops.iter().any(|o| o == want), "{want} is no command");
     }
     let op_params = &extension(&op, COMMAND_EXTENSION)["params"];
     let fired: Vec<&str> = op_params["commands"]
@@ -261,7 +278,8 @@ fn the_public_card_reveals_no_posture_and_the_extended_card_adds_per_caller() {
         .map(|a| a.iter().filter_map(|c| c["op"].as_str()).collect())
         .unwrap_or_default();
     assert_eq!(fired, vec!["ops.go", "report.make"], "{op_params}");
-    assert!(op_params["settable"].is_array(), "{op_params}");
+    let operator = &extension(&op, OPERATOR_EXTENSION)["params"];
+    assert!(operator["settable"].is_array(), "{operator}");
 
     // The user — every grant, still no operator: no operator-floor op, no
     // command only an operator may fire, no workflow whose start admits only
@@ -273,12 +291,22 @@ fn the_public_card_reveals_no_posture_and_the_extended_card_adds_per_caller() {
     );
     let user_ops = ops(&user);
     assert!(user_ops.iter().any(|o| o == "workflow.run"), "{user_ops:?}");
+    let user_methods = methods(&user);
+    assert!(
+        user_methods.iter().any(|o| o == "status"),
+        "{user_methods:?}"
+    );
     for never in ["admin.drain", "admin.set", "config", "debug.events"] {
         assert!(
-            !user_ops.iter().any(|o| o == never),
+            !user_methods.iter().any(|o| o == never),
             "{never} offered to a user"
         );
     }
+    assert!(
+        extension(&user, OPERATOR_EXTENSION)["params"]
+            .get("settable")
+            .is_none()
+    );
     let user_params = &extension(&user, COMMAND_EXTENSION)["params"];
     assert_eq!(
         user_params["commands"],
@@ -428,7 +456,7 @@ fn the_echo_is_exactly_what_was_activated() {
     let (_d, addr) = boot();
     let task = greet_task(&addr);
     let get = rpc_body(1, "GetTask", json!({"id": task}));
-    let status = SendMessage::command("status", json!({}));
+    let status = SendMessage::command("workflow.signal", json!({"name": "nobody-waits"}));
 
     // A command send: two field lines, a duplicate, an unknown URI and a
     // declared extension that does not apply to a send's DataPart all fold to
@@ -487,6 +515,36 @@ fn the_echo_is_exactly_what_was_activated() {
         );
     }
 
+    // An operator method: its own extension, and the annotations when the
+    // method answers with a Task; a read's document carries none.
+    let every = format!(
+        "{COMMAND_EXTENSION}, {OPERATOR_EXTENSION}, {EVENTS_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}"
+    );
+    let read = post_with(
+        &addr,
+        OPERATOR,
+        &OperatorCall::new("status", json!({})).body(1),
+        &[&every],
+    );
+    assert!(read.json()["result"]["runs"].is_array(), "{read:?}");
+    assert_eq!(
+        read.header("a2a-extensions"),
+        Some(OPERATOR_EXTENSION),
+        "{read:?}"
+    );
+    let work = post_with(
+        &addr,
+        OPERATOR,
+        &OperatorCall::new("admin.resume", json!({})).body(1),
+        &[&every],
+    );
+    assert!(common::is_task(&work.json()["result"]), "{work:?}");
+    assert_eq!(
+        work.header("a2a-extensions"),
+        Some(format!("{OPERATOR_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}").as_str()),
+        "{work:?}"
+    );
+
     // A stream carries the echo on its head, before the body.
     let streamed = status.clone().streaming().bearer(OPERATOR).post_raw(&addr);
     assert!(
@@ -526,8 +584,10 @@ fn the_echo_is_exactly_what_was_activated() {
     let forbidden = post_with(
         &addr,
         USER,
-        &SendMessage::command("admin.pause", json!({})).body(3),
-        &[&all],
+        &OperatorCall::new("admin.pause", json!({})).body(3),
+        &[&format!(
+            "{OPERATOR_EXTENSION}, {TASK_ANNOTATIONS_EXTENSION}"
+        )],
     );
     assert_eq!(forbidden.status, 403, "{forbidden:?}");
     assert_eq!(forbidden.header("a2a-extensions"), None, "{forbidden:?}");
@@ -718,36 +778,69 @@ fn task_annotations_follow_activation() {
     }
 }
 
-/// The operator family, reached with a stock `SendMessage` — and refused for a
-/// non-operator even with `grants: ["*"]`.
+/// The operator family is a set of methods, `agentd.operator/<op>`, of the
+/// operator extension — refused for a non-operator even with `grants: ["*"]`,
+/// unreachable as a command DataPart, and refused to a caller that activates
+/// the command extension alone, whoever it is.
 #[test]
-fn admin_is_a_command_datapart_and_stays_operator_only() {
+fn admin_is_an_operator_method_and_stays_operator_only() {
     let (_d, addr) = boot();
 
     // A `user` with a wildcard grant is still not an operator.
-    let refused = SendMessage::command("admin.pause", json!({}))
+    let refused = OperatorCall::new("admin.pause", json!({}))
         .bearer(USER)
-        .post(&addr);
-    assert!(
-        refused["error"].is_object() || refused["result"]["status"]["state"] == "TASK_STATE_FAILED",
-        "a non-operator must not pause the instance: {refused}"
-    );
+        .post_raw(&addr);
+    assert_eq!(refused.status, 403, "{refused:?}");
+    assert_eq!(refused.json()["error"]["code"], -31403, "{refused:?}");
+    assert_eq!(status_doc(&addr, OPERATOR)["paused"], false);
 
-    // The operator can, through the same ordinary method.
-    let paused = SendMessage::command("admin.pause", json!({"reason": "e2e"}))
+    // The operator activates the command extension alone: the method is no
+    // method of it, refused before any authorization.
+    let wrong = OperatorCall::new("admin.pause", json!({}))
+        .bearer(OPERATOR)
+        .activating(&[COMMAND_EXTENSION])
+        .post(&addr);
+    assert_eq!(wrong["error"]["code"], -32601, "{wrong}");
+    assert_eq!(
+        wrong["error"]["data"][0]["metadata"]["agentdReason"], "EXTENSION_NOT_ACTIVATED",
+        "{wrong}"
+    );
+    assert_eq!(
+        wrong["error"]["data"][0]["metadata"]["extension"], OPERATOR_EXTENSION,
+        "{wrong}"
+    );
+    // …and the op, sent as a command, is no command at all.
+    let as_command = SendMessage::command("admin.pause", json!({}))
         .bearer(OPERATOR)
         .post(&addr);
-    let body = serde_json::to_string(&paused).unwrap();
-    assert!(
-        body.contains("paused"),
-        "the admin op answers as a task: {body}"
+    assert_eq!(
+        as_command["error"]["data"][1]["metadata"]["agentdReason"], "UNKNOWN_OP",
+        "{as_command}"
     );
+    assert_eq!(status_doc(&addr, OPERATOR)["paused"], false);
 
-    let resumed = SendMessage::command("admin.resume", json!({}))
+    // The operator, through the method: the Task the call created, completed
+    // with what it did.
+    let paused = OperatorCall::new("admin.pause", json!({"reason": "e2e"}))
         .bearer(OPERATOR)
-        .post(&addr);
-    assert!(
-        serde_json::to_string(&resumed).unwrap().contains("running"),
+        .result(&addr);
+    assert!(common::is_task(&paused), "{paused}");
+    assert_eq!(
+        paused["status"]["state"], "TASK_STATE_COMPLETED",
+        "{paused}"
+    );
+    assert_eq!(
+        common::answer_of(&json!({"result": paused}))["state"],
+        "paused"
+    );
+    assert_eq!(status_doc(&addr, OPERATOR)["paused"], true);
+
+    let resumed = OperatorCall::new("admin.resume", json!({}))
+        .bearer(OPERATOR)
+        .result(&addr);
+    assert_eq!(
+        common::answer_of(&json!({"result": resumed}))["state"],
+        "running",
         "and resume brings it back: {resumed}"
     );
 }
@@ -759,18 +852,17 @@ fn task_count(addr: &str, bearer: &str) -> usize {
     v["result"]["tasks"].as_array().map_or(0, Vec::len)
 }
 
-/// The `status` document, read as `bearer` through an activated command.
+/// The `status` document, read as `bearer` through its operator method.
 fn status_doc(addr: &str, bearer: &str) -> Value {
-    let v = SendMessage::command("status", json!({}))
+    OperatorCall::new("status", json!({}))
         .bearer(bearer)
-        .result(addr);
-    v["message"]["parts"][0]["data"].clone()
+        .result(addr)
 }
 
 /// A command is a command only when the request activates the command
 /// extension and the message is marked with it; anything less is refused with
-/// a reason that says which, and nothing it asked for happens — no pause, no
-/// run, no task. A DataPart carrying `agentd.op` is not enough: a client that
+/// a reason that says which, and nothing it asked for happens — no signal,
+/// no run, no task. A DataPart carrying `agentd.op` is not enough: a client that
 /// never negotiated the extension does not drive the instance through it.
 #[test]
 fn a_command_without_activation_is_refused_and_not_run() {
@@ -780,7 +872,7 @@ fn a_command_without_activation_is_refused_and_not_run() {
 
     // Marked on the message, but the header never asked for it.
     for (op, args) in [
-        ("admin.pause", json!({"reason": "unasked"})),
+        ("workflow.signal", json!({"name": "unasked"})),
         ("workflow.run", json!({"workflow": "greet"})),
         ("report.make", json!({"x": 1})),
     ] {
@@ -808,7 +900,8 @@ fn a_command_without_activation_is_refused_and_not_run() {
     }
 
     // Activated by the header, but the message does not say it is a command.
-    let mut unmarked = SendMessage::command("admin.pause", json!({})).params();
+    let mut unmarked =
+        SendMessage::command("workflow.signal", json!({"name": "unmarked"})).params();
     unmarked["message"]
         .as_object_mut()
         .unwrap()
@@ -833,7 +926,7 @@ fn a_command_without_activation_is_refused_and_not_run() {
     // A streaming send is refused the same way, as JSON rather than a frame.
     let streamed = a2a_post(
         &addr,
-        &SendMessage::command("admin.pause", json!({}))
+        &SendMessage::command("workflow.signal", json!({"name": "streamed"}))
             .streaming()
             .body(3),
         &[("Authorization", &auth)],
@@ -849,8 +942,7 @@ fn a_command_without_activation_is_refused_and_not_run() {
         "EXTENSION_NOT_ACTIVATED"
     );
 
-    // Nothing happened: the instance is not paused, and no task was made.
-    assert_eq!(status_doc(&addr, OPERATOR)["paused"], false);
+    // Nothing happened: no task was made.
     assert_eq!(
         task_count(&addr, OPERATOR),
         before,
@@ -858,14 +950,14 @@ fn a_command_without_activation_is_refused_and_not_run() {
     );
 
     // With both, the same command runs.
-    let paused = SendMessage::command("admin.pause", json!({"reason": "asked"}))
+    let signalled = SendMessage::command("workflow.signal", json!({"name": "asked"}))
         .bearer(OPERATOR)
         .result(&addr);
     assert_eq!(
-        paused["task"]["status"]["state"], "TASK_STATE_COMPLETED",
-        "{paused}"
+        signalled["task"]["status"]["state"], "TASK_STATE_COMPLETED",
+        "{signalled}"
     );
-    assert_eq!(status_doc(&addr, OPERATOR)["paused"], true);
+    assert_eq!(task_count(&addr, OPERATOR), before + 1);
 }
 
 /// An argument the op does not take is refused rather than ignored — so a
@@ -919,21 +1011,33 @@ fn an_argument_the_op_does_not_take_is_refused() {
         .post(&taddr);
     assert!(v.get("error").is_none(), "{v}");
 
+    // An operator method's param it does not take, the same: named as the
+    // param it is.
+    let v = OperatorCall::new("admin.pause", json!({"why": "typo"}))
+        .bearer(OPERATOR)
+        .post(&addr);
+    assert_eq!(v["error"]["code"], -32602, "{v}");
+    assert_eq!(
+        v["error"]["data"][1]["metadata"]["agentdReason"], "INVALID_COMMAND_ARGS",
+        "{v}"
+    );
+    assert_eq!(
+        v["error"]["data"][0]["fieldViolations"][0]["field"], "params",
+        "{v}"
+    );
+
     // Every read answers with the document its published schema describes.
-    for op in ["status", "config", "workflow.status", "auth.sessions"] {
-        let v = SendMessage::command(op, json!({}))
+    for op in ["status", "config", "auth.sessions"] {
+        let doc = OperatorCall::new(op, json!({}))
             .bearer(OPERATOR)
             .result(&addr);
-        let doc = &v["message"]["parts"][0]["data"];
         let schema = agentd::runtime::surface::result_schema_of(op).unwrap();
-        agentd::jsonschema::validate(&schema, doc)
+        agentd::jsonschema::validate(&schema, &doc)
             .unwrap_or_else(|e| panic!("{op} answers off its schema: {e:?}\n{doc}"));
     }
-    let v = SendMessage::command("status", json!({}))
-        .bearer(USER)
-        .result(&addr);
+    let doc = status_doc(&addr, USER);
     let schema = agentd::runtime::surface::result_schema_of("status").unwrap();
-    agentd::jsonschema::validate(&schema, &v["message"]["parts"][0]["data"])
+    agentd::jsonschema::validate(&schema, &doc)
         .unwrap_or_else(|e| panic!("a user's status is off its schema: {e:?}"));
 }
 

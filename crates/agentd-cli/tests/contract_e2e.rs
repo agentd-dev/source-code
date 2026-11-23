@@ -117,6 +117,23 @@ fn assert_complete(name: &str, bundle: &Value) {
                 );
             }
         }
+        "operator" => {
+            use agentd::runtime::surface::{operator_method, operator_vocabulary};
+            let methods = bundle["properties"]["method"]["enum"].clone();
+            for op in operator_vocabulary() {
+                let entry = &defs["ops"][op];
+                for key in ["method", "reply", "description", "params", "result"] {
+                    assert!(entry.get(key).is_some(), "operator: {op} has no {key}");
+                }
+                assert_eq!(entry["method"], operator_method(op), "operator: {op}");
+                assert!(
+                    methods
+                        .as_array()
+                        .is_some_and(|m| m.contains(&json!(operator_method(op)))),
+                    "operator: the root names {op}'s method"
+                );
+            }
+        }
         "events" => {
             let kinds: Vec<&str> = FeedKind::ALL.iter().map(|k| k.as_str()).collect();
             for k in &kinds {
@@ -262,13 +279,14 @@ fn every_reachable_feed_kind_and_read_reply_matches_the_published_schema() {
     use std::time::{Duration, Instant};
 
     use agentd::runtime::surface::{
-        EVENTS_EXTENSION, OPS, Reply, TASK_ANNOTATIONS_EXTENSION, static_vocabulary,
+        EVENTS_EXTENSION, OPS, Reply, TASK_ANNOTATIONS_EXTENSION, operator_vocabulary,
     };
     use common::SendMessage;
 
     const OPS_TOKEN: &str = "contract-e2e-operator-token";
     let events = read_json("web/public/a2a/ext/events/schema.json");
     let command = read_json("web/public/a2a/ext/command/schema.json");
+    let operator = read_json("web/public/a2a/ext/operator/schema.json");
     let annotations = read_json("web/public/a2a/ext/task-annotations/schema.json");
 
     struct Daemon(std::process::Child, String, String);
@@ -354,28 +372,39 @@ fn every_reachable_feed_kind_and_read_reply_matches_the_published_schema() {
     };
     wait_for("hello", &|f| f.iter().any(|v| v.get("hello").is_some()));
 
-    // A command whose result is checked against its op's published result:
-    // a read's Message document, or a task's result artifact.
+    // An op whose result is checked against its op's published result —
+    // an operator method's against the operator bundle, a command's against
+    // the command bundle: a read's document, or a task's result artifact.
     let run = |op: &str, args: Value| -> Value {
-        let r = SendMessage::command(op, args)
-            .bearer(OPS_TOKEN)
-            .result(&addr);
+        let on_operator = common::is_operator_op(op);
+        let r = if on_operator {
+            common::OperatorCall::new(op, args)
+                .bearer(OPS_TOKEN)
+                .result(&addr)
+        } else {
+            SendMessage::command(op, args)
+                .bearer(OPS_TOKEN)
+                .result(&addr)
+        };
         let spec = OPS.iter().find(|s| s.name == op).unwrap();
         let doc = match spec.reply {
             Reply::Message => {
-                assert!(r.get("task").is_none(), "{op} made a task: {r}");
-                r["message"]["parts"][0]["data"].clone()
+                assert!(on_operator, "{op}: every read is an operator method");
+                assert!(!common::is_task(&r), "{op} made a task: {r}");
+                r.clone()
             }
             Reply::Task => {
-                let data = &r["task"]["artifacts"][0]["parts"][0]["data"];
+                let task = if common::is_task(&r) { &r } else { &r["task"] };
+                let data = &task["artifacts"][0]["parts"][0]["data"];
                 if data.is_null() {
                     return r;
                 }
                 data.clone()
             }
         };
+        let bundle = if on_operator { &operator } else { &command };
         validate(
-            &at(&command, &format!("/$defs/ops/{op}/result")),
+            &at(bundle, &format!("/$defs/ops/{op}/result")),
             &doc,
             &format!("{op}'s result"),
         );
@@ -431,7 +460,7 @@ fn every_reachable_feed_kind_and_read_reply_matches_the_published_schema() {
     // A read with no object to name here is listed, so a new read op must
     // be given arguments before this passes.
     let mut read = BTreeSet::new();
-    for op in static_vocabulary() {
+    for op in operator_vocabulary() {
         let spec = OPS.iter().find(|s| s.name == op).unwrap();
         if spec.reply != Reply::Message {
             continue;
@@ -440,7 +469,7 @@ fn every_reachable_feed_kind_and_read_reply_matches_the_published_schema() {
             "status" | "config" | "debug.events" | "auth.device.pending" | "auth.sessions" => {
                 json!({})
             }
-            "workflow.status" | "run.get" => json!({"run": run_id}),
+            "run.get" => json!({"run": run_id}),
             "plan.get" | "conversation.get" => json!({"id": "c1"}),
             // Nothing here spawns a subagent; the subagent reads are held
             // to their schemas by the tool schemas they publish verbatim.
@@ -462,7 +491,7 @@ fn every_reachable_feed_kind_and_read_reply_matches_the_published_schema() {
         run(op, args);
         read.insert(op);
     }
-    assert!(read.len() >= 9, "{read:?}");
+    assert!(read.len() >= 8, "{read:?}");
     run(
         "auth.device.approve",
         json!({"user_code": user_code, "as": "contract-device", "scope": "user"}),

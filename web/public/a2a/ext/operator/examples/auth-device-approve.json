@@ -1,0 +1,10 @@
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "agentd.operator/auth.device.approve",
+  "params": {
+    "user_code": "WDJB-MJHT",
+    "as": "alice.laptop",
+    "scope": "user"
+  }
+}

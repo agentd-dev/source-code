@@ -1872,10 +1872,7 @@ mod over_a2a {
 
     /// A read's document, or a task's result data.
     fn doc_of(result: &Value) -> Value {
-        if let Some(doc) = result["message"]["parts"][0].get("data") {
-            return doc.clone();
-        }
-        result["task"]["artifacts"][0]["parts"][0]["data"].clone()
+        common::answer_of(&json!({"result": result}))
     }
 
     fn get_task(addr: &str, bearer: &str, id: &str) -> Value {
@@ -1921,7 +1918,7 @@ mod over_a2a {
         let (a, b) = (wait_calls(&shop, 1), wait_calls(&travel, 1));
         let (a, b) = (&a[0], &b[0]);
         let runs = doc_of(
-            &common::SendMessage::command("workflow.status", json!({}))
+            &common::OperatorCall::new("status", json!({}))
                 .bearer(OPERATOR)
                 .result(&addr),
         );
@@ -2400,7 +2397,7 @@ mod over_a2a {
         let (d, addr) = start_listening(&s, "status", &[]);
         wait_for(&d.log, "joined", |l| joined(l, "shop"));
         let st = doc_of(
-            &common::SendMessage::command("company.status", json!({}))
+            &common::OperatorCall::new("company.status", json!({}))
                 .bearer(OPERATOR)
                 .result(&addr),
         );
@@ -2415,9 +2412,7 @@ mod over_a2a {
         assert_eq!(shop["signed_in"], false, "{st}");
         assert_eq!(shop["servers"][0]["joined"], true, "{st}");
         assert!(shop["rate_limited_until"].is_null(), "{st}");
-        let refused = common::SendMessage::command("company.status", json!({}))
-            .bearer(DANA)
-            .post(&addr);
+        let refused = common::operator_as(&addr, DANA, "company.status", json!({}));
         assert!(refused.get("error").is_some(), "{refused}");
         let starts = |r: &[Value]| -> Vec<Value> {
             r.iter()
@@ -2440,7 +2435,7 @@ mod over_a2a {
         let user = first[0]["assertion"]["sub"].clone();
         let before = f.record().len();
         let reset = doc_of(
-            &common::SendMessage::command("company.user_id.reset", json!({"company": "shop"}))
+            &common::OperatorCall::new("company.user_id.reset", json!({"company": "shop"}))
                 .bearer(OPERATOR)
                 .result(&addr),
         );
@@ -2948,7 +2943,7 @@ mod over_a2a {
         });
         let t = wait_state(&addr, OPERATOR, &task, "TASK_STATE_COMPLETED", &again.log);
         let runs = doc_of(
-            &common::SendMessage::command("workflow.status", json!({}))
+            &common::OperatorCall::new("status", json!({}))
                 .bearer(OPERATOR)
                 .result(&addr),
         );
@@ -3141,10 +3136,9 @@ mod over_a2a {
         let doc: Value =
             serde_json::from_slice(&get(&format!("{origin}/companies/client.json")).body).unwrap();
         assert_eq!(doc["redirect_uris"], json!([callback.clone()]));
-        let started = common::SendMessage::command("company.sign_in", json!({"company": "shop"}))
-            .return_immediately()
+        let started = common::OperatorCall::new("company.sign_in", json!({"company": "shop"}))
             .post_tls(&origin);
-        let task = started["result"]["task"]["id"]
+        let task = started["result"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("{started}"))
             .to_string();
@@ -3431,16 +3425,9 @@ mod over_a2a {
 
     /// What the operator's `payment.allowances` says of `shopping`.
     fn shopping_left(addr: &str) -> Value {
-        let v = common::SendMessage::command("payment.allowances", json!({}))
-            .bearer(OPERATOR)
-            .post(addr);
+        let v = common::operator_as(addr, OPERATOR, "payment.allowances", json!({}));
         let text = v.to_string();
-        let doc = v["result"]["message"]["parts"][0]["data"].clone();
-        let doc = if doc.is_null() {
-            v["result"]["parts"][0]["data"].clone()
-        } else {
-            doc
-        };
+        let doc = v["result"].clone();
         doc["allowances"]
             .as_array()
             .and_then(|l| l.iter().find(|a| a["id"] == "shopping").cloned())

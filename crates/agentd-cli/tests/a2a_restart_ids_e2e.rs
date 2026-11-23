@@ -269,7 +269,7 @@ fn the_config_command_never_echoes_a_credential() {
     );
 
     // The redaction assertion is about the bytes on the wire, not a parsed field.
-    let raw = SendMessage::command("config", json!({}))
+    let raw = common::OperatorCall::new("config", json!({}))
         .post_raw(&addr)
         .body;
     assert!(
@@ -283,8 +283,8 @@ fn the_config_command_never_echoes_a_credential() {
 
     // The view is still the effective configuration, minus the credentials.
     let v: Value = serde_json::from_str(&raw).unwrap_or_else(|_| panic!("non-JSON: {raw:?}"));
-    // A read: the document is the Message's data part.
-    let doc = v["result"]["message"]["parts"][0]["data"].clone();
+    // A read: the document is the method's result.
+    let doc = v["result"].clone();
     assert_eq!(doc["config"]["intelligence"]["token"], "***", "{doc}");
     assert_eq!(
         doc["config"]["intelligence"]["headers"][HEADER_NAME], "***",

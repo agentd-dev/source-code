@@ -1,0 +1,2986 @@
+{
+  "$defs": {
+    "ops": {
+      "admin.cancel": {
+        "description": "Cancel one run by id, whoever started it",
+        "method": "agentd.operator/admin.cancel",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            },
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "cancelled": {
+              "type": "string"
+            },
+            "ok": {
+              "const": true
+            }
+          },
+          "required": [
+            "ok",
+            "cancelled"
+          ],
+          "type": "object"
+        }
+      },
+      "admin.drain": {
+        "description": "Begin a graceful drain, then exit 0",
+        "method": "agentd.operator/admin.drain",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "reason": {
+              "type": "string"
+            },
+            "state": {
+              "const": "draining"
+            }
+          },
+          "required": [
+            "ok",
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        }
+      },
+      "admin.pause": {
+        "description": "Hold the instance, or one run, at a safe boundary",
+        "method": "agentd.operator/admin.pause",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "description": "Why, for the log and the feed",
+              "type": "string"
+            },
+            "run": {
+              "description": "Pause this run; without it, the whole instance",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "ok": {
+                  "const": true
+                },
+                "paused": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ok",
+                "paused"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "ok": {
+                  "const": true
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "state": {
+                  "const": "paused"
+                }
+              },
+              "required": [
+                "ok",
+                "state",
+                "reason"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "admin.resume": {
+        "description": "Clear a prior pause",
+        "method": "agentd.operator/admin.resume",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "description": "Resume this run; without it, the whole instance",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "oneOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "ok": {
+                  "const": true
+                },
+                "resumed": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "ok",
+                "resumed"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "ok": {
+                  "const": true
+                },
+                "state": {
+                  "const": "running"
+                }
+              },
+              "required": [
+                "ok",
+                "state"
+              ],
+              "type": "object"
+            }
+          ]
+        }
+      },
+      "admin.set": {
+        "description": "Set a runtime-settable path (agent.approval, a2a.introspection.enabled) until the next reload",
+        "method": "agentd.operator/admin.set",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "enum": [
+                "agent.approval",
+                "a2a.introspection.enabled"
+              ]
+            },
+            "value": {
+              "description": "What the config file accepts at `path`"
+            }
+          },
+          "required": [
+            "path",
+            "value"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "enum": [
+                "agent.approval",
+                "a2a.introspection.enabled"
+              ]
+            },
+            "value": {
+              "description": "as parsed"
+            }
+          },
+          "required": [
+            "path",
+            "value"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.device.approve": {
+        "description": "Approve a device sign-in {user_code, as, scope?}; every session approved as one name is one principal",
+        "method": "agentd.operator/auth.device.approve",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "as": {
+              "description": "The name the device signs in as: every session approved as one name is one principal",
+              "not": {
+                "enum": [
+                  "operator",
+                  "anonymous",
+                  "unknown",
+                  "launcher",
+                  "runtime",
+                  "system"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+              "type": "string"
+            },
+            "scope": {
+              "enum": [
+                "user",
+                "operator"
+              ]
+            },
+            "user_code": {
+              "description": "The code the device shows",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "user_code",
+            "as"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "approved": {
+              "additionalProperties": false,
+              "properties": {
+                "client_id": {
+                  "type": "string"
+                },
+                "existing": {
+                  "type": "boolean"
+                },
+                "peer": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "principal": {
+                  "type": "string"
+                },
+                "scope": {
+                  "enum": [
+                    "user",
+                    "operator"
+                  ]
+                },
+                "user_code": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "user_code",
+                "client_id",
+                "scope",
+                "peer",
+                "principal",
+                "existing"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "approved"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.device.deny": {
+        "description": "Refuse a pending device sign-in {user_code}, or all of them {all: true}",
+        "method": "agentd.operator/auth.device.deny",
+        "params": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "user_code"
+              ]
+            },
+            {
+              "properties": {
+                "all": {
+                  "const": true
+                }
+              },
+              "required": [
+                "all"
+              ]
+            }
+          ],
+          "properties": {
+            "all": {
+              "type": "boolean"
+            },
+            "user_code": {
+              "description": "The code the device shows",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "denied": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "denied"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.device.pending": {
+        "description": "Device sign-ins waiting for an operator's decision",
+        "method": "agentd.operator/auth.device.pending",
+        "params": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "pending": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "expires_at": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "peer": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "requested_at": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "scope": {
+                    "enum": [
+                      "user",
+                      "operator"
+                    ]
+                  },
+                  "user_code": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "user_code",
+                  "client_id",
+                  "scope",
+                  "peer",
+                  "requested_at",
+                  "expires_at"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "pending"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.sessions": {
+        "description": "The signed-in sessions: kind, name, principal and expiry",
+        "method": "agentd.operator/auth.sessions",
+        "params": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "sessions": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "approved_by": {
+                    "type": "string"
+                  },
+                  "approved_rule": {
+                    "type": "string"
+                  },
+                  "client_id": {
+                    "type": "string"
+                  },
+                  "created_at": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "expires_at": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "idp_proof": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "at": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "idp": {
+                        "type": "string"
+                      },
+                      "iss": {
+                        "type": "string"
+                      },
+                      "sub": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "idp",
+                      "iss",
+                      "sub",
+                      "at"
+                    ],
+                    "type": "object"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "principal": {
+                    "type": "string"
+                  },
+                  "role": {
+                    "type": "string"
+                  },
+                  "sid": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "description": "how the session's principal was established: an approved device's name, an IdP sign-in (a2a.login), or the operator (a launch)",
+                    "enum": [
+                      "device",
+                      "oidc",
+                      "operator"
+                    ]
+                  }
+                },
+                "required": [
+                  "sid",
+                  "kind",
+                  "principal",
+                  "role",
+                  "client_id",
+                  "created_at",
+                  "expires_at",
+                  "approved_by"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "sessions"
+          ],
+          "type": "object"
+        }
+      },
+      "auth.sessions.revoke": {
+        "description": "End one session {sid}, every session of a name {name}, or all {all: true}",
+        "method": "agentd.operator/auth.sessions.revoke",
+        "params": {
+          "additionalProperties": false,
+          "oneOf": [
+            {
+              "required": [
+                "sid"
+              ]
+            },
+            {
+              "required": [
+                "name"
+              ]
+            },
+            {
+              "properties": {
+                "all": {
+                  "const": true
+                }
+              },
+              "required": [
+                "all"
+              ]
+            }
+          ],
+          "properties": {
+            "all": {
+              "type": "boolean"
+            },
+            "name": {
+              "description": "Every session approved as this name",
+              "minLength": 1,
+              "type": "string"
+            },
+            "sid": {
+              "description": "One session",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "revoked": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "revoked"
+          ],
+          "type": "object"
+        }
+      },
+      "company.sign_in": {
+        "description": "Ask the User to sign in at a Company {company, account?, scopes?, new_account?} — to the account `account` labels, the only one held, else `default`: the task is the User's gate, closed when they have signed in on the Company's own page, and says how it ended. The configured User's alone",
+        "method": "agentd.operator/company.sign_in",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "account": {
+              "description": "The label of the User's account at the Company to act with (1 to 32 of a-z, 0-9, _ and -), as company.status lists them; omit it when the User holds one there, or none",
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "company": {
+              "description": "The company entry",
+              "minLength": 1,
+              "type": "string"
+            },
+            "new_account": {
+              "description": "Sign in to another account than the one the label names, in a new Session",
+              "type": "boolean"
+            },
+            "scopes": {
+              "description": "The account scopes to ask for; every scope the entry allows when absent",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "company"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "account": {
+              "description": "the label of the account it signs in to, once known",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "company": {
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "signed_in",
+                "cancelled",
+                "denied",
+                "expired",
+                "account_mismatch",
+                "interrupted"
+              ]
+            },
+            "requested": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "scope": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "signed_in": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "company",
+            "account",
+            "outcome",
+            "signed_in"
+          ],
+          "type": "object"
+        }
+      },
+      "company.sign_out": {
+        "description": "Sign the User out of one account at a Company {company, account?} — the one `account` labels, or the only one held: its Account Token is revoked there and forgotten here, and every other account stays signed in. The configured User's alone",
+        "method": "agentd.operator/company.sign_out",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "account": {
+              "description": "The label of the User's account at the Company to act with (1 to 32 of a-z, 0-9, _ and -), as company.status lists them; omit it when the User holds one there, or none",
+              "maxLength": 32,
+              "minLength": 1,
+              "type": "string"
+            },
+            "company": {
+              "description": "The company entry the User signs out at",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "company"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "account": {
+              "description": "the label of the account signed out of; null when none was held",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "company": {
+              "type": "string"
+            },
+            "revoked": {
+              "description": "the Company revoked it",
+              "type": "boolean"
+            },
+            "signed_out": {
+              "description": "an Account Token was held, and is forgotten",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "company",
+            "account",
+            "signed_out",
+            "revoked"
+          ],
+          "type": "object"
+        }
+      },
+      "company.status": {
+        "description": "Each declared Company as the supervisor knows it now: verified or why not, its domain and issuer, the User's accounts there by label and whether the Session its MCP servers act with is signed in, until when it asked for no requests, and its MCP servers",
+        "method": "agentd.operator/company.status",
+        "params": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "companies": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "accounts": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "account": {
+                          "description": "its label, agentd's own word",
+                          "type": "string"
+                        },
+                        "expires_at": {
+                          "description": "RFC 3339: when its Account Token stops being good, if the Company said",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "kind": {
+                          "description": "how the User signed in: device or direct",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "scope": {
+                          "items": {
+                            "type": "string"
+                          },
+                          "type": "array"
+                        },
+                        "signed_in": {
+                          "description": "whether its Session is signed in, once one is open",
+                          "type": [
+                            "boolean",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "account",
+                        "scope",
+                        "expires_at",
+                        "kind",
+                        "signed_in"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "company": {
+                    "description": "the company entry",
+                    "type": "string"
+                  },
+                  "domain": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "in_flight": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "issuer": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "limit": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "privacy": {
+                    "enum": [
+                      "strict",
+                      "standard"
+                    ]
+                  },
+                  "rate_limited_until": {
+                    "description": "RFC 3339: nothing is sent to the Company before then",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reason": {
+                    "description": "why its documents were refused, as one word, while it is unverified",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "servers": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "joined": {
+                          "type": "boolean"
+                        },
+                        "server": {
+                          "type": "string"
+                        },
+                        "unusable": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "server",
+                        "joined",
+                        "unusable"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
+                  "signed_in": {
+                    "description": "whether the Session its MCP servers act with — the account labelled default, or the only one held, else the signed-out Session — is signed in, once one is open",
+                    "type": [
+                      "boolean",
+                      "null"
+                    ]
+                  },
+                  "state": {
+                    "enum": [
+                      "verified",
+                      "unverified",
+                      "unavailable",
+                      "suspended"
+                    ]
+                  }
+                },
+                "required": [
+                  "company",
+                  "state",
+                  "reason",
+                  "domain",
+                  "issuer",
+                  "privacy",
+                  "signed_in",
+                  "accounts",
+                  "rate_limited_until",
+                  "in_flight",
+                  "limit",
+                  "servers",
+                  "error"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "user": {
+              "description": "The User every Company sees this instance act for",
+              "type": "string"
+            }
+          },
+          "required": [
+            "user",
+            "companies"
+          ],
+          "type": "object"
+        }
+      },
+      "company.user_id.reset": {
+        "description": "Forget the User ID one Company knows the User by {company}, with its Session and MCP connections: the Company sees a new User from the next call on",
+        "method": "agentd.operator/company.user_id.reset",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "description": "The company entry whose User ID is forgotten",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "company"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "company": {
+              "type": "string"
+            },
+            "reset": {
+              "const": true
+            },
+            "started_over": {
+              "description": "the seal key opened none of the store's records: this Company started over with it as a new User, and the others stay unavailable until each is reset",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "company",
+            "reset",
+            "started_over"
+          ],
+          "type": "object"
+        }
+      },
+      "config": {
+        "description": "The effective configuration, credentials redacted",
+        "method": "agentd.operator/config",
+        "params": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "config": {
+              "description": "credentials redacted to their {{secret:…}} references",
+              "type": "object"
+            }
+          },
+          "required": [
+            "config"
+          ],
+          "type": "object"
+        }
+      },
+      "conversation.get": {
+        "description": "One conversation's transcript, message bodies included",
+        "method": "agentd.operator/conversation.get",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "The conversation, as the caller names it",
+              "minLength": 1,
+              "type": "string"
+            },
+            "limit": {
+              "description": "The newest messages to return (default 200, at most 1000)",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "conversation": {
+              "additionalProperties": false,
+              "properties": {
+                "est_tokens": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "id": {
+                  "type": "string"
+                },
+                "kind": true,
+                "messages": {
+                  "items": {
+                    "description": "strings truncated at 4096 bytes"
+                  },
+                  "type": "array"
+                },
+                "plan": true,
+                "principal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "skills": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "summary": true,
+                "task": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "total_messages": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "turns": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "updated": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "version": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "id",
+                "kind",
+                "version",
+                "turns",
+                "est_tokens",
+                "principal",
+                "task",
+                "skills",
+                "plan",
+                "summary",
+                "total_messages",
+                "messages",
+                "updated"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "conversation"
+          ],
+          "type": "object"
+        }
+      },
+      "debug.events": {
+        "description": "A cursor read of the live log ring, across every principal",
+        "method": "agentd.operator/debug.events",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "description": "Lines after this sequence number",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "level": {
+              "description": "Only lines of this level",
+              "type": "string"
+            },
+            "limit": {
+              "description": "At most this many (default 200, at most 500)",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "prefix": {
+              "description": "Only events whose name starts with this",
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "dropped": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "events": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "newest_seq": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "oldest_seq": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "events",
+            "newest_seq",
+            "oldest_seq",
+            "dropped"
+          ],
+          "type": "object"
+        }
+      },
+      "delegation.approve": {
+        "description": "Approve one consent gate {gate, nonce, args_hash}, or several of one shape {gates: [...]}: the calls they hold run. Each bound to its gate's nonce and arguments; the person's alone, through a session whose own IdP sign-in is recent enough — or an operator's where the person's template lists one among its approvers",
+        "method": "agentd.operator/delegation.approve",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "args_hash": {
+              "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+              "type": "string"
+            },
+            "gate": {
+              "description": "The consent gate",
+              "minLength": 1,
+              "type": "string"
+            },
+            "gates": {
+              "description": "Several gates of one shape — the same `shape` in delegation.list — answered together, each bound to its own nonce and argument hash; in place of gate, nonce and args_hash",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "args_hash": {
+                    "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+                    "type": "string"
+                  },
+                  "gate": {
+                    "description": "The consent gate",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "nonce": {
+                    "description": "The gate's nonce, as delegation.list gives it",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "gate",
+                  "nonce"
+                ],
+                "type": "object"
+              },
+              "maxItems": 50,
+              "minItems": 1,
+              "type": "array"
+            },
+            "nonce": {
+              "description": "The gate's nonce, as delegation.list gives it",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": false
+      },
+      "delegation.audit": {
+        "description": "A person's consent records {principal?} from the audit chain, the latest first, as the task's result — each with what the gate showed opened under their personal key, or `unreadable` once they were forgotten; read off the loop. The per-person operator reads their own; any other operator names a principal",
+        "method": "agentd.operator/delegation.audit",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "limit": {
+              "description": "At most this many records, the latest; default 100",
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "principal": {
+              "description": "The principal whose records are read; the caller's own when absent",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": {
+          "properties": {
+            "principal": {
+              "type": "string"
+            },
+            "records": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "principal",
+            "records"
+          ],
+          "type": "object"
+        }
+      },
+      "delegation.deny": {
+        "description": "Deny one consent gate {gate, nonce}, or several of one shape {gates: [...]}: the calls they hold are refused, NOT made; a step-up gate's sign-in is cancelled. The person's alone, as delegation.approve says",
+        "method": "agentd.operator/delegation.deny",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "args_hash": {
+              "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+              "type": "string"
+            },
+            "gate": {
+              "description": "The consent gate",
+              "minLength": 1,
+              "type": "string"
+            },
+            "gates": {
+              "description": "Several gates of one shape — the same `shape` in delegation.list — answered together, each bound to its own nonce and argument hash; in place of gate, nonce and args_hash",
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "args_hash": {
+                    "description": "The hash of the call's canonical arguments, as delegation.list gives it; required to approve",
+                    "type": "string"
+                  },
+                  "gate": {
+                    "description": "The consent gate",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "nonce": {
+                    "description": "The gate's nonce, as delegation.list gives it",
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "gate",
+                  "nonce"
+                ],
+                "type": "object"
+              },
+              "maxItems": 50,
+              "minItems": 1,
+              "type": "array"
+            },
+            "nonce": {
+              "description": "The gate's nonce, as delegation.list gives it",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": false
+      },
+      "delegation.enrol": {
+        "description": "Sign the caller in at an identity provider {idp, grant?} and keep their delegation grant — a per-person operator, an a2a.login session, or a device session whose name a pin or the first binding makes eligible: the task says where to sign in (a display session's start link is its signIn annotation), and how it ended. The caller's own enrolment alone",
+        "method": "agentd.operator/delegation.enrol",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "grant": {
+              "description": "The sign-in grant; the provider's first that its IdP supports when absent",
+              "enum": [
+                "device",
+                "authorization_code"
+              ]
+            },
+            "idp": {
+              "description": "The identity.providers entry to sign in at",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "idp"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": false
+      },
+      "delegation.forget": {
+        "description": "Erase a person {principal}: their grants revoked as delegation.revoke does, then their personal key destroyed — what it sealed in the audit chain, the arguments their consent gates showed, is unreadable from then on, and the chain still verifies",
+        "method": "agentd.operator/delegation.forget",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "principal": {
+              "description": "The principal to erase (operator:<id>)",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "principal"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": false
+      },
+      "delegation.list": {
+        "description": "The delegation grants and the open consent gates — every one to an operator, the caller's own to anyone else; never a secret — each gate with its nonce and argument hash for the person who answers it",
+        "method": "agentd.operator/delegation.list",
+        "params": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "properties": {
+            "gates": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "grants": {
+              "items": {
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "grants",
+            "gates"
+          ],
+          "type": "object"
+        }
+      },
+      "delegation.revoke": {
+        "description": "Revoke the grants {target?} names — a principal, or idp:<name>#<sub> for every grant of that subject; the caller's own when absent: RFC 7009 at the IdP, then the tombstone, the record and every token. An operator revokes anyone's; anyone else their own alone",
+        "method": "agentd.operator/delegation.revoke",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "target": {
+              "description": "A principal (operator:<id>), or idp:<name>#<sub> for every grant of that IdP subject; the caller's own grants when absent. Anyone but an operator revokes their own alone",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": false
+      },
+      "payment.allowances": {
+        "description": "What each spending allowance has left: its currency, its period and when the current one started, its budget, what was spent in it and how many payments were made. Read-only",
+        "method": "agentd.operator/payment.allowances",
+        "params": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "allowances": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "approve_above": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "budget": {
+                    "description": "a decimal in the allowance's currency",
+                    "type": "string"
+                  },
+                  "currency": {
+                    "type": "string"
+                  },
+                  "document": {
+                    "description": "a document's allowance: the document's URI",
+                    "type": "string"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "left": {
+                    "description": "a decimal in the allowance's currency",
+                    "type": "string"
+                  },
+                  "max": {
+                    "description": "a decimal in the allowance's currency",
+                    "type": "string"
+                  },
+                  "payments": {
+                    "type": "integer"
+                  },
+                  "period": {
+                    "enum": [
+                      "day",
+                      "week",
+                      "month",
+                      "quarter",
+                      "year",
+                      "once"
+                    ]
+                  },
+                  "period_end": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "period_start": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "source": {
+                    "description": "the operator's security.payments.allowances, or an instruction document's own allowance (doc:<id>, RFC 0057 §8)",
+                    "enum": [
+                      "operator",
+                      "document"
+                    ]
+                  },
+                  "spent": {
+                    "description": "a decimal in the allowance's currency",
+                    "type": "string"
+                  },
+                  "times": {
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "title": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "id",
+                  "currency",
+                  "period",
+                  "period_start",
+                  "spent",
+                  "budget",
+                  "left",
+                  "max",
+                  "payments"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "allowances"
+          ],
+          "type": "object"
+        }
+      },
+      "plan.get": {
+        "description": "One conversation's current plan and its progress",
+        "method": "agentd.operator/plan.get",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "description": "The conversation, as the caller names it; without it, the root",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "conversation": {
+              "type": "string"
+            },
+            "plan": {
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "progress": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "conversation",
+            "plan",
+            "progress"
+          ],
+          "type": "object"
+        }
+      },
+      "run.get": {
+        "description": "One run with per-step status, timings, errors and output",
+        "method": "agentd.operator/run.get",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "additionalProperties": false,
+              "properties": {
+                "created": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "finished": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "id": {
+                  "type": "string"
+                },
+                "output": true,
+                "principal": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "start": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string"
+                },
+                "steps": {
+                  "additionalProperties": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "attempt": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "error": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "finished": {
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "output": {
+                        "description": "strings truncated at 2048 bytes"
+                      },
+                      "started": {
+                        "minimum": 0,
+                        "type": [
+                          "integer",
+                          "null"
+                        ]
+                      },
+                      "status": true,
+                      "wait": true
+                    },
+                    "required": [
+                      "status",
+                      "attempt",
+                      "started",
+                      "finished",
+                      "error",
+                      "wait",
+                      "output"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "object"
+                },
+                "task": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tokens": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "trace_id": {
+                  "description": "a W3C trace id, 32 lowercase hex digits",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "updated": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "vars": {
+                  "type": "object"
+                },
+                "workflow": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "workflow",
+                "status",
+                "start",
+                "steps",
+                "tokens",
+                "created",
+                "updated",
+                "finished",
+                "output",
+                "error",
+                "task",
+                "principal",
+                "trace_id",
+                "vars"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "type": "object"
+        }
+      },
+      "status": {
+        "description": "Liveness and a snapshot of this instance, as the caller may see it: its runs, conversations and activity; an operator sees everything",
+        "method": "agentd.operator/status",
+        "params": {
+          "additionalProperties": false,
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "properties": {
+            "activity": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "ctx": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "type": "string"
+                  },
+                  "round": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "started_ms": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "task": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "tokens_in": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "tokens_out": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "tool": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "trace_id": {
+                    "description": "a W3C trace id, 32 lowercase hex digits",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "updated_ms": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "task",
+                  "ctx",
+                  "phase",
+                  "tool",
+                  "round",
+                  "tokens_in",
+                  "tokens_out",
+                  "started_ms",
+                  "updated_ms",
+                  "trace_id"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "conversations": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "contextId": {
+                    "type": "string"
+                  },
+                  "est_tokens": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  },
+                  "messages": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "plan": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "principal": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "skills": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "turns": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "updated": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "version": {
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "id",
+                  "contextId",
+                  "kind",
+                  "version",
+                  "messages",
+                  "est_tokens",
+                  "turns",
+                  "principal",
+                  "skills",
+                  "plan",
+                  "updated"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "draining": {
+              "type": "boolean"
+            },
+            "instance": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "org": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "self",
+                      "template",
+                      "peer"
+                    ]
+                  },
+                  "name": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "reports_to": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "title": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "name",
+                  "kind",
+                  "title",
+                  "reports_to"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "paused": {
+              "type": "boolean"
+            },
+            "runs": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "created": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "error": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "finished": {
+                    "minimum": 0,
+                    "type": [
+                      "integer",
+                      "null"
+                    ]
+                  },
+                  "id": {
+                    "type": "string"
+                  },
+                  "output": true,
+                  "principal": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "start": {
+                    "type": "string"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "steps": {
+                    "additionalProperties": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "type": "object"
+                  },
+                  "task": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "tokens": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "trace_id": {
+                    "description": "a W3C trace id, 32 lowercase hex digits",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "updated": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "workflow": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "id",
+                  "workflow",
+                  "status",
+                  "start",
+                  "steps",
+                  "tokens",
+                  "created",
+                  "updated",
+                  "finished",
+                  "output",
+                  "error",
+                  "task",
+                  "principal",
+                  "trace_id"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            },
+            "skill_prefix": {
+              "type": "string"
+            },
+            "skills": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "uptime_ms": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "values": {
+              "type": "object"
+            },
+            "version": {
+              "type": "string"
+            },
+            "workflows": {
+              "items": {
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name"
+                ],
+                "type": "object"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "instance",
+            "uptime_ms",
+            "draining",
+            "paused",
+            "model",
+            "version",
+            "skills",
+            "skill_prefix",
+            "values",
+            "workflows",
+            "runs",
+            "conversations",
+            "activity"
+          ],
+          "type": "object"
+        }
+      },
+      "subagent.get": {
+        "description": "One subagent's instruction, attempts, result and error",
+        "method": "agentd.operator/subagent.get",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle"
+          ],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "additionalProperties": false,
+          "properties": {
+            "subagent": {
+              "additionalProperties": false,
+              "properties": {
+                "attempt": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "created": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "handle": {
+                  "type": "string"
+                },
+                "instruction": true,
+                "mode": true,
+                "node": {
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "reports_to": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "requested_by": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "result": true,
+                "status": true,
+                "template": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tier": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "tokens": {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "updated": {
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "handle",
+                "mode",
+                "status",
+                "template",
+                "tier",
+                "reports_to",
+                "attempt",
+                "tokens",
+                "instruction",
+                "result",
+                "error",
+                "requested_by",
+                "created",
+                "updated",
+                "node"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "subagent"
+          ],
+          "type": "object"
+        }
+      },
+      "subagent.log": {
+        "description": "The last lines of one subagent's log {handle, lines?, after?} and a cursor to tail it with: an instance child's own log file, a flat worker's lines from this instance's log ring. Read-only",
+        "method": "agentd.operator/subagent.log",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "after": {
+              "description": "The cursor a previous read returned: only lines written since",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            },
+            "lines": {
+              "default": 200,
+              "description": "How many of the newest lines (at most 1000)",
+              "maximum": 1000,
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "handle"
+          ],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "properties": {
+            "cursor": {
+              "description": "Pass as `after` to read only what comes next",
+              "type": "integer"
+            },
+            "handle": {
+              "type": "string"
+            },
+            "lines": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "note": {
+              "description": "Why there are no lines to read, when there are none",
+              "type": "string"
+            },
+            "skipped": {
+              "description": "Older lines since the cursor were left out (the byte cap or the line count)",
+              "type": "boolean"
+            },
+            "source": {
+              "description": "file: the instance child's own log; ring: this instance's log ring",
+              "enum": [
+                "file",
+                "ring"
+              ]
+            }
+          },
+          "required": [
+            "handle",
+            "source",
+            "lines",
+            "cursor"
+          ],
+          "type": "object"
+        }
+      },
+      "subagent.status": {
+        "description": "The status of one subagent, and its result once it has one",
+        "method": "agentd.operator/subagent.status",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "handle": {
+              "description": "The subagent handle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle"
+          ],
+          "type": "object"
+        },
+        "reply": "message",
+        "result": {
+          "properties": {
+            "error": {
+              "type": "string"
+            },
+            "handle": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "reply": {
+              "description": "An instance child's answer to the latest subagent.send whose answer it has; a later send's replaces an earlier one's, never the other way"
+            },
+            "reply_to": {
+              "description": "Which send `reply` answers: the id that send's answer named to its caller — the A2A task of a subagent.send command, else the tool's message_id",
+              "type": "string"
+            },
+            "result": {},
+            "status": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "handle",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "workflow.cancel": {
+        "description": "Cancel one run by id",
+        "method": "agentd.operator/workflow.cancel",
+        "params": {
+          "additionalProperties": false,
+          "properties": {
+            "run": {
+              "description": "The run id",
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "run"
+          ],
+          "type": "object"
+        },
+        "reply": "task",
+        "result": false
+      }
+    }
+  },
+  "$id": "https://agentd.dev/a2a/ext/operator/schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/status"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/status/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/config"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/config/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/workflow.cancel"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/workflow.cancel/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/subagent.status"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/subagent.status/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/subagent.log"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/subagent.log/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/plan.get"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/plan.get/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/conversation.get"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/conversation.get/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/run.get"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/run.get/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/subagent.get"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/subagent.get/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/debug.events"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/debug.events/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/admin.drain"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/admin.drain/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/admin.pause"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/admin.pause/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/admin.resume"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/admin.resume/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/admin.cancel"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/admin.cancel/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/admin.set"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/admin.set/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/auth.device.pending"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/auth.device.pending/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/auth.device.approve"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/auth.device.approve/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/auth.device.deny"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/auth.device.deny/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/auth.sessions"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/auth.sessions/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/auth.sessions.revoke"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/auth.sessions.revoke/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/payment.allowances"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/payment.allowances/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/company.status"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/company.status/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/company.user_id.reset"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/company.user_id.reset/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/company.sign_in"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/company.sign_in/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/company.sign_out"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/company.sign_out/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/delegation.enrol"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/delegation.enrol/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/delegation.list"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/delegation.list/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/delegation.approve"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/delegation.approve/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/delegation.deny"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/delegation.deny/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/delegation.revoke"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/delegation.revoke/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/delegation.forget"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/delegation.forget/params"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "agentd.operator/delegation.audit"
+          }
+        },
+        "required": [
+          "method"
+        ]
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/ops/delegation.audit/params"
+          }
+        }
+      }
+    }
+  ],
+  "description": "A call of one of the operator extension's methods, agentd.operator/<op>: the JSON-RPC request, its params held to the method's. $defs/ops/<op> gives each op's method, its reply kind — message: the JSON-RPC result is the document; task: the result is the A2A Task the call created, as GetTask answers — its params and its result: for a message method the document, for a task method the data of the result artifact its task completes with (false: none).",
+  "properties": {
+    "id": {
+      "type": [
+        "string",
+        "integer"
+      ]
+    },
+    "jsonrpc": {
+      "const": "2.0"
+    },
+    "method": {
+      "enum": [
+        "agentd.operator/status",
+        "agentd.operator/config",
+        "agentd.operator/workflow.cancel",
+        "agentd.operator/subagent.status",
+        "agentd.operator/subagent.log",
+        "agentd.operator/plan.get",
+        "agentd.operator/conversation.get",
+        "agentd.operator/run.get",
+        "agentd.operator/subagent.get",
+        "agentd.operator/debug.events",
+        "agentd.operator/admin.drain",
+        "agentd.operator/admin.pause",
+        "agentd.operator/admin.resume",
+        "agentd.operator/admin.cancel",
+        "agentd.operator/admin.set",
+        "agentd.operator/auth.device.pending",
+        "agentd.operator/auth.device.approve",
+        "agentd.operator/auth.device.deny",
+        "agentd.operator/auth.sessions",
+        "agentd.operator/auth.sessions.revoke",
+        "agentd.operator/payment.allowances",
+        "agentd.operator/company.status",
+        "agentd.operator/company.user_id.reset",
+        "agentd.operator/company.sign_in",
+        "agentd.operator/company.sign_out",
+        "agentd.operator/delegation.enrol",
+        "agentd.operator/delegation.list",
+        "agentd.operator/delegation.approve",
+        "agentd.operator/delegation.deny",
+        "agentd.operator/delegation.revoke",
+        "agentd.operator/delegation.forget",
+        "agentd.operator/delegation.audit"
+      ]
+    },
+    "params": {
+      "type": "object"
+    }
+  },
+  "required": [
+    "jsonrpc",
+    "method"
+  ],
+  "title": "agentd operator",
+  "type": "object"
+}

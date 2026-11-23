@@ -418,11 +418,8 @@ fn listed_in(addr: &str, bearer: &str, ctx: &str) -> Vec<String> {
 /// The runtime's key for the conversation `bearer` calls `ctx`, as its own
 /// `status` lists it.
 fn conversation_key(addr: &str, bearer: &str, ctx: &str) -> String {
-    let v = SendMessage::command("status", json!({}))
-        .bearer(bearer)
-        .return_immediately()
-        .post(addr);
-    v["result"]["message"]["parts"][0]["data"]["conversations"]
+    let v = common::operator_as(addr, bearer, "status", json!({}));
+    v["result"]["conversations"]
         .as_array()
         .unwrap_or_else(|| panic!("status lists conversations: {v}"))
         .iter()

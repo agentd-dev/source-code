@@ -21,6 +21,7 @@ import {
   COMMAND_EXTENSION,
   EVENTS_EXTENSION,
   INTROSPECTION_OPS,
+  OPERATOR_EXTENSION,
   SLASH_OPS,
   TASK_ANNOTATIONS_EXTENSION,
   UNIX_BINDING,
@@ -29,13 +30,17 @@ import { ClientError, RpcError } from '../dist/client/types.js';
 import { classify } from '../dist/client/errors.js';
 import { startFakeA2a } from './fake-a2a.mjs';
 
-// The command op vocabulary a public card publishes: every op an agentd
-// can serve, the same for every caller (the daemon's `static_vocabulary()`).
+// The command op vocabulary a public card publishes: every command op an
+// agentd can serve, the same for every caller (the daemon's
+// `static_vocabulary()`) — and the operator one, every operator method's op
+// (`operator_vocabulary()`).
 const STATIC_OPS = [
+  { op: 'workflow.run', reply: 'task' },
+  { op: 'workflow.signal', reply: 'task' },
+];
+const STATIC_METHODS = [
   { op: 'status', reply: 'message' },
   { op: 'config', reply: 'message' },
-  { op: 'workflow.status', reply: 'message' },
-  { op: 'workflow.run', reply: 'task' },
   { op: 'admin.drain', reply: 'task' },
   { op: 'admin.set', reply: 'task' },
   { op: 'conversation.get', reply: 'message' },
@@ -356,6 +361,7 @@ test('capabilities come from the card', async (t) => {
     extendedAgentCard: true,
     extensions: [
       { uri: COMMAND_EXTENSION, params: { dataPartKey: COMMAND_DATA_KEY, ops: STATIC_OPS } },
+      { uri: OPERATOR_EXTENSION, params: { methodPrefix: 'agentd.operator/', ops: STATIC_METHODS } },
       { uri: EVENTS_EXTENSION, params: { method: 'agentd.events/SubscribeToEvents' } },
       { uri: TASK_ANNOTATIONS_EXTENSION, params: {} },
     ],
@@ -374,8 +380,14 @@ test('capabilities come from the card', async (t) => {
         {
           uri: COMMAND_EXTENSION,
           params: {
-            ops: [{ op: 'status', reply: 'message' }, { op: 'debug.events', reply: 'message' }],
+            ops: [{ op: 'workflow.run', reply: 'task' }],
             commands: [{ op: 'ship', workflow: 'deploy' }],
+          },
+        },
+        {
+          uri: OPERATOR_EXTENSION,
+          params: {
+            ops: [{ op: 'status', reply: 'message' }, { op: 'debug.events', reply: 'message' }],
             settable: ['agent.approval'],
           },
         },
@@ -384,6 +396,7 @@ test('capabilities come from the card', async (t) => {
     },
   };
   const statics = new Set(STATIC_OPS.map((o) => o.op));
+  const staticMethods = new Set(STATIC_METHODS.map((o) => o.op));
 
   // No credential: the extended card is never asked for (it could only 401),
   // and the ops are the public static vocabulary.
@@ -391,6 +404,7 @@ test('capabilities come from the card', async (t) => {
   assert.equal(f.rpcCalls('GetExtendedAgentCard').length, 0);
   assert.equal(anon.caps.extendedCard, false);
   assert.deepEqual(anon.caps.command.ops, statics);
+  assert.deepEqual(anon.caps.operator.ops, staticMethods);
   assert.equal(anon.caps.introspection, null, 'the static list cannot say whether introspection is on — not "off"');
   assert.equal(anon.caps.authRequired, true);
   assert.deepEqual(anon.caps.workflows, []);
@@ -409,9 +423,10 @@ test('capabilities come from the card', async (t) => {
   assert.equal(ext[0].headers.authorization, 'Bearer tok');
   assert.equal(ext[0].headers['a2a-version'], '1.0');
   assert.equal(signed.caps.extendedCard, true);
-  assert.deepEqual(signed.caps.command.ops, new Set(['status', 'debug.events']));
+  assert.deepEqual(signed.caps.command.ops, new Set(['workflow.run']));
   assert.deepEqual(signed.caps.command.commands, [{ op: 'ship', workflow: 'deploy' }]);
-  assert.deepEqual(signed.caps.command.settable, ['agent.approval']);
+  assert.deepEqual(signed.caps.operator.ops, new Set(['status', 'debug.events']));
+  assert.deepEqual(signed.caps.operator.settable, ['agent.approval']);
   assert.deepEqual(signed.caps.events, { ring: 4096, kinds: ['task', 'run'] });
   assert.equal(signed.caps.annotations, false, 'the extended card governs: it does not declare annotations');
   assert.equal(signed.caps.introspection, true);
@@ -432,6 +447,7 @@ test('capabilities come from the card', async (t) => {
   // --no-extensions: core A2A only.
   const core = await openSession(f.url, { credential: { token: 'tok' }, noExtensions: true, cache: new CardCache() });
   assert.equal(core.caps.command, null);
+  assert.equal(core.caps.operator, null);
   assert.equal(core.caps.events, null);
   assert.equal(core.caps.annotations, false);
   assert.equal(core.caps.introspection, false);
@@ -447,7 +463,7 @@ test('capabilities come from the card', async (t) => {
   const narrowed = f.extendedCard;
   f.extendedCard = {
     ...narrowed,
-    capabilities: { ...narrowed.capabilities, extensions: [{ uri: COMMAND_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } }] },
+    capabilities: { ...narrowed.capabilities, extensions: [{ uri: OPERATOR_EXTENSION, params: { ops: [{ op: 'status', reply: 'message' }] } }] },
   };
   const off = await openSession(f.url, { credential: { token: 'tok' }, cache: new CardCache() });
   assert.equal(off.caps.introspection, false);
@@ -507,7 +523,7 @@ test('capabilities come from the card', async (t) => {
 test('a2a.ts messages', async (t) => {
   // The vocabulary: three URIs under one module, and no agentd-owned name
   // carries a version.
-  assert.deepEqual([...CLIENT_EXTENSIONS], [COMMAND_EXTENSION, EVENTS_EXTENSION, TASK_ANNOTATIONS_EXTENSION]);
+  assert.deepEqual([...CLIENT_EXTENSIONS], [COMMAND_EXTENSION, OPERATOR_EXTENSION, EVENTS_EXTENSION, TASK_ANNOTATIONS_EXTENSION]);
   for (const uri of [...CLIENT_EXTENSIONS, UNIX_BINDING]) assert.doesNotMatch(uri, /\/v\d+$/);
   assert.equal(SLASH_OPS.set, 'admin.set');
   assert.ok(INTROSPECTION_OPS.every((op) => !Object.values(SLASH_OPS).includes(op)));

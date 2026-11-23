@@ -2,8 +2,8 @@
 //! `agentd --login idp:<name>`, `--delegation-list`, `--delegation-approve
 //! <gate>`, `--delegation-deny <gate>`, `--delegation-revoke <target>`,
 //! `--delegation-forget <principal>` and `--delegation-audit` (RFC 0044):
-//! thin clients of the running daemon. Each sends an operator
-//! op over the daemon's unix A2A listener — whose peer the kernel holds to
+//! thin clients of the running daemon. Each calls an operator method
+//! (`agentd.operator/delegation.*`) over the daemon's unix A2A listener — whose peer the kernel holds to
 //! the daemon's own uid, or root, and which names the per-person operator by
 //! that uid — prints what the daemon says, and, for a sign-in, follows its
 //! task to the end. The sign-in itself happens in the daemon, where every
@@ -24,6 +24,7 @@ use crate::config::A2aEndpoint;
 use crate::config::settings::Settings;
 use crate::config::settings::delegation as cfg;
 use crate::mcp::a2a_client::{self, PeerAuth};
+use crate::runtime::surface::{OPERATOR_EXTENSION, operator_method};
 
 /// Why a command did not end as asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,30 +56,18 @@ fn daemon(settings: &Settings, what: &str) -> Result<A2aEndpoint, String> {
     Ok(A2aEndpoint::Https(format!("unix://{path}")))
 }
 
-/// Send `op` with `args`: the daemon's answer.
+/// Call the operator method of `op` with `args`: its result — a read's
+/// document, or the Task work started.
 fn send(endpoint: &A2aEndpoint, op: &str, args: Value, deadline: Instant) -> Result<Value, String> {
-    let mut command = json!({"op": op});
-    if let (Value::Object(c), Value::Object(a)) = (&mut command, args) {
-        c.extend(a);
-    }
-    let id = crate::sec::random::b64url_token(16)
-        .map_err(|e| format!("no OS randomness for a message id: {e}"))?;
-    let params = crate::a2a::peer::send_message_params_cmd(
-        "",
-        Some(&command),
-        None,
-        &format!("delegation-{id}"),
-        None,
-        true,
-    );
-    a2a_client::call(
+    a2a_client::call_extension(
         endpoint,
         PeerAuth::default(),
-        "SendMessage",
-        params,
+        OPERATOR_EXTENSION,
+        &operator_method(op),
+        args,
         deadline,
     )
-    .map_err(|e| format!("no daemon answered on its A2A listener ({e})"))
+    .map_err(|e| format!("the daemon did not answer {op} on its A2A listener ({e})"))
 }
 
 /// What a task's status message says.
@@ -92,7 +81,7 @@ fn status_text(task: &Value) -> String {
         .join("\n")
 }
 
-/// Follow the task `sent` answered with to its end, writing each thing it
+/// Follow the task a method answered with (`sent`) to its end, writing each thing it
 /// says.
 fn follow(endpoint: &A2aEndpoint, sent: Value, out: &mut dyn Write) -> Result<String, String> {
     follow_task(endpoint, sent, out).map(|(said, _)| said)
@@ -105,13 +94,10 @@ fn follow_task(
     out: &mut dyn Write,
 ) -> Result<(String, Value), String> {
     let deadline = Instant::now() + FOLLOW_FOR;
-    if let Some(err) = sent.get("_error").or_else(|| sent.get("error")) {
-        return Err(err.to_string());
-    }
-    let mut task = sent["task"].clone();
+    let mut task = sent;
     let id = task["id"].as_str().unwrap_or_default().to_string();
     if id.is_empty() {
-        return Err(format!("the daemon answered no task: {sent}"));
+        return Err(format!("the daemon answered no task: {task}"));
     }
     let mut said = String::new();
     loop {
@@ -146,10 +132,9 @@ fn follow_task(
     }
 }
 
-/// The document a Message-reply op answered with.
+/// The document a read's method answered with.
 fn doc_of(sent: &Value) -> Result<Value, String> {
-    sent["message"]["parts"][0]["data"]
-        .as_object()
+    sent.as_object()
         .map(|d| Value::Object(d.clone()))
         .ok_or_else(|| format!("the daemon answered no document: {sent}"))
 }

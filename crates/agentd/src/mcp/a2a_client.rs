@@ -100,6 +100,12 @@
 //! refuses. That bridge is deleted when `a2a-pb` releases 90e2876
 //! ([`crate::a2a::sdk_gaps`]); every other request goes through the SDK,
 //! whose command arguments go out as doubles until then.
+//!
+//! An extension method: an agentd's operator methods (`agentd.operator/<op>`)
+//! are no method of the core protocol, and the SDK's client calls only those,
+//! so [`call_extension`] sends one through [`framed`] too — what a thin client
+//! of the daemon on this host (`agentd --login company:`, `--delegation-*`)
+//! asks with.
 
 #[cfg(feature = "x402")]
 mod paying;
@@ -537,6 +543,33 @@ pub fn call(
     conn.call(method, params, deadline)
 }
 
+/// One call of the extension method `method` — `agentd.operator/<op>` —
+/// with `params` to the agentd at `endpoint`, activating `extension`, the
+/// URI that declares it: the JSON-RPC `result`, or why there is none. What a
+/// thin client of a daemon on this host calls an operator op with
+/// (`agentd --login company:<name>`, `agentd --delegation-list`).
+///
+/// The SDK's client has no call for a method an extension declares, so this
+/// one goes through agentd's one-request sender ([`framed`]): the request,
+/// its response, nothing else — no card read, no stream, no redirect.
+pub fn call_extension(
+    endpoint: &A2aEndpoint,
+    auth: PeerAuth,
+    extension: &str,
+    method: &str,
+    params: Value,
+    deadline: Instant,
+) -> Result<Value, String> {
+    let ep = HttpEp::of(endpoint)?;
+    let mut headers = vec![("A2A-Extensions".to_string(), extension.to_string())];
+    if let Some(t) = &auth.trace {
+        headers.extend(t.headers());
+    }
+    headers.extend(auth.headers.iter().cloned());
+    framed::to_peer(&ep, &auth, &headers, method, params, deadline)
+        .map_err(framed::Failure::into_message)
+}
+
 /// How a streaming attempt resolved: a terminal outcome; a task id whose
 /// terminal state must be RECOVERED over unary `GetTask` (a stream that broke,
 /// went quiet or ran into the deadline after the run had started, or stopped
@@ -679,11 +712,9 @@ struct HttpEp {
     /// interfaces are matched against, and where a TCP peer is dialled.
     url: String,
     host: String,
-    /// The TCP port and request path the payment request (`framed`) is
-    /// posted to; the SDK's transport takes `url` whole.
-    #[cfg_attr(not(feature = "x402"), allow(dead_code))]
+    /// The TCP port and request path a framed request ([`framed`]: a
+    /// payment, an extension method) is posted to; the SDK takes `url` whole.
     port: u16,
-    #[cfg_attr(not(feature = "x402"), allow(dead_code))]
     path: String,
     host_header: String,
     tls: bool,

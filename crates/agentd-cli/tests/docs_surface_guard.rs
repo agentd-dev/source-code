@@ -8,7 +8,7 @@
 //! the tables the listener, the card and the launcher are built from:
 //!
 //! - a JSON-RPC method a page names is one of the specification's eleven
-//!   ([`SpecMethod::ALL`]) or an extension method ([`EXTENSION_METHODS`]) —
+//!   ([`SpecMethod::ALL`]) or an extension method ([`extension_methods`]) —
 //!   MCP's own, read from the mcp crate, aside;
 //! - an `https://agentd.dev/a2a/…` or `…/oauth/grant-type/…` URI is one
 //!   agentd declares — an extension, the unix binding, the launch grant — or a
@@ -26,7 +26,7 @@
 use agentd::engine::model::kind_info;
 use agentd::runtime::surface::auth::LOGIN_GRANT_TYPE;
 use agentd::runtime::surface::launch::{LAUNCH_CONTRACT, LAUNCH_GRANT_TYPE};
-use agentd::runtime::surface::{EXTENSION_METHODS, Ext, SpecMethod, UNIX_BINDING};
+use agentd::runtime::surface::{Ext, SpecMethod, UNIX_BINDING, extension_methods};
 use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
@@ -124,7 +124,7 @@ fn answered() -> Vec<&'static str> {
     SpecMethod::ALL
         .iter()
         .map(|m| m.name())
-        .chain(EXTENSION_METHODS.iter().map(|(m, ..)| *m))
+        .chain(extension_methods().iter().map(|(m, ..)| *m))
         .collect()
 }
 
@@ -257,10 +257,13 @@ fn method_names(line: &str) -> Vec<String> {
         if ns.is_empty() || ns == "dev" || !tail[ns.len()..].starts_with('/') {
             continue;
         }
+        // An operator method's op is dotted (`agentd.operator/admin.drain`);
+        // a sentence's full stop after one is not part of it.
         let method: String = tail[ns.len() + 1..]
             .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
             .collect();
+        let method = method.trim_end_matches('.');
         if !method.is_empty() {
             out.push(format!("agentd.{ns}/{method}"));
         }
@@ -712,6 +715,10 @@ fn the_matchers_find_each_shape_and_nothing_else() {
         (r#"  "method": "agentd.feed/Watch","#, "agentd.feed/Watch"),
         ("const m = { method: 'ListEverything' };", "ListEverything"),
         ("the agentd.interface/Pair method", "agentd.interface/Pair"),
+        (
+            "call agentd.operator/admin.drainx.",
+            "agentd.operator/admin.drainx",
+        ),
         (r#"{"method":"message/send","params":{}}"#, "message/send"),
         (r#"  "method": "tasks/resubscribe","#, "tasks/resubscribe"),
         (

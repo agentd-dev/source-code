@@ -293,11 +293,11 @@ pub fn send_text(addr: &str, id: i64, text: &str, return_immediately: bool) -> V
 /// Run the command `op` the way a client that read the card would: the command
 /// extension's URI is looked up on the card, the message is marked with it, and
 /// the request activates it. Returns the envelope.
-pub fn send_command(addr: &str, id: i64, op: &str) -> Value {
+pub fn send_command(addr: &str, id: i64, op: &str, args: &Value) -> Value {
     let uri = command_uri(&get_card(addr));
     let resp = post(
         addr,
-        &rpc_body(id, "SendMessage", command_params(&uri, op)),
+        &rpc_body(id, "SendMessage", command_params(&uri, op, args)),
         &[("A2A-Extensions", &uri)],
     );
     serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
@@ -438,14 +438,19 @@ pub fn call_operator(addr: &str, id: i64, op: &str, args: &Value) -> Value {
     serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
 }
 
-/// `SendMessage` params for the command `op`, marked with the extension `uri`.
-fn command_params(uri: &str, op: &str) -> Value {
+/// `SendMessage` params for the command `op` with `args`, marked with the
+/// extension `uri`.
+fn command_params(uri: &str, op: &str, args: &Value) -> Value {
+    let mut body = json!({"op": op});
+    if let (Some(b), Some(a)) = (body.as_object_mut(), args.as_object()) {
+        b.extend(a.clone());
+    }
     json!({
         "message": {
             "role": "ROLE_USER",
             "messageId": message_id(),
             "extensions": [uri],
-            "parts": [{"data": {"agentd": {"op": op}}}],
+            "parts": [{"data": {"agentd": body}}],
         },
         "configuration": {"returnImmediately": false},
     })
@@ -455,9 +460,16 @@ fn command_params(uri: &str, op: &str) -> Value {
 /// says whether the `A2A-Extensions` header names the extension, `mark` whether
 /// the message lists it. A client that read the card does both; the checks
 /// that prove each one is REQUIRED leave it out. Returns the envelope.
-pub fn send_command_dressed(addr: &str, id: i64, op: &str, activate: bool, mark: bool) -> Value {
+pub fn send_command_dressed(
+    addr: &str,
+    id: i64,
+    op: &str,
+    args: &Value,
+    activate: bool,
+    mark: bool,
+) -> Value {
     let uri = command_uri(&get_card(addr));
-    let mut params = command_params(&uri, op);
+    let mut params = command_params(&uri, op, args);
     if !mark {
         params["message"]
             .as_object_mut()
@@ -476,11 +488,17 @@ pub fn send_command_dressed(addr: &str, id: i64, op: &str, activate: bool, mark:
 /// Send the command `op`, marked, with `activation` as the whole
 /// `A2A-Extensions` value — for a check that activates another extension
 /// beside the command one. Returns the envelope.
-pub fn send_command_activating(addr: &str, id: i64, op: &str, activation: &str) -> Value {
+pub fn send_command_activating(
+    addr: &str,
+    id: i64,
+    op: &str,
+    args: &Value,
+    activation: &str,
+) -> Value {
     let uri = command_uri(&get_card(addr));
     let resp = post(
         addr,
-        &rpc_body(id, "SendMessage", command_params(&uri, op)),
+        &rpc_body(id, "SendMessage", command_params(&uri, op, args)),
         &[("A2A-Extensions", activation)],
     );
     serde_json::from_str(&resp).unwrap_or_else(|_| panic!("non-JSON A2A response: {resp:?}"))
@@ -488,11 +506,11 @@ pub fn send_command_activating(addr: &str, id: i64, op: &str, activation: &str) 
 
 /// Stream the command `op` (`SendStreamingMessage`), dressed as a client that
 /// read the card; the status, the headers and the frames.
-pub fn stream_command(addr: &str, id: i64, op: &str) -> (u16, Headers, Vec<Frame>) {
+pub fn stream_command(addr: &str, id: i64, op: &str, args: &Value) -> (u16, Headers, Vec<Frame>) {
     let uri = command_uri(&get_card(addr));
     stream(
         addr,
-        &rpc_body(id, "SendStreamingMessage", command_params(&uri, op)),
+        &rpc_body(id, "SendStreamingMessage", command_params(&uri, op, args)),
         &[("A2A-Extensions", &uri)],
     )
 }
@@ -681,7 +699,7 @@ mod tests {
     /// command carries the extension it was sent under.
     #[test]
     fn messages_are_spec_shaped_and_commands_are_marked() {
-        let c = command_params("urn:x", "status");
+        let c = command_params("urn:x", "workflow.signal", &json!({"name": "go"}));
         assert_eq!(c["message"]["role"], "ROLE_USER", "{c}");
         assert_eq!(c["message"]["extensions"], json!(["urn:x"]), "{c}");
         assert_eq!(c["configuration"]["returnImmediately"], false, "{c}");

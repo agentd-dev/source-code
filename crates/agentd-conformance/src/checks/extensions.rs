@@ -105,14 +105,28 @@ fn command_requires_activation(h: &Harness) -> Outcome {
         (false, true, "EXTENSION_NOT_ACTIVATED"),
         (true, false, "EXTENSION_NOT_MARKED"),
     ] {
-        let env = send_command_dressed(addr, 1, "workflow.signal", activate, mark);
+        let env = send_command_dressed(
+            addr,
+            1,
+            "workflow.signal",
+            &json!({"name": "conformance-probe"}),
+            activate,
+            mark,
+        );
         if env["error"]["code"] != -32602 || reason(&env) != Some(want) {
             return Outcome::fail(format!(
                 "a command (activated: {activate}, marked: {mark}) should be -32602 {want}: {env}"
             ));
         }
     }
-    let bare = send_command_dressed(addr, 2, "workflow.signal", false, false);
+    let bare = send_command_dressed(
+        addr,
+        2,
+        "workflow.signal",
+        &json!({"name": "conformance-probe"}),
+        false,
+        false,
+    );
     if bare["error"]["code"] != -32602 {
         return Outcome::fail(format!(
             "a command neither activated nor marked should be -32602: {bare}"
@@ -271,7 +285,12 @@ fn results_are_spec_shaped(h: &Harness) -> Outcome {
         &[],
     );
     let turn: Value = serde_json::from_str(&turn).unwrap_or(Value::Null);
-    let task_op = send_command(addr, 3, "workflow.signal");
+    let task_op = send_command(
+        addr,
+        3,
+        "workflow.signal",
+        &json!({"name": "conformance-probe"}),
+    );
     for (what, env, want) in [
         ("a conversation turn", &turn, "task"),
         ("a task command", &task_op, "task"),
@@ -302,7 +321,12 @@ fn results_are_spec_shaped(h: &Harness) -> Outcome {
         &rpc_body(4, "SendStreamingMessage", text_params("hi", None, false)),
         &[],
     );
-    let (_, _, op_frames) = stream_command(addr, 5, "workflow.signal");
+    let (_, _, op_frames) = stream_command(
+        addr,
+        5,
+        "workflow.signal",
+        &json!({"name": "conformance-probe"}),
+    );
     for (what, frames) in [
         ("a streamed turn", &turn_frames),
         ("a streamed task command", &op_frames),
@@ -404,7 +428,13 @@ fn no_bare_metadata(h: &Harness) -> Outcome {
         } else {
             uri.as_str()
         };
-        let op = send_command_activating(addr, 5, "workflow.signal", activation);
+        let op = send_command_activating(
+            addr,
+            5,
+            "workflow.signal",
+            &json!({"name": "conformance-probe"}),
+            activation,
+        );
         let mut out = vec![
             ("SendMessage".to_string(), sent),
             ("GetTask".to_string(), got),

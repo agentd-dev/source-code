@@ -313,6 +313,29 @@ fn a2a_calls_are_audited_when_the_audit_log_sink_is_on() {
     );
     assert_eq!(a["role"], "operator");
     assert_eq!(a["outcome"], "ok");
+    // A read creates no task, so its record names none.
+    assert!(a["target"].get("task").is_none(), "{a}");
+
+    // An operator method that does work answers with the Task it created,
+    // and its record names that task as its target.
+    let paused = common::OperatorCall::new("admin.pause", json!({"reason": "audit"})).result(&addr);
+    let task = paused["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("admin.pause answered no task: {paused}"))
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut audit = None;
+    while Instant::now() < deadline && audit.is_none() {
+        audit = daemon
+            .stderr()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|v| v["event"] == "audit" && v["action"] == "a2a.agentd.operator/admin.pause");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let a = audit.expect("an audit event for admin.pause");
+    assert_eq!(a["target"], json!({"task": task}), "{a}");
+    let _ = common::OperatorCall::new("admin.resume", json!({})).result(&addr);
 
     std::fs::remove_file(&cfg).ok();
 }

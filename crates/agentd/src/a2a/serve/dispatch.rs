@@ -368,12 +368,16 @@ async fn dispatch(
         Some(spec) => Some(spec.name.to_string()),
         None => send.then(|| peeked.op()).flatten(),
     };
-    // An op the table names but nothing serves is unknown to every caller
-    // alike, which the runtime says (`UNKNOWN_OP`): no grant could reach it,
-    // so the op gate does not answer "not permitted" for it first.
-    let unserved = op
-        .as_deref()
-        .is_some_and(|op| surface::is_builtin_op(op) && surface::command_envelope(op).is_none());
+    // An op the table names but nothing serves as a command — held in
+    // reserve, or an operator op sent as a DataPart — is unknown to every
+    // caller alike, which the runtime says (`UNKNOWN_OP`): no grant could
+    // reach it, so the op gate does not answer "not permitted" for it
+    // first. An operator method's op is served, by its method, and the op
+    // gate holds it to the op's floor and the caller's grants.
+    let unserved = operator.is_none()
+        && op.as_deref().is_some_and(|op| {
+            surface::is_builtin_op(op) && surface::command_envelope(op).is_none()
+        });
 
     if let Some(route) = route {
         let name = route.name();

@@ -263,7 +263,8 @@ names no `to`:
 | `accept` | the ask's recommendation is taken: a `recommend` argument to `ask_human`, or the schema's `default`; with neither, the judge answers |
 
 It can be changed while the daemon runs, until the next reload: from a
-client with `/set agent.approval auto`, or with the `admin.set` command.
+client with `/set agent.approval auto`, or with the operator method
+`agentd.operator/admin.set`.
 
 The judge runs on the model `intelligence.roles.approve` names, which only
 the operator's configuration may set. On a decision model it answers only a

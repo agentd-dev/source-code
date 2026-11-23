@@ -175,6 +175,19 @@ impl Runtime {
             );
         };
         let op = spec.name;
+        // The listener answers an operator method only while the request
+        // activates the extension; the runtime holds it to that itself, as
+        // it holds a command to the command extension, so no path into the
+        // loop that skipped the listener reaches an op without it.
+        if !self.a2a_active.contains(surface::Ext::Operator) {
+            return err_obj(
+                errors::METHOD_NOT_FOUND,
+                &format!(
+                    "method not available: activate {} with the A2A-Extensions header",
+                    surface::OPERATOR_EXTENSION
+                ),
+            );
+        }
         let envelope = match surface::check_operator(spec, params) {
             Ok(envelope) => envelope,
             Err(e) => return json!({"_error": e}),

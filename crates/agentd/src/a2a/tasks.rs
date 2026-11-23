@@ -387,9 +387,15 @@ impl Task {
     /// task tracks. From then on the task is the run's, as a `workflow.run`
     /// task is — its annotations say so, and `CancelTask` on it cancels the
     /// run. Only a turn's link is replaced: a task already tracking a run
-    /// or a subagent keeps what it tracks. Whether it changed.
-    pub fn link_run(&mut self, run: &str) -> bool {
-        if !matches!(self.link, Link::Turn { .. }) {
+    /// or a subagent keeps what it tracks. And only for a run its owner's
+    /// (`run_principal`): a run someone else started on the task — an
+    /// operator's — is not the owner's to cancel through it. Whether it
+    /// changed.
+    pub fn link_run(&mut self, run: &str, run_principal: Option<&str>) -> bool {
+        if !matches!(self.link, Link::Turn { .. })
+            || self.principal.is_none()
+            || self.principal.as_deref() != run_principal
+        {
             return false;
         }
         self.link = Link::Run {
@@ -530,6 +536,23 @@ impl Task {
 }
 #[cfg(test)]
 mod tests {
+    /// A turn's task is relinked to the run its message started only when
+    /// the run is its owner's; another principal's run, a task with no
+    /// owner, and a task already tracking work keep their link.
+    #[test]
+    fn a_task_is_linked_only_to_its_owners_run() {
+        let turn = || Task::new("t", "c", Some("user:alice"), Link::Turn { ctx: "c".into() });
+        let mut t = turn();
+        assert!(!t.link_run("r-op", Some("operator")), "another's run");
+        assert!(!t.link_run("r-none", None), "a run nobody owns");
+        assert_eq!(t.link, Link::Turn { ctx: "c".into() });
+        assert!(t.link_run("r-1", Some("user:alice")));
+        assert_eq!(t.link, Link::Run { id: "r-1".into() });
+        assert!(!t.link_run("r-2", Some("user:alice")), "already a run's");
+        let mut ownerless = Task::new("t2", "c", None, Link::Turn { ctx: "c".into() });
+        assert!(!ownerless.link_run("r-3", None));
+    }
+
     use super::*;
 
     /// The durable record's own behaviour. What it looks like on the wire is

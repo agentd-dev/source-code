@@ -389,8 +389,14 @@ impl Runtime {
         } else {
             "ok"
         };
+        // The task the call answered with: a send's `{task}`, or the bare
+        // Task an operator method that does work answers with.
+        let operator_task = Verb::of(&method) == Some(Verb::Operator)
+            && out["status"]["state"].is_string()
+            && out["contextId"].is_string();
         let target = out["task"]["id"]
             .as_str()
+            .or_else(|| operator_task.then(|| out["id"].as_str()).flatten())
             .map(|id| json!({"task": id}))
             .unwrap_or(Value::Null);
         let request_id = params["message"]["messageId"].as_str();

@@ -138,7 +138,8 @@ The events that explain a run, in the order they usually help:
 For a run that is still live, attach the [terminal or web UI](interface.md)
 and turn on introspection (`/set a2a.introspection.enabled true`): the run
 detail shows each step's status, timings, errors and output, and the debug
-view tails the live log. Over A2A the same detail is the `run.get` command;
+view tails the live log. Over A2A the same detail is the operator method
+`agentd.operator/run.get`;
 the agent itself can call `workflow.status`. Turn introspection off when you
 are done: it exposes message bodies and internals.
 

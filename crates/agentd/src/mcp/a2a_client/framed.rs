@@ -61,25 +61,39 @@ pub(super) fn to_parent(
     auth: &PeerAuth,
     deadline: Instant,
 ) -> Result<Value, String> {
+    let marked = crate::a2a::peer::extensions_of(&params);
+    let mut headers = Vec::new();
+    if !marked.is_empty() {
+        headers.push(("A2A-Extensions".to_string(), marked.join(", ")));
+    }
+    call_parent(headers, "SendMessage", params, auth, deadline)
+}
+
+/// `method` with `params` to the parent through this instance child's
+/// channel, presenting `headers` (its extensions) and `auth`'s trace and
+/// headers. The parent names the caller by the channel and holds it to what
+/// that principal may do, as it does a `SendMessage`.
+pub(super) fn call_parent(
+    mut headers: Vec<(String, String)>,
+    method: &str,
+    params: Value,
+    auth: &PeerAuth,
+    deadline: Instant,
+) -> Result<Value, String> {
     #[cfg(unix)]
     {
-        let marked = crate::a2a::peer::extensions_of(&params);
-        let mut headers = Vec::new();
-        if !marked.is_empty() {
-            headers.push(("A2A-Extensions".to_string(), marked.join(", ")));
-        }
         if let Some(t) = &auth.trace {
             headers.extend(t.headers());
         }
         headers.extend(auth.headers.iter().cloned());
         let stream = crate::a2a::channel::connect(request_timeout(deadline))
             .map_err(|e| format!("a2a: cannot reach the parent through its channel: {e}"))?;
-        send_request(stream, "localhost", "/", &headers, "SendMessage", params)
+        send_request(stream, "localhost", "/", &headers, method, params)
             .map_err(Failure::into_message)
     }
     #[cfg(not(unix))]
     {
-        let _ = (params, auth, deadline);
+        let _ = (headers, method, params, auth, deadline);
         Err("a2a: an instance child reaches its parent through a unix channel".to_string())
     }
 }

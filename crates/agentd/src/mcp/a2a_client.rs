@@ -560,8 +560,14 @@ pub fn call_extension(
     params: Value,
     deadline: Instant,
 ) -> Result<Value, String> {
+    let ext = vec![("A2A-Extensions".to_string(), extension.to_string())];
+    // An instance child's call to its parent goes through its channel, and
+    // the parent's own gate answers it.
+    if matches!(endpoint, A2aEndpoint::Parent) {
+        return framed::call_parent(ext, method, params, &auth, deadline);
+    }
     let ep = HttpEp::of(endpoint)?;
-    let mut headers = vec![("A2A-Extensions".to_string(), extension.to_string())];
+    let mut headers = ext;
     if let Some(t) = &auth.trace {
         headers.extend(t.headers());
     }

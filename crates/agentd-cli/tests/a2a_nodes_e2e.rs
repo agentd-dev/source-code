@@ -667,6 +667,130 @@ fn a2a_send_calls_a_peers_operator_method() {
     std::fs::remove_file(&cfg_b).ok();
 }
 
+/// **The peer holds the call to its own floor.** A's credential is B's
+/// `user`: `status` (any named caller) answers, and `admin.pause`
+/// (operator only) is refused at B's gate, and the step fails.
+#[test]
+fn a2a_send_operator_call_is_held_to_the_peers_floor() {
+    let cfg_b = common::unique_path("operator-floor-b", "yaml");
+    let (b, b_addr) = common::spawn_bound(|b_port| {
+        std::fs::write(
+            &cfg_b,
+            format!(
+                "\
+                 agent:\n  name: guarded\n  instruction: test\n  preflight: never\n\
+                 intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+                 store:\n  kind: memory\n\
+                 a2a:\n  listen: http://127.0.0.1:{b_port}\n\
+                 \x20 principals:\n\
+                 \x20   - id: watcher\n\
+                 \x20     match: {{ bearer_ref: \"{{{{secret:FLOOR_E2E_USER}}}}\" }}\n\
+                 \x20     role: user\n\
+                 lifecycle:\n  run_until: drained\n\
+                 observability:\n  log_level: info\n"
+            ),
+        )
+        .unwrap();
+        let stderr_path = common::unique_path("a2a-nodes", "log");
+        let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+            .args(["--config", &cfg_b])
+            .env("FLOOR_E2E_USER", "floor-user-token")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+            .spawn()
+            .expect("spawn agentd");
+        let log = stderr_path.clone();
+        (Daemon { child, stderr_path }, log)
+    });
+
+    let cfg_a = common::unique_path("operator-floor-a", "yaml");
+    std::fs::write(
+        &cfg_a,
+        format!(
+            "\
+             agent:\n  name: watcher\n  instruction: test\n  preflight: never\n\
+             intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+             store:\n  kind: memory\n\
+             a2a:\n  peers:\n    - name: b\n      endpoint: http://{b_addr}\n      headers: {{ Authorization: \"Bearer {{{{secret:FLOOR_E2E_USER}}}}\" }}\n\
+             lifecycle:\n  run_until: idle\n  idle_grace: 900ms\n\
+             observability:\n  log_level: info\n\
+             workflows:\n\
+             \x20 - name: read\n\
+             \x20   steps:\n\
+             \x20     s:  {{kind: once, policy: always}}\n\
+             \x20     st: {{kind: a2a.send, depends_on: [s], to: b, command: status}}\n\
+             \x20     f:  {{kind: finish, depends_on: [st], status: completed}}\n\
+             \x20 - name: hold\n\
+             \x20   steps:\n\
+             \x20     s:  {{kind: once, policy: always}}\n\
+             \x20     pz: {{kind: a2a.send, depends_on: [s], to: b, command: admin.pause, args: {{reason: look}}}}\n\
+             \x20     f:  {{kind: finish, depends_on: [pz], status: completed}}\n"
+        ),
+    )
+    .unwrap();
+    let stderr_a = common::unique_path("a2a-nodes", "log");
+    let child = Command::new(env!("CARGO_BIN_EXE_agentd"))
+        .args(["--config", &cfg_a])
+        .env("FLOOR_E2E_USER", "floor-user-token")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&stderr_a).unwrap()))
+        .spawn()
+        .expect("spawn agentd");
+    let a = Daemon {
+        child,
+        stderr_path: stderr_a,
+    };
+
+    let done = |step: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(e) = events(&a, "step.done")
+                .into_iter()
+                .find(|e| e["step"] == step)
+            {
+                return e;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no step.done for {step}:\n{}",
+                a.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let st = done("st");
+    assert_eq!(
+        st["status"],
+        "done",
+        "a user reads status: {st}\nB:\n{}",
+        b.stderr()
+    );
+    let pz = done("pz");
+    assert_eq!(
+        pz["status"],
+        "failed",
+        "a user may not pause B: {pz}\nB:\n{}",
+        b.stderr()
+    );
+    assert!(
+        wait_for(&b, "\"event\":\"a2a.denied\"", 5),
+        "B logged no refusal:\n{}",
+        b.stderr()
+    );
+    let denied = events(&b, "a2a.denied");
+    assert!(
+        denied.iter().any(|e| e["op"] == "admin.pause"
+            && e["status"] == 403
+            && e["principal"] == "user:watcher"),
+        "B refused admin.pause from its user: {denied:?}"
+    );
+
+    std::fs::remove_file(&cfg_a).ok();
+    std::fs::remove_file(&cfg_b).ok();
+}
+
 /// One request the fixture peer below received.
 struct PeerRequest {
     head: String,

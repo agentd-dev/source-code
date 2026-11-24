@@ -165,6 +165,55 @@ fn wait_for(what: &str, mut ready: impl FnMut() -> Option<Value>) -> Value {
     }
 }
 
+/// A parent's workflow calls its instance child's operator methods with
+/// `a2a.send`: the child's unix listener takes its parent as operator, so a
+/// `status` read answers with the child's snapshot, and an `admin.pause` and
+/// `admin.resume` hold and release it — each read back by the next `status`.
+#[test]
+fn a_parents_workflow_calls_its_childs_operator_methods() {
+    let dirs = Dirs::new("inst-operator");
+    let call = |id: &str, after: &str, op: &str, args: &str| {
+        format!(
+            "\x20     {id}: {{ kind: a2a.send, depends_on: [{after}], to: \"{{{{steps.spawn.output.peer}}}}\", command: {op}, args: {{ {args} }}, timeout: 10s, retry: {{ max: 6, backoff: 1s }} }}\n"
+        )
+    };
+    let steps = [
+        "\x20     s:     { kind: once }\n\
+         \x20     spawn: { kind: subagent, template: room, params: { id: solo }, depends_on: [s] }\n"
+            .to_string(),
+        call("before", "spawn", "status", ""),
+        call("pause", "before", "admin.pause", "reason: look"),
+        call("held", "pause", "status", ""),
+        call("resume", "held", "admin.resume", ""),
+        call("after", "resume", "status", ""),
+        "\x20     f:     { kind: finish, depends_on: [after], status: completed, output: \"{{steps.before.output.paused}} {{steps.held.output.paused}} {{steps.after.output.paused}}\" }\n"
+            .to_string(),
+    ]
+    .concat();
+    let cfg = parent("run_until: idle, idle_grace: 1500ms", &steps);
+    let (code, log) = dirs.run("operator", &cfg);
+    assert_eq!(code, Some(0), "{log}");
+    assert_eq!(caller_output(&log), "false true false", "{log}");
+    // Each went as the operator method, not a command DataPart; the first
+    // `status` may be retried while the child comes up.
+    let mut methods: Vec<String> = events(&log, "a2a.send")
+        .iter()
+        .filter_map(|e| e["method"].as_str().map(str::to_string))
+        .collect();
+    methods.dedup();
+    assert_eq!(
+        methods,
+        [
+            "agentd.operator/status",
+            "agentd.operator/admin.pause",
+            "agentd.operator/status",
+            "agentd.operator/admin.resume",
+            "agentd.operator/status",
+        ],
+        "{log}"
+    );
+}
+
 /// An instance child is composed its parent's `http.endpoints`: under
 /// `egress: closed` its template's `http` step reaches the parent's endpoint
 /// — with the entry's headers — and nothing else.

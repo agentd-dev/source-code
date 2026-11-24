@@ -2663,6 +2663,15 @@ fn parse_step(
             if spec.get("args").is_some() && spec.get("command").is_none() {
                 errs.push(format!("{at}: `args` needs `command`"));
             }
+            // An operator method answers at once; there is no task to
+            // delegate and follow.
+            if let Some(cmd) = spec.get("command").and_then(Value::as_str)
+                && crate::runtime::surface::is_operator_op(cmd)
+            {
+                errs.push(format!(
+                    "{at}: {cmd:?} is an operator method, which answers at once — call it with a2a.send"
+                ));
+            }
             // Whom a peer's `AUTH_REQUIRED` is shown to when the run has no
             // task of its own: one principal, who owns the task it is shown
             // on — never a pattern nobody owns.
@@ -2686,6 +2695,20 @@ fn parse_step(
         "a2a.send" => {
             if spec.get("args").is_some() && spec.get("command").is_none() {
                 errs.push(format!("{at}: `args` needs `command`"));
+            }
+            // An operator op is a method call, not a message: it carries its
+            // `args` and nothing a message would.
+            if let Some(cmd) = spec.get("command").and_then(Value::as_str)
+                && crate::runtime::surface::is_operator_op(cmd)
+            {
+                for field in OPERATOR_SEND_REFUSES {
+                    if spec.contains_key(*field) {
+                        errs.push(format!(
+                            "{at}: {cmd:?} is an operator method, called with `args` alone — \
+                             `{field}` belongs to a message"
+                        ));
+                    }
+                }
             }
         }
         // WHO a message wait listens to. A conversation id is the sender's to
@@ -3737,6 +3760,11 @@ pub fn is_raw_field(kind: &str, field: &str) -> bool {
     RAW_FIELDS.iter().any(|(k, f)| *k == kind && *f == field)
 }
 
+/// What an `a2a.send` that calls an operator method may not carry: each is
+/// part of a message (`parts`, `context`), a message's id (`idempotency`) or
+/// a paid send (`payment`), and an operator method is none of those.
+pub(crate) const OPERATOR_SEND_REFUSES: &[&str] = &["parts", "context", "idempotency", "payment"];
+
 /// `Some(ms)` for a duration field, `None` when absent/invalid.
 pub fn duration_ms_opt(v: &Value) -> Option<u64> {
     duration_ms(v).ok()
@@ -3849,6 +3877,42 @@ pub fn workflow_schema() -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// An `a2a.send` whose `command` is an operator op calls the method with
+    /// `args` alone, and `a2a.delegate` does not take one: an operator
+    /// method answers at once, with no task to follow.
+    #[test]
+    fn an_operator_command_is_called_by_a2a_send_with_args_alone() {
+        use serde_json::json;
+        let def = |step: &serde_json::Value| {
+            json!({"name": "w", "steps": {"s": {"kind": "manual"}, "p": step,
+                   "f": {"kind": "finish", "depends_on": ["p"]}}})
+        };
+        for step in [
+            json!({"kind": "a2a.send", "to": "child", "command": "status", "depends_on": ["s"]}),
+            json!({"kind": "a2a.send", "to": "child", "command": "run.get",
+                   "args": {"run": "r1"}, "timeout": "5s", "depends_on": ["s"]}),
+        ] {
+            assert!(parse_workflow(&def(&step)).is_ok(), "{step}");
+        }
+        for (step, says) in [
+            (
+                json!({"kind": "a2a.send", "to": "child", "command": "status", "parts": "hi", "depends_on": ["s"]}),
+                "`parts` belongs to a message",
+            ),
+            (
+                json!({"kind": "a2a.send", "to": "child", "command": "status", "idempotency": true, "depends_on": ["s"]}),
+                "`idempotency` belongs to a message",
+            ),
+            (
+                json!({"kind": "a2a.delegate", "peer": "child", "command": "status", "depends_on": ["s"]}),
+                "call it with a2a.send",
+            ),
+        ] {
+            let e = parse_workflow(&def(&step)).unwrap_err().join("\n");
+            assert!(e.contains(says), "{step}: {e}");
+        }
+    }
+
     /// `payment` is a field of the kinds that pay (RFC 0049 §7): an MCP
     /// tool's call and an A2A peer's task as an HTTP request, literal, and a
     /// paying MCP call is never detached nor its task asked about.

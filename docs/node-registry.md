@@ -1156,6 +1156,14 @@ Sends a message to a peer and continues: a notification.
 - `to` names an `a2a.peers` entry. `command` with `args` sends the typed
   payload a peer's `a2a` start matches. `idempotency: true` pins the message
   id across retries so the peer can deduplicate. `timeout` defaults to 30 s.
+- A `command` that is an [operator op](ext/operator.md) (`status`,
+  `run.get`, `subagent.status`, `admin.pause`, …) is called as the method
+  `agentd.operator/<command>` with `args` as its params, and the output is
+  its result: a read's document, or the Task the work started. The peer
+  holds the call to its own floor and grants, as it does every caller's;
+  a live instance child's unix listener takes its parent as operator.
+  `parts`, `context`, `idempotency` and `payment` belong to a message and
+  are refused with one; `a2a.delegate` takes no operator op.
 - `payment: {wallet, max, approve?}` lets the step pay a peer that asks to
   be paid (a2a-x402, the `x402` feature), within `security.payments`: the
   peer's task is answered with the payment and followed until its receipt,
@@ -1169,6 +1177,11 @@ Sends a message to a peer and continues: a notification.
 ```yaml
 # fragment: under workflows[].steps
 ask: {kind: a2a.send, depends_on: [start], to: reviewer, parts: [{text: "Review PR {{ inputs.pr }}"}], idempotency: true}
+```
+
+```yaml
+# fragment: under workflows[].steps
+child: {kind: a2a.send, depends_on: [start], to: researcher, command: status}
 ```
 
 ### `a2a.delegate`

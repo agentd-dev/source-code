@@ -588,6 +588,85 @@ fn plain_text_send_to_agentd_peer() {
     std::fs::remove_file(&cfg_b).ok();
 }
 
+/// **A workflow calls a peer's operator method.** `a2a.send` with an
+/// operator op as its `command` calls `agentd.operator/<op>` on the peer, and
+/// the method's result is the step's output — so a parent reads a child's
+/// `status` as the TS client and the CLIs do. B listens on loopback with no
+/// principals, so A is its operator.
+#[test]
+fn a2a_send_calls_a_peers_operator_method() {
+    let cfg_b = common::unique_path("operator-b", "yaml");
+    let (b, b_addr) = common::spawn_bound(|b_port| {
+        std::fs::write(
+            &cfg_b,
+            format!(
+                "\
+                 agent:\n  name: watched\n  instruction: test\n  preflight: never\n\
+                 intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+                 store:\n  kind: memory\n\
+                 a2a:\n  listen: http://127.0.0.1:{b_port}\n\
+                 lifecycle:\n  run_until: drained\n\
+                 observability:\n  log_level: info\n"
+            ),
+        )
+        .unwrap();
+        let b = spawn(&cfg_b);
+        let log = b.stderr_path.clone();
+        (b, log)
+    });
+
+    let cfg_a = common::unique_path("operator-a", "yaml");
+    std::fs::write(
+        &cfg_a,
+        format!(
+            "\
+             agent:\n  name: watcher\n  instruction: test\n  preflight: never\n\
+             intelligence:\n  endpoints: http://127.0.0.1:1/v1\n  model: mock\n\
+             store:\n  kind: memory\n\
+             a2a:\n  peers:\n    - name: b\n      endpoint: http://{b_addr}\n\
+             lifecycle:\n  run_until: idle\n  idle_grace: 900ms\n\
+             observability:\n  log_level: info\n  log_content: true\n\
+             workflows:\n\
+             \x20 - name: watch\n\
+             \x20   steps:\n\
+             \x20     s:  {{kind: once, policy: always}}\n\
+             \x20     st: {{kind: a2a.send, depends_on: [s], to: b, command: status}}\n\
+             \x20     f:  {{kind: finish, depends_on: [st], status: completed, output: \"b is {{{{steps.st.output.instance}}}} paused={{{{steps.st.output.paused}}}}\"}}\n"
+        ),
+    )
+    .unwrap();
+    let a = spawn(&cfg_a);
+
+    assert!(
+        wait_for(&a, "\"event\":\"run.done\"", 20),
+        "A's run never finished:\n{}",
+        a.stderr()
+    );
+    let st = events(&a, "step.done")
+        .into_iter()
+        .find(|e| e["step"] == "st")
+        .unwrap_or_else(|| panic!("A logged no step.done for the call:\n{}", a.stderr()));
+    assert_eq!(
+        st["status"],
+        "done",
+        "B refused the operator call: {st}\nB:\n{}",
+        b.stderr()
+    );
+    assert!(
+        a.stderr().contains("\"method\":\"agentd.operator/status\""),
+        "A did not call the method:\n{}",
+        a.stderr()
+    );
+    assert!(
+        wait_for(&a, "b is watched paused=false", 5),
+        "A's run did not read B's status:\n{}",
+        a.stderr()
+    );
+
+    std::fs::remove_file(&cfg_a).ok();
+    std::fs::remove_file(&cfg_b).ok();
+}
+
 /// One request the fixture peer below received.
 struct PeerRequest {
     head: String,

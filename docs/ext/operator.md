@@ -71,6 +71,10 @@ The params are held to the op's schema (`$defs/ops/<op>/params`); a
 member the schema does not name is refused, never ignored. The request states
 `A2A-Version: 1.0` like every other.
 
+A workflow calls one with `a2a.send`, `command` naming the op and `args`
+its params; the step's output is the result
+([node registry](../node-registry.md#a2asend)).
+
 ## Replies
 
 A method answers in one of two ways, given by its `reply` column below and by

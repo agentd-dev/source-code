@@ -2092,6 +2092,15 @@ impl Runtime {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        if let Some(op) = spec
+            .get("command")
+            .and_then(Value::as_str)
+            .filter(|op| crate::runtime::surface::is_operator_op(op))
+        {
+            let op = op.to_string();
+            self.step_a2a_operator(run_id, step_id, spec, &peer_name, &op);
+            return;
+        }
         // `command` + `args` build the typed DataPart the peer's `a2a` start
         // nodes match on; `parts` text (if any) rides along for the humans
         // reading the transcript. Without `command`, `parts` goes as before.
@@ -2232,6 +2241,117 @@ impl Runtime {
                 )
                 .attr("rpc.system", "jsonrpc")
                 .attr("rpc.method", "SendMessage")
+                .attr("agentd.a2a.peer", peer_name.as_str())
+                .end(!is_error);
+                let _ = tx.send(super::events::Event::StepDone {
+                    run: r,
+                    step: st,
+                    output,
+                    is_error,
+                    error,
+                    tokens: 0,
+                });
+            })
+            .ok();
+    }
+
+    /// `a2a.send {to, command, args?}` where `command` is an operator op: the
+    /// JSON-RPC method `agentd.operator/<command>` on the peer, under the
+    /// operator extension, with `args` as its params. The step's output is
+    /// the method's result — a read's document, or the Task the work
+    /// started — so a workflow reads a peer's or a child's `status`, a run,
+    /// a log, as the TS client and the CLIs do. The peer authorizes the call
+    /// as it would any other: the credential is the one `a2a.peers` names.
+    #[cfg(feature = "a2a")]
+    fn step_a2a_operator(
+        &mut self,
+        run_id: &str,
+        step_id: &str,
+        spec: &Map<String, Value>,
+        peer_name: &str,
+        op: &str,
+    ) {
+        // Checked at load for a literal `command`; a rendered one lands here.
+        if let Some(field) = crate::engine::model::OPERATOR_SEND_REFUSES
+            .iter()
+            .find(|f| spec.contains_key(**f))
+        {
+            self.finish_step_pub(
+                run_id,
+                step_id,
+                StepStatus::Failed,
+                None,
+                Some(format!(
+                    "a2a.send: {op:?} is an operator method, called with `args` alone — `{field}` belongs to a message"
+                )),
+                0,
+            );
+            return;
+        }
+        let params = match spec.get("args") {
+            None => json!({}),
+            Some(Value::Object(o)) => Value::Object(o.clone()),
+            Some(_) => {
+                self.finish_step_pub(
+                    run_id,
+                    step_id,
+                    StepStatus::Failed,
+                    None,
+                    Some("a2a.send: args must be a mapping".into()),
+                    0,
+                );
+                return;
+            }
+        };
+        let timeout = spec
+            .get("timeout")
+            .and_then(crate::engine::model::duration_ms_opt)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| self.peer_timeout(peer_name, Duration::from_secs(30)));
+        let (endpoint, mut auth) = match self.a2a_peer_conn(peer_name, timeout, "a2a.send") {
+            Ok(v) => v,
+            Err(e) => {
+                self.finish_step_pub(run_id, step_id, StepStatus::Failed, None, Some(e), 0);
+                return;
+            }
+        };
+        let tx = self.events_tx.clone();
+        let (r, st) = (run_id.to_string(), step_id.to_string());
+        self.executing
+            .insert(format!("{run_id}/{step_id}"), std::time::Instant::now());
+        let hop = self.step_trace(run_id, step_id).map(|t| t.child());
+        auth.trace = hop.clone();
+        let method = crate::runtime::surface::operator_method(op);
+        self.log.in_trace(hop.as_ref()).info(
+            "a2a.send",
+            json!({"run": run_id, "step": step_id, "to": peer_name, "method": method}),
+        );
+        let peer_name = peer_name.to_string();
+        std::thread::Builder::new()
+            .name(format!("a2a.send:{peer_name}"))
+            .spawn(move || {
+                let start = crate::obs::otel::now_unix_nanos();
+                let deadline = std::time::Instant::now() + timeout;
+                let answered = crate::mcp::a2a_client::call_extension(
+                    &endpoint,
+                    auth,
+                    crate::runtime::surface::OPERATOR_EXTENSION,
+                    &method,
+                    params,
+                    deadline,
+                );
+                let (output, is_error, error) = match answered {
+                    Ok(v) => (v, false, None),
+                    Err(e) => (Value::Null, true, Some(e)),
+                };
+                crate::obs::otel::span(
+                    hop.as_ref(),
+                    &format!("a2a.send {peer_name}"),
+                    crate::obs::otel::Kind::Client,
+                    start,
+                )
+                .attr("rpc.system", "jsonrpc")
+                .attr("rpc.method", method.as_str())
                 .attr("agentd.a2a.peer", peer_name.as_str())
                 .end(!is_error);
                 let _ = tx.send(super::events::Event::StepDone {

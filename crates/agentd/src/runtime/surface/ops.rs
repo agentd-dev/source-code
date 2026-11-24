@@ -755,6 +755,12 @@ pub fn is_builtin_op(op: &str) -> bool {
     op_spec(op).is_some()
 }
 
+/// Is `op` one the operator extension carries — called as the method
+/// `agentd.operator/<op>`, not sent as a command DataPart?
+pub fn is_operator_op(op: &str) -> bool {
+    op_spec(op).is_some_and(|s| s.ext == OpExt::Operator)
+}
+
 /// Does `op` answer to the operator role alone, whatever the grants say?
 pub fn is_operator_floor(op: &str) -> bool {
     op_spec(op).is_some_and(|s| s.floor == Floor::Operator)

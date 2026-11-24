@@ -7,6 +7,13 @@ runtime (developed in the `agentd-dev` org). The format is loosely
 
 ## Unreleased
 
+- **A workflow calls a peer's operator methods.** An `a2a.send` whose
+  `command` is an operator op calls `agentd.operator/<command>` on the peer
+  with `args` as its params, and the step's output is the method's result —
+  so a parent reads a child's `status`, a run or a log, and pauses or drains
+  a peer it operates. `parts`, `context`, `idempotency` and `payment` are
+  refused on such a step, and `a2a.delegate` refuses an operator op.
+
 - **Breaking: the operator surface is a method extension, and the command
   extension carries the workload.** A new extension,
   `https://agentd.dev/a2a/ext/operator`, declares one JSON-RPC method per

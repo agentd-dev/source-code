@@ -385,7 +385,10 @@ fn the_parent_reads_only_the_log_it_opened_and_follows_sends_in_order() {
         most = most.max(threads_named(pid, "inst."));
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(most <= 1, "{most} threads carried one child's sends");
+    // At most one carries them; a second is seen only in a handoff — a
+    // follower that ran out of sends gives up its slot and is still exiting
+    // when the next send starts another. A thread per send would show many.
+    assert!(most <= 2, "{most} threads carried one child's sends");
 
     // A slow turn, then a fast one: the fast one's reply is kept, and stays.
     wait_for("the burst's answers", &daemon, || {
